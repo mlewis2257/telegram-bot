@@ -10,7 +10,9 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@solana/web3.js": "^1.98.4",
     "dotenv": "^16.4.1",
-    "node-telegram-bot-api": "^0.64.0"
+    "node-telegram-bot-api": "^0.64.0",
+    "ws": "^8.19.0"
   }
 }
