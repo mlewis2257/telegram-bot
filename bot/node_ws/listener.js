@@ -1,4 +1,4 @@
-require("dotenv").config();
+import { config } from "dotenv";
 const web3 = require("@solana/web3.js");
 // Uses url for direct blockchain access
 const RPC_URL = process.env.RPC_URL;
