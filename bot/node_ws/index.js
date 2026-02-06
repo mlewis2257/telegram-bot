@@ -1,30 +1,60 @@
 // index.js
 import "dotenv/config";
 import { Connection } from "@solana/web3.js";
-import {
-  RAYDIUM_AMM_PROGRAM_ID,
-  isRaydiumInitLogs,
-  parseRaydiumInitFromSignature,
-} from "./parsers/raydiumParser.js";
 import { rpcQueue } from "./utils/queue.js";
+import { parseRaydiumSwapFromSignature } from "./parsers/raydiumSwapParser.js";
 
-const RPC_URL = process.env.RPC_URL || "https://api.devnet.solana.com";
-const RPC_WSS = process.env.RPC_WSS; // strongly recommended (wss://...)
-const MODE = process.env.MODE || "init"; // "init" | "debug"
+const RPC_URL = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
+const RPC_WSS = process.env.RPC_WSS;
+const MODE = process.env.MODE || "debug";
+
+const RAYDIUM_AMM_PROGRAM_ID = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 
 const connection = new Connection(RPC_URL, {
   commitment: "confirmed",
   wsEndpoint: RPC_WSS,
 });
 
-const pending = new Map(); // signature -> { signature, slot }
+const pending = new Map(); // signature -> slot
 let draining = false;
 
-let raydiumLogsSeen = 0;
-let raydiumInitSeen = 0;
+const BATCH_SIZE = Number(process.env.BATCH_SIZE || 20);
+const DRAIN_EVERY_MS = Number(process.env.DRAIN_EVERY_MS || 250);
 
-function pushPending({ signature, slot }) {
-  pending.set(signature, { signature, slot });
+let seen = 0;
+
+function extractProgramLogBlocks(logs, programIdStr) {
+  const blocks = [];
+  let current = null;
+
+  for (const line of logs || []) {
+    if (line.startsWith(`Program ${programIdStr} invoke`)) {
+      if (current?.length) blocks.push(current);
+      current = [line];
+      continue;
+    }
+    if (current) {
+      current.push(line);
+      if (
+        line === `Program ${programIdStr} success` ||
+        line.startsWith(`Program ${programIdStr} failed:`)
+      ) {
+        blocks.push(current);
+        current = null;
+      }
+    }
+  }
+  if (current?.length) blocks.push(current);
+  return blocks;
+}
+
+function pickBiggestBlock(blocks) {
+  if (!blocks.length) return null;
+  return blocks.reduce((a, b) => (b.length > a.length ? b : a), blocks[0]);
+}
+
+function enqueue(sig, slot) {
+  pending.set(sig, slot);
 }
 
 async function drainBatch() {
@@ -32,103 +62,67 @@ async function drainBatch() {
   draining = true;
 
   try {
-    const batch = Array.from(pending.values()).slice(0, 15);
-    for (const item of batch) pending.delete(item.signature);
-    if (batch.length === 0) return;
+    const batch = Array.from(pending.entries()).slice(0, BATCH_SIZE);
+    for (const [sig] of batch) pending.delete(sig);
+    if (!batch.length) return;
 
     const results = await Promise.all(
-      batch.map((item) =>
+      batch.map(([signature, slot]) =>
         rpcQueue.add(() =>
-          parseRaydiumInitFromSignature(connection, item.signature, item.slot),
+          parseRaydiumSwapFromSignature(connection, signature, slot),
         ),
       ),
     );
 
     for (const r of results) {
       if (!r) continue;
-      console.log("\n🧠 Raydium init parsed:");
+      console.log("\n💱 Raydium Swap Parsed:");
       console.dir(r, { depth: null });
-      if (r.debug) console.log("⚠️ debug:", r.debug);
     }
+  } catch (e) {
+    console.error("drainBatch error:", e?.message || e);
   } finally {
     draining = false;
   }
 }
 
-function pickRaydiumOnlyLines(allLogs, raydiumProgramIdStr) {
-  if (!Array.isArray(allLogs)) return [];
-
-  // Keep only lines that clearly belong to Raydium program execution
-  // (invoke/success/consumed lines for Raydium program id, plus raydium-specific markers)
-  return allLogs.filter((l) => {
-    if (!l) return false;
-    return (
-      l.includes(`Program ${raydiumProgramIdStr} `) || // invoke/success/consumed
-      l.includes("ray_log:") || // Raydium emits ray_log
-      l.includes("initialize2") || // init pools
-      l.includes("AddLiquidity") || // add liquidity
-      l.includes("swap") // swaps (if/when you add swap parsing)
-    );
-  });
-}
-
 async function main() {
   console.log("RPC:", RPC_URL);
-  console.log("WSS:", RPC_WSS || "(inferred by web3.js)");
-  console.log(`MODE: ${MODE}`);
-  console.log("🔁 Listening to Raydium program logs...");
+  console.log("WSS:", RPC_WSS || "(inferred)");
+  console.log("MODE:", MODE);
+  console.log("🔁 Listening to Raydium program logs (swap-driven)...");
 
   connection.onLogs(
     RAYDIUM_AMM_PROGRAM_ID,
     async (logInfo) => {
-      raydiumLogsSeen++;
-      if (raydiumLogsSeen % 50 === 0) {
-        console.log(`📡 Raydium logs seen: ${raydiumLogsSeen}`);
-      }
+      seen++;
+      if (seen % 50 === 0) console.log(`📡 Raydium logs seen: ${seen}`);
 
-      // DEBUG mode: print occasional samples so you KNOW it's alive
-      if (MODE === "debug" && raydiumLogsSeen % 200 === 0) {
-        const rayOnly = pickRaydiumOnlyLines(
+      // Debug: show Raydium-only block every 200 hits
+      if (MODE === "debug" && seen % 200 === 0) {
+        const blocks = extractProgramLogBlocks(
           logInfo.logs,
-          RAYDIUM_AMM_PROGRAM_ID.toBase58(),
+          RAYDIUM_AMM_PROGRAM_ID,
         );
-
+        const biggest = pickBiggestBlock(blocks);
         console.log("🧾 SAMPLE SIG:", logInfo.signature);
-
-        if (rayOnly.length) {
-          console.log("🟣 Raydium-only logs:");
-          console.log(rayOnly.slice(0, 50).join("\n"));
+        if (biggest) {
+          console.log("🟣 Raydium Block:");
+          console.log(biggest.slice(0, 80).join("\n"));
         } else {
-          // Fallback if tx had Raydium but logs didn't match patterns (rare)
-          console.log(
-            "🟡 No Raydium-only lines matched; showing first 25 raw lines:",
-          );
-          console.log(logInfo.logs.slice(0, 25).join("\n"));
+          console.log("🟡 No Raydium-only block found");
         }
-
         console.log("—".repeat(70));
       }
-      const rayOnly = pickRaydiumOnlyLines(
-        logInfo.logs,
-        RAYDIUM_AMM_PROGRAM_ID.toBase58(),
-      );
 
-      // Strict init filter (use rayOnly to avoid false context noise)
-      if (!isRaydiumInitLogs(rayOnly)) return;
-
-      raydiumInitSeen++;
-      console.log(
-        `🆕 initialize2 detected: ${raydiumInitSeen} | sig=${logInfo.signature}`,
-      );
-
-      pushPending(logInfo);
+      // ✅ For swaps we don’t rely on log keywords;
+      // we just enqueue signatures and let the parser decide if it’s a swap.
+      enqueue(logInfo.signature, logInfo.slot);
     },
     "confirmed",
   );
 
-  setInterval(() => {
-    drainBatch().catch((e) => console.error("drainBatch error:", e));
-  }, 250);
+  setInterval(() => drainBatch().catch(console.error), DRAIN_EVERY_MS);
 }
 
 main().catch(console.error);

@@ -1,86 +1,140 @@
-// raydiumSwapParser.js (ESM)
+// parsers/raydiumSwapParser.js
+import { PublicKey } from "@solana/web3.js";
+import { getMetaplexMetadata } from "../utils/metaplexMetadata.js";
+import { getTokenSupplyUi } from "../utils/onChain.js"; // you likely already have something similar
+
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 
-// Raydium often emits base64 `ray_log:` lines on swaps
-export function isRaydiumSwapLogs(logs) {
-  return logs.some((l) => l.includes("ray_log:"));
+function toUiAmount(balanceObj) {
+  if (!balanceObj) return null;
+  const ui = balanceObj.uiTokenAmount;
+  if (!ui) return null;
+  return {
+    amount: Number(ui.amount), // raw integer
+    decimals: ui.decimals,
+    uiAmount: ui.uiAmount ?? null,
+    uiAmountString: ui.uiAmountString ?? null,
+  };
 }
 
-function extractTokenDeltas(parsedTx) {
+function indexBalancesByAccount(tokenBalances = []) {
+  const map = new Map();
+  for (const b of tokenBalances) {
+    if (!b?.accountIndex) continue;
+    map.set(b.accountIndex, b);
+  }
+  return map;
+}
+
+/**
+ * Returns token deltas per accountIndex:
+ * deltaRaw = post.amount - pre.amount (raw integer)
+ */
+function computeTokenDeltas(parsedTx) {
   const pre = parsedTx?.meta?.preTokenBalances || [];
   const post = parsedTx?.meta?.postTokenBalances || [];
 
-  // Map: accountIndex -> { mint, owner, uiAmount }
-  const preMap = new Map();
-  for (const b of pre) {
-    preMap.set(b.accountIndex, {
-      mint: b.mint,
-      owner: b.owner,
-      ui: b.uiTokenAmount?.uiAmount ?? null,
+  const preMap = indexBalancesByAccount(pre);
+  const postMap = indexBalancesByAccount(post);
+
+  const deltas = [];
+
+  for (const [idx, postB] of postMap.entries()) {
+    const preB = preMap.get(idx);
+    if (!preB) continue;
+
+    const preAmt = BigInt(preB.uiTokenAmount.amount);
+    const postAmt = BigInt(postB.uiTokenAmount.amount);
+
+    const delta = postAmt - preAmt;
+    if (delta === 0n) continue;
+
+    deltas.push({
+      accountIndex: idx,
+      mint: postB.mint,
+      owner: postB.owner || null,
+      decimals: postB.uiTokenAmount.decimals,
+      deltaRaw: delta.toString(),
     });
   }
 
-  const deltas = []; // [{ mint, owner, deltaUi }]
-  for (const b of post) {
-    const before = preMap.get(b.accountIndex);
-    const mint = b.mint;
-    const owner = b.owner;
-    const afterUi = b.uiTokenAmount?.uiAmount ?? null;
-    const beforeUi = before?.ui ?? 0;
-
-    if (afterUi === null) continue;
-    const delta = afterUi - beforeUi;
-    if (!delta) continue;
-
-    deltas.push({ mint, owner, deltaUi: delta });
-  }
-
-  // Remove wSOL if you want the other token(s)
-  const filtered = deltas.filter((d) => d.mint !== WSOL_MINT);
-
-  // Pick the two biggest absolute deltas (often the swap legs)
-  filtered.sort((a, b) => Math.abs(b.deltaUi) - Math.abs(a.deltaUi));
-  const top = filtered.slice(0, 2);
-
-  const mints = [...new Set(top.map((t) => t.mint))];
-  return { deltas: top, mints };
+  return deltas;
 }
 
-function deriveImpliedPrice(deltas) {
-  // heuristic: if we have two legs, price = |quote| / |base|
-  if (!deltas || deltas.length < 2) return null;
-  const [a, b] = deltas;
-
-  const base = Math.abs(a.deltaUi);
-  const quote = Math.abs(b.deltaUi);
-
-  if (!base || !quote) return null;
-  return quote / base;
-}
-
-export async function parseRaydiumSwapEvent({
+export async function parseRaydiumSwapFromSignature(
   connection,
   signature,
   slot,
-  logs,
-}) {
+) {
   const parsedTx = await connection.getParsedTransaction(signature, {
     commitment: "confirmed",
-    maxSupportedTransactionVersion: 0, // supports v0 tx
+    maxSupportedTransactionVersion: 0,
   });
 
   if (!parsedTx?.meta) return null;
 
-  const { deltas, mints } = extractTokenDeltas(parsedTx);
-  if (!mints.length) return null;
+  // Quick reject: no token balances changed
+  const deltas = computeTokenDeltas(parsedTx);
+  if (!deltas.length) return null;
+
+  // Identify the two “main” mints involved (ignore WSOL if desired)
+  const mintCounts = new Map();
+  for (const d of deltas) {
+    const m = d.mint;
+    if (m === WSOL_MINT) continue;
+    mintCounts.set(m, (mintCounts.get(m) || 0) + 1);
+  }
+  const mints = Array.from(mintCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([m]) => m)
+    .slice(0, 2);
+
+  // If we can’t find 2, still return what we have
+  const [mintA, mintB] = mints;
+
+  // Heuristic: pick biggest negative delta as “amount in”, biggest positive as “amount out”
+  const sorted = [...deltas].sort((a, b) => {
+    const da = BigInt(a.deltaRaw);
+    const db = BigInt(b.deltaRaw);
+    // sort by absolute value desc
+    const aa = da < 0n ? -da : da;
+    const ab = db < 0n ? -db : db;
+    return ab > aa ? 1 : ab < aa ? -1 : 0;
+  });
+
+  const neg = sorted.find((d) => BigInt(d.deltaRaw) < 0n) || null;
+  const pos = sorted.find((d) => BigInt(d.deltaRaw) > 0n) || null;
+
+  // If no clear in/out, skip
+  if (!neg || !pos) return null;
+
+  // Enrich metadata (optional but useful)
+  const [mdIn, mdOut] = await Promise.all([
+    getMetaplexMetadata(connection, neg.mint).catch(() => null),
+    getMetaplexMetadata(connection, pos.mint).catch(() => null),
+  ]);
 
   return {
     signature,
     slot,
-    mints,
-    deltas,
-    price: deriveImpliedPrice(deltas),
-    // keep raw logs if you want:
-    // logs,
+    kind: "swap",
+    in: {
+      mint: neg.mint,
+      symbol: mdIn?.symbol ?? null,
+      name: mdIn?.name ?? null,
+      deltaRaw: neg.deltaRaw, // negative
+      decimals: neg.decimals,
+      owner: neg.owner,
+    },
+    out: {
+      mint: pos.mint,
+      symbol: mdOut?.symbol ?? null,
+      name: mdOut?.name ?? null,
+      deltaRaw: pos.deltaRaw, // positive
+      decimals: pos.decimals,
+      owner: pos.owner,
+    },
+    mintsDetected: mints,
+    // You can add: price, pool reserves, marketCap here next
   };
 }

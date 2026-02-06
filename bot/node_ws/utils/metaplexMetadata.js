@@ -62,7 +62,7 @@ export async function getMetaplexMetadata(connection, mint) {
         raw: md,
       };
     } catch (error) {
-      console.error("Error getting the metadata:", error.message);
+      return null;
     }
   });
 }
