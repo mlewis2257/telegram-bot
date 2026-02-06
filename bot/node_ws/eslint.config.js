@@ -1,13 +1,23 @@
+import globals from "globals";
+
 export default [
+  // CommonJS files
+  //   {
+  //     files: ["**/*.js"],
+  //     languageOptions: {
+  //       ecmaVersion: "latest",
+  //       sourceType: "commonjs",
+  //       globals: { ...globals.node, ...globals.browser },
+  //     },
+  //   },
+
+  // If you have ESM files like *.mjs or a directory you know is ESM:
   {
-    files: ["**/*.js"],
+    files: ["**/*.mjs"],
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "module",
-    },
-    rules: {
-      "no-unused-vars": "warn",
-      "no-undef": "error",
+      globals: { ...globals.node, ...globals.browser },
     },
   },
 ];
