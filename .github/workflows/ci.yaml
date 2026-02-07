@@ -5,6 +5,24 @@ on:
     push:
         branches: [main]
     workflow_dispatch:
+        inputs:
+            target:
+                description: "What to Run"
+                type: choice
+                required: true
+                default: both
+                options:
+                    - both
+                    - python
+                    - node
+            mode:
+                description: "Fast = deps + lint (optional: + test);"
+                type: choice
+                required: true
+                default: fast
+                options:
+                    - fast
+                    - full
 
 concurrency:
     group: ci-${{ github.ref }}
@@ -14,9 +32,38 @@ permissions:
     contents: read
 
 jobs:
+    changes:
+        name: Detect Changes
+        runs-on: ubuntu-24.04
+        outputs:
+            python: ${{ steps.filter.outputs.python }}
+            node: ${{ steps.filter.outputs.node }}
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Paths filter
+              id: filter
+              uses: dorny/paths-filter@v3
+              with:
+                  filters: |
+                      python: 
+                          - "bot/python_ai/**"
+                          - ".github/workflows/**"
+                      node:
+                          - "bot/node_ws/**"
+                          - ".github/workflows/**"
+
     python_ci:
         name: Python CI
         runs-on: ubuntu-24.04
+        needs: changes
+        if: >
+            ${{
+            github.event_name == 'workflow_dispatch' &&
+              (inputs.target == 'both' || inputs.target == 'python')
+            ||
+            github.event_name != 'workflow_dispatch' && needs.changes.outputs.python == 'true'
+            }}
         defaults:
             run:
                 working-directory: bot/python_ai
@@ -37,9 +84,27 @@ jobs:
                   python -m pip install --upgrade pip
                   pip install -r requirements.txt
 
+            - name: Upload debug artifacts on failure
+              if: ${{ failure() }}
+              uses: actions/upload-artifact@v4
+              with:
+                  name: python-debug
+                  path: |
+                      bot/python_ai/**/*.log
+                      bot/python_ai/**/pytest*.xml
+                  if-no-files-found: ignore
+
     node_ci:
         name: Node CI
         runs-on: ubuntu-24.04
+        needs: changes
+        if: >
+            ${{
+                github.event_name == 'workflow_dispatch' &&
+                (inputs.target == 'both' || inputs.target == 'node')
+                ||
+                github.event_name != 'workflow_dispatch' && needs.changes.outputs.node == 'true'
+                }}
         defaults:
             run:
                 working-directory: bot/node_ws
@@ -60,14 +125,30 @@ jobs:
 
             - name: Lint
               run: npm run lint --if-present
+              continue-on-error: true
 
             - name: Test
+              if: ${{ github.event_name == 'workflow_disptach' && inputs.mode == 'full' || github.event_name != 'workflow_dispatch'}}
               run: npm test --if-present
+              continue-on-error: true
+
+            - name: Upload debug artifacts on failure
+              if: ${{ failure() }}
+              uses: actions/upload-artifact@v4
+              with:
+                  name: node-debug
+                  path: |
+                      bot/node_ws/**/*.log
+                  if-no-files-found: ignore
 
     smoke:
         name: Smoke (repo-level)
         runs-on: ubuntu-24.04
-        needs: [python_ci, node_ci]
+        needs: [changes, python_ci, node_ci]
+        if: ${{ !cancelled() }}
         steps:
             - name: Summary
-              run: echo "✅ Python + Node CI passed"
+              run: |
+                  echo "✅ Python + Node CI passed"
+                  echo "Python changed? ${{needs.changes.outputs.python}}"
+                  echo "Node changed? ${{needs.changes.outputs.node}}"

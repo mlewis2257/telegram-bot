@@ -1,7 +1,8 @@
 import openai
 import os
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = openai.Client(OPENAI_API_KEY)
 
 
 def classify_message_with_gpt(msg):
