@@ -1,55 +1,682 @@
-from telethon.sync import TelegramClient
-from telethon.tl.types import Message
-from dotenv import load_dotenv
-import os
-import re
-import csv
-from datetime import datetime
+"""
+Telegram listener — multi-channel, type-aware.
 
+Reads active channel configs from the channels table at startup.
+For each channel, runs a catchup scan from the last-seen message ID
+(stored in .last_run/<handle>.txt), then registers a persistent
+NewMessage event handler for all active channels simultaneously.
+
+Routes each message to the correct parser based on channel_type:
+  lagging  → parsers/type_a.py  (entry + result in one message)
+  realtime → parsers/type_b.py  (entry only; updates handled separately)
+
+Adding a new channel requires only inserting a row in the channels table.
+No code changes needed.
+"""
+
+import os
+import time
+from pathlib import Path
+
+from dotenv import load_dotenv
+from telethon.sync import TelegramClient
+from telethon import events
+
+import db
+import data_fetcher
+import tags
+from parsers import type_a, type_b
 
 load_dotenv()
 
-api_id = int(os.environ.get("API_ID"))
-api_hash = os.environ.get("API_HASH")
-channel_username = os.getenv("CHANNEL_USERNAME")  # e.g. @Solhouse_signals
+api_id   = int(os.environ["API_ID"])
+api_hash = os.environ["API_HASH"]
+
+# ── Last-run state directory ───────────────────────────────────────────────────
+
+_LAST_RUN_DIR = Path(__file__).parent / ".last_run"
+_LAST_RUN_DIR.mkdir(exist_ok=True)
+
+CATCHUP_FALLBACK_LIMIT = 50   # used on first run, when no state file exists
 
 
-# Message filtering function
-def is_sol_meme_call(text):
-    sol_keywords = ["solana", "$", "degods",
-                    "bonk", "pump", "call", "launch", "raydium"]
-    token_pattern = r'\$?[A-Za-z]{2,5}'
-
-    if any(kw in text.lower() for kw in sol_keywords) and re.search(token_pattern, text):
-        return True
-    return False
-
-# Save to CSV
+def _last_run_path(handle: str) -> Path:
+    safe = handle.lstrip("@").replace("/", "_")
+    return _LAST_RUN_DIR / f"{safe}.txt"
 
 
-def save_to_csv(data, filename="calls.csv"):
-    with open(filename, mode='a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(["Date", "Sender ID", "Message"])
-        for row in data:
-            writer.writerow(row)
+def _read_last_message_id(handle: str) -> int | None:
+    path = _last_run_path(handle)
+    try:
+        return int(path.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
 
 
-with TelegramClient("Solana_meme_tracker_session", api_id, api_hash) as client:
-    messages_to_save = []
-    print(f"Scanning")
+def _write_last_message_id(handle: str, message_id: int) -> None:
+    _last_run_path(handle).write_text(str(message_id))
 
-    for message in client.iter_messages(channel_username, limit=200):
-        if message.text and is_sol_meme_call(message.text):
-            messages_to_save.append([
-                message.date.strftime("%Y-%m-%d %H:%M:%S"),
-                message.sender_id,
-                message.text.strip().replace('\n', ' '),
-            ])
-            print(f"[MATCH] {message.date} | {message.text[:100]}")
 
-    if messages_to_save:
-        save_to_csv(messages_to_save)
-        print(f"✅ Saved {len(messages_to_save)} filtered messages to call.csv")
+# ── Keyword pre-filter ────────────────────────────────────────────────────────
+# Applied before the heavier parsers to skip obvious non-call messages cheaply.
+
+CALL_KEYWORDS = [
+    "solana", "$", "pump", "call", "launch", "raydium",
+    "bonk", "ca:", "contract", "mint", "ticker", "achiev",
+    "whale",   # catches realtime entry signals, daily stats, leaderboards
+]
+
+
+def is_candidate(text: str) -> bool:
+    lower = text.lower()
+    return any(kw in lower for kw in CALL_KEYWORDS)
+
+
+# ── Per-channel stats ─────────────────────────────────────────────────────────
+
+_STAT_KEYS = [
+    "logged", "milestone", "dupe", "whale_alert",
+    "dex_paid", "boost", "update", "daily_stats",
+    "leaderboard", "noise", "skipped", "error",
+]
+
+_stats: dict[str, dict] = {}
+
+
+def _init_stats(handle: str) -> None:
+    _stats[handle] = {k: 0 for k in _STAT_KEYS}
+
+
+def _bump(handle: str, result: str) -> None:
+    key = result if result in _STAT_KEYS else "skipped"
+    _stats.setdefault(handle, {k: 0 for k in _STAT_KEYS})[key] += 1
+
+
+def _print_final_stats() -> None:
+    print("\n[listener] ── Final stats ──────────────────────────────────────")
+    for handle, counts in _stats.items():
+        parts = "  ".join(f"{k}={v}" for k, v in counts.items() if v)
+        print(f"  {handle}: {parts or '(nothing processed)'}")
+    print("[listener] ────────────────────────────────────────────────────")
+
+
+# ── Per-channel-type handlers ─────────────────────────────────────────────────
+
+def handle_lagging(message, caller_id: int, channel_id: int) -> str:
+    """
+    Process one message from a lagging channel.
+    Returns a status string: 'logged' | 'milestone' | 'dupe' | 'noise'
+    """
+    text  = message.text.strip()
+    kind  = type_a.classify(text)
+
+    if kind == 'noise':
+        return 'noise'
+
+    if kind == 'whale_alert':
+        whale = type_a.parse_whale_alert(text)
+        if not whale:
+            return 'noise'
+        token_id = db.get_token_id_by_symbol(whale["symbol"]) if whale["symbol"] else None
+        call_id  = None
+        if token_id:
+            call_id = db.get_call_id_by_token_name(whale["symbol"])
+        whale_id = db.insert_whale_alert(
+            symbol=whale["symbol"],
+            sol_amount=whale["sol_amount"],
+            wallet_size_sol=whale["wallet_size_sol"],
+            mcap_at_whale=whale["mcap_at_whale"],
+            signal_count=whale["signal_count"],
+            raw_message=text,
+            token_id=token_id,
+            call_id=call_id,
+        )
+        print(
+            f"  [whale] id={whale_id} symbol={whale['symbol']} "
+            f"sol={whale['sol_amount']} wallet={whale['wallet_size_sol']} "
+            f"signal#{whale['signal_count']} call_id={call_id}"
+        )
+        return 'whale_alert'
+
+    if kind == 'dexscreener_paid':
+        dex = type_a.parse_dexscreener_paid(text)
+        if not dex:
+            return 'noise'
+        lookup = dex["symbol"] or dex["name"]
+        token_id = db.get_token_id_by_symbol(lookup) if lookup else None
+        if token_id:
+            db.update_token_dexscreener_paid(token_id)
+            print(f"  [dex_paid] token_id={token_id} symbol={dex['symbol']} name={dex['name']}")
+        return 'dexscreener_paid'
+
+    if kind == 'boost_alert':
+        boost = type_a.parse_boost_alert(text)
+        if not boost:
+            return 'noise'
+        lookup = boost["symbol"] or boost["name"]
+        token_id = db.get_token_id_by_symbol(lookup) if lookup else None
+        if token_id:
+            db.update_token_boost(token_id, boost["boost_count"])
+            print(
+                f"  [boost] token_id={token_id} symbol={boost['symbol']} "
+                f"boosts={boost['boost_count']}"
+            )
+        return 'boost_alert'
+
+    if kind == 'milestone':
+        milestone = type_a.parse_milestone(text)
+        if not milestone:
+            return 'noise'
+
+        call_id = db.get_call_id_by_token_name(milestone["token_name"])
+
+        if call_id is None:
+            # ── Orphan milestone: the initial call predates our scraper ──
+            token_id = db.get_token_id_by_symbol(milestone["token_name"])
+            if token_id is None:
+                token_id = db.upsert_token(
+                    mint_address=f"INFERRED:{milestone['token_name'].upper()}",
+                    symbol=milestone["token_name"],
+                )
+            call_id = db.insert_call(
+                caller_id=caller_id,
+                token_id=token_id,
+                source_platform="telegram",
+                source_message_id=f"orphan_{message.id}",
+                raw_message=text,
+                created_at=message.date,
+                message_type="inferred_call",
+                channel_id=channel_id,
+                mcap_at_call=milestone["entry_mcap"],
+                narrative_tags=tags.tag_token(milestone["token_name"], "", text),
+            )
+            if call_id is None:
+                return 'milestone'
+            db.insert_outcome(call_id)
+            db.update_outcome_from_lagging(
+                call_id=call_id,
+                mcap_at_result=milestone["current_mcap"],
+                result_reported_at=message.date,
+                stated_multiplier=milestone["multiplier_stated"],
+                peak_multiplier=milestone["multiplier_computed"] or milestone["multiplier_stated"],
+                outcome_label="runner",
+            )
+            print(
+                f"  [orphan_milestone] call_id={call_id} token={milestone['token_name']} "
+                f"entry={milestone['entry_mcap']} result={milestone['current_mcap']} "
+                f"stated={milestone['multiplier_stated']}x "
+                f"computed={milestone['multiplier_computed']}x"
+            )
+            return 'milestone'
+
+        db.update_outcome_peak(
+            call_id=call_id,
+            multiplier_computed=milestone["multiplier_computed"] or milestone["multiplier_stated"],
+            multiplier_stated=milestone["multiplier_stated"],
+            current_mcap=milestone["current_mcap"],
+            reported_at=message.date,
+        )
+        print(
+            f"  [milestone] call_id={call_id} token={milestone['token_name']} "
+            f"stated={milestone['multiplier_stated']}x "
+            f"computed={milestone['multiplier_computed']}x"
+        )
+        return 'milestone'
+
+    # kind == 'gem_alert'
+    parsed = type_a.parse(text)
+    if not parsed:
+        return 'noise'
+
+    token_id = db.upsert_token(
+        mint_address=parsed["mint"],
+        symbol=parsed["symbol"],
+        name=parsed["name"],
+    )
+
+    call_id = db.insert_call(
+        caller_id=caller_id,
+        token_id=token_id,
+        source_platform="telegram",
+        source_message_id=message.id,
+        raw_message=text,
+        created_at=message.date,
+        message_type="lagging_call",
+        channel_id=channel_id,
+        mcap_at_call=parsed["mcap_at_call"],
+        narrative_tags=tags.tag_token(parsed["symbol"] or "", parsed["name"] or "", text),
+    )
+
+    if call_id is None:
+        return "dupe"
+
+    linked = db.backfill_whale_alert_call_ids(token_id=token_id, call_id=call_id)
+    if linked:
+        print(f"  [whale-backfill] linked {linked} whale alert(s) to call_id={call_id}")
+
+    market = data_fetcher.fetch_metadata_only(parsed["mint"])
+    if market:
+        db.update_call_market_data(
+            call_id=call_id,
+            price_usd=market["price_usd"],
+            mcap=market["mcap"],
+            liquidity_usd=market["liquidity_usd"],
+        )
+        if market["name"] or market["symbol"]:
+            db.upsert_token(
+                mint_address=parsed["mint"],
+                symbol=market["symbol"],
+                name=market["name"],
+            )
+
+    db.insert_outcome(call_id)
+
+    if parsed["mcap_at_result"] is not None:
+        db.update_outcome_from_lagging(
+            call_id=call_id,
+            mcap_at_result=parsed["mcap_at_result"],
+            result_reported_at=message.date,
+            stated_multiplier=parsed["stated_multiplier"],
+            peak_multiplier=parsed["peak_multiplier"],
+            outcome_label="runner",
+        )
+
+    mint_short = parsed["mint"][:8] + "..."
+    print(
+        f"  [logged] call_id={call_id} "
+        f"mint={mint_short} symbol={parsed['symbol']} "
+        f"entry={parsed['mcap_at_call']} result={parsed['mcap_at_result']} "
+        f"computed={parsed['peak_multiplier']}x stated={parsed['stated_multiplier']}x"
+    )
+    return "logged"
+
+
+def handle_realtime(message, caller_id: int, channel_id: int) -> str:
+    """
+    Process one message from a realtime channel (@solwhaletrending, @solearlytrending).
+    Returns: 'logged' | 'dupe' | 'whale_alert' | 'update' |
+             'daily_stats' | 'leaderboard' | 'skipped' | 'noise'
+    """
+    text = message.text.strip()
+    kind = type_b.classify_b(text)
+
+    if kind == 'noise':
+        return 'noise'
+
+    # ── Another Whale — second/third whale buying an already-signalled token ──
+    if kind == 'another_whale':
+        whale = type_b.parse_another_whale(text)
+        if not whale:
+            return 'skipped'
+
+        token_id = db.get_token_id_by_symbol(whale["symbol"]) if whale["symbol"] else None
+        call_id  = db.get_call_id_by_token_name(whale["symbol"]) if whale["symbol"] else None
+
+        whale_id = db.insert_whale_alert(
+            symbol=whale["symbol"],
+            sol_amount=whale["sol_spent"],
+            wallet_size_sol=whale["wallet_sol"],
+            mcap_at_whale=whale["mcap"],
+            signal_count=None,
+            raw_message=text,
+            token_id=token_id,
+            call_id=call_id,
+        )
+        print(
+            f"  [another_whale] id={whale_id} symbol={whale['symbol']} "
+            f"sol={whale['sol_spent']} wallet={whale['wallet_sol']} "
+            f"call_id={call_id}"
+        )
+        return 'whale_alert'
+
+    # ── Entry signals (whale or trending) — shared handling ──
+    if kind in ('entry_signal_whale', 'entry_signal_trending'):
+        if kind == 'entry_signal_whale':
+            parsed = type_b.parse_entry_signal_whale(text)
+        else:
+            parsed = type_b.parse_entry_signal_trending(text)
+
+        if not parsed:
+            return 'skipped'
+
+        symbol = parsed.get("symbol")
+        mint   = parsed.get("mint")
+
+        mint_resolved = mint is not None
+        if not mint_resolved:
+            mint = f"UNKNOWN:{symbol.upper()}" if symbol else f"UNKNOWN:msg{message.id}"
+
+        token_id = db.upsert_token(
+            mint_address=mint,
+            symbol=symbol,
+            name=parsed.get("name"),
+        )
+
+        call_id = db.insert_call(
+            caller_id=caller_id,
+            token_id=token_id,
+            source_platform="telegram",
+            source_message_id=str(message.id),
+            raw_message=text,
+            created_at=message.date,
+            message_type="initial_call",
+            channel_id=channel_id,
+            mcap_at_call=parsed.get("mcap_at_call"),
+            narrative_tags=tags.tag_token(symbol or "", parsed.get("name") or "", text),
+        )
+
+        if call_id is None:
+            return 'dupe'
+
+        db.upsert_token_realtime_metadata(
+            token_id=token_id,
+            mint_resolved=mint_resolved,
+            token_age_minutes=parsed.get("token_age_minutes"),
+            security_flag=parsed.get("security_flag"),
+            is_cto=parsed.get("is_cto"),
+            bundle_count=parsed.get("bundle_count"),
+            bundle_pct_initial=parsed.get("bundle_pct_initial"),
+            bundle_pct_remaining=parsed.get("bundle_pct_remaining"),
+            sniper_count=parsed.get("sniper_count"),
+            sniper_pct_initial=parsed.get("sniper_pct_initial"),
+            sniper_pct_remaining=parsed.get("sniper_pct_remaining"),
+            first_20_pct=parsed.get("first_20_pct"),
+            dev_sol_held=parsed.get("dev_sol_held"),
+            dev_pct_held=parsed.get("dev_pct_held"),
+            dev_sold=parsed.get("dev_sold"),
+            dev_tokens_made=parsed.get("dev_tokens_made"),
+            dev_bonds=parsed.get("dev_bonds"),
+            dev_best_mcap=parsed.get("dev_best_mcap"),
+            bundled_pct=parsed.get("bundled_pct"),
+            bundled_sold_pct=parsed.get("bundled_sold_pct"),
+            hodl_count=parsed.get("hodl_count"),
+            liq_at_detection=parsed.get("liq_at_detection"),
+            vol_1h_at_detection=parsed.get("vol_1h_at_detection"),
+            detecting_wallet_sol=parsed.get("detecting_wallet_sol"),
+            detecting_sol_spent=parsed.get("detecting_sol_spent"),
+            fake_vol_usd=parsed.get("fake_vol_usd"),
+            fake_vol_pct=parsed.get("fake_vol_pct"),
+        )
+
+        if mint_resolved:
+            market = data_fetcher.fetch_token_data(mint)
+            if market:
+                db.update_call_market_data(
+                    call_id=call_id,
+                    price_usd=market["price_usd"],
+                    mcap=market["mcap"],
+                    liquidity_usd=market["liquidity_usd"],
+                )
+                if market["name"] or market["symbol"]:
+                    db.upsert_token(
+                        mint_address=mint,
+                        symbol=market["symbol"],
+                        name=market["name"],
+                    )
+
+        db.insert_outcome(call_id)
+
+        linked = db.backfill_whale_alert_call_ids(token_id=token_id, call_id=call_id)
+        if linked:
+            print(f"  [whale-backfill] linked {linked} whale alert(s) to call_id={call_id}")
+
+        mint_short = mint[:12] + ("..." if len(mint) > 12 else "")
+        status = "resolved" if mint_resolved else "UNKNOWN"
+        print(
+            f"  [realtime:{kind}] call_id={call_id} symbol={symbol} "
+            f"mint={mint_short} ({status}) "
+            f"age={parsed.get('token_age_minutes')}m "
+            f"security={parsed.get('security_flag')}"
+        )
+        return 'logged'
+
+    # ── Price update ──
+    if kind == 'price_update':
+        update = type_b.parse_price_update(text)
+        if not update:
+            return 'skipped'
+        call_id = db.get_call_id_by_token_name(update["symbol"])
+        if not call_id:
+            return 'skipped'
+        db.update_outcome_peak(
+            call_id=call_id,
+            multiplier_computed=update.get("multiplier"),
+            multiplier_stated=update.get("multiplier"),
+            current_mcap=update.get("current_mcap"),
+            reported_at=message.date,
+        )
+        return 'update'
+
+    # ── Daily stats ──
+    if kind == 'daily_stats':
+        stats = type_b.parse_daily_stats(text)
+        if not stats:
+            return 'skipped'
+        db.insert_channel_daily_stats(
+            channel_id=channel_id,
+            stat_date=message.date.date(),
+            **stats,
+        )
+        return 'daily_stats'
+
+    # ── Leaderboard ──
+    if kind == 'leaderboard':
+        entries = type_b.parse_leaderboard(text)
+        if not entries:
+            return 'skipped'
+        db.insert_channel_daily_stats(
+            channel_id=channel_id,
+            stat_date=message.date.date(),
+            top_performers=entries,
+        )
+        return 'leaderboard'
+
+    return 'skipped'
+
+
+# ── Catchup ───────────────────────────────────────────────────────────────────
+
+def _catchup(client, entity, channel_cfg: dict, caller_id: int) -> int:
+    """
+    Scan messages since the last run for a single channel.
+
+    If a last-seen message ID is recorded, fetches only newer messages
+    via min_id. Otherwise falls back to the most recent CATCHUP_FALLBACK_LIMIT
+    messages (first run). Returns the highest message ID seen (0 if none).
+    """
+    raw_handle = channel_cfg["handle"]
+    handle   = raw_handle if raw_handle.startswith("@") else f"@{raw_handle}"
+    c_type   = channel_cfg["channel_type"]
+    c_id     = channel_cfg["id"]
+    last_id  = _read_last_message_id(handle)
+
+    if last_id is not None:
+        kwargs = {"min_id": last_id}
+        mode   = f"since msg_id={last_id}"
     else:
-        print("No matches found.")
+        kwargs = {"limit": CATCHUP_FALLBACK_LIMIT}
+        mode   = f"limit={CATCHUP_FALLBACK_LIMIT} (first run)"
+
+    print(f"[listener] Catchup {handle} ({mode})...")
+
+    highest_id = last_id or 0
+
+    for message in client.iter_messages(entity, **kwargs):
+        if message.id > highest_id:
+            highest_id = message.id
+
+        if not message.text:
+            continue
+        if not is_candidate(message.text):
+            continue
+
+        if c_type == "lagging":
+            result = handle_lagging(message, caller_id, c_id)
+        elif c_type == "realtime":
+            result = handle_realtime(message, caller_id, c_id)
+        else:
+            continue
+
+        _bump(handle, result)
+
+    print(
+        f"  [catchup done] {handle}  "
+        f"logged={_stats[handle].get('logged', 0)}  "
+        f"milestone={_stats[handle].get('milestone', 0)}  "
+        f"dupe={_stats[handle].get('dupe', 0)}  "
+        f"whale_alert={_stats[handle].get('whale_alert', 0)}  "
+        f"noise={_stats[handle].get('noise', 0)}"
+    )
+
+    return highest_id
+
+
+# ── Live listener ─────────────────────────────────────────────────────────────
+
+_RECONNECT_BACKOFF = [5, 10, 30, 60]
+
+
+def normalize_chat_id(chat_id: int) -> int:
+    """
+    Normalize a Telethon chat ID to a bare positive integer.
+
+    Channel events arrive as negative IDs with a -100 prefix
+    (e.g. -1002093384030) while get_entity() returns the bare ID
+    (e.g. 2093384030). Stripping the -100 prefix unifies both forms.
+    """
+    s = str(abs(chat_id))
+    if s.startswith("100"):
+        return int(s[3:])
+    return abs(chat_id)
+
+
+def run_listener() -> None:
+    channels = db.get_active_channels()
+    if not channels:
+        print("[listener] No active channels found in database. Exiting.")
+        return
+
+    client = TelegramClient("Solana_meme_tracker_session", api_id, api_hash)
+    client.start()
+    client.get_dialogs()   # sync session's channel/dialog list before registering handlers
+
+    # ── Resolve entities, run catchup, build routing map ──────────────────────
+    # entity_map: chat_id (int) → {cfg, caller_id, handle}
+    entity_map: dict[int, dict] = {}
+
+    for channel_cfg in channels:
+        handle    = channel_cfg["handle"]
+        tg_handle = handle if handle.startswith("@") else f"@{handle}"
+
+        _init_stats(tg_handle)
+
+        try:
+            entity = client.get_entity(tg_handle)
+        except Exception as e:
+            print(f"[listener] Could not resolve {tg_handle}: {e} — skipping")
+            continue
+
+        caller_id = db.upsert_caller(
+            platform="telegram",
+            handle=tg_handle,
+            name=getattr(entity, "title", tg_handle),
+        )
+
+        highest_id = _catchup(client, entity, channel_cfg, caller_id)
+
+        if highest_id:
+            _write_last_message_id(tg_handle, highest_id)
+
+        entity_map[normalize_chat_id(entity.id)] = {
+            "cfg":       channel_cfg,
+            "caller_id": caller_id,
+            "handle":    tg_handle,
+            "entity":    entity,
+        }
+
+    if not entity_map:
+        print("[listener] No channels could be resolved. Exiting.")
+        client.disconnect()
+        return
+
+    # ── Register NewMessage handler ───────────────────────────────────────────
+
+    client.get_dialogs()   # re-sync after catchup to ensure all entities are known
+
+    @client.on(events.NewMessage(chats=[info["entity"] for info in entity_map.values()]))
+    async def _handler(event):
+        norm_id = normalize_chat_id(event.chat_id)
+        info    = entity_map.get(norm_id)
+        if info is None:
+            return
+
+        cfg      = info["cfg"]
+        handle   = info["handle"]
+        msg      = event.message
+
+        if not msg.text or not is_candidate(msg.text):
+            return
+
+        try:
+            if cfg["channel_type"] == "lagging":
+                result = handle_lagging(msg, info["caller_id"], cfg["id"])
+            elif cfg["channel_type"] == "realtime":
+                result = handle_realtime(msg, info["caller_id"], cfg["id"])
+            else:
+                return
+
+            _bump(handle, result)
+
+            # Persist the latest seen message ID after each live message
+            _write_last_message_id(handle, msg.id)
+
+        except Exception as e:
+            print(f"[listener] handler error ({handle} msg={msg.id}): {e}")
+            _bump(handle, "error")
+
+    # ── Print startup summary ─────────────────────────────────────────────────
+
+    channel_summary = ", ".join(
+        f"{info['handle']} ({info['cfg']['channel_type']})"
+        for info in entity_map.values()
+    )
+    print(f"\n[listener] Live monitoring {len(entity_map)} channel(s): {channel_summary}")
+    print("[listener] Press Ctrl+C to stop.\n")
+
+    # ── Reconnect loop ────────────────────────────────────────────────────────
+
+    attempt = 0
+    try:
+        while True:
+            try:
+                client.run_until_disconnected()
+                break   # clean return (Ctrl+C propagates as KeyboardInterrupt above)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                delay = _RECONNECT_BACKOFF[min(attempt, len(_RECONNECT_BACKOFF) - 1)]
+                print(
+                    f"[listener] Disconnected: {e}. "
+                    f"Reconnect attempt {attempt + 1} in {delay}s..."
+                )
+                time.sleep(delay)
+                attempt += 1
+                try:
+                    client.connect()
+                    print("[listener] Reconnected successfully.")
+                    attempt = 0
+                except Exception as e2:
+                    print(f"[listener] Reconnect failed: {e2}")
+
+    except KeyboardInterrupt:
+        print("\n[listener] Shutting down...")
+
+    finally:
+        _print_final_stats()
+        db.close_conn()
+        client.disconnect()
+        print("[listener] Goodbye.")
+
+
+if __name__ == "__main__":
+    run_listener()
