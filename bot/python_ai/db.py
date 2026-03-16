@@ -15,11 +15,11 @@ def get_conn():
     global _conn
     if _conn is None or _conn.closed:
         _conn = psycopg2.connect(
-            host=os.getenv("DB_HOST", "127.0.0.1"),
-            port=os.getenv("DB_PORT", "5432"),
-            dbname=os.getenv("DB_NAME", "solana_signals"),
-            user=os.getenv("DB_USER", "postgres"),
-            password=os.getenv("DB_PASSWORD", "postgres"),
+            host=os.environ["DB_HOST"],
+            port=os.environ["DB_PORT"],
+            dbname=os.environ["DB_NAME"],
+            user=os.environ["DB_USER"],
+            password=os.environ["DB_PASSWORD"],
         )
     return _conn
 
