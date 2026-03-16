@@ -352,22 +352,8 @@ def handle_realtime(message, caller_id: int, channel_id: int) -> str:
             name=parsed.get("name"),
         )
 
-        call_id = db.insert_call(
-            caller_id=caller_id,
-            token_id=token_id,
-            source_platform="telegram",
-            source_message_id=str(message.id),
-            raw_message=text,
-            created_at=message.date,
-            message_type="initial_call",
-            channel_id=channel_id,
-            mcap_at_call=parsed.get("mcap_at_call"),
-            narrative_tags=tags.tag_token(symbol or "", parsed.get("name") or "", text),
-        )
-
-        if call_id is None:
-            return 'dupe'
-
+        # Write on-chain metadata unconditionally — before the dupe check so
+        # duplicate calls (same message seen on restart) still update the token.
         db.upsert_token_realtime_metadata(
             token_id=token_id,
             mint_resolved=mint_resolved,
@@ -397,6 +383,22 @@ def handle_realtime(message, caller_id: int, channel_id: int) -> str:
             fake_vol_usd=parsed.get("fake_vol_usd"),
             fake_vol_pct=parsed.get("fake_vol_pct"),
         )
+
+        call_id = db.insert_call(
+            caller_id=caller_id,
+            token_id=token_id,
+            source_platform="telegram",
+            source_message_id=str(message.id),
+            raw_message=text,
+            created_at=message.date,
+            message_type="initial_call",
+            channel_id=channel_id,
+            mcap_at_call=parsed.get("mcap_at_call"),
+            narrative_tags=tags.tag_token(symbol or "", parsed.get("name") or "", text),
+        )
+
+        if call_id is None:
+            return 'dupe'
 
         if mint_resolved:
             market = data_fetcher.fetch_token_data(mint)

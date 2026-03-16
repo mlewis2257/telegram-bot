@@ -578,3 +578,88 @@ def update_outcome_from_lagging(
             ),
         )
         conn.commit()
+
+
+# ── Backfill helpers ──────────────────────────────────────────────────────────
+
+def get_pending_backfill(interval_hours: int, limit: int = 50) -> list[dict]:
+    """
+    Return up to `limit` calls that:
+      - have passed the interval window (created_at < NOW() - INTERVAL)
+      - have not yet been backfilled for that interval
+      - have a resolved mint address (not UNKNOWN: or INFERRED: prefixed)
+
+    Returns a list of dicts with keys:
+      call_id, symbol, mint_address, mcap_at_call,
+      peak_multiplier, created_at, pct_change_24h
+    """
+    col = {1: "backfilled_1h_at", 4: "backfilled_4h_at", 24: "backfilled_24h_at"}[interval_hours]
+
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+                c.id            AS call_id,
+                t.symbol,
+                t.mint_address,
+                c.mcap_at_call,
+                o.peak_multiplier,
+                c.created_at,
+                o.pct_change_24h
+            FROM calls c
+            JOIN tokens  t ON t.id = c.token_id
+            JOIN outcomes o ON o.call_id = c.id
+            WHERE o.{col} IS NULL
+              AND c.created_at < NOW() - INTERVAL '{interval_hours} hours'
+              AND t.mint_address IS NOT NULL
+              AND t.mint_address NOT LIKE 'UNKNOWN:%%'
+              AND t.mint_address NOT LIKE 'INFERRED:%%'
+            ORDER BY c.created_at
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        cols = [d.name for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def update_outcome_interval(
+    call_id: int,
+    interval_hours: int,
+    price: float | None,
+    mcap: float | None,
+    pct_change: float | None,
+    outcome_label: str | None = None,
+) -> None:
+    """
+    Write DexScreener snapshot data for one time interval into the outcomes row.
+    Set outcome_label when provided (after 24h backfill).
+    """
+    sets = {
+        1:  ("price_1h",  "mcap_1h",  "pct_change_1h",  "backfilled_1h_at"),
+        4:  ("price_4h",  "mcap_4h",  "pct_change_4h",  "backfilled_4h_at"),
+        24: ("price_24h", "mcap_24h", "pct_change_24h", "backfilled_24h_at"),
+    }
+    price_col, mcap_col, pct_col, ts_col = sets[interval_hours]
+
+    label_clause = ", outcome_label = %s" if outcome_label is not None else ""
+    params = [price, mcap, pct_change, call_id]
+    if outcome_label is not None:
+        params.insert(-1, outcome_label)   # before call_id
+
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE outcomes SET
+                {price_col} = %s,
+                {mcap_col}  = %s,
+                {pct_col}   = %s,
+                {ts_col}    = NOW(){label_clause},
+                updated_at  = NOW()
+            WHERE call_id = %s
+            """,
+            params,
+        )
+        conn.commit()

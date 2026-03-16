@@ -215,7 +215,7 @@ CREATE TABLE IF NOT EXISTS outcomes (
     peak_reached_at    TIMESTAMPTZ,
 
     -- Set once all three intervals are filled
-    outcome_label      TEXT CHECK (outcome_label IN ('runner', 'rug', 'flat', 'slow_bleed')),
+    outcome_label      TEXT CHECK (outcome_label IN ('runner', 'rug', 'flat', 'slow_bleed', 'pumped_and_dumped')),
 
     created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()

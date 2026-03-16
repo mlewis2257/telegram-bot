@@ -280,3 +280,61 @@ def fetch_metadata_only(mint: str) -> Optional[dict]:
     }
     _cache_set(mint, result)
     return result
+
+
+def fetch_token_price(mint: str) -> Optional[dict]:
+    """
+    Lightweight DexScreener price fetch for the backfill job.
+
+    Unlike fetch_token_data() this bypasses the 60-second cache so the
+    backfill always gets a fresh snapshot. Retries up to 3 times with
+    a 2-second backoff. On HTTP 429 sleeps 30s then retries once more.
+
+    Returns:
+        {"price_usd": float|None, "mcap": float|None, "liquidity_usd": float|None}
+        or None if the token is not found on DexScreener.
+    """
+    url = f"{DEXSCREENER_URL}/{mint}"
+
+    for attempt in range(1, MAX_RETRIES + 2):   # +1 extra slot for the 429 retry
+        try:
+            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+
+            if resp.status_code == 404:
+                return None
+
+            if resp.status_code == 429:
+                log.warning(f"[fetcher] 429 rate-limited on {mint[:8]}... sleeping 30s")
+                time.sleep(30)
+                continue
+
+            if resp.status_code in RETRY_STATUS_CODES:
+                if attempt <= MAX_RETRIES:
+                    time.sleep(2)
+                    continue
+                return None
+
+            resp.raise_for_status()
+            data = resp.json()
+
+        except requests.exceptions.RequestException as e:
+            log.warning(f"[fetcher] fetch_token_price attempt {attempt}: {e}")
+            if attempt <= MAX_RETRIES:
+                time.sleep(2)
+                continue
+            return None
+
+        pairs = data.get("pairs") or []
+        sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+        if not sol_pairs:
+            return None
+
+        best = max(sol_pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
+        price_str = best.get("priceUsd")
+        return {
+            "price_usd":     float(price_str) if price_str else None,
+            "mcap":          best.get("marketCap"),
+            "liquidity_usd": (best.get("liquidity") or {}).get("usd"),
+        }
+
+    return None

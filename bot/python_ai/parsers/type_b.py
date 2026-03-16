@@ -188,7 +188,7 @@ AGE_RE           = re.compile(r'Age\*{0,2}:\s*(\d+)([smhd])', re.IGNORECASE)
 SECURITY_RE      = re.compile(r'Security\*{0,2}:\s*([✅⚠️⚠]+)', re.UNICODE)
 
 # Whale wallet size (whale entry signals only): "Wallet: 184 SOL"
-WALLET_RE        = re.compile(r'Wallet:\s*([\d,.]+)\s*SOL', re.IGNORECASE)
+WALLET_RE        = re.compile(r'Wallet:\s*\*{0,2}([\d,.]+)\s*SOL', re.IGNORECASE)
 
 # SOL spent (whale entry signals + another_whale): "1.48 SOL →"
 SOL_SPENT_RE     = re.compile(r'([\d.]+)\s*SOL\s*→')
@@ -197,7 +197,7 @@ SOL_SPENT_RE     = re.compile(r'([\d.]+)\s*SOL\s*→')
 MC_RE            = re.compile(r'MC:\s*\$([\d,]+(?:\.\d+)?[KMBkmb]?)', re.IGNORECASE)
 
 # Liquidity
-LIQ_RE           = re.compile(r'Liq:\s*\$([\d,]+(?:\.\d+)?[KMBkmb]?)', re.IGNORECASE)
+LIQ_RE           = re.compile(r'Liq\*{0,2}:\*{0,2}\s*\$([\d,]+(?:\.\d+)?[KMBkmb]?)', re.IGNORECASE)
 
 # 1h volume — handles both:
 #   "Vol: __1h__: $26.3K"   (solearlytrending)
@@ -206,24 +206,24 @@ LIQ_RE           = re.compile(r'Liq:\s*\$([\d,]+(?:\.\d+)?[KMBkmb]?)', re.IGNORE
 VOL_RE           = re.compile(r'Vol:.*?\$([\d,]+(?:\.\d+)?[KMBkmb]?)', re.IGNORECASE)
 
 # Hodl count + optional CTO flag
-HODL_RE          = re.compile(r'Hodls:\s*(\d+)',  re.IGNORECASE)
-CTO_RE           = re.compile(r'Hodls:.*?CTO',    re.IGNORECASE)
+HODL_RE          = re.compile(r'Hodls\*{0,2}:\*{0,2}\s*(\d+)', re.IGNORECASE)
+CTO_RE           = re.compile(r'Hodls.*?CTO',                  re.IGNORECASE)
 
 # Bundles: "/Bundles: 9 • 50% → 6.8%"
 BUNDLES_RE       = re.compile(
-    r'/Bundles:\s*(\d+)\s*•\s*([\d.]+)%\s*→\s*([\d.]+)%', re.IGNORECASE
+    r'/Bundles\*{0,2}:\s*(\d+)\s*•\s*([\d.]+)%\s*→\s*([\d.]+)%', re.IGNORECASE
 )
 
-# Snipers: "Snipers: 34 • 35% → 13.2%"
+# Snipers: "Snipers: 34 • 35% → 13.2%" or "**Snipers**: 48 • 49% → 0.4%"
 SNIPERS_RE       = re.compile(
-    r'Snipers:\s*(\d+)\s*•\s*([\d.]+)%\s*→\s*([\d.]+)%', re.IGNORECASE
+    r'Snipers\*{0,2}:\s*(\d+)\s*•\s*([\d.]+)%\s*→\s*([\d.]+)%', re.IGNORECASE
 )
 
 # First 20
-FIRST_20_RE      = re.compile(r'First 20:\s*([\d.]+)%', re.IGNORECASE)
+FIRST_20_RE      = re.compile(r'First 20\*{0,4}:\*{0,2}\s*([\d.]+)%', re.IGNORECASE)
 
 # Dev holdings: "Dev: 38 SOL | 0% $SYMBOL"
-DEV_RE           = re.compile(r'Dev:\s*([\d.]+)\s*SOL\s*\|\s*([\d.]+)%', re.IGNORECASE)
+DEV_RE           = re.compile(r'Dev\*{0,2}:\*{0,2}\s*([\d.]+)\s*SOL\s*\|\s*([\d.]+)%', re.IGNORECASE)
 
 # Dev history line: "Made: 75879 | Bond: 420 | Best: $21.1M"
 DEV_HISTORY_RE   = re.compile(
@@ -235,7 +235,7 @@ DEV_HISTORY_RE   = re.compile(
 BUNDLED_RE       = re.compile(r'Bundled:\s*([\d.]+)%.*?Sold:\s*([\d.]+)%', re.IGNORECASE)
 
 # Fake volume: "Fake: $1.1K [2%]"
-FAKE_VOL_RE      = re.compile(r'Fake:\s*\$([\d,.]+[KMBkmb]?)\s*\[([\d.]+)%\]', re.IGNORECASE)
+FAKE_VOL_RE      = re.compile(r'Fake\*{0,2}:\s*\$([\d,.]+[KMBkmb]?)\s*\[([\d.]+)%\]', re.IGNORECASE)
 
 
 def _parse_entry_fields(text: str, is_whale: bool) -> dict | None:
