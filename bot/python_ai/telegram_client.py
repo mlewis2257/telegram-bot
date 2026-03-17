@@ -26,6 +26,7 @@ import db
 import data_fetcher
 import tags
 import scorer
+import alert_bot
 from parsers import type_a, type_b
 
 load_dotenv()
@@ -103,21 +104,27 @@ def _print_final_stats() -> None:
 
 # ── Per-channel-type handlers ─────────────────────────────────────────────────
 
-def handle_lagging(message, caller_id: int, channel_id: int) -> str:
+def handle_lagging(message, caller_id: int, channel_id: int) -> tuple:
     """
     Process one message from a lagging channel.
-    Returns a status string: 'logged' | 'milestone' | 'dupe' | 'noise'
+    Returns (status, score_result, extra) where:
+      status       — 'logged' | 'milestone' | 'dupe' | 'noise' | ...
+      score_result — scorer dict on gem_alert logged path, else None
+      extra        — token_data on logged path; milestone_info dict on 5x+
+                     milestone path; None everywhere else
+    Catchup callers should discard extra: status, *_ = handle_lagging(...)
+    Alert sending (await) must happen in the async _handler, not here.
     """
     text  = message.text.strip()
     kind  = type_a.classify(text)
 
     if kind == 'noise':
-        return 'noise'
+        return 'noise', None, None
 
     if kind == 'whale_alert':
         whale = type_a.parse_whale_alert(text)
         if not whale:
-            return 'noise'
+            return 'noise', None, None
         token_id = db.get_token_id_by_symbol(whale["symbol"]) if whale["symbol"] else None
         call_id  = None
         if token_id:
@@ -137,23 +144,23 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> str:
             f"sol={whale['sol_amount']} wallet={whale['wallet_size_sol']} "
             f"signal#{whale['signal_count']} call_id={call_id}"
         )
-        return 'whale_alert'
+        return 'whale_alert', None, None
 
     if kind == 'dexscreener_paid':
         dex = type_a.parse_dexscreener_paid(text)
         if not dex:
-            return 'noise'
+            return 'noise', None, None
         lookup = dex["symbol"] or dex["name"]
         token_id = db.get_token_id_by_symbol(lookup) if lookup else None
         if token_id:
             db.update_token_dexscreener_paid(token_id)
             print(f"  [dex_paid] token_id={token_id} symbol={dex['symbol']} name={dex['name']}")
-        return 'dexscreener_paid'
+        return 'dexscreener_paid', None, None
 
     if kind == 'boost_alert':
         boost = type_a.parse_boost_alert(text)
         if not boost:
-            return 'noise'
+            return 'noise', None, None
         lookup = boost["symbol"] or boost["name"]
         token_id = db.get_token_id_by_symbol(lookup) if lookup else None
         if token_id:
@@ -162,12 +169,12 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> str:
                 f"  [boost] token_id={token_id} symbol={boost['symbol']} "
                 f"boosts={boost['boost_count']}"
             )
-        return 'boost_alert'
+        return 'boost_alert', None, None
 
     if kind == 'milestone':
         milestone = type_a.parse_milestone(text)
         if not milestone:
-            return 'noise'
+            return 'noise', None, None
 
         call_id = db.get_call_id_by_token_name(milestone["token_name"])
 
@@ -192,7 +199,7 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> str:
                 narrative_tags=tags.tag_token(milestone["token_name"], "", text),
             )
             if call_id is None:
-                return 'milestone'
+                return 'milestone', None, None
             db.insert_outcome(call_id)
             db.update_outcome_from_lagging(
                 call_id=call_id,
@@ -208,7 +215,7 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> str:
                 f"stated={milestone['multiplier_stated']}x "
                 f"computed={milestone['multiplier_computed']}x"
             )
-            return 'milestone'
+            return 'milestone', None, None
 
         db.update_outcome_peak(
             call_id=call_id,
@@ -222,12 +229,22 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> str:
             f"stated={milestone['multiplier_stated']}x "
             f"computed={milestone['multiplier_computed']}x"
         )
-        return 'milestone'
+        # Only alert on 5x+ milestones to avoid spam
+        milestone_info = None
+        if milestone["multiplier_stated"] and milestone["multiplier_stated"] >= 5:
+            milestone_info = {
+                "call_id":           call_id,
+                "symbol":            milestone["token_name"],
+                "stated_multiplier": milestone["multiplier_stated"],
+                "mcap_at_call":      milestone.get("entry_mcap"),
+                "current_mcap":      milestone.get("current_mcap"),
+            }
+        return 'milestone', None, milestone_info
 
     # kind == 'gem_alert'
     parsed = type_a.parse(text)
     if not parsed:
-        return 'noise'
+        return 'noise', None, None
 
     token_id = db.upsert_token(
         mint_address=parsed["mint"],
@@ -249,7 +266,7 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> str:
     )
 
     if call_id is None:
-        return "dupe"
+        return "dupe", None, None
 
     linked = db.backfill_whale_alert_call_ids(token_id=token_id, call_id=call_id)
     if linked:
@@ -289,32 +306,46 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> str:
         f"entry={parsed['mcap_at_call']} result={parsed['mcap_at_result']} "
         f"computed={parsed['peak_multiplier']}x stated={parsed['stated_multiplier']}x"
     )
+    score_result = None
     try:
-        s = scorer.score_call(call_id)
-        print(f"  [score] {parsed['symbol']} call_id={call_id}  score={s['score']}  label={s['label']}")
-        print(f"  Reasons: {', '.join(s['reasons'])}")
+        score_result = scorer.score_call(call_id)
+        print(f"  [score] {parsed['symbol']} call_id={call_id}  score={score_result['score']}  label={score_result['label']}")
+        print(f"  Reasons: {', '.join(score_result['reasons'])}")
     except Exception as e:
         print(f"  [score] error: {e}")
-    return "logged"
+    token_data = {
+        "symbol":            parsed.get("symbol"),
+        "mint_address":      parsed.get("mint"),
+        "mcap_at_call":      parsed.get("mcap_at_call"),
+        "security_flag":     None,
+        "token_age_minutes": None,
+    }
+    return "logged", score_result, token_data
 
 
-def handle_realtime(message, caller_id: int, channel_id: int) -> str:
+def handle_realtime(message, caller_id: int, channel_id: int) -> tuple:
     """
     Process one message from a realtime channel (@solwhaletrending, @solearlytrending).
-    Returns: 'logged' | 'dupe' | 'whale_alert' | 'update' |
-             'daily_stats' | 'leaderboard' | 'skipped' | 'noise'
+    Returns (status, score_result, token_data) where:
+      status       — 'logged' | 'dupe' | 'whale_alert' | 'update' |
+                     'daily_stats' | 'leaderboard' | 'skipped' | 'noise'
+      score_result — scorer dict on logged path, else None
+      token_data   — {symbol, mint_address, mcap_at_call, security_flag,
+                     token_age_minutes} on logged path, else None
+    Catchup callers should discard extra: status, *_ = handle_realtime(...)
+    Alert sending (await) must happen in the async _handler, not here.
     """
     text = message.text.strip()
     kind = type_b.classify_b(text)
 
     if kind == 'noise':
-        return 'noise'
+        return 'noise', None, None
 
     # ── Another Whale — second/third whale buying an already-signalled token ──
     if kind == 'another_whale':
         whale = type_b.parse_another_whale(text)
         if not whale:
-            return 'skipped'
+            return 'skipped', None, None
 
         token_id = db.get_token_id_by_symbol(whale["symbol"]) if whale["symbol"] else None
         call_id  = db.get_call_id_by_token_name(whale["symbol"]) if whale["symbol"] else None
@@ -334,7 +365,7 @@ def handle_realtime(message, caller_id: int, channel_id: int) -> str:
             f"sol={whale['sol_spent']} wallet={whale['wallet_sol']} "
             f"call_id={call_id}"
         )
-        return 'whale_alert'
+        return 'whale_alert', None, None
 
     # ── Entry signals (whale or trending) — shared handling ──
     if kind in ('entry_signal_whale', 'entry_signal_trending'):
@@ -344,7 +375,7 @@ def handle_realtime(message, caller_id: int, channel_id: int) -> str:
             parsed = type_b.parse_entry_signal_trending(text)
 
         if not parsed:
-            return 'skipped'
+            return 'skipped', None, None
 
         symbol = parsed.get("symbol")
         mint   = parsed.get("mint")
@@ -405,7 +436,7 @@ def handle_realtime(message, caller_id: int, channel_id: int) -> str:
         )
 
         if call_id is None:
-            return 'dupe'
+            return 'dupe', None, None
 
         if mint_resolved:
             market = data_fetcher.fetch_token_data(mint)
@@ -437,22 +468,30 @@ def handle_realtime(message, caller_id: int, channel_id: int) -> str:
             f"age={parsed.get('token_age_minutes')}m "
             f"security={parsed.get('security_flag')}"
         )
+        score_result = None
         try:
-            s = scorer.score_call(call_id)
-            print(f"  [score] {symbol} call_id={call_id}  score={s['score']}  label={s['label']}")
-            print(f"  Reasons: {', '.join(s['reasons'])}")
+            score_result = scorer.score_call(call_id)
+            print(f"  [score] {symbol} call_id={call_id}  score={score_result['score']}  label={score_result['label']}")
+            print(f"  Reasons: {', '.join(score_result['reasons'])}")
         except Exception as e:
             print(f"  [score] error: {e}")
-        return 'logged'
+        token_data = {
+            "symbol":            symbol,
+            "mint_address":      mint,
+            "mcap_at_call":      parsed.get("mcap_at_call"),
+            "security_flag":     parsed.get("security_flag"),
+            "token_age_minutes": parsed.get("token_age_minutes"),
+        }
+        return 'logged', score_result, token_data
 
     # ── Price update ──
     if kind == 'price_update':
         update = type_b.parse_price_update(text)
         if not update:
-            return 'skipped'
+            return 'skipped', None, None
         call_id = db.get_call_id_by_token_name(update["symbol"])
         if not call_id:
-            return 'skipped'
+            return 'skipped', None, None
         db.update_outcome_peak(
             call_id=call_id,
             multiplier_computed=update.get("multiplier"),
@@ -460,33 +499,33 @@ def handle_realtime(message, caller_id: int, channel_id: int) -> str:
             current_mcap=update.get("current_mcap"),
             reported_at=message.date,
         )
-        return 'update'
+        return 'update', None, None
 
     # ── Daily stats ──
     if kind == 'daily_stats':
         stats = type_b.parse_daily_stats(text)
         if not stats:
-            return 'skipped'
+            return 'skipped', None, None
         db.insert_channel_daily_stats(
             channel_id=channel_id,
             stat_date=message.date.date(),
             **stats,
         )
-        return 'daily_stats'
+        return 'daily_stats', None, None
 
     # ── Leaderboard ──
     if kind == 'leaderboard':
         entries = type_b.parse_leaderboard(text)
         if not entries:
-            return 'skipped'
+            return 'skipped', None, None
         db.insert_channel_daily_stats(
             channel_id=channel_id,
             stat_date=message.date.date(),
             top_performers=entries,
         )
-        return 'leaderboard'
+        return 'leaderboard', None, None
 
-    return 'skipped'
+    return 'skipped', None, None
 
 
 # ── Catchup ───────────────────────────────────────────────────────────────────
@@ -526,13 +565,13 @@ def _catchup(client, entity, channel_cfg: dict, caller_id: int) -> int:
             continue
 
         if c_type == "lagging":
-            result = handle_lagging(message, caller_id, c_id)
+            status, *_ = handle_lagging(message, caller_id, c_id)
         elif c_type == "realtime":
-            result = handle_realtime(message, caller_id, c_id)
+            status, *_ = handle_realtime(message, caller_id, c_id)
         else:
             continue
 
-        _bump(handle, result)
+        _bump(handle, status)
 
     print(
         f"  [catchup done] {handle}  "
@@ -634,13 +673,19 @@ def run_listener() -> None:
 
         try:
             if cfg["channel_type"] == "lagging":
-                result = handle_lagging(msg, info["caller_id"], cfg["id"])
+                status, score_result, extra = handle_lagging(msg, info["caller_id"], cfg["id"])
             elif cfg["channel_type"] == "realtime":
-                result = handle_realtime(msg, info["caller_id"], cfg["id"])
+                status, score_result, extra = handle_realtime(msg, info["caller_id"], cfg["id"])
             else:
                 return
 
-            _bump(handle, result)
+            _bump(handle, status)
+
+            if score_result and score_result["label"] in ("alert", "strong_alert"):
+                await alert_bot.send_alert(score_result, extra)
+
+            if status == "milestone" and extra:
+                await alert_bot.send_milestone(**extra)
 
             # Persist the latest seen message ID after each live message
             _write_last_message_id(handle, msg.id)
