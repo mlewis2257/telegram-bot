@@ -154,8 +154,8 @@ def insert_call(
 def get_call_id_by_token_name(token_name: str) -> int | None:
     """
     Look up the most recent call_id whose token symbol or name matches
-    token_name (case-insensitive). Used to link milestone updates back to
-    the original call.
+    token_name (case-insensitive). Channel-agnostic — used for cross-channel
+    lookups (e.g. linking whale alerts to any call for that token).
     """
     conn = get_conn()
     with conn.cursor() as cur:
@@ -170,6 +170,31 @@ def get_call_id_by_token_name(token_name: str) -> int | None:
             LIMIT 1
             """,
             (token_name, token_name),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def get_call_id_by_token_and_channel(token_name: str, channel_id: int) -> int | None:
+    """
+    Look up the most recent call_id for a token FROM A SPECIFIC CHANNEL.
+    Used in lagging milestone attribution so a solhousesignal milestone
+    only ever updates solhousesignal's own call, never a realtime channel's
+    call for the same token.
+    """
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT c.id
+            FROM calls c
+            JOIN tokens t ON t.id = c.token_id
+            WHERE (LOWER(t.symbol) = LOWER(%s) OR LOWER(t.name) = LOWER(%s))
+              AND c.channel_id = %s
+            ORDER BY c.created_at DESC
+            LIMIT 1
+            """,
+            (token_name, token_name, channel_id),
         )
         row = cur.fetchone()
         return row[0] if row else None
@@ -711,6 +736,23 @@ def get_call_for_scoring(call_id: int) -> dict | None:
             return None
         cols = [d.name for d in cur.description]
         return dict(zip(cols, row))
+
+
+def get_mint_by_call_id(call_id: int) -> str | None:
+    """Return the mint_address for the token linked to a call, or None."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT t.mint_address
+            FROM calls c
+            JOIN tokens t ON t.id = c.token_id
+            WHERE c.id = %s
+            """,
+            (call_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
 
 
 def update_call_conviction_score(call_id: int, score: float) -> None:

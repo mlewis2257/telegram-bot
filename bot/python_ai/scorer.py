@@ -19,8 +19,8 @@ import data_fetcher
 # ── Label thresholds ──────────────────────────────────────────────────────────
 
 _THRESHOLDS = [
-    (90, "strong_alert"),
-    (75, "alert"),
+    (92, "strong_alert"),
+    (78, "alert"),
     (60, "caution"),
     (40, "watch"),
     (0,  "skip"),
@@ -35,7 +35,7 @@ def _label(score: int) -> str:
 
 
 def _clamp(score: int) -> int:
-    return max(0, min(100, score))
+    return max(0, min(95, score))
 
 
 # ── Path A: Realtime scoring ──────────────────────────────────────────────────
@@ -120,6 +120,22 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
         else:
             score -= 15
             reasons.append(f"holders={hodl}-15")
+
+    # mcap_at_call — penalise late entries
+    mcap_entry = row.get("mcap_at_call")
+    if mcap_entry is not None:
+        mcap_entry = float(mcap_entry)
+        if mcap_entry < 20_000:
+            score += 10
+            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k+10")
+        elif mcap_entry <= 50_000:
+            pass  # normal band
+        elif mcap_entry <= 100_000:
+            score -= 10
+            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k-10")
+        else:
+            score -= 20
+            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k-20")
 
     # ── Tier 2: applied only when not NULL ────────────────────────────────
 

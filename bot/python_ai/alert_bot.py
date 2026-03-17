@@ -119,14 +119,28 @@ def _build_milestone(
     stated_multiplier: float,
     mcap_at_call,
     current_mcap,
+    mint_address: str | None = None,
 ) -> str:
     sym  = html.escape(str(symbol or "?"))
     mult = f"{stated_multiplier:.0f}x"
-    return "\n".join([
+    mint = html.escape(str(mint_address or ""))
+
+    lines = [
         "📢 <b>CONFIRMED RUNNER</b>",
         f"💎 <b>${sym}</b> hit {mult} from {_fmt_mcap(mcap_at_call)} entry",
         f"Current MCap: {_fmt_mcap(current_mcap)}",
-    ])
+    ]
+
+    if mint:
+        dex_url   = f"https://dexscreener.com/solana/{mint}"
+        axiom_url = f"https://axiom.trade/t/{mint}"
+        lines += [
+            f"⛓ <code>{mint}</code>",
+            "",
+            f'🔗 <a href="{dex_url}">DexScreener</a>  🔗 <a href="{axiom_url}">Axiom</a>',
+        ]
+
+    return "\n".join(lines)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -164,13 +178,14 @@ async def send_milestone(
     stated_multiplier: float,
     mcap_at_call,
     current_mcap,
+    mint_address: str | None = None,
 ) -> bool:
     """
     Send a 5x+ milestone notification to the configured Telegram chat.
     Returns True on success, False on failure. Never raises.
     """
     try:
-        text = _build_milestone(symbol, stated_multiplier, mcap_at_call, current_mcap)
+        text = _build_milestone(symbol, stated_multiplier, mcap_at_call, current_mcap, mint_address)
         await _get_bot().send_message(
             chat_id=_chat_id(),
             text=text,

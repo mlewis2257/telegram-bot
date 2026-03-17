@@ -176,7 +176,7 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> tuple:
         if not milestone:
             return 'noise', None, None
 
-        call_id = db.get_call_id_by_token_name(milestone["token_name"])
+        call_id = db.get_call_id_by_token_and_channel(milestone["token_name"], channel_id)
 
         if call_id is None:
             # ── Orphan milestone: the initial call predates our scraper ──
@@ -238,6 +238,7 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> tuple:
                 "stated_multiplier": milestone["multiplier_stated"],
                 "mcap_at_call":      milestone.get("entry_mcap"),
                 "current_mcap":      milestone.get("current_mcap"),
+                "mint_address":      db.get_mint_by_call_id(call_id),
             }
         return 'milestone', None, milestone_info
 
