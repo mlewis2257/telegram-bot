@@ -25,6 +25,7 @@ from telethon import events
 import db
 import data_fetcher
 import tags
+import scorer
 from parsers import type_a, type_b
 
 load_dotenv()
@@ -288,6 +289,12 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> str:
         f"entry={parsed['mcap_at_call']} result={parsed['mcap_at_result']} "
         f"computed={parsed['peak_multiplier']}x stated={parsed['stated_multiplier']}x"
     )
+    try:
+        s = scorer.score_call(call_id)
+        print(f"  [score] {parsed['symbol']} call_id={call_id}  score={s['score']}  label={s['label']}")
+        print(f"  Reasons: {', '.join(s['reasons'])}")
+    except Exception as e:
+        print(f"  [score] error: {e}")
     return "logged"
 
 
@@ -430,6 +437,12 @@ def handle_realtime(message, caller_id: int, channel_id: int) -> str:
             f"age={parsed.get('token_age_minutes')}m "
             f"security={parsed.get('security_flag')}"
         )
+        try:
+            s = scorer.score_call(call_id)
+            print(f"  [score] {symbol} call_id={call_id}  score={s['score']}  label={s['label']}")
+            print(f"  Reasons: {', '.join(s['reasons'])}")
+        except Exception as e:
+            print(f"  [score] error: {e}")
         return 'logged'
 
     # ── Price update ──

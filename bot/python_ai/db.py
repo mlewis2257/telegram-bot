@@ -663,3 +663,62 @@ def update_outcome_interval(
             params,
         )
         conn.commit()
+
+
+# ── Scorer helpers ────────────────────────────────────────────────────────────
+
+def get_call_for_scoring(call_id: int) -> dict | None:
+    """
+    Return a flat dict of every field needed by scorer.py for a single call.
+    Joins calls → tokens → channels → outcomes (LEFT).
+    Returns None if the call_id doesn't exist.
+    """
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                c.id              AS call_id,
+                c.mcap_at_call,
+                c.message_type,
+                ch.handle,
+                ch.channel_type,
+                t.symbol,
+                t.security_flag,
+                t.token_age_minutes,
+                t.bundle_pct_remaining,
+                t.liq_at_detection,
+                t.hodl_count,
+                t.bundle_count,
+                t.sniper_count,
+                t.fake_vol_pct,
+                t.first_20_pct,
+                t.dev_tokens_made,
+                t.dev_best_mcap,
+                t.mint_address,
+                o.stated_multiplier,
+                o.mcap_at_result
+            FROM calls c
+            JOIN tokens   t  ON t.id  = c.token_id
+            JOIN channels ch ON ch.id = c.channel_id
+            LEFT JOIN outcomes o ON o.call_id = c.id
+            WHERE c.id = %s
+            """,
+            (call_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [d.name for d in cur.description]
+        return dict(zip(cols, row))
+
+
+def update_call_conviction_score(call_id: int, score: float) -> None:
+    """Write the scorer output back to calls.conviction_score."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE calls SET conviction_score = %s WHERE id = %s",
+            (score, call_id),
+        )
+        conn.commit()
