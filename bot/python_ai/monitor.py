@@ -148,6 +148,8 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
                     multiplier=threshold,
                     mcap_at_call=row["mcap_at_call"],
                     current_mcap=current_mcap,
+                    source_message_id=row.get("source_message_id"),
+                    channel_handle=row.get("channel_handle"),
                 )
                 await asyncio.sleep(1.0)
 

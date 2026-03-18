@@ -159,17 +159,24 @@ def _build_monitor_milestone(
     multiplier: float,
     mcap_at_call,
     current_mcap,
+    source_message_id=None,
+    channel_handle: str = None,
 ) -> str:
     sym  = html.escape(str(symbol or "?"))
     mint = html.escape(str(mint_address or ""))
     mult_str  = f"{int(multiplier)}x"
     dex_url   = f"https://dexscreener.com/solana/{mint}"
     axiom_url = f"https://axiom.trade/t/{mint}"
+    origin_line = (
+        f'🔍 <a href="https://t.me/{channel_handle}/{source_message_id}">View Original Signal</a>'
+        if source_message_id and channel_handle else None
+    )
     return "\n".join([
         f"🚀 <b>${sym} hit {mult_str}!</b>",
         f"Entry: {_fmt_mcap(mcap_at_call)} → Now: {_fmt_mcap(current_mcap)}",
         f"⛓ <code>{mint}</code>",
         "",
+        *([origin_line, ""] if origin_line else []),
         f'🔗 <a href="{dex_url}">DexScreener</a>  🔗 <a href="{axiom_url}">Axiom</a>',
     ])
 
@@ -261,6 +268,8 @@ async def send_monitor_milestone(
     multiplier: float,
     mcap_at_call,
     current_mcap,
+    source_message_id=None,
+    channel_handle: str = None,
 ) -> bool:
     """
     Send a live monitor milestone alert (2x / 5x / 10x threshold hit).
@@ -268,7 +277,10 @@ async def send_monitor_milestone(
     Returns True on success, False on failure. Never raises.
     """
     try:
-        text = _build_monitor_milestone(symbol, mint_address, multiplier, mcap_at_call, current_mcap)
+        text = _build_monitor_milestone(
+            symbol, mint_address, multiplier, mcap_at_call, current_mcap,
+            source_message_id=source_message_id, channel_handle=channel_handle,
+        )
         await _get_bot().send_message(
             chat_id=_chat_id(),
             text=text,

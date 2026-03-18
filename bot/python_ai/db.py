@@ -784,16 +784,19 @@ def get_active_watchlist(min_score: int = 55, max_age_hours: int = 24) -> list[d
         cur.execute(
             """
             SELECT
-                c.id            AS call_id,
+                c.id                AS call_id,
                 t.symbol,
                 t.mint_address,
                 c.mcap_at_call,
                 c.conviction_score,
                 c.created_at,
+                c.source_message_id,
+                ch.handle           AS channel_handle,
                 o.peak_multiplier
             FROM calls    c
-            JOIN tokens   t ON t.id      = c.token_id
-            JOIN outcomes o ON o.call_id = c.id
+            JOIN tokens   t  ON t.id      = c.token_id
+            JOIN channels ch ON ch.id     = c.channel_id
+            JOIN outcomes o  ON o.call_id = c.id
             WHERE c.created_at > NOW() - INTERVAL '1 hour' * %s
               AND c.conviction_score >= %s
               AND t.mint_resolved = TRUE
