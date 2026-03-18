@@ -24,7 +24,6 @@ Usage:
 import asyncio
 import os
 import sys
-import time
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -42,9 +41,8 @@ MAX_WATCHLIST_SPREAD = 50     # above this, spread calls evenly across the windo
 MIN_SCORE            = 55     # minimum conviction_score to include (caution+)
 MAX_AGE_HOURS        = 24     # only monitor calls from the last N hours
 
-MILESTONE_THRESHOLDS = [2.0, 5.0, 10.0]  # send alert on first crossing of each
-
-SUPPRESS_HISTORICAL_HOURS = 2  # don't fire milestones for stored peaks on old tokens
+MILESTONE_THRESHOLDS    = [2.0, 5.0, 10.0]  # send alert on first crossing of each
+SUPPRESS_HISTORICAL_HOURS = 2  # don't fire milestones/drawdowns for stored peaks on old tokens
 
 DRAWDOWN_WARN = 0.30   # 30% from peak → ⚠️ pulling back alert
 DRAWDOWN_DUMP = 0.50   # 50% from peak → 🚨 dump alert
@@ -73,7 +71,7 @@ def _fmt_mult(m: float) -> str:
 
 # ── Per-token processing ──────────────────────────────────────────────────────
 
-def _process_token(row: dict, dry_run: bool) -> dict:
+async def _process_token(row: dict, dry_run: bool) -> dict:
     """
     Fetch current price for one token, update peak if higher, fire any alerts.
     Returns {new_peak: bool, alerts_sent: int, skipped: bool}.
@@ -143,15 +141,15 @@ def _process_token(row: dict, dry_run: bool) -> dict:
             result["alerts_sent"] += 1
             print(f"  [monitor] → milestone alert: {symbol} hit {key}")
             if not dry_run:
-                asyncio.run(alert_bot.send_monitor_milestone(
+                await alert_bot.send_monitor_milestone(
                     call_id=call_id,
                     symbol=symbol,
                     mint_address=mint,
                     multiplier=threshold,
                     mcap_at_call=row["mcap_at_call"],
                     current_mcap=current_mcap,
-                ))
-                time.sleep(1.0)
+                )
+                await asyncio.sleep(1.0)
 
     # ── Drawdown alerts ───────────────────────────────────────────────────────
     if active_peak > 0 and current_mult < active_peak:
@@ -169,7 +167,7 @@ def _process_token(row: dict, dry_run: bool) -> dict:
                 result["alerts_sent"] += 1
                 print(f"  [monitor] → dump alert: {symbol} -{drawdown:.0%} from peak")
                 if not dry_run:
-                    asyncio.run(alert_bot.send_drawdown_alert(
+                    await alert_bot.send_drawdown_alert(
                         call_id=call_id,
                         symbol=symbol,
                         mint_address=mint,
@@ -178,15 +176,15 @@ def _process_token(row: dict, dry_run: bool) -> dict:
                         drawdown_pct=drawdown * 100,
                         entry_mult=current_mult,
                         severe=True,
-                    ))
-                    time.sleep(1.0)
+                    )
+                    await asyncio.sleep(1.0)
 
             elif drawdown >= DRAWDOWN_WARN and "30pct_drawdown" not in sent:
                 sent.add("30pct_drawdown")
                 result["alerts_sent"] += 1
                 print(f"  [monitor] → drawdown alert: {symbol} -{drawdown:.0%} from peak")
                 if not dry_run:
-                    asyncio.run(alert_bot.send_drawdown_alert(
+                    await alert_bot.send_drawdown_alert(
                         call_id=call_id,
                         symbol=symbol,
                         mint_address=mint,
@@ -195,15 +193,15 @@ def _process_token(row: dict, dry_run: bool) -> dict:
                         drawdown_pct=drawdown * 100,
                         entry_mult=current_mult,
                         severe=False,
-                    ))
-                    time.sleep(1.0)
+                    )
+                    await asyncio.sleep(1.0)
 
     return result
 
 
 # ── Full pass ─────────────────────────────────────────────────────────────────
 
-def run_pass(pass_num: int, dry_run: bool) -> dict:
+async def run_pass(pass_num: int, dry_run: bool) -> dict:
     """Run one full monitoring pass across the active watchlist."""
     watchlist = db.get_active_watchlist(min_score=MIN_SCORE, max_age_hours=MAX_AGE_HOURS)
     count = len(watchlist)
@@ -214,13 +212,13 @@ def run_pass(pass_num: int, dry_run: bool) -> dict:
         return {"checked": 0, "new_peaks": 0, "alerts_sent": 0, "errors": 0}
 
     sleep_per_call = _inter_call_sleep(count)
-    stats  = {"checked": 0, "new_peaks": 0, "alerts_sent": 0, "errors": 0}
+    stats   = {"checked": 0, "new_peaks": 0, "alerts_sent": 0, "errors": 0}
     skipped = 0
 
     for row in watchlist:
         try:
-            result = _process_token(row, dry_run)
-            time.sleep(sleep_per_call)
+            result = await _process_token(row, dry_run)
+            await asyncio.sleep(sleep_per_call)
 
             if result["skipped"]:
                 skipped += 1
@@ -234,7 +232,7 @@ def run_pass(pass_num: int, dry_run: bool) -> dict:
             sym = row.get("symbol") or "?"
             print(f"[monitor] error on {sym} call_id={row['call_id']}: {e}")
             stats["errors"] += 1
-            time.sleep(sleep_per_call)
+            await asyncio.sleep(sleep_per_call)
 
     if skipped == count:
         print(f"[monitor] WARNING: DexScreener returned no data for any of the {count} token(s)")
@@ -252,22 +250,26 @@ def run_pass(pass_num: int, dry_run: bool) -> dict:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+async def _async_main(once: bool, dry_run: bool) -> None:
+    if dry_run:
+        print("[monitor] Dry-run mode — no DB writes, no alerts sent")
+
+    pass_num = 1
+    while True:
+        await run_pass(pass_num, dry_run=dry_run)
+        if once:
+            break
+        await asyncio.sleep(PASS_INTERVAL)
+        pass_num += 1
+
+
 def main() -> None:
     args    = sys.argv[1:]
     once    = "--once"    in args
     dry_run = "--dry-run" in args
 
-    if dry_run:
-        print("[monitor] Dry-run mode — no DB writes, no alerts sent")
-
     try:
-        pass_num = 1
-        while True:
-            run_pass(pass_num, dry_run=dry_run)
-            if once:
-                break
-            time.sleep(PASS_INTERVAL)
-            pass_num += 1
+        asyncio.run(_async_main(once=once, dry_run=dry_run))
     except KeyboardInterrupt:
         print("\n[monitor] Stopped.")
     finally:
