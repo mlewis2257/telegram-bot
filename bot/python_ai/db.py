@@ -692,10 +692,18 @@ def update_outcome_interval(
 
 # ── Scorer helpers ────────────────────────────────────────────────────────────
 
-def get_call_for_scoring(call_id: int) -> dict | None:
+def get_call_for_scoring(
+    call_id: int,
+    cross_channel_window_seconds: int = 3600,
+) -> dict | None:
     """
     Return a flat dict of every field needed by scorer.py for a single call.
     Joins calls → tokens → channels → outcomes (LEFT).
+
+    Includes cross_channel_confirmed: True when the same token has calls from
+    BOTH solwhaletrending and solearlytrending within cross_channel_window_seconds
+    of this call — used by the realtime scorer's cross-channel bonus rule.
+
     Returns None if the call_id doesn't exist.
     """
     conn = get_conn()
@@ -708,6 +716,7 @@ def get_call_for_scoring(call_id: int) -> dict | None:
                 c.message_type,
                 ch.handle,
                 ch.channel_type,
+                t.id              AS token_id,
                 t.symbol,
                 t.security_flag,
                 t.token_age_minutes,
@@ -722,14 +731,22 @@ def get_call_for_scoring(call_id: int) -> dict | None:
                 t.dev_best_mcap,
                 t.mint_address,
                 o.stated_multiplier,
-                o.mcap_at_result
+                o.mcap_at_result,
+                (
+                    SELECT COUNT(DISTINCT ch2.handle)
+                    FROM calls c2
+                    JOIN channels ch2 ON ch2.id = c2.channel_id
+                    WHERE c2.token_id = t.id
+                      AND ch2.handle IN ('solwhaletrending', 'solearlytrending')
+                      AND ABS(EXTRACT(EPOCH FROM (c2.created_at - c.created_at))) <= %s
+                ) >= 2 AS cross_channel_confirmed
             FROM calls c
             JOIN tokens   t  ON t.id  = c.token_id
             JOIN channels ch ON ch.id = c.channel_id
             LEFT JOIN outcomes o ON o.call_id = c.id
             WHERE c.id = %s
             """,
-            (call_id,),
+            (cross_channel_window_seconds, call_id),
         )
         row = cur.fetchone()
         if not row:
