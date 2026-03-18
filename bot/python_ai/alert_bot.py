@@ -98,6 +98,13 @@ def _build_alert(score_result: dict, token_data: dict) -> str:
     dex_url   = f"https://dexscreener.com/solana/{mint}"
     axiom_url = f"https://axiom.trade/t/{mint}"
 
+    msg_id  = token_data.get("source_message_id")
+    handle  = token_data.get("channel_handle")
+    origin_line = (
+        f'🔍 <a href="https://t.me/{handle}/{msg_id}">View Original Signal</a>'
+        if msg_id and handle else None
+    )
+
     return "\n".join([
         header,
         f"💎 <b>${symbol}</b>",
@@ -111,6 +118,7 @@ def _build_alert(score_result: dict, token_data: dict) -> str:
         "📈 <b>Reasons:</b>",
         reason_lines,
         "",
+        *([origin_line, ""] if origin_line else []),
         f'🔗 <a href="{dex_url}">DexScreener</a>',
         f'🔗 <a href="{axiom_url}">Axiom</a>',
     ])

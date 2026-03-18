@@ -223,12 +223,15 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
         elif dtm <= 200:
             score -= 10
             reasons.append(f"dev_tokens={dtm}-10")
-        elif dtm <= 1000:
+        elif dtm <= 500:
             score -= 20
             reasons.append(f"dev_tokens={dtm}-20")
-        else:
+        elif dtm <= 1000:
             score -= 30
             reasons.append(f"dev_tokens={dtm}-30")
+        else:
+            score -= 40
+            reasons.append(f"dev_tokens={dtm}-40")
 
     # dev_best_mcap
     dbm = row.get("dev_best_mcap")
@@ -261,6 +264,11 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     if row.get("cross_channel_confirmed"):
         score += 15
         reasons.append("cross_channel_confirmed+15")
+
+    # ── Hard cap: rug factory ──────────────────────────────────────────────
+    if row.get("dev_tokens_made") is not None and int(row["dev_tokens_made"]) > 5000:
+        score = min(score, 25)
+        reasons.append("rug_factory_cap<=25")
 
     return score, reasons
 

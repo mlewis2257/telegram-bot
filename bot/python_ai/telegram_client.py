@@ -324,7 +324,7 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> tuple:
     return "logged", score_result, token_data
 
 
-def handle_realtime(message, caller_id: int, channel_id: int) -> tuple:
+def handle_realtime(message, caller_id: int, channel_id: int, channel_handle: str = None) -> tuple:
     """
     Process one message from a realtime channel (@solwhaletrending, @solearlytrending).
     Returns (status, score_result, token_data) where:
@@ -482,6 +482,8 @@ def handle_realtime(message, caller_id: int, channel_id: int) -> tuple:
             "mcap_at_call":      parsed.get("mcap_at_call"),
             "security_flag":     parsed.get("security_flag"),
             "token_age_minutes": parsed.get("token_age_minutes"),
+            "source_message_id": message.id,
+            "channel_handle":    channel_handle,
         }
         return 'logged', score_result, token_data
 
@@ -676,7 +678,7 @@ def run_listener() -> None:
             if cfg["channel_type"] == "lagging":
                 status, score_result, extra = handle_lagging(msg, info["caller_id"], cfg["id"])
             elif cfg["channel_type"] == "realtime":
-                status, score_result, extra = handle_realtime(msg, info["caller_id"], cfg["id"])
+                status, score_result, extra = handle_realtime(msg, info["caller_id"], cfg["id"], channel_handle=cfg["handle"])
             else:
                 return
 
