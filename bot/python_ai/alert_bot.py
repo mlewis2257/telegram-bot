@@ -143,6 +143,48 @@ def _build_milestone(
     return "\n".join(lines)
 
 
+def _build_monitor_milestone(
+    symbol: str,
+    mint_address: str,
+    multiplier: float,
+    mcap_at_call,
+    current_mcap,
+) -> str:
+    sym  = html.escape(str(symbol or "?"))
+    mint = html.escape(str(mint_address or ""))
+    mult_str  = f"{int(multiplier)}x"
+    dex_url   = f"https://dexscreener.com/solana/{mint}"
+    axiom_url = f"https://axiom.trade/t/{mint}"
+    return "\n".join([
+        f"🚀 <b>${sym} hit {mult_str}!</b>",
+        f"Entry: {_fmt_mcap(mcap_at_call)} → Now: {_fmt_mcap(current_mcap)}",
+        f"⛓ <code>{mint}</code>",
+        "",
+        f'🔗 <a href="{dex_url}">DexScreener</a>  🔗 <a href="{axiom_url}">Axiom</a>',
+    ])
+
+
+def _build_drawdown_alert(
+    symbol: str,
+    mint_address: str,
+    peak_mult: float,
+    current_mult: float,
+    drawdown_pct: float,
+    entry_mult: float,
+    severe: bool,
+) -> str:
+    sym     = html.escape(str(symbol or "?"))
+    mint    = html.escape(str(mint_address or ""))
+    header  = f"🚨 <b>${sym} dumping</b>" if severe else f"⚠️ <b>${sym} pulling back</b>"
+    dex_url = f"https://dexscreener.com/solana/{mint}"
+    return "\n".join([
+        header,
+        f"Peak: {peak_mult:.1f}x → Now: {current_mult:.1f}x (-{drawdown_pct:.0f}% from peak)",
+        f"Still up {entry_mult:.1f}x from entry",
+        f'🔗 <a href="{dex_url}">DexScreener</a>',
+    ])
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 async def send_alert(score_result: dict, token_data: dict) -> bool:
@@ -195,6 +237,73 @@ async def send_milestone(
         print(
             f"[alert_bot] milestone sent"
             f"  call_id={call_id}  symbol={symbol}  {stated_multiplier:.0f}x"
+        )
+        return True
+    except Exception as e:
+        print(f"[alert_bot] failed: {e}")
+        return False
+
+
+async def send_monitor_milestone(
+    call_id: int,
+    symbol: str,
+    mint_address: str,
+    multiplier: float,
+    mcap_at_call,
+    current_mcap,
+) -> bool:
+    """
+    Send a live monitor milestone alert (2x / 5x / 10x threshold hit).
+    multiplier should be a round threshold value (2.0, 5.0, 10.0).
+    Returns True on success, False on failure. Never raises.
+    """
+    try:
+        text = _build_monitor_milestone(symbol, mint_address, multiplier, mcap_at_call, current_mcap)
+        await _get_bot().send_message(
+            chat_id=_chat_id(),
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        print(
+            f"[alert_bot] monitor milestone sent"
+            f"  call_id={call_id}  symbol={symbol}  {int(multiplier)}x"
+        )
+        return True
+    except Exception as e:
+        print(f"[alert_bot] failed: {e}")
+        return False
+
+
+async def send_drawdown_alert(
+    call_id: int,
+    symbol: str,
+    mint_address: str,
+    peak_mult: float,
+    current_mult: float,
+    drawdown_pct: float,
+    entry_mult: float,
+    severe: bool = False,
+) -> bool:
+    """
+    Send a drawdown alert — ⚠️ pulling back (30%+) or 🚨 dumping (50%+).
+    entry_mult is current_mult at alert time (how much token is still up from entry).
+    Returns True on success, False on failure. Never raises.
+    """
+    try:
+        text = _build_drawdown_alert(
+            symbol, mint_address, peak_mult, current_mult, drawdown_pct, entry_mult, severe
+        )
+        await _get_bot().send_message(
+            chat_id=_chat_id(),
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        kind = "dump" if severe else "drawdown"
+        print(
+            f"[alert_bot] {kind} alert sent"
+            f"  call_id={call_id}  symbol={symbol}  -{drawdown_pct:.0f}%"
         )
         return True
     except Exception as e:

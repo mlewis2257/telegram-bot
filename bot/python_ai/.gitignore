@@ -1,0 +1,21 @@
+# Environment / secrets
+.env
+**/.env
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Telethon session files (contain auth tokens)
+*.session
+*.session-journal
+
+# Node
+node_modules/
+**/.last_run/
+
+# OS
+.DS_Store

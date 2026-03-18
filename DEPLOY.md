@@ -157,31 +157,37 @@ Subsequent runs use this file and do not prompt again.
 
 ## 8. Start All Processes with PM2
 
-Run from the repo root. All three commands use the venv interpreter.
+Run from the repo root. All commands use the venv interpreter.
 
 ```bash
 VENV=bot/python_ai/.venv/bin/python3
 
 # Telegram listener (live message ingestion)
 pm2 start bot/python_ai/telegram_client.py \
-  --name telegram-listener \
+  --name sol-listener \
   --interpreter $VENV
 
 # Backfill job (price snapshots at 1h / 4h / 24h)
 pm2 start bot/python_ai/backfill.py \
-  --name backfill \
+  --name sol-backfill \
   --interpreter $VENV \
   -- --loop
+
+# Real-time price monitor (peak tracking, milestone & drawdown alerts)
+pm2 start bot/python_ai/monitor.py \
+  --name sol-monitor \
+  --interpreter $VENV
 
 pm2 save
 ```
 
-Check that both processes are running:
+Check that all processes are running:
 
 ```bash
 pm2 status
-pm2 logs telegram-listener --lines 50
-pm2 logs backfill --lines 20
+pm2 logs sol-listener --lines 50
+pm2 logs sol-backfill --lines 20
+pm2 logs sol-monitor --lines 20
 ```
 
 ---

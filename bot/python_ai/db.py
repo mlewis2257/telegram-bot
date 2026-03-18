@@ -772,6 +772,78 @@ def get_mint_by_call_id(call_id: int) -> str | None:
         return row[0] if row else None
 
 
+# ── Monitor helpers ───────────────────────────────────────────────────────────
+
+def get_active_watchlist(min_score: int = 55, max_age_hours: int = 24) -> list[dict]:
+    """
+    Return calls that are recent, resolved, and scored high enough to monitor.
+    Ordered by conviction_score DESC so highest-conviction tokens are checked first.
+    """
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                c.id            AS call_id,
+                t.symbol,
+                t.mint_address,
+                c.mcap_at_call,
+                c.conviction_score,
+                c.created_at,
+                o.peak_multiplier
+            FROM calls    c
+            JOIN tokens   t ON t.id      = c.token_id
+            JOIN outcomes o ON o.call_id = c.id
+            WHERE c.created_at > NOW() - INTERVAL '1 hour' * %s
+              AND c.conviction_score >= %s
+              AND t.mint_resolved = TRUE
+              AND t.mint_address IS NOT NULL
+              AND t.mint_address NOT LIKE 'UNKNOWN:%%'
+              AND t.mint_address NOT LIKE 'INFERRED:%%'
+            ORDER BY c.conviction_score DESC
+            """,
+            (max_age_hours, min_score),
+        )
+        cols = [d.name for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def update_peak_multiplier(call_id: int, new_peak: float) -> bool:
+    """
+    Conditionally update peak_multiplier — only when new_peak exceeds the stored value.
+    Also promotes outcome_label to 'runner' when new_peak >= 2.0 and it isn't already.
+
+    Returns True if the peak row was actually updated (new_peak was a genuine new high),
+    False if the stored value was already equal or higher.
+    """
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE outcomes SET
+                peak_multiplier = %s,
+                updated_at      = NOW()
+            WHERE call_id = %s
+              AND (peak_multiplier IS NULL OR peak_multiplier < %s)
+            """,
+            (new_peak, call_id, new_peak),
+        )
+        updated = cur.rowcount > 0
+
+        if new_peak >= 2.0:
+            cur.execute(
+                """
+                UPDATE outcomes SET outcome_label = 'runner'
+                WHERE call_id = %s
+                  AND (outcome_label IS NULL OR outcome_label != 'runner')
+                """,
+                (call_id,),
+            )
+
+        conn.commit()
+    return updated
+
+
 def update_call_conviction_score(call_id: int, score: float) -> None:
     """Write the scorer output back to calls.conviction_score."""
     conn = get_conn()
