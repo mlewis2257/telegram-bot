@@ -16,12 +16,16 @@ score_call(call_id: int) -> dict
 import db
 import data_fetcher
 
+# ── Cross-channel confirmation window ─────────────────────────────────────────
+
+CROSS_CHANNEL_WINDOW_SECONDS = 3600  # 1 hour
+
 # ── Label thresholds ──────────────────────────────────────────────────────────
 
 _THRESHOLDS = [
-    (92, "strong_alert"),
-    (78, "alert"),
-    (60, "caution"),
+    (85, "strong_alert"),
+    (70, "alert"),
+    (55, "caution"),
     (40, "watch"),
     (0,  "skip"),
 ]
@@ -41,7 +45,7 @@ def _clamp(score: int) -> int:
 # ── Path A: Realtime scoring ──────────────────────────────────────────────────
 
 def _score_realtime(row: dict) -> tuple[int, list[str]]:
-    score = 50
+    score = 35
     reasons: list[str] = []
 
     # ── Tier 1: always applied ─────────────────────────────────────────────
@@ -49,8 +53,8 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     # security_flag
     sf = row.get("security_flag")
     if sf == "safe":
-        score += 15
-        reasons.append("security=safe+15")
+        score += 5
+        reasons.append("security=safe+5")
     elif sf == "warning":
         score -= 20
         reasons.append("security=warning-20")
@@ -77,8 +81,8 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     if bpr is not None:
         bpr = float(bpr)
         if bpr < 5:
-            score += 20
-            reasons.append(f"bundles_remaining={bpr:.1f}%+20")
+            score += 10
+            reasons.append(f"bundles_remaining={bpr:.1f}%+10")
         elif bpr < 15:
             score += 5
             reasons.append(f"bundles_remaining={bpr:.1f}%+5")
@@ -110,32 +114,35 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     if hodl is not None:
         hodl = int(hodl)
         if hodl > 500:
-            score += 15
-            reasons.append(f"holders={hodl}+15")
-        elif hodl >= 300:
             score += 8
             reasons.append(f"holders={hodl}+8")
+        elif hodl >= 300:
+            score += 4
+            reasons.append(f"holders={hodl}+4")
         elif hodl >= 100:
             pass  # neutral band
         else:
-            score -= 15
-            reasons.append(f"holders={hodl}-15")
+            score -= 8
+            reasons.append(f"holders={hodl}-8")
 
     # mcap_at_call — penalise late entries
     mcap_entry = row.get("mcap_at_call")
     if mcap_entry is not None:
         mcap_entry = float(mcap_entry)
-        if mcap_entry < 20_000:
+        if mcap_entry < 15_000:
+            score += 15
+            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k+15")
+        elif mcap_entry < 30_000:
             score += 10
             reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k+10")
-        elif mcap_entry <= 50_000:
+        elif mcap_entry <= 60_000:
             pass  # normal band
         elif mcap_entry <= 100_000:
-            score -= 10
-            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k-10")
+            score -= 15
+            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k-15")
         else:
-            score -= 20
-            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k-20")
+            score -= 25
+            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k-25")
 
     # ── Tier 2: applied only when not NULL ────────────────────────────────
 
@@ -144,17 +151,17 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     if bc is not None:
         bc = int(bc)
         if bc < 5:
-            score += 10
-            reasons.append(f"bundle_count={bc}+10")
+            score += 15
+            reasons.append(f"bundle_count={bc}+15")
         elif bc < 15:
             score += 5
             reasons.append(f"bundle_count={bc}+5")
-        elif bc < 30:
-            score -= 5
-            reasons.append(f"bundle_count={bc}-5")
+        elif bc <= 25:
+            score -= 10
+            reasons.append(f"bundle_count={bc}-10")
         else:
-            score -= 15
-            reasons.append(f"bundle_count={bc}-15")
+            score -= 20
+            reasons.append(f"bundle_count={bc}-20")
 
     # sniper_count
     sc = row.get("sniper_count")
@@ -163,15 +170,14 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
         if sc < 10:
             score += 10
             reasons.append(f"snipers={sc}+10")
-        elif sc < 25:
-            score += 5
-            reasons.append(f"snipers={sc}+5")
-        elif sc < 40:
-            score -= 5
-            reasons.append(f"snipers={sc}-5")
-        else:
+        elif sc <= 30:
+            pass  # neutral band
+        elif sc <= 50:
             score -= 10
             reasons.append(f"snipers={sc}-10")
+        else:
+            score -= 20
+            reasons.append(f"snipers={sc}-20")
 
     # fake_vol_pct
     fvp = row.get("fake_vol_pct")
@@ -212,14 +218,17 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
         if dtm < 10:
             score += 5
             reasons.append(f"dev_tokens={dtm}+5")
-        elif dtm < 50:
+        elif dtm <= 50:
             pass  # neutral band
-        elif dtm < 200:
-            score -= 5
-            reasons.append(f"dev_tokens={dtm}-5")
+        elif dtm <= 200:
+            score -= 10
+            reasons.append(f"dev_tokens={dtm}-10")
+        elif dtm <= 1000:
+            score -= 20
+            reasons.append(f"dev_tokens={dtm}-20")
         else:
-            score -= 15
-            reasons.append(f"dev_tokens={dtm}-15")
+            score -= 30
+            reasons.append(f"dev_tokens={dtm}-30")
 
     # dev_best_mcap
     dbm = row.get("dev_best_mcap")
@@ -247,6 +256,11 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     elif available_tier1 < 4:
         score -= 15
         reasons.append("partial_data-15")
+
+    # ── Cross-channel confirmation ─────────────────────────────────────────
+    if row.get("cross_channel_confirmed"):
+        score += 15
+        reasons.append("cross_channel_confirmed+15")
 
     return score, reasons
 
@@ -319,7 +333,7 @@ def score_call(call_id: int) -> dict:
     writes conviction_score back to calls.conviction_score, and returns
     a result dict with keys: call_id, score, label, reasons, path.
     """
-    row = db.get_call_for_scoring(call_id)
+    row = db.get_call_for_scoring(call_id, cross_channel_window_seconds=CROSS_CHANNEL_WINDOW_SECONDS)
     if not row:
         return {
             "call_id": call_id,
