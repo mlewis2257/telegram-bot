@@ -26,6 +26,7 @@ import re
 from dotenv import load_dotenv
 from telegram import Bot
 from telegram.constants import ParseMode
+from telegram.request import HTTPXRequest
 
 load_dotenv()
 
@@ -37,7 +38,8 @@ _bot: Bot | None = None
 def _get_bot() -> Bot:
     global _bot
     if _bot is None:
-        _bot = Bot(token=os.environ["TELEGRAM_BOT_TOKEN"])
+        request = HTTPXRequest(connection_pool_size=8)
+        _bot = Bot(token=os.environ["TELEGRAM_BOT_TOKEN"], request=request)
     return _bot
 
 

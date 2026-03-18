@@ -151,44 +151,52 @@ def _process_token(row: dict, dry_run: bool) -> dict:
                     mcap_at_call=row["mcap_at_call"],
                     current_mcap=current_mcap,
                 ))
+                time.sleep(1.0)
 
     # ── Drawdown alerts ───────────────────────────────────────────────────────
     if active_peak > 0 and current_mult < active_peak:
         drawdown = (active_peak - current_mult) / active_peak
 
-        # Check 50% first — avoids sending both alerts for the same drop
-        if drawdown >= DRAWDOWN_DUMP and "50pct_dump" not in sent:
-            sent.add("50pct_dump")
-            sent.add("30pct_drawdown")  # severe alert supersedes the milder one
-            result["alerts_sent"] += 1
-            print(f"  [monitor] → dump alert: {symbol} -{drawdown:.0%} from peak")
-            if not dry_run:
-                asyncio.run(alert_bot.send_drawdown_alert(
-                    call_id=call_id,
-                    symbol=symbol,
-                    mint_address=mint,
-                    peak_mult=active_peak,
-                    current_mult=current_mult,
-                    drawdown_pct=drawdown * 100,
-                    entry_mult=current_mult,
-                    severe=True,
-                ))
+        # Suppress if we never witnessed the peak live this pass and the token
+        # isn't freshly created — avoids firing on stored historical peaks at startup.
+        if not recently_created and not is_new_peak:
+            sent.update({"30pct_drawdown", "50pct_dump"})
+        else:
+            # Check 50% first — avoids sending both alerts for the same drop
+            if drawdown >= DRAWDOWN_DUMP and "50pct_dump" not in sent:
+                sent.add("50pct_dump")
+                sent.add("30pct_drawdown")  # severe alert supersedes the milder one
+                result["alerts_sent"] += 1
+                print(f"  [monitor] → dump alert: {symbol} -{drawdown:.0%} from peak")
+                if not dry_run:
+                    asyncio.run(alert_bot.send_drawdown_alert(
+                        call_id=call_id,
+                        symbol=symbol,
+                        mint_address=mint,
+                        peak_mult=active_peak,
+                        current_mult=current_mult,
+                        drawdown_pct=drawdown * 100,
+                        entry_mult=current_mult,
+                        severe=True,
+                    ))
+                    time.sleep(1.0)
 
-        elif drawdown >= DRAWDOWN_WARN and "30pct_drawdown" not in sent:
-            sent.add("30pct_drawdown")
-            result["alerts_sent"] += 1
-            print(f"  [monitor] → drawdown alert: {symbol} -{drawdown:.0%} from peak")
-            if not dry_run:
-                asyncio.run(alert_bot.send_drawdown_alert(
-                    call_id=call_id,
-                    symbol=symbol,
-                    mint_address=mint,
-                    peak_mult=active_peak,
-                    current_mult=current_mult,
-                    drawdown_pct=drawdown * 100,
-                    entry_mult=current_mult,
-                    severe=False,
-                ))
+            elif drawdown >= DRAWDOWN_WARN and "30pct_drawdown" not in sent:
+                sent.add("30pct_drawdown")
+                result["alerts_sent"] += 1
+                print(f"  [monitor] → drawdown alert: {symbol} -{drawdown:.0%} from peak")
+                if not dry_run:
+                    asyncio.run(alert_bot.send_drawdown_alert(
+                        call_id=call_id,
+                        symbol=symbol,
+                        mint_address=mint,
+                        peak_mult=active_peak,
+                        current_mult=current_mult,
+                        drawdown_pct=drawdown * 100,
+                        entry_mult=current_mult,
+                        severe=False,
+                    ))
+                    time.sleep(1.0)
 
     return result
 
