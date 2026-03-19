@@ -225,6 +225,11 @@ async def send_alert(score_result: dict, token_data: dict) -> bool:
             f"[alert_bot] sent  symbol={token_data.get('symbol', '?')}"
             f"  score={score_result.get('score')}  label={score_result.get('label')}"
         )
+        try:
+            import paper_trader
+            paper_trader.open_position(score_result, token_data)
+        except Exception as pe:
+            print(f"[paper_trader] open_position failed: {pe}")
         return True
     except Exception as e:
         print(f"[alert_bot] failed: {e}")

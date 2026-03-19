@@ -856,3 +856,165 @@ def update_call_conviction_score(call_id: int, score: float) -> None:
             (score, call_id),
         )
         conn.commit()
+
+
+# ── Paper trading helpers ──────────────────────────────────────────────────────
+
+def open_paper_position(call_id: int, entry_price: float, sol_in: float) -> None:
+    """
+    Open a simulated paper trade position for a scored call.
+    Resolves token_id via subquery. No-ops silently if a simulation
+    position already exists for this call (prevents duplicates).
+    """
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO trading_positions
+                (token_id, call_id, is_simulation, entry_price, sol_in, entry_time, status)
+            SELECT c.token_id, %s, TRUE, %s, %s, NOW(), 'open'
+            FROM calls c
+            WHERE c.id = %s
+              AND NOT EXISTS (
+                SELECT 1 FROM trading_positions
+                WHERE call_id = %s AND is_simulation = TRUE
+              )
+            """,
+            (call_id, entry_price, sol_in, call_id, call_id),
+        )
+        conn.commit()
+
+
+def get_open_paper_position(call_id: int) -> dict | None:
+    """
+    Return {entry_price, sol_in, entry_time} for the open simulation
+    position on this call, or None if no open position exists.
+    """
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT entry_price, sol_in, entry_time
+            FROM trading_positions
+            WHERE call_id = %s
+              AND is_simulation = TRUE
+              AND status = 'open'
+            """,
+            (call_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {"entry_price": float(row[0]), "sol_in": float(row[1]), "entry_time": row[2]}
+
+
+def close_paper_position(
+    call_id: int,
+    exit_price: float,
+    sol_out: float,
+    exit_reason: str,
+) -> None:
+    """Close an open simulation position with exit data."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE trading_positions SET
+                exit_price  = %s,
+                sol_out     = %s,
+                exit_time   = NOW(),
+                exit_reason = %s,
+                status      = 'closed'
+            WHERE call_id      = %s
+              AND is_simulation = TRUE
+              AND status        = 'open'
+            """,
+            (exit_price, sol_out, exit_reason, call_id),
+        )
+        conn.commit()
+
+
+def get_paper_pnl_summary() -> dict:
+    """
+    Return aggregate P&L stats for all closed simulation positions,
+    plus open count and exit breakdown by reason.
+    """
+    conn = get_conn()
+    with conn.cursor() as cur:
+        # Aggregate stats
+        cur.execute(
+            """
+            SELECT
+                COUNT(*)                                          AS total,
+                SUM(pnl_sol)                                     AS total_pnl,
+                AVG(pnl_pct)                                     AS avg_pnl_pct,
+                COUNT(CASE WHEN pnl_sol > 0  THEN 1 END)        AS winners,
+                COUNT(CASE WHEN pnl_sol <= 0 THEN 1 END)        AS losers,
+                MAX(pnl_pct)                                     AS best_pct,
+                MIN(pnl_pct)                                     AS worst_pct
+            FROM trading_positions
+            WHERE is_simulation = TRUE
+              AND status = 'closed'
+            """
+        )
+        row = cur.fetchone()
+        summary = {
+            "closed":      int(row[0] or 0),
+            "total_pnl":   float(row[1] or 0),
+            "avg_pnl_pct": float(row[2] or 0),
+            "winners":     int(row[3] or 0),
+            "losers":      int(row[4] or 0),
+            "best_pct":    float(row[5]) if row[5] is not None else None,
+            "worst_pct":   float(row[6]) if row[6] is not None else None,
+        }
+
+        # Open count
+        cur.execute(
+            "SELECT COUNT(*) FROM trading_positions WHERE is_simulation = TRUE AND status = 'open'"
+        )
+        summary["open"] = int(cur.fetchone()[0])
+
+        # Exit breakdown
+        cur.execute(
+            """
+            SELECT exit_reason, COUNT(*) AS n
+            FROM trading_positions
+            WHERE is_simulation = TRUE AND status = 'closed'
+            GROUP BY exit_reason
+            """
+        )
+        breakdown = {"3x_tp": 0, "5x_tp": 0, "trail": 0, "stop": 0, "time": 0}
+        for reason, count in cur.fetchall():
+            if reason in breakdown:
+                breakdown[reason] = int(count)
+        summary["exit_breakdown"] = breakdown
+
+    return summary
+
+
+def get_open_paper_positions() -> list[dict]:
+    """
+    Return all open simulation positions with symbol and mint_address
+    for use in the paper trading report.
+    """
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                tp.call_id,
+                t.symbol,
+                t.mint_address,
+                tp.entry_price,
+                tp.sol_in,
+                tp.entry_time
+            FROM trading_positions tp
+            JOIN calls  c ON c.id       = tp.call_id
+            JOIN tokens t ON t.id       = c.token_id
+            WHERE tp.is_simulation = TRUE
+              AND tp.status        = 'open'
+            ORDER BY tp.entry_time DESC
+            """
+        )
+        cols = [d.name for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]

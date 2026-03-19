@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import db
 import data_fetcher
 import alert_bot
+import paper_trader
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -197,6 +198,14 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
                         severe=False,
                     )
                     await asyncio.sleep(1.0)
+
+    # ── Paper trade exit check ────────────────────────────────────────────────
+    if not dry_run:
+        peak_mcap   = active_peak * mcap_at_call
+        exit_result = paper_trader.check_exits(call_id, current_mcap, peak_mcap, mcap_at_call)
+        if exit_result.should_exit:
+            paper_trader.close_position(call_id, current_mcap, exit_result.reason)
+            print(f"  [paper] {symbol} closed — {exit_result.reason}")
 
     return result
 
