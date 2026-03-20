@@ -29,6 +29,47 @@ import scorer
 import alert_bot
 from parsers import type_a, type_b
 
+
+def _is_valid_peak_update(
+    new_mult,
+    current_peak,
+    mcap_at_call,
+    new_mcap_result,
+    label: str = "",
+) -> bool:
+    """
+    Guard against corrupted DexScreener data polluting peak_multiplier / mcap_at_result.
+
+    Rejects:
+      1. new_mult > 2000             — absolute hard cap
+      2. new_mult > current_peak*10  — single-update jump (e.g. 5x → 11,866x)
+      3. entry mcap < $100k AND result mcap > $50M — small-cap data error
+    """
+    if new_mult is None:
+        return True
+    if new_mult > 2000:
+        print(f"  [peak_guard] {label} rejected: {new_mult:.1f}x exceeds hard cap (2000x)")
+        return False
+    if current_peak and current_peak > 0 and new_mult > current_peak * 10:
+        print(
+            f"  [peak_guard] {label} rejected: {new_mult:.1f}x is >10x jump"
+            f" from stored peak {current_peak:.1f}x"
+        )
+        return False
+    if (
+        mcap_at_call is not None
+        and new_mcap_result is not None
+        and mcap_at_call < 100_000
+        and new_mcap_result > 50_000_000
+    ):
+        print(
+            f"  [peak_guard] {label} rejected: small-cap entry"
+            f" (${mcap_at_call:,.0f}) with result ${new_mcap_result / 1_000_000:.1f}M"
+            f" — likely corrupted DexScreener data"
+        )
+        return False
+    return True
+
 load_dotenv()
 
 api_id   = int(os.environ["API_ID"])
@@ -201,14 +242,22 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> tuple:
             if call_id is None:
                 return 'milestone', None, None
             db.insert_outcome(call_id)
-            db.update_outcome_from_lagging(
-                call_id=call_id,
-                mcap_at_result=milestone["current_mcap"],
-                result_reported_at=message.date,
-                stated_multiplier=milestone["multiplier_stated"],
-                peak_multiplier=milestone["multiplier_computed"] or milestone["multiplier_stated"],
-                outcome_label="runner",
-            )
+            _new_mult = milestone["multiplier_computed"] or milestone["multiplier_stated"]
+            if _is_valid_peak_update(
+                new_mult=_new_mult,
+                current_peak=None,
+                mcap_at_call=milestone["entry_mcap"],
+                new_mcap_result=milestone["current_mcap"],
+                label=f"orphan_milestone call_id={call_id}",
+            ):
+                db.update_outcome_from_lagging(
+                    call_id=call_id,
+                    mcap_at_result=milestone["current_mcap"],
+                    result_reported_at=message.date,
+                    stated_multiplier=milestone["multiplier_stated"],
+                    peak_multiplier=_new_mult,
+                    outcome_label="runner",
+                )
             print(
                 f"  [orphan_milestone] call_id={call_id} token={milestone['token_name']} "
                 f"entry={milestone['entry_mcap']} result={milestone['current_mcap']} "
@@ -217,13 +266,22 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> tuple:
             )
             return 'milestone', None, None
 
-        db.update_outcome_peak(
-            call_id=call_id,
-            multiplier_computed=milestone["multiplier_computed"] or milestone["multiplier_stated"],
-            multiplier_stated=milestone["multiplier_stated"],
-            current_mcap=milestone["current_mcap"],
-            reported_at=message.date,
-        )
+        _new_mult   = milestone["multiplier_computed"] or milestone["multiplier_stated"]
+        _peak_info  = db.get_call_peak_info(call_id)
+        if _is_valid_peak_update(
+            new_mult=_new_mult,
+            current_peak=_peak_info["peak_multiplier"] if _peak_info else None,
+            mcap_at_call=_peak_info["mcap_at_call"] if _peak_info else None,
+            new_mcap_result=milestone["current_mcap"],
+            label=f"milestone call_id={call_id}",
+        ):
+            db.update_outcome_peak(
+                call_id=call_id,
+                multiplier_computed=_new_mult,
+                multiplier_stated=milestone["multiplier_stated"],
+                current_mcap=milestone["current_mcap"],
+                reported_at=message.date,
+            )
         print(
             f"  [milestone] call_id={call_id} token={milestone['token_name']} "
             f"stated={milestone['multiplier_stated']}x "
@@ -290,7 +348,13 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> tuple:
 
     db.insert_outcome(call_id)
 
-    if parsed["mcap_at_result"] is not None:
+    if parsed["mcap_at_result"] is not None and _is_valid_peak_update(
+        new_mult=parsed["peak_multiplier"],
+        current_peak=None,
+        mcap_at_call=parsed["mcap_at_call"],
+        new_mcap_result=parsed["mcap_at_result"],
+        label=f"lagging_gem call_id={call_id}",
+    ):
         db.update_outcome_from_lagging(
             call_id=call_id,
             mcap_at_result=parsed["mcap_at_result"],
@@ -495,13 +559,22 @@ def handle_realtime(message, caller_id: int, channel_id: int, channel_handle: st
         call_id = db.get_call_id_by_token_name(update["symbol"])
         if not call_id:
             return 'skipped', None, None
-        db.update_outcome_peak(
-            call_id=call_id,
-            multiplier_computed=update.get("multiplier"),
-            multiplier_stated=update.get("multiplier"),
-            current_mcap=update.get("current_mcap"),
-            reported_at=message.date,
-        )
+        _new_mult  = update.get("multiplier")
+        _peak_info = db.get_call_peak_info(call_id)
+        if _is_valid_peak_update(
+            new_mult=_new_mult,
+            current_peak=_peak_info["peak_multiplier"] if _peak_info else None,
+            mcap_at_call=_peak_info["mcap_at_call"] if _peak_info else None,
+            new_mcap_result=update.get("current_mcap"),
+            label=f"price_update call_id={call_id}",
+        ):
+            db.update_outcome_peak(
+                call_id=call_id,
+                multiplier_computed=_new_mult,
+                multiplier_stated=_new_mult,
+                current_mcap=update.get("current_mcap"),
+                reported_at=message.date,
+            )
         return 'update', None, None
 
     # ── Daily stats ──

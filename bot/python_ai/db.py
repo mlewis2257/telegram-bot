@@ -811,6 +811,26 @@ def get_active_watchlist(min_score: int = 55, max_age_hours: int = 24) -> list[d
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
+def get_call_peak_info(call_id: int) -> dict | None:
+    """Return {peak_multiplier, mcap_at_call} for sanity-checking multiplier updates."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT c.mcap_at_call, o.peak_multiplier
+            FROM calls c
+            LEFT JOIN outcomes o ON o.call_id = c.id
+            WHERE c.id = %s
+            """,
+            (call_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {"mcap_at_call": float(row[0]) if row[0] else None,
+            "peak_multiplier": float(row[1]) if row[1] else None}
+
+
 def update_peak_multiplier(call_id: int, new_peak: float) -> bool:
     """
     Conditionally update peak_multiplier — only when new_peak exceeds the stored value.

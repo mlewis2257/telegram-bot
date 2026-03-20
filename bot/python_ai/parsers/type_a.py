@@ -28,7 +28,8 @@ import re
 IS_GEM_ALERT_RE = re.compile(r'[➔→>].*?ACHIEV', re.IGNORECASE | re.DOTALL)
 
 # Milestone update: "TOKEN has reached Nx from our call"
-IS_MILESTONE_RE = re.compile(r'has reached\s+[\d.]+x\s+from our call', re.IGNORECASE)
+# Only matches clean integer or .5 multipliers (2x, 2.5x, 3x … 999x)
+IS_MILESTONE_RE = re.compile(r'has reached\s+\d{1,3}(?:\.5)?x\s+from our call', re.IGNORECASE)
 
 # Whale alert — checked BEFORE VIP promo because whale messages contain VIP links
 IS_WHALE_ALERT_RE = re.compile(r'whale\s+(alert|signal|just\s+made)', re.IGNORECASE)
@@ -58,8 +59,8 @@ MILESTONE_MCAP_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Milestone multiplier: "has reached 4x"
-MILESTONE_MULT_RE = re.compile(r'has reached\s+([\d.]+)x', re.IGNORECASE)
+# Milestone multiplier: "has reached 4x" — integer or .5 only, 1–3 digits
+MILESTONE_MULT_RE = re.compile(r'has reached\s+(\d{1,3}(?:\.5)?)x', re.IGNORECASE)
 
 # Token name from milestone: "PUMPERS has reached..."
 MILESTONE_NAME_RE = re.compile(r'^[\U0001F600-\U0001FFFF\s]*(\S+)\s+has reached', re.MULTILINE)
@@ -141,7 +142,21 @@ MCAP_LINE_RE = re.compile(
 )
 
 # Stated multiplier — e.g. (2x ACHIEVED!) or (37x ACHIEVED)
-MULTIPLIER_RE = re.compile(r'\(([\d.]+)x\s*ACHIEV', re.IGNORECASE)
+# Integer or .5 only, 1–3 digits — rejects garbled mcap values like (10634x ACHIEVED)
+MULTIPLIER_RE = re.compile(r'\((\d{1,3}(?:\.5)?)x\s*ACHIEV', re.IGNORECASE)
+
+
+# ── Multiplier validator ──────────────────────────────────────────────────────
+
+def _is_valid_multiplier(v: float) -> bool:
+    """
+    Return True only for positive integers and .5 half-steps up to 999.5.
+    Rejects arbitrary decimals (4.73x) and large outliers (10634x).
+    Used as defense-in-depth after regex extraction.
+    """
+    if v <= 0 or v > 999:
+        return False
+    return abs((v * 2) - round(v * 2)) < 1e-9
 
 
 # ── Mcap value converter ──────────────────────────────────────────────────────
@@ -313,6 +328,8 @@ def parse_milestone(text: str) -> dict | None:
     # Stated multiplier from "has reached 4x"
     m = MILESTONE_MULT_RE.search(text)
     multiplier_stated = float(m.group(1)) if m else None
+    if multiplier_stated is not None and not _is_valid_multiplier(multiplier_stated):
+        multiplier_stated = None  # parse error — store NULL not garbage
 
     # Entry and current mcap
     entry_mcap   = None
@@ -398,7 +415,8 @@ def parse(text: str) -> dict | None:
     stated_multiplier = None
     m = MULTIPLIER_RE.search(text)
     if m:
-        stated_multiplier = float(m.group(1))
+        v = float(m.group(1))
+        stated_multiplier = v if _is_valid_multiplier(v) else None  # NULL on parse error
 
     # ── Computed (accurate) multiplier ──
     peak_multiplier = None

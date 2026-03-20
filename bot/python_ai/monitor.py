@@ -22,9 +22,10 @@ Usage:
 """
 
 import asyncio
+import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -48,13 +49,21 @@ SUPPRESS_HISTORICAL_HOURS = 2  # don't fire milestones/drawdowns for stored peak
 DRAWDOWN_WARN = 0.30   # 30% from peak → ⚠️ pulling back alert
 DRAWDOWN_DUMP = 0.50   # 50% from peak → 🚨 dump alert
 
-# ── In-memory dedup state ─────────────────────────────────────────────────────
-# Tracks which alert keys have already been sent per call_id this session.
-# Resets on restart — acceptable since peak_multiplier persists in DB.
+PEAK_MAX_MULT    = 100.0  # above this, treat as data error and skip
+
+# ── Alert dedup state — persisted across restarts ─────────────────────────────
+# Tracks which alert keys have already been sent per call_id.
+# Persisted to _STATE_FILE so restarts don't re-fire dump alerts for dead tokens.
+# Entries older than ALERTS_TTL_HOURS are pruned on load.
 #
 # Keys per call_id: '2x', '5x', '10x', '30pct_drawdown', '50pct_dump'
 
-_alerts_sent: dict[int, set[str]] = {}
+_STATE_DIR       = os.path.join(os.path.dirname(__file__), ".last_run")
+_STATE_FILE      = os.path.join(_STATE_DIR, "monitor_alerts.json")
+ALERTS_TTL_HOURS = 48
+
+_alerts_sent:       dict[int, set[str]] = {}
+_alerts_first_seen: dict[int, str]      = {}  # call_id → ISO timestamp of first alert
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -68,6 +77,67 @@ def _inter_call_sleep(watchlist_size: int) -> float:
 
 def _fmt_mult(m: float) -> str:
     return f"{m:.1f}x"
+
+
+def _load_alerts_state() -> None:
+    """
+    Load _alerts_sent from disk on startup.
+    Prunes entries whose first-seen timestamp is older than ALERTS_TTL_HOURS.
+    """
+    global _alerts_sent, _alerts_first_seen
+    if not os.path.exists(_STATE_FILE):
+        return
+
+    try:
+        with open(_STATE_FILE, "r") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[monitor] could not load alert state: {e}")
+        return
+
+    cutoff    = datetime.now(timezone.utc) - timedelta(hours=ALERTS_TTL_HOURS)
+    first_seen = data.pop("_first_seen", {})
+    loaded = pruned = 0
+
+    for str_id, keys in data.items():
+        try:
+            call_id = int(str_id)
+        except ValueError:
+            continue
+
+        ts_str = first_seen.get(str_id)
+        if ts_str:
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                if ts < cutoff:
+                    pruned += 1
+                    continue
+            except ValueError:
+                pass  # malformed ts — keep the entry
+
+        _alerts_sent[call_id]       = set(keys)
+        _alerts_first_seen[call_id] = ts_str or datetime.now(timezone.utc).isoformat()
+        loaded += 1
+
+    print(f"[monitor] alert state loaded — {loaded} entries, {pruned} pruned (>{ALERTS_TTL_HOURS}h old)")
+
+
+def _save_alerts_state() -> None:
+    """Persist _alerts_sent to disk with first-seen timestamps for TTL tracking."""
+    try:
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        data: dict = {}
+        first_seen: dict = {}
+        for call_id, keys in _alerts_sent.items():
+            str_id              = str(call_id)
+            data[str_id]        = sorted(keys)
+            first_seen[str_id]  = _alerts_first_seen.get(call_id, now_iso)
+        data["_first_seen"] = first_seen
+        with open(_STATE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[monitor] could not save alert state: {e}")
 
 
 # ── Per-token processing ──────────────────────────────────────────────────────
@@ -103,6 +173,11 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
         result["skipped"] = True
         return result
 
+    if current_mult > PEAK_MAX_MULT:
+        print(f"[monitor] {symbol_pad} suspicious peak {_fmt_mult(current_mult)} — skipping")
+        result["skipped"] = True
+        return result
+
     # ── Peak update ───────────────────────────────────────────────────────────
     is_new_peak = current_mult > stored_peak
     if is_new_peak:
@@ -128,6 +203,8 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
     ) if created_at else False
 
     sent = _alerts_sent.setdefault(call_id, set())
+    if call_id not in _alerts_first_seen and sent:
+        _alerts_first_seen[call_id] = datetime.now(timezone.utc).isoformat()
 
     # ── Milestone threshold alerts ────────────────────────────────────────────
     for threshold in MILESTONE_THRESHOLDS:
@@ -139,6 +216,7 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
                 sent.add(key)  # mark so we never re-evaluate this threshold
                 continue
             sent.add(key)
+            _alerts_first_seen.setdefault(call_id, datetime.now(timezone.utc).isoformat())
             result["alerts_sent"] += 1
             print(f"  [monitor] → milestone alert: {symbol} hit {key}")
             if not dry_run:
@@ -153,6 +231,7 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
                     channel_handle=row.get("channel_handle"),
                 )
                 await asyncio.sleep(1.0)
+                _save_alerts_state()
 
     # ── Drawdown alerts ───────────────────────────────────────────────────────
     if active_peak > 0 and current_mult < active_peak:
@@ -167,6 +246,7 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
             if drawdown >= DRAWDOWN_DUMP and "50pct_dump" not in sent:
                 sent.add("50pct_dump")
                 sent.add("30pct_drawdown")  # severe alert supersedes the milder one
+                _alerts_first_seen.setdefault(call_id, datetime.now(timezone.utc).isoformat())
                 result["alerts_sent"] += 1
                 print(f"  [monitor] → dump alert: {symbol} -{drawdown:.0%} from peak")
                 if not dry_run:
@@ -181,9 +261,11 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
                         severe=True,
                     )
                     await asyncio.sleep(1.0)
+                    _save_alerts_state()
 
             elif drawdown >= DRAWDOWN_WARN and "30pct_drawdown" not in sent:
                 sent.add("30pct_drawdown")
+                _alerts_first_seen.setdefault(call_id, datetime.now(timezone.utc).isoformat())
                 result["alerts_sent"] += 1
                 print(f"  [monitor] → drawdown alert: {symbol} -{drawdown:.0%} from peak")
                 if not dry_run:
@@ -198,6 +280,7 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
                         severe=False,
                     )
                     await asyncio.sleep(1.0)
+                    _save_alerts_state()
 
     # ── Paper trade exit check ────────────────────────────────────────────────
     if not dry_run:
@@ -265,6 +348,8 @@ async def _async_main(once: bool, dry_run: bool) -> None:
     if dry_run:
         print("[monitor] Dry-run mode — no DB writes, no alerts sent")
 
+    _load_alerts_state()
+
     pass_num = 1
     while True:
         await run_pass(pass_num, dry_run=dry_run)
@@ -284,6 +369,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n[monitor] Stopped.")
     finally:
+        _save_alerts_state()
         db.close_conn()
 
 
