@@ -30,8 +30,7 @@ SOL_ALERT        = 0.5   # simulated SOL for alert (70–84)
 TAKE_PROFIT_5X   = 5.0   # exit at 5x from entry
 TAKE_PROFIT_3X   = 3.0   # exit at 3x from entry
 TRAIL_PEAK_MIN   = 2.0   # trailing stop only arms once peak >= 2x
-TRAIL_DRAWDOWN   = 0.40  # trailing stop fires on 40% drop from peak
-HARD_STOP_PCT    = 0.60  # hard stop fires on 60% loss from entry
+HARD_STOP_PCT    = 0.50  # hard stop fires on 50% loss from entry
 MAX_HOURS        = 24    # time stop after 24 hours open
 
 
@@ -95,8 +94,8 @@ def check_exits(
     Exit conditions checked in priority order:
       1. 5x take profit
       2. 3x take profit
-      3. Trailing stop  (peak >= 2x AND current dropped 40% from peak)
-      4. Hard stop      (down 60% from entry)
+      3. Trailing stop  (peak >= 2x; tiered threshold: 25% / 20% / 15%)
+      4. Hard stop      (down 50% from entry)
       5. Time stop      (open > 24 hours)
     """
     position = db.get_open_paper_position(call_id)
@@ -117,15 +116,27 @@ def check_exits(
     if current_mult >= TAKE_PROFIT_3X:
         return ExitResult(True, "3x_tp")
 
-    # Trailing stop — only arms after peak has been >= 2x
+    # Trailing stop — tiered by how much the token has run.
+    # Base threshold tightens at each tier; tightens a further 5% once
+    # the token has ever peaked at 2x ("half secured").
     if peak_mcap > 0:
         peak_mult = peak_mcap / entry_mcap
         if peak_mult >= TRAIL_PEAK_MIN:
+            if peak_mult >= 5.0:
+                trail_pct = 0.20
+            elif peak_mult >= 3.0:
+                trail_pct = 0.25
+            else:                       # peak >= 2x
+                trail_pct = 0.30
+            # half_secured: token has ever peaked at 2x (always True here
+            # since TRAIL_PEAK_MIN == 2.0, but explicit for future-proofing)
+            if peak_mult >= 2.0:
+                trail_pct -= 0.05
             drawdown = (peak_mcap - current_mcap) / peak_mcap
-            if drawdown >= TRAIL_DRAWDOWN:
+            if drawdown >= trail_pct:
                 return ExitResult(True, "trail_stop")
 
-    # Hard stop — down 60% from entry
+    # Hard stop — down 50% from entry (tightened from 60%)
     if current_mult <= (1.0 - HARD_STOP_PCT):
         return ExitResult(True, "hard_stop")
 
