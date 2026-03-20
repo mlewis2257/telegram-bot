@@ -76,6 +76,7 @@ def open_position(score_result: dict, token_data: dict) -> None:
         print(f"[paper] opened {symbol}  call_id={call_id}  {sol_in} SOL @ {entry_price}")
 
     except Exception as e:
+        db.safe_rollback()
         print(f"[paper_trader] open_position failed: {e}")
 
 
@@ -122,11 +123,11 @@ def check_exits(
         if peak_mult >= TRAIL_PEAK_MIN:
             drawdown = (peak_mcap - current_mcap) / peak_mcap
             if drawdown >= TRAIL_DRAWDOWN:
-                return ExitResult(True, "trail")
+                return ExitResult(True, "trail_stop")
 
     # Hard stop — down 60% from entry
     if current_mult <= (1.0 - HARD_STOP_PCT):
-        return ExitResult(True, "stop")
+        return ExitResult(True, "hard_stop")
 
     # Time stop — position open longer than MAX_HOURS
     entry_time = position["entry_time"]
@@ -135,7 +136,7 @@ def check_exits(
             entry_time = entry_time.replace(tzinfo=timezone.utc)
         age_hours = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
         if age_hours > MAX_HOURS:
-            return ExitResult(True, "time")
+            return ExitResult(True, "time_stop")
 
     return ExitResult(False)
 
@@ -168,4 +169,5 @@ def close_position(call_id: int, current_mcap: float, reason: str) -> None:
         )
 
     except Exception as e:
+        db.safe_rollback()
         print(f"[paper_trader] close_position failed: {e}")

@@ -30,6 +30,22 @@ def close_conn():
         _conn.close()
 
 
+def safe_rollback() -> None:
+    """
+    Roll back any failed transaction on the shared connection.
+
+    psycopg2 marks a connection as "in failed transaction" after any error,
+    blocking all subsequent queries until rollback() is called. Call this
+    in every except block that catches a DB write failure so the connection
+    is clean for the next query.
+    """
+    try:
+        if _conn and not _conn.closed:
+            _conn.rollback()
+    except Exception:
+        pass
+
+
 # ── Channels ──────────────────────────────────────────────────────────────────
 
 def get_active_channels():
@@ -1003,7 +1019,7 @@ def get_paper_pnl_summary() -> dict:
             GROUP BY exit_reason
             """
         )
-        breakdown = {"3x_tp": 0, "5x_tp": 0, "trail": 0, "stop": 0, "time": 0}
+        breakdown = {"5x_tp": 0, "3x_tp": 0, "trail_stop": 0, "hard_stop": 0, "time_stop": 0}
         for reason, count in cur.fetchall():
             if reason in breakdown:
                 breakdown[reason] = int(count)

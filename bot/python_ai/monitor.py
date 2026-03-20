@@ -345,6 +345,7 @@ async def _check_paper_exits() -> int:
                 closed += 1
 
         except Exception as e:
+            db.safe_rollback()
             print(f"[paper] exit check error for {symbol} call_id={call_id}: {e}")
 
     return closed
@@ -379,6 +380,7 @@ async def run_pass(pass_num: int, dry_run: bool) -> dict:
         except Exception as e:
             sym = row.get("symbol") or "?"
             print(f"[monitor] error on {sym} call_id={row['call_id']}: {e}")
+            db.safe_rollback()
             stats["errors"] += 1
             await asyncio.sleep(sleep_per_call)
 
