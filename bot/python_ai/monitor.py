@@ -293,6 +293,63 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
     return result
 
 
+# ── Paper position exit sweep ─────────────────────────────────────────────────
+
+async def _check_paper_exits() -> int:
+    """
+    Exit sweep for all open paper positions, independent of watchlist age.
+
+    Runs once per pass AFTER the main watchlist loop to catch positions
+    that aged out of the 24-hour watchlist window before being closed.
+    Returns the number of positions closed this sweep.
+    """
+    positions = db.get_open_paper_positions()
+    if not positions:
+        return 0
+
+    closed = 0
+    for pos in positions:
+        call_id     = pos["call_id"]
+        symbol      = pos.get("symbol") or "?"
+        mint        = pos.get("mint_address")
+        entry_price = float(pos["entry_price"]) if pos["entry_price"] else 0.0
+
+        if entry_price <= 0 or not mint or mint.startswith(("INFERRED:", "UNKNOWN:")):
+            continue
+
+        try:
+            market = data_fetcher.fetch_token_price(mint)
+            await asyncio.sleep(INTER_CALL_SLEEP)
+
+            if not market or not market.get("mcap"):
+                continue
+
+            current_mcap = float(market["mcap"])
+            current_mult = current_mcap / entry_price
+
+            peak_info   = db.get_call_peak_info(call_id)
+            stored_peak = (
+                peak_info["peak_multiplier"]
+                if peak_info and peak_info["peak_multiplier"]
+                else 0.0
+            )
+            peak_mcap = stored_peak * entry_price
+
+            exit_result = paper_trader.check_exits(call_id, current_mcap, peak_mcap, entry_price)
+            if exit_result.should_exit:
+                print(
+                    f"[paper] checking exit: {symbol}"
+                    f"  current={current_mult:.2f}x → closing ({exit_result.reason})"
+                )
+                paper_trader.close_position(call_id, current_mcap, exit_result.reason)
+                closed += 1
+
+        except Exception as e:
+            print(f"[paper] exit check error for {symbol} call_id={call_id}: {e}")
+
+    return closed
+
+
 # ── Full pass ─────────────────────────────────────────────────────────────────
 
 async def run_pass(pass_num: int, dry_run: bool) -> dict:
@@ -302,10 +359,7 @@ async def run_pass(pass_num: int, dry_run: bool) -> dict:
 
     print(f"[monitor] Pass {pass_num} — watching {count} active call(s)")
 
-    if count == 0:
-        return {"checked": 0, "new_peaks": 0, "alerts_sent": 0, "errors": 0}
-
-    sleep_per_call = _inter_call_sleep(count)
+    sleep_per_call = _inter_call_sleep(count) if count > 0 else INTER_CALL_SLEEP
     stats   = {"checked": 0, "new_peaks": 0, "alerts_sent": 0, "errors": 0}
     skipped = 0
 
@@ -328,8 +382,14 @@ async def run_pass(pass_num: int, dry_run: bool) -> dict:
             stats["errors"] += 1
             await asyncio.sleep(sleep_per_call)
 
-    if skipped == count:
+    if count > 0 and skipped == count:
         print(f"[monitor] WARNING: DexScreener returned no data for any of the {count} token(s)")
+
+    # ── Paper trade exit sweep (all open positions, age-independent) ──────────
+    if not dry_run:
+        paper_closed = await _check_paper_exits()
+        if paper_closed:
+            print(f"[paper] exit sweep closed {paper_closed} position(s)")
 
     suffix = " (dry-run)" if dry_run else ""
     print(
