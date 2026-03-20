@@ -1019,7 +1019,7 @@ def get_paper_pnl_summary() -> dict:
             GROUP BY exit_reason
             """
         )
-        breakdown = {"5x_tp": 0, "3x_tp": 0, "trail_stop": 0, "hard_stop": 0, "time_stop": 0}
+        breakdown = {"10x_tp": 0, "5x_tp": 0, "3x_tp": 0, "trail_stop": 0, "hard_stop": 0, "time_stop": 0}
         for reason, count in cur.fetchall():
             if reason in breakdown:
                 breakdown[reason] = int(count)

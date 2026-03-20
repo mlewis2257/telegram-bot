@@ -107,6 +107,10 @@ def check_exits(
 
     current_mult = current_mcap / entry_mcap
 
+    # 10x take profit — checked first so high runners are labelled correctly
+    if current_mult >= 10.0:
+        return ExitResult(True, "10x_tp")
+
     # 5x take profit — checked before 3x so a position that bypassed
     # the 3x check is labelled correctly
     if current_mult >= TAKE_PROFIT_5X:
