@@ -195,8 +195,11 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
     sig             = result["signature"]
     sol_spent       = result["sol_spent"]
     tokens_received = result["tokens_received"]
+    decimals        = result.get("tokens_decimals", 6)
     router          = result.get("router", "unknown")
     entry_price     = float(token_data.get("mcap_at_call") or 0)
+
+    tokens_display = tokens_received / (10 ** decimals) if decimals > 0 else tokens_received
 
     db.open_live_position(
         call_id=call_id,
@@ -215,7 +218,7 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         symbol=symbol,
         mint=mint,
         sol_spent=sol_spent,
-        tokens_received=tokens_received,
+        tokens_received=tokens_display,
         signature=sig,
     )
     return True
@@ -244,7 +247,7 @@ async def close_live_position(
 
     # ── Verify on-chain balance before selling ─────────────────────────────────
     wallet_addr = _wallet.get_public_key()
-    balance     = await jupiter.get_token_balance(mint, wallet_addr, _rpc_url())
+    balance, _decimals = await jupiter.get_token_balance(mint, wallet_addr, _rpc_url())
     print(f"[live_sell] on-chain balance for {symbol} call_id={call_id}: {balance}")
 
     if balance == 0:

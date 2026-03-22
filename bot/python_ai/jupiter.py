@@ -219,11 +219,17 @@ async def buy_token(
                 print(f"[jupiter] outputAmount missing from /execute response, checking on-chain balance...")
                 await asyncio.sleep(2)  # wait for tx to finalize
                 try:
-                    tokens_received = await get_token_balance(mint_address, wallet_address, _rpc_url())
+                    tokens_received, _decimals = await get_token_balance(mint_address, wallet_address, _rpc_url())
                     print(f"[jupiter] on-chain balance fallback: {tokens_received}")
                 except Exception as bal_err:
                     print(f"[jupiter] on-chain balance check failed: {bal_err}")
                     # Still return success — the buy executed, we just don't know exact tokens
+            # Get decimals for human-readable display if not already fetched above
+            if tokens_received > 0 and '_decimals' not in dir():
+                try:
+                    _, _decimals = await get_token_balance(mint_address, wallet_address, _rpc_url())
+                except Exception:
+                    _decimals = 6  # default for most pump.fun tokens
             print(
                 f"[jupiter] buy OK  mint={mint_address[:8]}..."
                 f"  sol={sol_amount:.4f}  tokens={tokens_received}  sig={sig[:16]}..."
@@ -233,6 +239,7 @@ async def buy_token(
                 "signature":       sig,
                 "sol_spent":       sol_amount,
                 "tokens_received": tokens_received,
+                "tokens_decimals": _decimals if '_decimals' in dir() else 6,
                 "mint":            mint_address,
                 "router":          router,
             }
@@ -283,6 +290,7 @@ async def sell_token(
 
     for attempt in range(1, max_retries + 1):
         try:
+            sol_before = _wallet.get_sol_balance(_rpc_url())
             order      = await get_order(mint_address, SOL_MINT, token_amount, wallet_address)
             order_time = time.time()
             signed_tx  = await sign_transaction(order, keypair)
@@ -294,6 +302,15 @@ async def sell_token(
 
             sig          = result.get("signature", "")
             sol_received = int(result.get("outputAmount", 0)) / 1_000_000_000
+            if sol_received == 0:
+                print("[jupiter] outputAmount missing from sell /execute, using SOL balance delta...")
+                await asyncio.sleep(2)
+                try:
+                    sol_after    = _wallet.get_sol_balance(_rpc_url())
+                    sol_received = max(0, sol_after - sol_before)
+                    print(f"[jupiter] SOL balance delta: before={sol_before:.4f} after={sol_after:.4f} received={sol_received:.4f}")
+                except Exception as bal_err:
+                    print(f"[jupiter] SOL balance delta failed: {bal_err}")
             print(
                 f"[jupiter] sell OK  mint={mint_address[:8]}..."
                 f"  tokens={token_amount}  sol={sol_received:.4f}  sig={sig[:16]}..."
@@ -363,18 +380,18 @@ async def get_token_balance(
     accounts = data.get("result", {}).get("value", [])
     if not accounts:
         print(f"[jupiter] get_token_balance  mint={mint_address[:12]}...  no account found → 0")
-        return 0
+        return 0, 0
 
     try:
         token_amount = accounts[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]
         amount_str   = token_amount["amount"]
-        decimals     = token_amount.get("decimals", "?")
+        dec          = int(token_amount.get("decimals", 0))
         balance      = int(amount_str)
         print(
             f"[jupiter] get_token_balance  mint={mint_address[:12]}..."
-            f"  balance={balance}  decimals={decimals}"
+            f"  balance={balance}  decimals={dec}"
         )
-        return balance
+        return balance, dec
     except (KeyError, IndexError) as e:
         print(f"[jupiter] get_token_balance parse error ({e}) — raw response: {data}")
         raise RuntimeError(f"Failed to parse token balance response: {e}") from e
@@ -433,4 +450,4 @@ def _mock_token_balance(mint: str) -> int:
     """
     balance = 1_000_000
     print(f"[DEVNET MOCK] token_balance  mint={mint[:8]}...  → {balance}")
-    return balance
+    return balance, 6

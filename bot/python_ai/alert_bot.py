@@ -367,7 +367,7 @@ def _build_live_buy(
         f"⛓ <code>{mint_e}</code>",
         "",
         f"💰 SOL spent: <b>{sol_spent:.4f} SOL</b>",
-        f"🪙 Tokens received: {tokens_received:,}",
+        f"🪙 Tokens received: {tokens_received:,.2f}" if isinstance(tokens_received, float) else f"🪙 Tokens received: {tokens_received:,}",
         "",
         f'🔗 <a href="{sol_url}">View Transaction</a>',
     ])
