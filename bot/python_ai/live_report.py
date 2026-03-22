@@ -95,13 +95,12 @@ def main() -> None:
     # ── Closed positions ──────────────────────────────────────────────────────
     summary = live_trader.get_live_pnl_summary()
 
-    total    = summary.get("total_trades", 0)
-    wins     = summary.get("wins", 0)
-    losses   = summary.get("losses", 0)
-    total_pnl = summary.get("total_pnl_sol", 0.0)
-    avg_win  = summary.get("avg_win_sol", 0.0)
-    avg_loss = summary.get("avg_loss_sol", 0.0)
-    breakdown = summary.get("by_exit_reason", {})
+    total     = summary.get("closed", 0)
+    wins      = summary.get("winners", 0)
+    losses    = summary.get("losers", 0)
+    total_pnl = summary.get("total_pnl", 0.0)
+    avg_pnl   = summary.get("avg_pnl_pct", 0.0)
+    breakdown = summary.get("exit_breakdown", {})
 
     win_rate = (wins / total * 100) if total > 0 else 0.0
 
@@ -113,8 +112,7 @@ def main() -> None:
     else:
         print(f"  Win rate  : {wins}/{total} ({win_rate:.0f}%)")
         print(f"  Total P&L : {_fmt_sol(total_pnl)}")
-        print(f"  Avg win   : {_fmt_sol(avg_win)}")
-        print(f"  Avg loss  : {_fmt_sol(avg_loss)}")
+        print(f"  Avg P&L % : {avg_pnl:+.1f}%")
         print()
         print("  Exit breakdown:")
         for reason, count in sorted(breakdown.items()):

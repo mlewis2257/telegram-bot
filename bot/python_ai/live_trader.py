@@ -287,13 +287,24 @@ async def close_live_position(
     sol_received = result["sol_received"]
     pnl          = sol_received - sol_in
 
-    db.close_live_position_db(
-        call_id=call_id,
-        exit_price=current_mcap,
-        sol_out=sol_received,
-        exit_reason=exit_reason,
-        tx_signature=sig,
+    print(
+        f"[live_debug] calling close_live_position_db"
+        f"  call_id={call_id} exit_price={current_mcap}"
+        f"  sol_out={sol_received} reason={exit_reason}"
     )
+    try:
+        db.close_live_position_db(
+            call_id=call_id,
+            exit_price=current_mcap,
+            sol_out=sol_received,
+            exit_reason=exit_reason,
+            tx_signature=sig,
+        )
+        print(f"[live_debug] close_live_position_db completed call_id={call_id}")
+    except Exception as e:
+        print(f"[live_debug] close_live_position_db FAILED: {e}")
+        import traceback
+        traceback.print_exc()
     print(
         f"[live] SELL OK  {symbol}  call_id={call_id}"
         f"  reason={exit_reason}  sol_received={sol_received:.4f}"
