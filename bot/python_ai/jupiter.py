@@ -23,6 +23,7 @@ SOLANA_RPC_URL             — Solana RPC endpoint for balance/token checks
 import asyncio
 import base64
 import os
+import time
 import uuid
 
 import httpx
@@ -144,6 +145,8 @@ async def execute_order(signed_tx: str, request_id: str) -> dict:
         f"{BASE_URL}/execute",
         json={"signedTransaction": signed_tx, "requestId": request_id},
     )
+    if resp.is_error:
+        print(f"[jupiter] HTTP {resp.status_code} response body: {resp.text}")
     resp.raise_for_status()
     data = resp.json()
 
@@ -199,9 +202,14 @@ async def buy_token(
 
     for attempt in range(1, max_retries + 1):
         try:
-            order     = await get_order(SOL_MINT, mint_address, lamports, wallet_address)
-            signed_tx = await sign_transaction(order, keypair)
-            result    = await execute_order(signed_tx, order["requestId"])
+            order      = await get_order(SOL_MINT, mint_address, lamports, wallet_address)
+            order_time = time.time()
+            signed_tx  = await sign_transaction(order, keypair)
+            sign_time  = time.time()
+            print(f"[jupiter] sign took {sign_time - order_time:.2f}s")
+            result     = await execute_order(signed_tx, order["requestId"])
+            exec_time  = time.time()
+            print(f"[jupiter] total order→execute: {exec_time - order_time:.2f}s")
 
             sig             = result.get("signature", "")
             tokens_received = int(result.get("outputAmount", 0))
@@ -265,9 +273,14 @@ async def sell_token(
 
     for attempt in range(1, max_retries + 1):
         try:
-            order     = await get_order(mint_address, SOL_MINT, token_amount, wallet_address)
-            signed_tx = await sign_transaction(order, keypair)
-            result    = await execute_order(signed_tx, order["requestId"])
+            order      = await get_order(mint_address, SOL_MINT, token_amount, wallet_address)
+            order_time = time.time()
+            signed_tx  = await sign_transaction(order, keypair)
+            sign_time  = time.time()
+            print(f"[jupiter] sign took {sign_time - order_time:.2f}s")
+            result     = await execute_order(signed_tx, order["requestId"])
+            exec_time  = time.time()
+            print(f"[jupiter] total order→execute: {exec_time - order_time:.2f}s")
 
             sig          = result.get("signature", "")
             sol_received = int(result.get("outputAmount", 0)) / 1_000_000_000
