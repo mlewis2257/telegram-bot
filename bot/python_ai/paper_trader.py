@@ -84,9 +84,17 @@ def open_position(score_result: dict, token_data: dict) -> None:
 
         entry_price = actual_entry or msg_mcap
 
+        max_slippage = float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "50"))
+
         if actual_entry and msg_mcap > 0:
             slippage = ((actual_entry - msg_mcap) / msg_mcap) * 100
             print(f"[paper] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
+            if slippage > max_slippage:
+                print(f"[paper] {symbol} SKIPPED — slippage {slippage:.0f}% exceeds max {max_slippage:.0f}%")
+                return
+            if slippage < -30:
+                print(f"[paper] {symbol} SKIPPED — price dropped {slippage:.0f}% since message (dump)")
+                return
 
         db.open_paper_position(call_id, entry_price, sol_in)
         print(f"[paper] opened {symbol}  call_id={call_id}  {sol_in} SOL @ {entry_price:.0f}")

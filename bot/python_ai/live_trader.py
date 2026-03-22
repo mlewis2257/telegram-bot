@@ -179,6 +179,28 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         print(f"[live] {symbol} skipped — balance check failed: {e}")
         return False
 
+    # ── Slippage check (before spending SOL) ──────────────────────────────────
+    msg_mcap     = float(token_data.get("mcap_at_call") or 0)
+    actual_entry = None
+    if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
+        try:
+            market = data_fetcher.fetch_token_price(mint)
+            if market and market.get("mcap"):
+                actual_entry = float(market["mcap"])
+        except Exception as e:
+            print(f"[live] price fetch failed for {symbol}: {e}")
+
+    max_slippage = float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "50"))
+    if actual_entry and msg_mcap > 0:
+        slippage = ((actual_entry - msg_mcap) / msg_mcap) * 100
+        print(f"[live] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
+        if slippage > max_slippage:
+            print(f"[live] {symbol} SKIPPED — slippage {slippage:.0f}% exceeds max {max_slippage:.0f}%")
+            return False
+        if slippage < -30:
+            print(f"[live] {symbol} SKIPPED — price dropped {slippage:.0f}% since message (dump)")
+            return False
+
     # ── Execute buy ────────────────────────────────────────────────────────────
     print(
         f"[live] BUY {symbol}  call_id={call_id}"
@@ -199,21 +221,7 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
     decimals        = result.get("tokens_decimals", 6)
     router          = result.get("router", "unknown")
 
-    msg_mcap     = float(token_data.get("mcap_at_call") or 0)
-    actual_entry = None
-    if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
-        try:
-            market = data_fetcher.fetch_token_price(mint)
-            if market and market.get("mcap"):
-                actual_entry = float(market["mcap"])
-        except Exception as e:
-            print(f"[live] price fetch failed for {symbol}: {e}")
-
     entry_price = actual_entry or msg_mcap
-
-    if actual_entry and msg_mcap > 0:
-        slippage = ((actual_entry - msg_mcap) / msg_mcap) * 100
-        print(f"[live] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
 
     tokens_display = tokens_received / (10 ** decimals) if decimals > 0 else tokens_received
 
