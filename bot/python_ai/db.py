@@ -1124,6 +1124,25 @@ def get_open_live_position(call_id: int) -> dict | None:
     }
 
 
+def has_open_live_position_for_mint(mint_address: str) -> bool:
+    """Check if ANY open live position exists for this mint address."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM trading_positions tp
+            JOIN calls  c ON c.id = tp.call_id
+            JOIN tokens t ON t.id = c.token_id
+            WHERE t.mint_address = %s
+              AND tp.is_simulation = FALSE
+              AND tp.status = 'open'
+            LIMIT 1
+            """,
+            (mint_address,),
+        )
+        return cur.fetchone() is not None
+
+
 def get_open_live_positions() -> list[dict]:
     """Return all open live positions with symbol and mint for reporting."""
     conn = get_conn()
@@ -1161,12 +1180,13 @@ def close_live_position_db(
                 sol_out      = %s,
                 exit_time    = NOW(),
                 exit_reason  = %s,
+                tx_signature = COALESCE(%s, tx_signature),
                 status       = 'closed'
             WHERE call_id       = %s
               AND is_simulation  = FALSE
               AND status         = 'open'
             """,
-            (exit_price, sol_out, exit_reason, call_id),
+            (exit_price, sol_out, exit_reason, tx_signature, call_id),
         )
         conn.commit()
 

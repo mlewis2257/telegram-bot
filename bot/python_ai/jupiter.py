@@ -214,6 +214,16 @@ async def buy_token(
             sig             = result.get("signature", "")
             tokens_received = int(result.get("outputAmount", 0))
             router          = result.get("router", "unknown")
+            # Fallback: if Jupiter didn't return token count, check on-chain
+            if tokens_received == 0:
+                print(f"[jupiter] outputAmount missing from /execute response, checking on-chain balance...")
+                await asyncio.sleep(2)  # wait for tx to finalize
+                try:
+                    tokens_received = await get_token_balance(mint_address, wallet_address, _rpc_url())
+                    print(f"[jupiter] on-chain balance fallback: {tokens_received}")
+                except Exception as bal_err:
+                    print(f"[jupiter] on-chain balance check failed: {bal_err}")
+                    # Still return success — the buy executed, we just don't know exact tokens
             print(
                 f"[jupiter] buy OK  mint={mint_address[:8]}..."
                 f"  sol={sol_amount:.4f}  tokens={tokens_received}  sig={sig[:16]}..."

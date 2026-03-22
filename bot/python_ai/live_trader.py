@@ -160,6 +160,10 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         print(f"[live] {symbol} skipped — live position already open for call_id={call_id}")
         return False
 
+    if db.has_open_live_position_for_mint(mint):
+        print(f"[live] {symbol} skipped — live position already open for mint={mint[:12]}...")
+        return False
+
     # ── Guard 6: SOL balance ───────────────────────────────────────────────────
     size = _position_size(label)
     try:
