@@ -241,6 +241,7 @@ async def close_live_position(
     # ── Verify on-chain balance before selling ─────────────────────────────────
     wallet_addr = _wallet.get_public_key()
     balance     = await jupiter.get_token_balance(mint, wallet_addr, _rpc_url())
+    print(f"[live_sell] on-chain balance for {symbol} call_id={call_id}: {balance}")
 
     if balance == 0:
         print(
@@ -262,6 +263,7 @@ async def close_live_position(
         f"  balance={balance}  reason={exit_reason}"
     )
     result = await jupiter.sell_token(mint, balance)
+    print(f"[live_sell] sell_token result: {result}")
 
     if not result["success"]:
         print(
