@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import db
 import jupiter
 import alert_bot
+import data_fetcher
 import wallet as _wallet
 from paper_trader import (
     ExitResult,
@@ -197,7 +198,22 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
     tokens_received = result["tokens_received"]
     decimals        = result.get("tokens_decimals", 6)
     router          = result.get("router", "unknown")
-    entry_price     = float(token_data.get("mcap_at_call") or 0)
+
+    msg_mcap     = float(token_data.get("mcap_at_call") or 0)
+    actual_entry = None
+    if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
+        try:
+            market = data_fetcher.fetch_token_price(mint)
+            if market and market.get("mcap"):
+                actual_entry = float(market["mcap"])
+        except Exception as e:
+            print(f"[live] price fetch failed for {symbol}: {e}")
+
+    entry_price = actual_entry or msg_mcap
+
+    if actual_entry and msg_mcap > 0:
+        slippage = ((actual_entry - msg_mcap) / msg_mcap) * 100
+        print(f"[live] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
 
     tokens_display = tokens_received / (10 ** decimals) if decimals > 0 else tokens_received
 

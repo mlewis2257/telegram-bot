@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(__file__))
 
 import db
+import data_fetcher
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -64,15 +65,31 @@ def open_position(score_result: dict, token_data: dict) -> None:
         else:
             return  # only paper trade on actionable signals
 
-        call_id     = score_result.get("call_id")
-        entry_price = token_data.get("mcap_at_call")
+        call_id  = score_result.get("call_id")
+        symbol   = token_data.get("symbol", "?")
+        mint     = token_data.get("mint_address")
+        msg_mcap = float(token_data.get("mcap_at_call") or 0)
 
-        if not call_id or not entry_price or float(entry_price) <= 0:
+        if not call_id or msg_mcap <= 0:
             return
 
-        db.open_paper_position(call_id, float(entry_price), sol_in)
-        symbol = token_data.get("symbol", "?")
-        print(f"[paper] opened {symbol}  call_id={call_id}  {sol_in} SOL @ {entry_price}")
+        actual_entry = None
+        if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
+            try:
+                market = data_fetcher.fetch_token_price(mint)
+                if market and market.get("mcap"):
+                    actual_entry = float(market["mcap"])
+            except Exception as e:
+                print(f"[paper] price fetch failed for {symbol}: {e}")
+
+        entry_price = actual_entry or msg_mcap
+
+        if actual_entry and msg_mcap > 0:
+            slippage = ((actual_entry - msg_mcap) / msg_mcap) * 100
+            print(f"[paper] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
+
+        db.open_paper_position(call_id, entry_price, sol_in)
+        print(f"[paper] opened {symbol}  call_id={call_id}  {sol_in} SOL @ {entry_price:.0f}")
 
     except Exception as e:
         db.safe_rollback()
