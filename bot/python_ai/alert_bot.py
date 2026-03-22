@@ -230,6 +230,17 @@ async def send_alert(score_result: dict, token_data: dict) -> bool:
             paper_trader.open_position(score_result, token_data)
         except Exception as pe:
             print(f"[paper_trader] open_position failed: {pe}")
+        # Live trading integration
+        try:
+            import live_trader
+            import asyncio
+            asyncio.create_task(
+                live_trader.open_live_position(
+                    score_result, token_data
+                )
+            )
+        except Exception as le:
+            print(f"[live_trader] open failed: {le}")
         return True
     except Exception as e:
         print(f"[alert_bot] failed: {e}")
