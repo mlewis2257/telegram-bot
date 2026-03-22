@@ -114,7 +114,7 @@ async def sign_transaction(order: dict, keypair: Keypair) -> str:
     """
     tx_bytes = base64.b64decode(order["transaction"])
     tx = VersionedTransaction.from_bytes(tx_bytes)
-    sig = keypair.sign_message(bytes(tx.message))
+    sig = keypair.sign_message(b"\x80" + bytes(tx.message))
 
     try:
         sigs = list(tx.signatures)
