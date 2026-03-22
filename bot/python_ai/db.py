@@ -1054,3 +1054,201 @@ def get_open_paper_positions() -> list[dict]:
         )
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+# ── Live trading helpers ───────────────────────────────────────────────────────
+
+def open_live_position(
+    call_id: int,
+    entry_price: float,
+    sol_in: float,
+    tokens_held: int,
+    tx_signature: str,
+    router: str | None = None,
+) -> None:
+    """
+    Open a real (non-simulation) trading position.
+    No-ops silently if a live position already exists for this call.
+    """
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO trading_positions
+                (token_id, call_id, is_simulation, entry_price, sol_in,
+                 tokens_held, tx_signature, router, entry_time, status)
+            SELECT c.token_id, %s, FALSE, %s, %s, %s, %s, %s, NOW(), 'open'
+            FROM calls c
+            WHERE c.id = %s
+              AND NOT EXISTS (
+                SELECT 1 FROM trading_positions
+                WHERE call_id = %s AND is_simulation = FALSE
+              )
+            """,
+            (call_id, entry_price, sol_in, tokens_held, tx_signature, router,
+             call_id, call_id),
+        )
+        conn.commit()
+
+
+def get_open_live_position(call_id: int) -> dict | None:
+    """
+    Return the open live position for call_id, or None.
+    Includes mint_address and symbol for use in close_live_position.
+    """
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT tp.entry_price, tp.sol_in, tp.entry_time,
+                   tp.tokens_held, t.mint_address, t.symbol
+            FROM trading_positions tp
+            JOIN calls  c ON c.id  = tp.call_id
+            JOIN tokens t ON t.id  = c.token_id
+            WHERE tp.call_id       = %s
+              AND tp.is_simulation = FALSE
+              AND tp.status        = 'open'
+            """,
+            (call_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "entry_price":  float(row[0]),
+        "sol_in":       float(row[1]),
+        "entry_time":   row[2],
+        "tokens_held":  int(row[3]) if row[3] else 0,
+        "mint_address": row[4],
+        "symbol":       row[5],
+    }
+
+
+def get_open_live_positions() -> list[dict]:
+    """Return all open live positions with symbol and mint for reporting."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT tp.call_id, t.symbol, t.mint_address,
+                   tp.entry_price, tp.sol_in, tp.entry_time, tp.tokens_held
+            FROM trading_positions tp
+            JOIN calls  c ON c.id  = tp.call_id
+            JOIN tokens t ON t.id  = c.token_id
+            WHERE tp.is_simulation = FALSE
+              AND tp.status        = 'open'
+            ORDER BY tp.entry_time DESC
+            """
+        )
+        cols = [d.name for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def close_live_position_db(
+    call_id: int,
+    exit_price: float,
+    sol_out: float,
+    exit_reason: str,
+    tx_signature: str | None,
+) -> None:
+    """Update a live position to closed with exit data."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE trading_positions SET
+                exit_price   = %s,
+                sol_out      = %s,
+                exit_time    = NOW(),
+                exit_reason  = %s,
+                status       = 'closed'
+            WHERE call_id       = %s
+              AND is_simulation  = FALSE
+              AND status         = 'open'
+            """,
+            (exit_price, sol_out, exit_reason, call_id),
+        )
+        conn.commit()
+
+
+def get_live_positions_count() -> int:
+    """Count of currently open live positions."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM trading_positions"
+            " WHERE is_simulation = FALSE AND status = 'open'"
+        )
+        return int(cur.fetchone()[0])
+
+
+def get_today_live_losses() -> float:
+    """
+    Sum of absolute losses (SOL) on closed live positions today.
+    Returns a positive number representing total SOL lost.
+    """
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(ABS(pnl_sol)), 0)
+            FROM trading_positions
+            WHERE is_simulation = FALSE
+              AND status        = 'closed'
+              AND pnl_sol       < 0
+              AND exit_time     >= CURRENT_DATE
+            """
+        )
+        return float(cur.fetchone()[0])
+
+
+def get_live_pnl_summary() -> dict:
+    """Aggregate P&L stats for all closed live positions."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                COUNT(*)                                          AS total,
+                SUM(pnl_sol)                                     AS total_pnl,
+                AVG(pnl_pct)                                     AS avg_pnl_pct,
+                COUNT(CASE WHEN pnl_sol > 0  THEN 1 END)        AS winners,
+                COUNT(CASE WHEN pnl_sol <= 0 THEN 1 END)        AS losers
+            FROM trading_positions
+            WHERE is_simulation = FALSE
+              AND status        = 'closed'
+            """
+        )
+        row = cur.fetchone()
+        summary = {
+            "closed":      int(row[0] or 0),
+            "total_pnl":   float(row[1] or 0),
+            "avg_pnl_pct": float(row[2] or 0),
+            "winners":     int(row[3] or 0),
+            "losers":      int(row[4] or 0),
+        }
+
+        cur.execute(
+            "SELECT COUNT(*) FROM trading_positions"
+            " WHERE is_simulation = FALSE AND status = 'open'"
+        )
+        summary["open"] = int(cur.fetchone()[0])
+
+        cur.execute(
+            """
+            SELECT exit_reason, COUNT(*) AS n
+            FROM trading_positions
+            WHERE is_simulation = FALSE AND status = 'closed'
+            GROUP BY exit_reason
+            """
+        )
+        breakdown = {
+            "10x_tp": 0, "5x_tp": 0, "3x_tp": 0,
+            "trail_stop": 0, "hard_stop": 0, "time_stop": 0,
+        }
+        for reason, count in cur.fetchall():
+            if reason in breakdown:
+                breakdown[reason] = int(count)
+        summary["exit_breakdown"] = breakdown
+
+    return summary

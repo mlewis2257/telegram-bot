@@ -33,6 +33,7 @@ import db
 import data_fetcher
 import alert_bot
 import paper_trader
+import live_trader
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -290,6 +291,15 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
             paper_trader.close_position(call_id, current_mcap, exit_result.reason)
             print(f"  [paper] {symbol} closed — {exit_result.reason}")
 
+        # ── Live trade exit check ──────────────────────────────────────────────
+        try:
+            live_exit = live_trader.check_live_exits(call_id, current_mcap, peak_mcap, mcap_at_call)
+            if live_exit.should_exit:
+                await live_trader.close_live_position(call_id, current_mcap, live_exit.reason)
+                print(f"  [live] {symbol} closed — {live_exit.reason}")
+        except Exception as le:
+            print(f"  [live] exit check error for {symbol} call_id={call_id}: {le}")
+
     return result
 
 
@@ -322,6 +332,15 @@ async def _check_paper_exits() -> int:
             await asyncio.sleep(INTER_CALL_SLEEP)
 
             if not market or not market.get("mcap"):
+                entry_time = pos["entry_time"]
+                if entry_time:
+                    if entry_time.tzinfo is None:
+                        entry_time = entry_time.replace(tzinfo=timezone.utc)
+                    hours_open = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
+                    if hours_open > 4:
+                        print(f"[paper] {symbol} delisted — force closed after {hours_open:.1f}h")
+                        paper_trader.close_position(call_id, 0, "hard_stop")
+                        closed += 1
                 continue
 
             current_mcap = float(market["mcap"])
@@ -343,6 +362,15 @@ async def _check_paper_exits() -> int:
                 )
                 paper_trader.close_position(call_id, current_mcap, exit_result.reason)
                 closed += 1
+
+            # ── Live position exit check ───────────────────────────────────────
+            try:
+                live_exit = live_trader.check_live_exits(call_id, current_mcap, peak_mcap, entry_price)
+                if live_exit.should_exit:
+                    await live_trader.close_live_position(call_id, current_mcap, live_exit.reason)
+                    print(f"  [live] {symbol} closed — {live_exit.reason}")
+            except Exception as le:
+                print(f"  [live] exit check error for {symbol} call_id={call_id}: {le}")
 
         except Exception as e:
             db.safe_rollback()

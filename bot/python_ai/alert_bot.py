@@ -336,3 +336,134 @@ async def send_drawdown_alert(
     except Exception as e:
         print(f"[alert_bot] failed: {e}")
         return False
+
+
+# ── Live trading message builders ─────────────────────────────────────────────
+
+def _build_live_buy(
+    symbol: str,
+    mint: str,
+    sol_spent: float,
+    tokens_received: int,
+    signature: str,
+) -> str:
+    sym     = html.escape(str(symbol or "?"))
+    mint_e  = html.escape(str(mint or ""))
+    sol_url = f"https://solscan.io/tx/{html.escape(signature)}"
+    return "\n".join([
+        "🟢 <b>LIVE BUY EXECUTED</b>",
+        f"💎 <b>${sym}</b>",
+        f"⛓ <code>{mint_e}</code>",
+        "",
+        f"💰 SOL spent: <b>{sol_spent:.4f} SOL</b>",
+        f"🪙 Tokens received: {tokens_received:,}",
+        "",
+        f'🔗 <a href="{sol_url}">View Transaction</a>',
+    ])
+
+
+def _build_live_sell(
+    symbol: str,
+    mint: str,
+    sol_received: float,
+    pnl: float,
+    exit_reason: str,
+    signature: str,
+) -> str:
+    sym     = html.escape(str(symbol or "?"))
+    mint_e  = html.escape(str(mint or ""))
+    sol_url = f"https://solscan.io/tx/{html.escape(signature)}"
+    pnl_str = f"{pnl:+.4f} SOL"
+    icon    = "📈" if pnl >= 0 else "📉"
+    return "\n".join([
+        "🔴 <b>LIVE SELL EXECUTED</b>",
+        f"💎 <b>${sym}</b>  ({html.escape(exit_reason)})",
+        f"⛓ <code>{mint_e}</code>",
+        "",
+        f"💰 SOL received: <b>{sol_received:.4f} SOL</b>",
+        f"{icon} P&L: <b>{pnl_str}</b>",
+        "",
+        f'🔗 <a href="{sol_url}">View Transaction</a>',
+    ])
+
+
+def _build_live_sell_failed(symbol: str, mint: str) -> str:
+    sym    = html.escape(str(symbol or "?"))
+    mint_e = html.escape(str(mint or ""))
+    return "\n".join([
+        "🚨 <b>LIVE SELL FAILED — MANUAL INTERVENTION REQUIRED</b>",
+        f"💎 <b>${sym}</b>",
+        f"⛓ <code>{mint_e}</code>",
+        "",
+        "The sell transaction could not be submitted to Jupiter.",
+        "Check wallet and close position manually.",
+    ])
+
+
+# ── Live trading public API ───────────────────────────────────────────────────
+
+async def send_live_buy_alert(
+    symbol: str,
+    mint: str,
+    sol_spent: float,
+    tokens_received: int,
+    signature: str,
+) -> bool:
+    """Send a live buy confirmation alert. Never raises."""
+    try:
+        text = _build_live_buy(symbol, mint, sol_spent, tokens_received, signature)
+        await _get_bot().send_message(
+            chat_id=_chat_id(),
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        print(f"[alert_bot] live buy alert sent  symbol={symbol}  sol={sol_spent:.4f}")
+        return True
+    except Exception as e:
+        print(f"[alert_bot] live buy alert failed: {e}")
+        return False
+
+
+async def send_live_sell_alert(
+    symbol: str,
+    mint: str,
+    sol_received: float,
+    pnl: float,
+    exit_reason: str,
+    signature: str,
+) -> bool:
+    """Send a live sell confirmation alert. Never raises."""
+    try:
+        text = _build_live_sell(symbol, mint, sol_received, pnl, exit_reason, signature)
+        await _get_bot().send_message(
+            chat_id=_chat_id(),
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        print(
+            f"[alert_bot] live sell alert sent  symbol={symbol}"
+            f"  sol={sol_received:.4f}  pnl={pnl:+.4f}"
+        )
+        return True
+    except Exception as e:
+        print(f"[alert_bot] live sell alert failed: {e}")
+        return False
+
+
+async def send_live_sell_failed_alert(symbol: str, mint: str) -> bool:
+    """Send a sell-failed alert requiring manual intervention. Never raises."""
+    try:
+        text = _build_live_sell_failed(symbol, mint)
+        await _get_bot().send_message(
+            chat_id=_chat_id(),
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        print(f"[alert_bot] live sell FAILED alert sent  symbol={symbol}")
+        return True
+    except Exception as e:
+        print(f"[alert_bot] live sell failed alert send error: {e}")
+        return False
