@@ -322,33 +322,52 @@ async def get_token_balance(
 ) -> int:
     """
     Return the wallet's token balance in raw integer units (smallest denomination).
-    Returns 0 if no token account exists for this mint.
+    Returns 0 only if no token account exists for this mint.
+    Raises on RPC errors or unexpected response shape so callers are not silently
+    misled into thinking a balance is zero when the query actually failed.
+    Uses {"mint": mint_address} filter which works across Token Program and Token-2022.
     """
     if _is_devnet():
         return _mock_token_balance(mint_address)
 
-    resp = await _get_client().post(
-        rpc_url,
-        json={
-            "jsonrpc": "2.0",
-            "id":      1,
-            "method":  "getTokenAccountsByOwner",
-            "params":  [
-                wallet_address,
-                {"mint": mint_address},
-                {"encoding": "jsonParsed", "commitment": "confirmed"},
-            ],
-        },
-    )
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            rpc_url,
+            json={
+                "jsonrpc": "2.0",
+                "id":      1,
+                "method":  "getTokenAccountsByOwner",
+                "params":  [
+                    wallet_address,
+                    {"mint": mint_address},
+                    {"encoding": "jsonParsed", "commitment": "confirmed"},
+                ],
+            },
+        )
     resp.raise_for_status()
-    data     = resp.json()
+    data = resp.json()
+
+    if "error" in data:
+        raise RuntimeError(f"RPC getTokenAccountsByOwner error: {data['error']}")
+
     accounts = data.get("result", {}).get("value", [])
     if not accounts:
+        print(f"[jupiter] get_token_balance  mint={mint_address[:12]}...  no account found → 0")
         return 0
-    amount_str = (
-        accounts[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]
-    )
-    return int(amount_str)
+
+    try:
+        token_amount = accounts[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]
+        amount_str   = token_amount["amount"]
+        decimals     = token_amount.get("decimals", "?")
+        balance      = int(amount_str)
+        print(
+            f"[jupiter] get_token_balance  mint={mint_address[:12]}..."
+            f"  balance={balance}  decimals={decimals}"
+        )
+        return balance
+    except (KeyError, IndexError) as e:
+        print(f"[jupiter] get_token_balance parse error ({e}) — raw response: {data}")
+        raise RuntimeError(f"Failed to parse token balance response: {e}") from e
 
 
 # ── Devnet mocks ───────────────────────────────────────────────────────────────

@@ -245,16 +245,17 @@ async def close_live_position(
 
     if balance == 0:
         print(
-            f"[live] {symbol} call_id={call_id}"
-            f" — tokens already gone (balance=0), marking closed at sol_out=0"
+            f"[live] ⚠️ balance=0 for {symbol} call_id={call_id}"
+            f" — sell skipped, will retry next cycle  mint={mint}"
         )
-        db.close_live_position_db(
-            call_id=call_id,
-            exit_price=current_mcap,
-            sol_out=0.0,
-            exit_reason=exit_reason,
-            tx_signature=None,
-        )
+        try:
+            await alert_bot._get_bot().send_message(
+                chat_id=alert_bot._chat_id(),
+                text=f"⚠️ Balance 0 for ${symbol} — sell skipped, retrying",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            print(f"[live] balance=0 alert failed: {e}")
         return False
 
     # ── Execute sell ───────────────────────────────────────────────────────────
