@@ -194,14 +194,26 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
     router          = result.get("router", "unknown")
     entry_price     = float(token_data.get("mcap_at_call") or 0)
 
-    db.open_live_position(
-        call_id=call_id,
-        entry_price=entry_price,
-        sol_in=sol_spent,
-        tokens_held=tokens_received,
-        tx_signature=sig,
-        router=router,
+    print(
+        f"[live_debug] calling db.open_live_position"
+        f"  call_id={call_id} entry={entry_price}"
+        f"  sol={sol_spent} tokens={tokens_received}"
+        f"  sig={sig[:16]} router={router}"
     )
+    try:
+        db.open_live_position(
+            call_id=call_id,
+            entry_price=entry_price,
+            sol_in=sol_spent,
+            tokens_held=tokens_received,
+            tx_signature=sig,
+            router=router,
+        )
+        print(f"[live_debug] db.open_live_position completed for call_id={call_id}")
+    except Exception as e:
+        print(f"[live_debug] db.open_live_position FAILED: {e}")
+        import traceback
+        traceback.print_exc()
     print(
         f"[live] BUY OK  {symbol}  call_id={call_id}"
         f"  sol_spent={sol_spent:.4f}  tokens={tokens_received}"
