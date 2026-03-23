@@ -1286,3 +1286,158 @@ def get_live_pnl_summary() -> dict:
         summary["exit_breakdown"] = breakdown
 
     return summary
+
+
+# ── Daily summary queries ──────────────────────────────────────────────────────
+
+def get_daily_signal_summary() -> list[dict]:
+    """Count today's calls grouped by score label."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+              CASE WHEN conviction_score >= 85 THEN 'strong_alert'
+                   WHEN conviction_score >= 70 THEN 'alert'
+                   WHEN conviction_score >= 55 THEN 'caution'
+                   WHEN conviction_score >= 40 THEN 'watch'
+                   ELSE 'skip' END AS label,
+              COUNT(*) AS count
+            FROM calls
+            WHERE created_at >= CURRENT_DATE
+              AND conviction_score IS NOT NULL
+            GROUP BY label
+            ORDER BY count DESC
+            """
+        )
+        return [{"label": r[0], "count": int(r[1])} for r in cur.fetchall()]
+
+
+def _daily_position_summary(is_simulation: bool) -> dict:
+    """Shared query logic for paper and live daily summaries."""
+    conn = get_conn()
+    sim = is_simulation
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM trading_positions
+            WHERE is_simulation = %s
+              AND entry_time >= CURRENT_DATE
+            """,
+            (sim,),
+        )
+        opened = int(cur.fetchone()[0])
+
+        cur.execute(
+            """
+            SELECT
+                COUNT(*)                                   AS total,
+                COUNT(CASE WHEN pnl_sol > 0  THEN 1 END)  AS winners,
+                COUNT(CASE WHEN pnl_sol <= 0 THEN 1 END)  AS losers,
+                COALESCE(SUM(pnl_sol), 0)                 AS daily_pnl
+            FROM trading_positions
+            WHERE is_simulation = %s
+              AND status    = 'closed'
+              AND exit_time >= CURRENT_DATE
+            """,
+            (sim,),
+        )
+        row = cur.fetchone()
+
+        cur.execute(
+            """
+            SELECT t.symbol, tp.pnl_pct
+            FROM trading_positions tp
+            JOIN calls  c ON c.id = tp.call_id
+            JOIN tokens t ON t.id = c.token_id
+            WHERE tp.is_simulation = %s
+              AND tp.status    = 'closed'
+              AND tp.exit_time >= CURRENT_DATE
+              AND tp.pnl_pct IS NOT NULL
+            ORDER BY tp.pnl_pct DESC
+            LIMIT 1
+            """,
+            (sim,),
+        )
+        best = cur.fetchone()
+
+        cur.execute(
+            """
+            SELECT t.symbol, tp.pnl_pct
+            FROM trading_positions tp
+            JOIN calls  c ON c.id = tp.call_id
+            JOIN tokens t ON t.id = c.token_id
+            WHERE tp.is_simulation = %s
+              AND tp.status    = 'closed'
+              AND tp.exit_time >= CURRENT_DATE
+              AND tp.pnl_pct IS NOT NULL
+            ORDER BY tp.pnl_pct ASC
+            LIMIT 1
+            """,
+            (sim,),
+        )
+        worst = cur.fetchone()
+
+    return {
+        "opened":       opened,
+        "closed":       int(row[0]),
+        "winners":      int(row[1]),
+        "losers":       int(row[2]),
+        "daily_pnl":    float(row[3]),
+        "best_symbol":  best[0]        if best  else None,
+        "best_pct":     float(best[1]) if best  else None,
+        "worst_symbol": worst[0]       if worst else None,
+        "worst_pct":    float(worst[1]) if worst else None,
+    }
+
+
+def get_daily_paper_summary() -> dict:
+    """Paper trading stats for today."""
+    return _daily_position_summary(is_simulation=True)
+
+
+def get_daily_live_summary() -> dict:
+    """Live trading stats for today. Returns all-zeros dict if no live trades."""
+    return _daily_position_summary(is_simulation=False)
+
+
+def get_running_totals() -> dict:
+    """All-time totals for paper and live trading."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                COUNT(*)                                  AS total,
+                COUNT(CASE WHEN pnl_sol > 0 THEN 1 END)  AS winners,
+                COALESCE(SUM(pnl_sol), 0)                AS total_pnl
+            FROM trading_positions
+            WHERE is_simulation = TRUE
+              AND status = 'closed'
+            """
+        )
+        p = cur.fetchone()
+
+        cur.execute(
+            """
+            SELECT
+                COUNT(*)                                  AS total,
+                COUNT(CASE WHEN pnl_sol > 0 THEN 1 END)  AS winners,
+                COALESCE(SUM(pnl_sol), 0)                AS total_pnl
+            FROM trading_positions
+            WHERE is_simulation = FALSE
+              AND status = 'closed'
+            """
+        )
+        lv = cur.fetchone()
+
+    paper_total = int(p[0])
+    live_total  = int(lv[0])
+    return {
+        "paper_trades":   paper_total,
+        "paper_win_rate": round(int(p[1])  / paper_total * 100, 1) if paper_total else 0.0,
+        "paper_pnl":      float(p[2]),
+        "live_trades":    live_total,
+        "live_win_rate":  round(int(lv[1]) / live_total  * 100, 1) if live_total  else 0.0,
+        "live_pnl":       float(lv[2]),
+    }
