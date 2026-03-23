@@ -189,6 +189,8 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
                 actual_entry = float(market["mcap"])
         except Exception as e:
             print(f"[live] price fetch failed for {symbol}: {e}")
+    if actual_entry is None and mint:
+        print(f"[live] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
 
     max_slippage = float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "50"))
     if actual_entry and msg_mcap > 0:

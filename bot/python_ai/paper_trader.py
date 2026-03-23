@@ -81,6 +81,8 @@ def open_position(score_result: dict, token_data: dict) -> None:
                     actual_entry = float(market["mcap"])
             except Exception as e:
                 print(f"[paper] price fetch failed for {symbol}: {e}")
+        if actual_entry is None and mint:
+            print(f"[paper] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
 
         entry_price = actual_entry or msg_mcap
 
