@@ -307,7 +307,27 @@ async def close_live_position(
 
     sig          = result["signature"]
     sol_received = result["sol_received"]
-    pnl          = sol_received - sol_in
+
+    if sol_received <= 0:
+        print(
+            f"[live] SELL executed but sol_received=0 for {symbol} "
+            f"call_id={call_id} — NOT closing position, will retry. "
+            f"Check tx: {sig}"
+        )
+        try:
+            await alert_bot._get_bot().send_message(
+                chat_id=alert_bot._chat_id(),
+                text=(
+                    f"⚠️ Sell executed for ${symbol} but SOL received = 0. "
+                    f"Position kept open. Check Solscan."
+                ),
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            print(f"[live] sol_received=0 alert failed: {e}")
+        return False
+
+    pnl = sol_received - sol_in
 
     db.close_live_position_db(
         call_id=call_id,

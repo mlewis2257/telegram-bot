@@ -290,7 +290,21 @@ async def sell_token(
 
     for attempt in range(1, max_retries + 1):
         try:
-            sol_before = _wallet.get_sol_balance(_rpc_url())
+            # Capture SOL balance before sell for delta calculation (direct RPC,
+            # no MIN_SOL_RESERVE check that would raise on low balances)
+            sol_before = None
+            try:
+                async with httpx.AsyncClient(timeout=10) as _bc:
+                    _resp = await _bc.post(_rpc_url(), json={
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": "getBalance",
+                        "params": [wallet_address, {"commitment": "confirmed"}],
+                    })
+                    sol_before = _resp.json()["result"]["value"] / 1_000_000_000
+                    print(f"[jupiter] sell: SOL before = {sol_before:.6f}")
+            except Exception as e:
+                print(f"[jupiter] sell: could not capture SOL before balance: {e}")
+
             order      = await get_order(mint_address, SOL_MINT, token_amount, wallet_address)
             order_time = time.time()
             signed_tx  = await sign_transaction(order, keypair)
@@ -300,20 +314,56 @@ async def sell_token(
             exec_time  = time.time()
             print(f"[jupiter] total order→execute: {exec_time - order_time:.2f}s")
 
+            # Log full response so we know exactly what Jupiter returns
+            print(f"[jupiter] sell /execute response keys: {list(result.keys())}")
+            print(
+                f"[jupiter] sell /execute outputAmount={result.get('outputAmount')} "
+                f"inputAmount={result.get('inputAmount')} "
+                f"status={result.get('status')}"
+            )
+
             sig          = result.get("signature", "")
             sol_received = int(result.get("outputAmount", 0)) / 1_000_000_000
-            if sol_received == 0:
-                print("[jupiter] outputAmount missing from sell /execute, using SOL balance delta...")
-                await asyncio.sleep(2)
-                try:
-                    sol_after    = _wallet.get_sol_balance(_rpc_url())
-                    sol_received = max(0, sol_after - sol_before)
-                    print(f"[jupiter] SOL balance delta: before={sol_before:.4f} after={sol_after:.4f} received={sol_received:.4f}")
-                except Exception as bal_err:
-                    print(f"[jupiter] SOL balance delta failed: {bal_err}")
+
+            # Fallback: balance delta with retries if outputAmount is missing/zero
+            if sol_received <= 0 and sol_before is not None:
+                print("[jupiter] sell: outputAmount missing, using balance delta...")
+                for wait_attempt in range(3):
+                    await asyncio.sleep(2)
+                    try:
+                        async with httpx.AsyncClient(timeout=10) as _ac:
+                            _resp = await _ac.post(_rpc_url(), json={
+                                "jsonrpc": "2.0", "id": 1,
+                                "method": "getBalance",
+                                "params": [wallet_address, {"commitment": "confirmed"}],
+                            })
+                            sol_after = _resp.json()["result"]["value"] / 1_000_000_000
+                            delta = sol_after - sol_before
+                            print(
+                                f"[jupiter] sell: SOL after = {sol_after:.6f}, "
+                                f"delta = {delta:.6f} (attempt {wait_attempt + 1})"
+                            )
+                            if delta > 0:
+                                sol_received = delta
+                                break
+                    except Exception as e:
+                        print(f"[jupiter] sell: balance delta attempt {wait_attempt + 1} failed: {e}")
+
+                if sol_received <= 0:
+                    print(
+                        f"[jupiter] sell: WARNING — could not determine SOL received. "
+                        f"sol_before={sol_before:.6f}"
+                    )
+
+            if sol_received > 0 and sol_received < 0.001:
+                print(
+                    f"[jupiter] sell: WARNING — sol_received={sol_received:.6f} "
+                    f"seems unusually low for {token_amount} tokens of {mint_address[:12]}..."
+                )
+
             print(
                 f"[jupiter] sell OK  mint={mint_address[:8]}..."
-                f"  tokens={token_amount}  sol={sol_received:.4f}  sig={sig[:16]}..."
+                f"  tokens={token_amount}  sol={sol_received:.6f}  sig={sig[:16]}..."
             )
             return {
                 "success":      True,
