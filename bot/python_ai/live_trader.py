@@ -198,6 +198,18 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         print(f"[live] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
         if slippage > max_slippage:
             print(f"[live] {symbol} SKIPPED — slippage {slippage:.0f}% exceeds max {max_slippage:.0f}%")
+            score     = score_result.get("score", 0)
+            label_str = score_result.get("label", "")
+            if label_str in ("alert", "strong_alert"):
+                await alert_bot.send_slippage_skip_alert(
+                    symbol=symbol,
+                    mint=mint,
+                    score=score,
+                    label=label_str,
+                    msg_mcap=msg_mcap,
+                    actual_mcap=actual_entry,
+                    slippage_pct=slippage,
+                )
             return False
         if slippage < -30:
             print(f"[live] {symbol} SKIPPED — price dropped {slippage:.0f}% since message (dump)")

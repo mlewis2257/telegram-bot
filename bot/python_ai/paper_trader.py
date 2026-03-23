@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import db
 import data_fetcher
+import alert_bot
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -93,6 +94,24 @@ def open_position(score_result: dict, token_data: dict) -> None:
             print(f"[paper] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
             if slippage > max_slippage:
                 print(f"[paper] {symbol} SKIPPED — slippage {slippage:.0f}% exceeds max {max_slippage:.0f}%")
+                score = score_result.get("score", 0)
+                label = score_result.get("label", "")
+                if label in ("alert", "strong_alert"):
+                    import asyncio
+                    try:
+                        asyncio.get_event_loop().create_task(
+                            alert_bot.send_slippage_skip_alert(
+                                symbol=token_data.get("symbol", "?"),
+                                mint=token_data.get("mint_address", ""),
+                                score=score,
+                                label=label,
+                                msg_mcap=msg_mcap,
+                                actual_mcap=actual_entry,
+                                slippage_pct=slippage,
+                            )
+                        )
+                    except Exception:
+                        pass
                 return
             if slippage < -30:
                 print(f"[paper] {symbol} SKIPPED — price dropped {slippage:.0f}% since message (dump)")

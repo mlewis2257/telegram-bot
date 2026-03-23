@@ -411,6 +411,37 @@ def _build_live_sell_failed(symbol: str, mint: str) -> str:
     ])
 
 
+def _build_slippage_skip(
+    symbol: str,
+    mint: str,
+    score: int,
+    label: str,
+    msg_mcap: float,
+    actual_mcap: float,
+    slippage_pct: float,
+) -> str:
+    sym       = html.escape(str(symbol or "?"))
+    mint_e    = html.escape(str(mint or ""))
+    dex_url   = f"https://dexscreener.com/solana/{mint_e}"
+    axiom_url = f"https://axiom.trade/t/{mint_e}"
+    header    = "🚨 <b>SKIP — HIGH CONVICTION</b>" if label == "strong_alert" else "⚡ <b>SKIP — ALERT</b>"
+    return "\n".join([
+        header,
+        f"💎 <b>${sym}</b>",
+        f"⛓ <code>{mint_e}</code>",
+        "",
+        f"📊 Score: {score}/100",
+        f"📈 Slippage: +{slippage_pct:.0f}%",
+        f"🏦 Message MCap: ${msg_mcap/1000:.1f}k",
+        f"💰 Actual MCap: ${actual_mcap/1000:.1f}k",
+        "",
+        "⏭ Trade skipped — price moved too much.",
+        "Manual entry may still be viable.",
+        "",
+        f'🔗 <a href="{dex_url}">DexScreener</a>  🔗 <a href="{axiom_url}">Axiom</a>',
+    ])
+
+
 # ── Live trading public API ───────────────────────────────────────────────────
 
 async def send_live_buy_alert(
@@ -477,4 +508,29 @@ async def send_live_sell_failed_alert(symbol: str, mint: str) -> bool:
         return True
     except Exception as e:
         print(f"[alert_bot] live sell failed alert send error: {e}")
+        return False
+
+
+async def send_slippage_skip_alert(
+    symbol: str,
+    mint: str,
+    score: int,
+    label: str,
+    msg_mcap: float,
+    actual_mcap: float,
+    slippage_pct: float,
+) -> bool:
+    """Send alert when a high-conviction signal is skipped due to slippage. Never raises."""
+    try:
+        text = _build_slippage_skip(symbol, mint, score, label, msg_mcap, actual_mcap, slippage_pct)
+        await _get_bot().send_message(
+            chat_id=_chat_id(),
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        print(f"[alert_bot] slippage skip alert sent  symbol={symbol}  slippage={slippage_pct:.0f}%")
+        return True
+    except Exception as e:
+        print(f"[alert_bot] slippage skip alert failed: {e}")
         return False
