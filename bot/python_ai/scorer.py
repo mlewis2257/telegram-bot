@@ -45,7 +45,7 @@ def _clamp(score: int) -> int:
 # ── Path A: Realtime scoring ──────────────────────────────────────────────────
 
 def _score_realtime(row: dict) -> tuple[int, list[str]]:
-    score = 35
+    score = 30
     reasons: list[str] = []
 
     # ── Tier 1: always applied ─────────────────────────────────────────────
@@ -58,6 +58,9 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     elif sf == "warning":
         score -= 20
         reasons.append("security=warning-20")
+    elif sf == "unknown" or sf is None:
+        score -= 10
+        reasons.append("security=unknown-10")
 
     # token_age_minutes
     age = row.get("token_age_minutes")
@@ -66,9 +69,12 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
         if age < 2:
             score -= 5
             reasons.append(f"age={age}m-5")
-        elif age <= 15:
-            score += 15
-            reasons.append(f"age={age}m+15")
+        elif age <= 10:
+            score += 5
+            reasons.append(f"age={age}m+5")
+        elif age <= 30:
+            score += 10
+            reasons.append(f"age={age}m+10")
         elif age <= 60:
             score += 5
             reasons.append(f"age={age}m+5")
@@ -130,11 +136,11 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     if mcap_entry is not None:
         mcap_entry = float(mcap_entry)
         if mcap_entry < 15_000:
-            score += 15
-            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k+15")
+            score += 5
+            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k+5")
         elif mcap_entry < 30_000:
-            score += 10
-            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k+10")
+            score += 5
+            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k+5")
         elif mcap_entry <= 60_000:
             pass  # normal band
         elif mcap_entry <= 100_000:
@@ -215,23 +221,26 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     dtm = row.get("dev_tokens_made")
     if dtm is not None:
         dtm = int(dtm)
-        if dtm < 10:
+        if dtm < 5:
+            score += 10
+            reasons.append(f"dev_tokens={dtm}+10")
+        elif dtm <= 20:
             score += 5
             reasons.append(f"dev_tokens={dtm}+5")
         elif dtm <= 50:
             pass  # neutral band
+        elif dtm <= 100:
+            score -= 15
+            reasons.append(f"dev_tokens={dtm}-15")
         elif dtm <= 200:
-            score -= 10
-            reasons.append(f"dev_tokens={dtm}-10")
+            score -= 25
+            reasons.append(f"dev_tokens={dtm}-25")
         elif dtm <= 500:
-            score -= 20
-            reasons.append(f"dev_tokens={dtm}-20")
-        elif dtm <= 1000:
-            score -= 30
-            reasons.append(f"dev_tokens={dtm}-30")
+            score -= 35
+            reasons.append(f"dev_tokens={dtm}-35")
         else:
-            score -= 40
-            reasons.append(f"dev_tokens={dtm}-40")
+            score -= 45
+            reasons.append(f"dev_tokens={dtm}-45")
 
     # dev_best_mcap
     dbm = row.get("dev_best_mcap")
@@ -265,10 +274,16 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
         score += 15
         reasons.append("cross_channel_confirmed+15")
 
-    # ── Hard cap: rug factory ──────────────────────────────────────────────
-    if row.get("dev_tokens_made") is not None and int(row["dev_tokens_made"]) > 5000:
-        score = min(score, 25)
-        reasons.append("rug_factory_cap<=25")
+    # ── Hard cap: serial deployer / rug factory ────────────────────────────
+    dtm_val = row.get("dev_tokens_made")
+    if dtm_val is not None:
+        dtm_val = int(dtm_val)
+        if dtm_val > 2000:
+            score = min(score, 25)
+            reasons.append("rug_factory_cap<=25")
+        elif dtm_val > 500:
+            score = min(score, 40)
+            reasons.append("serial_deployer_cap<=40")
 
     return score, reasons
 

@@ -13,6 +13,19 @@ _conn = None
 def get_conn():
     """Lazy singleton connection. Re-opens if closed or broken."""
     global _conn
+    if _conn is not None and not _conn.closed:
+        try:
+            _conn.isolation_level
+            cur = _conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+        except Exception:
+            print("[db] stale connection detected — reconnecting")
+            try:
+                _conn.close()
+            except Exception:
+                pass
+            _conn = None
     if _conn is None or _conn.closed:
         _conn = psycopg2.connect(
             host=os.environ["DB_HOST"],
@@ -21,6 +34,7 @@ def get_conn():
             user=os.environ["DB_USER"],
             password=os.environ["DB_PASSWORD"],
         )
+        _conn.autocommit = False
     return _conn
 
 
