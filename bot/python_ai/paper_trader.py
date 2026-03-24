@@ -109,6 +109,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 print(f"[paper] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
                 if slippage > max_slippage:
                     print(f"[paper] {symbol} SKIPPED — slippage {slippage:.0f}% exceeds max {max_slippage:.0f}%")
+                    db.set_call_skip_reason(call_id, "slippage")
                     score = score_result.get("score", 0)
                     label = score_result.get("label", "")
                     if label in ("alert", "strong_alert"):
@@ -129,6 +130,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     return
                 if slippage < -30:
                     print(f"[paper] {symbol} SKIPPED — price dropped {slippage:.0f}% since message (dump)")
+                    db.set_call_skip_reason(call_id, "slippage")
                     return
 
             db.open_paper_position(call_id, entry_price, sol_in)

@@ -178,10 +178,12 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
 
         if db.get_open_live_position(call_id):
             print(f"[live] {symbol} skipped — live position already open for call_id={call_id}")
+            db.set_call_skip_reason(call_id, "duplicate")
             return False
 
         if db.has_open_live_position_for_mint(mint):
             print(f"[live] {symbol} skipped — live position already open for mint={mint[:12]}...")
+            db.set_call_skip_reason(call_id, "duplicate")
             return False
 
         # ── Guard 6: SOL balance ───────────────────────────────────────────────
@@ -193,9 +195,11 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
                     f"[live] {symbol} skipped — SOL balance {balance:.4f}"
                     f" < required {size + 0.05:.4f} (size={size:.4f} + 0.05 reserve)"
                 )
+                db.set_call_skip_reason(call_id, "balance")
                 return False
         except Exception as e:
             print(f"[live] {symbol} skipped — balance check failed: {e}")
+            db.set_call_skip_reason(call_id, "balance")
             return False
 
         # ── Allowed hours whitelist ────────────────────────────────────────────
@@ -203,6 +207,7 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         current_hour  = datetime.now(timezone.utc).hour
         if allowed_hours and current_hour not in allowed_hours:
             print(f"[live] {symbol} skipped — hour {current_hour} UTC not in allowed window")
+            db.set_call_skip_reason(call_id, "allowed_hours")
             return False
 
         # ── Slippage check (before spending SOL) ──────────────────────────────
@@ -224,6 +229,7 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             print(f"[live] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
             if slippage > max_slippage:
                 print(f"[live] {symbol} SKIPPED — slippage {slippage:.0f}% exceeds max {max_slippage:.0f}%")
+                db.set_call_skip_reason(call_id, "slippage")
                 score     = score_result.get("score", 0)
                 label_str = score_result.get("label", "")
                 if label_str in ("alert", "strong_alert"):
@@ -239,6 +245,7 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
                 return False
             if slippage < -30:
                 print(f"[live] {symbol} SKIPPED — price dropped {slippage:.0f}% since message (dump)")
+                db.set_call_skip_reason(call_id, "slippage")
                 return False
 
         # ── Execute buy ────────────────────────────────────────────────────────

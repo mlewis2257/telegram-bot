@@ -1489,3 +1489,30 @@ def get_hourly_performance(since=None) -> list:
             "pnl":      float(row[3]),
         })
     return result
+
+
+def set_call_skip_reason(call_id: int, reason: str) -> None:
+    """
+    Record why a call was not traded.
+
+    Only writes if skip_reason is currently NULL — first skip reason wins.
+    Silently no-ops if call_id is falsy or the UPDATE affects 0 rows.
+    """
+    if not call_id:
+        return
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE calls
+                SET skip_reason = %s
+                WHERE id = %s
+                  AND skip_reason IS NULL
+                """,
+                (reason, call_id),
+            )
+            conn.commit()
+    except Exception as e:
+        safe_rollback()
+        print(f"[db] set_call_skip_reason failed call_id={call_id} reason={reason}: {e}")

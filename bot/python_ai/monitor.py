@@ -34,6 +34,8 @@ import data_fetcher
 import alert_bot
 import paper_trader
 import live_trader
+import jupiter
+import wallet as _wallet
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -51,6 +53,14 @@ DRAWDOWN_WARN = 0.30   # 30% from peak → ⚠️ pulling back alert
 DRAWDOWN_DUMP = 0.50   # 50% from peak → 🚨 dump alert
 
 PEAK_MAX_MULT    = 100.0  # above this, treat as data error and skip
+
+# ── Stale live position detection ─────────────────────────────────────────────
+# Tracks consecutive passes where a live position has no DexScreener price AND
+# zero on-chain balance. After STALE_THRESHOLD hits the position is auto-closed
+# with exit_reason='rug'.
+
+_stale_checks:  dict[int, int] = {}  # call_id -> consecutive zero-balance count
+STALE_THRESHOLD = 3
 
 # ── Alert dedup state — persisted across restarts ─────────────────────────────
 # Tracks which alert keys have already been sent per call_id.
@@ -303,6 +313,83 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
     return result
 
 
+# ── Stale live position sweep ─────────────────────────────────────────────────
+
+async def _check_live_stale(dry_run: bool) -> None:
+    """
+    For each open live position, check whether DexScreener has no price AND
+    the on-chain token balance is zero. After STALE_THRESHOLD consecutive passes
+    in that state, auto-close the position with exit_reason='rug'.
+    """
+    positions = db.get_open_live_positions()
+    if not positions:
+        return
+
+    wallet_addr = _wallet.get_public_key()
+    rpc_url     = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+
+    for pos in positions:
+        call_id = pos["call_id"]
+        symbol  = pos.get("symbol") or "?"
+        mint    = pos.get("mint_address")
+
+        if not mint or mint.startswith(("INFERRED:", "UNKNOWN:")):
+            continue
+
+        # ── Check DexScreener price ────────────────────────────────────────────
+        market   = data_fetcher.fetch_token_price(mint)
+        price_ok = bool(market and market.get("mcap"))
+        await asyncio.sleep(INTER_CALL_SLEEP)
+
+        if price_ok:
+            _stale_checks.pop(call_id, None)
+            continue
+
+        # ── No price — verify on-chain balance ────────────────────────────────
+        balance_zero = False
+        try:
+            balance, _ = await jupiter.get_token_balance(mint, wallet_addr, rpc_url)
+            balance_zero = (balance == 0)
+        except Exception:
+            balance_zero = True
+
+        if not balance_zero:
+            # Token still held; price feed just temporarily unavailable
+            _stale_checks.pop(call_id, None)
+            continue
+
+        # ── Both price and balance gone — increment stale counter ─────────────
+        _stale_checks[call_id] = _stale_checks.get(call_id, 0) + 1
+        count = _stale_checks[call_id]
+        print(f"[monitor] {symbol} stale check {count}/{STALE_THRESHOLD}")
+
+        if count >= STALE_THRESHOLD:
+            print(
+                f"[monitor] {symbol} call_id={call_id}"
+                f" — auto-closing as rug after {STALE_THRESHOLD} stale checks"
+            )
+            if not dry_run:
+                db.close_live_position_db(
+                    call_id=call_id,
+                    exit_price=0,
+                    sol_out=0,
+                    exit_reason="rug",
+                    tx_signature=None,
+                )
+                try:
+                    await alert_bot._get_bot().send_message(
+                        chat_id=alert_bot._chat_id(),
+                        text=(
+                            f"🪦 ${symbol} auto-closed as rug"
+                            f" — zero balance for {STALE_THRESHOLD} consecutive checks"
+                        ),
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e:
+                    print(f"[monitor] rug alert send failed for {symbol}: {e}")
+            del _stale_checks[call_id]
+
+
 # ── Paper position exit sweep ─────────────────────────────────────────────────
 
 async def _check_paper_exits() -> int:
@@ -420,6 +507,9 @@ async def run_pass(pass_num: int, dry_run: bool) -> dict:
         paper_closed = await _check_paper_exits()
         if paper_closed:
             print(f"[paper] exit sweep closed {paper_closed} position(s)")
+
+    # ── Stale live position sweep ──────────────────────────────────────────────
+    await _check_live_stale(dry_run=dry_run)
 
     suffix = " (dry-run)" if dry_run else ""
     print(
