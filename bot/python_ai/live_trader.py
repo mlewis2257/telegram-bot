@@ -59,6 +59,11 @@ if _circuit_broken:
     print(f"[live] STARTUP: circuit breaker flag found — all live trading halted")
     print(f"[live] To re-enable: delete {_CIRCUIT_FLAG_FILE} and restart")
 
+_startup_allowed_hours = [
+    int(h) for h in os.getenv("LIVE_ALLOWED_HOURS_UTC", "").split(",") if h.strip()
+]
+print(f"[live] allowed hours UTC: {_startup_allowed_hours if _startup_allowed_hours else 'all (no restriction)'}")
+
 
 # ── Config helpers ─────────────────────────────────────────────────────────────
 
@@ -193,14 +198,12 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             print(f"[live] {symbol} skipped — balance check failed: {e}")
             return False
 
-        # ── Quiet hours guard ──────────────────────────────────────────────────
-        quiet_hours_str = os.getenv("QUIET_HOURS_UTC", "")
-        if quiet_hours_str:
-            quiet_hours  = [int(h.strip()) for h in quiet_hours_str.split(",") if h.strip()]
-            current_hour = datetime.now(timezone.utc).hour
-            if current_hour in quiet_hours:
-                print(f"[live] {symbol} skipped — quiet hour (UTC {current_hour})")
-                return False
+        # ── Allowed hours whitelist ────────────────────────────────────────────
+        allowed_hours = [int(h) for h in os.getenv("LIVE_ALLOWED_HOURS_UTC", "").split(",") if h.strip()]
+        current_hour  = datetime.now(timezone.utc).hour
+        if allowed_hours and current_hour not in allowed_hours:
+            print(f"[live] {symbol} skipped — hour {current_hour} UTC not in allowed window")
+            return False
 
         # ── Slippage check (before spending SOL) ──────────────────────────────
         msg_mcap     = float(token_data.get("mcap_at_call") or 0)
