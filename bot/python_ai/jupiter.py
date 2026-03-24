@@ -212,7 +212,12 @@ async def buy_token(
             print(f"[jupiter] total order→execute: {exec_time - order_time:.2f}s")
 
             sig             = result.get("signature", "")
-            tokens_received = int(result.get("outputAmount", 0))
+            tokens_received = int(
+                result.get("outputAmountResult")
+                or result.get("totalOutputAmount")
+                or result.get("outputAmount")
+                or 0
+            )
             router          = result.get("router", "unknown")
             # Fallback: if Jupiter didn't return token count, check on-chain
             if tokens_received == 0:
@@ -323,7 +328,12 @@ async def sell_token(
             )
 
             sig          = result.get("signature", "")
-            sol_received = int(result.get("outputAmount", 0)) / 1_000_000_000
+            sol_received = int(
+                result.get("outputAmountResult")
+                or result.get("totalOutputAmount")
+                or result.get("outputAmount")
+                or 0
+            ) / 1_000_000_000
 
             # Fallback: balance delta with retries if outputAmount is missing/zero
             if sol_received <= 0 and sol_before is not None:
