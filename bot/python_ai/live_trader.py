@@ -20,6 +20,7 @@ startup, if that file exists, all live trading is halted immediately.
 To re-enable: delete the flag file and restart.
 """
 
+import asyncio
 import os
 import sys
 from datetime import datetime, timezone
@@ -40,6 +41,12 @@ from paper_trader import (
     HARD_STOP_PCT,
     MAX_HOURS,
 )
+
+# ── In-flight mint guard (prevents race-condition duplicate buys) ──────────────
+
+_pending_mints: set[str] = set()
+_pending_lock = asyncio.Lock()
+
 
 # ── Circuit breaker state ──────────────────────────────────────────────────────
 
@@ -127,148 +134,158 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
     symbol  = token_data.get("symbol", "?")
     mint    = token_data.get("mint_address")
 
-    # ── Guard 1: kill switch ───────────────────────────────────────────────────
-    if not _is_enabled():
-        print(f"[live] {symbol} skipped — LIVE_TRADING_ENABLED is not 'true'")
-        return False
-
-    # ── Guard 2: circuit breaker ───────────────────────────────────────────────
-    if _circuit_broken:
-        print(f"[live] {symbol} skipped — circuit breaker is active")
-        return False
-
-    # ── Guard 3: position count cap ────────────────────────────────────────────
-    open_count = db.get_live_positions_count()
-    if open_count >= _max_positions():
-        print(
-            f"[live] {symbol} skipped — "
-            f"max open positions ({_max_positions()}) reached ({open_count} open)"
-        )
-        return False
-
-    # ── Guard 4: daily loss circuit check ──────────────────────────────────────
-    today_losses = db.get_today_live_losses()
-    if today_losses > _max_daily_loss():
-        await _trip_circuit_breaker(today_losses)
-        return False
-
-    # ── Guard 5: duplicate position ────────────────────────────────────────────
-    if not call_id or not mint:
-        print(f"[live] {symbol} skipped — missing call_id or mint_address")
-        return False
-
-    if db.get_open_live_position(call_id):
-        print(f"[live] {symbol} skipped — live position already open for call_id={call_id}")
-        return False
-
-    if db.has_open_live_position_for_mint(mint):
-        print(f"[live] {symbol} skipped — live position already open for mint={mint[:12]}...")
-        return False
-
-    # ── Guard 6: SOL balance ───────────────────────────────────────────────────
-    size = _position_size(label)
+    # ── In-flight mint guard ───────────────────────────────────────────────────
+    async with _pending_lock:
+        if mint in _pending_mints:
+            print(f"[live] {symbol} ({(mint or '')[:8]}...) skipped — buy already in-flight for this mint")
+            return False
+        _pending_mints.add(mint)
     try:
-        balance = _wallet.get_sol_balance(_rpc_url())
-        if balance < size + 0.05:
+        # ── Guard 1: kill switch ───────────────────────────────────────────────
+        if not _is_enabled():
+            print(f"[live] {symbol} skipped — LIVE_TRADING_ENABLED is not 'true'")
+            return False
+
+        # ── Guard 2: circuit breaker ───────────────────────────────────────────
+        if _circuit_broken:
+            print(f"[live] {symbol} skipped — circuit breaker is active")
+            return False
+
+        # ── Guard 3: position count cap ────────────────────────────────────────
+        open_count = db.get_live_positions_count()
+        if open_count >= _max_positions():
             print(
-                f"[live] {symbol} skipped — SOL balance {balance:.4f}"
-                f" < required {size + 0.05:.4f} (size={size:.4f} + 0.05 reserve)"
+                f"[live] {symbol} skipped — "
+                f"max open positions ({_max_positions()}) reached ({open_count} open)"
             )
             return False
-    except Exception as e:
-        print(f"[live] {symbol} skipped — balance check failed: {e}")
-        return False
 
-    # ── Quiet hours guard ─────────────────────────────────────────────────────
-    quiet_hours_str = os.getenv("QUIET_HOURS_UTC", "")
-    if quiet_hours_str:
-        quiet_hours  = [int(h.strip()) for h in quiet_hours_str.split(",") if h.strip()]
-        current_hour = datetime.now(timezone.utc).hour
-        if current_hour in quiet_hours:
-            print(f"[live] {symbol} skipped — quiet hour (UTC {current_hour})")
+        # ── Guard 4: daily loss circuit check ──────────────────────────────────
+        today_losses = db.get_today_live_losses()
+        if today_losses > _max_daily_loss():
+            await _trip_circuit_breaker(today_losses)
             return False
 
-    # ── Slippage check (before spending SOL) ──────────────────────────────────
-    msg_mcap     = float(token_data.get("mcap_at_call") or 0)
-    actual_entry = None
-    if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
+        # ── Guard 5: duplicate position ────────────────────────────────────────
+        if not call_id or not mint:
+            print(f"[live] {symbol} skipped — missing call_id or mint_address")
+            return False
+
+        if db.get_open_live_position(call_id):
+            print(f"[live] {symbol} skipped — live position already open for call_id={call_id}")
+            return False
+
+        if db.has_open_live_position_for_mint(mint):
+            print(f"[live] {symbol} skipped — live position already open for mint={mint[:12]}...")
+            return False
+
+        # ── Guard 6: SOL balance ───────────────────────────────────────────────
+        size = _position_size(label)
         try:
-            market = data_fetcher.fetch_token_price(mint)
-            if market and market.get("mcap"):
-                actual_entry = float(market["mcap"])
-        except Exception as e:
-            print(f"[live] price fetch failed for {symbol}: {e}")
-    if actual_entry is None and mint:
-        print(f"[live] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
-
-    max_slippage = float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "50"))
-    if actual_entry and msg_mcap > 0:
-        slippage = ((actual_entry - msg_mcap) / msg_mcap) * 100
-        print(f"[live] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
-        if slippage > max_slippage:
-            print(f"[live] {symbol} SKIPPED — slippage {slippage:.0f}% exceeds max {max_slippage:.0f}%")
-            score     = score_result.get("score", 0)
-            label_str = score_result.get("label", "")
-            if label_str in ("alert", "strong_alert"):
-                await alert_bot.send_slippage_skip_alert(
-                    symbol=symbol,
-                    mint=mint,
-                    score=score,
-                    label=label_str,
-                    msg_mcap=msg_mcap,
-                    actual_mcap=actual_entry,
-                    slippage_pct=slippage,
+            balance = _wallet.get_sol_balance(_rpc_url())
+            if balance < size + 0.05:
+                print(
+                    f"[live] {symbol} skipped — SOL balance {balance:.4f}"
+                    f" < required {size + 0.05:.4f} (size={size:.4f} + 0.05 reserve)"
                 )
-            return False
-        if slippage < -30:
-            print(f"[live] {symbol} SKIPPED — price dropped {slippage:.0f}% since message (dump)")
+                return False
+        except Exception as e:
+            print(f"[live] {symbol} skipped — balance check failed: {e}")
             return False
 
-    # ── Execute buy ────────────────────────────────────────────────────────────
-    print(
-        f"[live] BUY {symbol}  call_id={call_id}"
-        f"  size={size:.4f} SOL  mint={mint[:8]}..."
-    )
-    result = await jupiter.buy_token(mint, size)
+        # ── Quiet hours guard ──────────────────────────────────────────────────
+        quiet_hours_str = os.getenv("QUIET_HOURS_UTC", "")
+        if quiet_hours_str:
+            quiet_hours  = [int(h.strip()) for h in quiet_hours_str.split(",") if h.strip()]
+            current_hour = datetime.now(timezone.utc).hour
+            if current_hour in quiet_hours:
+                print(f"[live] {symbol} skipped — quiet hour (UTC {current_hour})")
+                return False
 
-    if not result["success"]:
+        # ── Slippage check (before spending SOL) ──────────────────────────────
+        msg_mcap     = float(token_data.get("mcap_at_call") or 0)
+        actual_entry = None
+        if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
+            try:
+                market = data_fetcher.fetch_token_price(mint)
+                if market and market.get("mcap"):
+                    actual_entry = float(market["mcap"])
+            except Exception as e:
+                print(f"[live] price fetch failed for {symbol}: {e}")
+        if actual_entry is None and mint:
+            print(f"[live] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
+
+        max_slippage = float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "50"))
+        if actual_entry and msg_mcap > 0:
+            slippage = ((actual_entry - msg_mcap) / msg_mcap) * 100
+            print(f"[live] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
+            if slippage > max_slippage:
+                print(f"[live] {symbol} SKIPPED — slippage {slippage:.0f}% exceeds max {max_slippage:.0f}%")
+                score     = score_result.get("score", 0)
+                label_str = score_result.get("label", "")
+                if label_str in ("alert", "strong_alert"):
+                    await alert_bot.send_slippage_skip_alert(
+                        symbol=symbol,
+                        mint=mint,
+                        score=score,
+                        label=label_str,
+                        msg_mcap=msg_mcap,
+                        actual_mcap=actual_entry,
+                        slippage_pct=slippage,
+                    )
+                return False
+            if slippage < -30:
+                print(f"[live] {symbol} SKIPPED — price dropped {slippage:.0f}% since message (dump)")
+                return False
+
+        # ── Execute buy ────────────────────────────────────────────────────────
         print(
-            f"[live] BUY FAILED {symbol}  call_id={call_id}"
-            f"  error={result.get('error')}  code={result.get('code')}"
+            f"[live] BUY {symbol}  call_id={call_id}"
+            f"  size={size:.4f} SOL  mint={mint[:8]}..."
         )
-        return False
+        result = await jupiter.buy_token(mint, size)
 
-    sig             = result["signature"]
-    sol_spent       = result["sol_spent"]
-    tokens_received = result["tokens_received"]
-    decimals        = result.get("tokens_decimals", 6)
-    router          = result.get("router", "unknown")
+        if not result["success"]:
+            print(
+                f"[live] BUY FAILED {symbol}  call_id={call_id}"
+                f"  error={result.get('error')}  code={result.get('code')}"
+            )
+            return False
 
-    entry_price = actual_entry or msg_mcap
+        sig             = result["signature"]
+        sol_spent       = result["sol_spent"]
+        tokens_received = result["tokens_received"]
+        decimals        = result.get("tokens_decimals", 6)
+        router          = result.get("router", "unknown")
 
-    tokens_display = tokens_received / (10 ** decimals) if decimals > 0 else tokens_received
+        entry_price = actual_entry or msg_mcap
 
-    db.open_live_position(
-        call_id=call_id,
-        entry_price=entry_price,
-        sol_in=sol_spent,
-        tokens_held=tokens_received,
-        tx_signature=sig,
-        router=router,
-    )
-    print(
-        f"[live] BUY OK  {symbol}  call_id={call_id}"
-        f"  sol_spent={sol_spent:.4f}  tokens={tokens_received}"
-        f"  router={router}  sig={sig[:16]}..."
-    )
-    await alert_bot.send_live_buy_alert(
-        symbol=symbol,
-        mint=mint,
-        sol_spent=sol_spent,
-        tokens_received=tokens_display,
-        signature=sig,
-    )
-    return True
+        tokens_display = tokens_received / (10 ** decimals) if decimals > 0 else tokens_received
+
+        db.open_live_position(
+            call_id=call_id,
+            entry_price=entry_price,
+            sol_in=sol_spent,
+            tokens_held=tokens_received,
+            tx_signature=sig,
+            router=router,
+        )
+        print(
+            f"[live] BUY OK  {symbol}  call_id={call_id}"
+            f"  sol_spent={sol_spent:.4f}  tokens={tokens_received}"
+            f"  router={router}  sig={sig[:16]}..."
+        )
+        await alert_bot.send_live_buy_alert(
+            symbol=symbol,
+            mint=mint,
+            sol_spent=sol_spent,
+            tokens_received=tokens_display,
+            signature=sig,
+        )
+        return True
+    finally:
+        async with _pending_lock:
+            _pending_mints.discard(mint)
 
 
 async def close_live_position(

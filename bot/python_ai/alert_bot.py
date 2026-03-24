@@ -19,6 +19,7 @@ TELEGRAM_BOT_TOKEN       — BotFather token
 TELEGRAM_ALERT_CHAT_ID   — destination chat/user ID
 """
 
+import asyncio
 import html
 import os
 import re
@@ -227,13 +228,12 @@ async def send_alert(score_result: dict, token_data: dict) -> bool:
         )
         try:
             import paper_trader
-            paper_trader.open_position(score_result, token_data)
+            asyncio.create_task(paper_trader.open_position(score_result, token_data))
         except Exception as pe:
             print(f"[paper_trader] open_position failed: {pe}")
         # Live trading integration
         try:
             import live_trader
-            import asyncio
             asyncio.create_task(
                 live_trader.open_live_position(
                     score_result, token_data

@@ -13,6 +13,7 @@ check_exits(call_id, current_mcap, peak_mcap,
 close_position(call_id, current_mcap, reason)       -> None
 """
 
+import asyncio
 import os
 import sys
 from dataclasses import dataclass
@@ -36,6 +37,12 @@ HARD_STOP_PCT    = 0.50  # hard stop fires on 50% loss from entry
 MAX_HOURS        = 24    # time stop after 24 hours open
 
 
+# ── In-flight mint guard (prevents race-condition duplicate buys) ──────────────
+
+_pending_mints: set[str] = set()
+_pending_lock = asyncio.Lock()
+
+
 # ── Result type ───────────────────────────────────────────────────────────────
 
 @dataclass
@@ -46,7 +53,7 @@ class ExitResult:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def open_position(score_result: dict, token_data: dict) -> None:
+async def open_position(score_result: dict, token_data: dict) -> None:
     """
     Open a simulated paper trade position when an alert fires.
 
@@ -57,80 +64,90 @@ def open_position(score_result: dict, token_data: dict) -> None:
     entry_price = mcap_at_call from token_data.
     Never raises — a paper trade failure must never affect alert delivery.
     """
-    try:
-        label = score_result.get("label")
-        if label == "strong_alert":
-            sol_in = SOL_STRONG_ALERT
-        elif label == "alert":
-            sol_in = SOL_ALERT
-        else:
-            return  # only paper trade on actionable signals
+    symbol = token_data.get("symbol", "?")
+    mint   = token_data.get("mint_address")
 
-        call_id  = score_result.get("call_id")
-        symbol   = token_data.get("symbol", "?")
-        mint     = token_data.get("mint_address")
-        msg_mcap = float(token_data.get("mcap_at_call") or 0)
-
-        if not call_id or msg_mcap <= 0:
+    # ── In-flight mint guard ───────────────────────────────────────────────────
+    async with _pending_lock:
+        if mint in _pending_mints:
+            print(f"[paper] {symbol} ({(mint or '')[:8]}...) skipped — buy already in-flight for this mint")
             return
+        _pending_mints.add(mint)
+    try:
+        try:
+            label = score_result.get("label")
+            if label == "strong_alert":
+                sol_in = SOL_STRONG_ALERT
+            elif label == "alert":
+                sol_in = SOL_ALERT
+            else:
+                return  # only paper trade on actionable signals
 
-        actual_entry = None
-        if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
-            try:
-                market = data_fetcher.fetch_token_price(mint)
-                if market and market.get("mcap"):
-                    actual_entry = float(market["mcap"])
-            except Exception as e:
-                print(f"[paper] price fetch failed for {symbol}: {e}")
-        if actual_entry is None and mint:
-            print(f"[paper] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
+            call_id  = score_result.get("call_id")
+            msg_mcap = float(token_data.get("mcap_at_call") or 0)
 
-        entry_price = actual_entry or msg_mcap
-
-        quiet_hours_str = os.getenv("QUIET_HOURS_UTC", "")
-        if quiet_hours_str:
-            quiet_hours = [int(h.strip()) for h in quiet_hours_str.split(",") if h.strip()]
-            current_hour = datetime.now(timezone.utc).hour
-            if current_hour in quiet_hours:
-                print(f"[paper] {symbol} SKIPPED — quiet hour (UTC {current_hour})")
+            if not call_id or msg_mcap <= 0:
                 return
 
-        max_slippage = float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "50"))
+            actual_entry = None
+            if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
+                try:
+                    market = data_fetcher.fetch_token_price(mint)
+                    if market and market.get("mcap"):
+                        actual_entry = float(market["mcap"])
+                except Exception as e:
+                    print(f"[paper] price fetch failed for {symbol}: {e}")
+            if actual_entry is None and mint:
+                print(f"[paper] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
 
-        if actual_entry and msg_mcap > 0:
-            slippage = ((actual_entry - msg_mcap) / msg_mcap) * 100
-            print(f"[paper] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
-            if slippage > max_slippage:
-                print(f"[paper] {symbol} SKIPPED — slippage {slippage:.0f}% exceeds max {max_slippage:.0f}%")
-                score = score_result.get("score", 0)
-                label = score_result.get("label", "")
-                if label in ("alert", "strong_alert"):
-                    import asyncio
-                    try:
-                        asyncio.get_event_loop().create_task(
-                            alert_bot.send_slippage_skip_alert(
-                                symbol=token_data.get("symbol", "?"),
-                                mint=token_data.get("mint_address", ""),
-                                score=score,
-                                label=label,
-                                msg_mcap=msg_mcap,
-                                actual_mcap=actual_entry,
-                                slippage_pct=slippage,
+            entry_price = actual_entry or msg_mcap
+
+            quiet_hours_str = os.getenv("QUIET_HOURS_UTC", "")
+            if quiet_hours_str:
+                quiet_hours = [int(h.strip()) for h in quiet_hours_str.split(",") if h.strip()]
+                current_hour = datetime.now(timezone.utc).hour
+                if current_hour in quiet_hours:
+                    print(f"[paper] {symbol} SKIPPED — quiet hour (UTC {current_hour})")
+                    return
+
+            max_slippage = float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "50"))
+
+            if actual_entry and msg_mcap > 0:
+                slippage = ((actual_entry - msg_mcap) / msg_mcap) * 100
+                print(f"[paper] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
+                if slippage > max_slippage:
+                    print(f"[paper] {symbol} SKIPPED — slippage {slippage:.0f}% exceeds max {max_slippage:.0f}%")
+                    score = score_result.get("score", 0)
+                    label = score_result.get("label", "")
+                    if label in ("alert", "strong_alert"):
+                        try:
+                            asyncio.get_event_loop().create_task(
+                                alert_bot.send_slippage_skip_alert(
+                                    symbol=token_data.get("symbol", "?"),
+                                    mint=token_data.get("mint_address", ""),
+                                    score=score,
+                                    label=label,
+                                    msg_mcap=msg_mcap,
+                                    actual_mcap=actual_entry,
+                                    slippage_pct=slippage,
+                                )
                             )
-                        )
-                    except Exception:
-                        pass
-                return
-            if slippage < -30:
-                print(f"[paper] {symbol} SKIPPED — price dropped {slippage:.0f}% since message (dump)")
-                return
+                        except Exception:
+                            pass
+                    return
+                if slippage < -30:
+                    print(f"[paper] {symbol} SKIPPED — price dropped {slippage:.0f}% since message (dump)")
+                    return
 
-        db.open_paper_position(call_id, entry_price, sol_in)
-        print(f"[paper] opened {symbol}  call_id={call_id}  {sol_in} SOL @ {entry_price:.0f}")
+            db.open_paper_position(call_id, entry_price, sol_in)
+            print(f"[paper] opened {symbol}  call_id={call_id}  {sol_in} SOL @ {entry_price:.0f}")
 
-    except Exception as e:
-        db.safe_rollback()
-        print(f"[paper_trader] open_position failed: {e}")
+        except Exception as e:
+            db.safe_rollback()
+            print(f"[paper_trader] open_position failed: {e}")
+    finally:
+        async with _pending_lock:
+            _pending_mints.discard(mint)
 
 
 def check_exits(
