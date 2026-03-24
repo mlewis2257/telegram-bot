@@ -45,44 +45,47 @@ def _clamp(score: int) -> int:
 # ── Path A: Realtime scoring ──────────────────────────────────────────────────
 
 def _score_realtime(row: dict) -> tuple[int, list[str]]:
-    score = 30
+    # Scoring weights updated based on empirical analysis of 1,000+ outcomes
+    # Runners avg: liq=$19k, holders=370, dev_tokens=5972, mcap=$29k
+    # Rugs avg:    liq=$71k, holders=584, dev_tokens=2129, mcap=$71k
+    score = 35
     reasons: list[str] = []
 
     # ── Tier 1: always applied ─────────────────────────────────────────────
 
-    # security_flag
+    # security_flag — nearly all runners are "safe"
     sf = row.get("security_flag")
     if sf == "safe":
-        score += 5
-        reasons.append("security=safe+5")
+        score += 8
+        reasons.append("security=safe+8")
     elif sf == "warning":
-        score -= 20
-        reasons.append("security=warning-20")
+        score -= 25
+        reasons.append("security=warning-25")
     elif sf == "unknown" or sf is None:
-        score -= 10
-        reasons.append("security=unknown-10")
+        score -= 15
+        reasons.append("security=unknown-15")
 
-    # token_age_minutes
+    # token_age_minutes — very early entry is opportunity, not risk
     age = row.get("token_age_minutes")
     if age is not None:
         age = int(age)
         if age < 2:
-            score -= 5
-            reasons.append(f"age={age}m-5")
-        elif age <= 10:
             score += 5
             reasons.append(f"age={age}m+5")
+        elif age <= 10:
+            score += 8
+            reasons.append(f"age={age}m+8")
         elif age <= 30:
             score += 10
             reasons.append(f"age={age}m+10")
         elif age <= 60:
-            score += 5
-            reasons.append(f"age={age}m+5")
+            score += 3
+            reasons.append(f"age={age}m+3")
         else:
-            score -= 10
-            reasons.append(f"age={age}m-10")
+            score -= 15
+            reasons.append(f"age={age}m-15")
 
-    # bundle_pct_remaining (the → X% from "/Bundles: N • X% → Y%")
+    # bundle_pct_remaining — unchanged
     bpr = row.get("bundle_pct_remaining")
     if bpr is not None:
         bpr = float(bpr)
@@ -99,60 +102,70 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
             score -= 20
             reasons.append(f"bundles_remaining={bpr:.1f}%-20")
 
-    # liq_at_detection
+    # liq_at_detection — FLIPPED: high liq = rug indicator
     liq = row.get("liq_at_detection")
     if liq is not None:
         liq = float(liq)
-        if liq > 25_000:
-            score += 15
-            reasons.append(f"liq=${liq/1000:.0f}k+15")
-        elif liq >= 15_000:
-            score += 8
-            reasons.append(f"liq=${liq/1000:.0f}k+8")
+        if 13_000 <= liq <= 25_000:
+            score += 12
+            reasons.append(f"liq=${liq/1000:.0f}k+12")
+        elif liq <= 50_000:
+            score += 5
+            reasons.append(f"liq=${liq/1000:.0f}k+5")
         elif liq >= 8_000:
-            pass  # neutral band
+            score += 3
+            reasons.append(f"liq=${liq/1000:.0f}k+3")
+        elif liq > 50_000:
+            score -= 15
+            reasons.append(f"liq=${liq/1000:.0f}k-15")
         else:
             score -= 15
             reasons.append(f"liq=${liq/1000:.0f}k-15")
 
-    # hodl_count
+    # hodl_count — FLIPPED: high holders = rug indicator
     hodl = row.get("hodl_count")
     if hodl is not None:
         hodl = int(hodl)
-        if hodl > 500:
+        if 200 <= hodl <= 450:
             score += 8
             reasons.append(f"holders={hodl}+8")
-        elif hodl >= 300:
+        elif hodl < 200 and hodl >= 100:
             score += 4
             reasons.append(f"holders={hodl}+4")
-        elif hodl >= 100:
-            pass  # neutral band
+        elif hodl <= 600:
+            pass  # neutral band (450-600)
+        elif hodl > 600:
+            score -= 8
+            reasons.append(f"holders={hodl}-8")
         else:
             score -= 8
             reasons.append(f"holders={hodl}-8")
 
-    # mcap_at_call — penalise late entries
+    # mcap_at_call — strongest runner signal, strengthened
     mcap_entry = row.get("mcap_at_call")
     if mcap_entry is not None:
         mcap_entry = float(mcap_entry)
         if mcap_entry < 15_000:
-            score += 5
-            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k+5")
-        elif mcap_entry < 30_000:
+            score += 15
+            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k+15")
+        elif mcap_entry < 25_000:
+            score += 10
+            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k+10")
+        elif mcap_entry < 40_000:
             score += 5
             reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k+5")
         elif mcap_entry <= 60_000:
-            pass  # normal band
+            pass  # neutral band
         elif mcap_entry <= 100_000:
             score -= 15
             reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k-15")
         else:
-            score -= 25
-            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k-25")
+            score -= 30
+            reasons.append(f"entry_mcap=${mcap_entry/1000:.0f}k-30")
 
     # ── Tier 2: applied only when not NULL ────────────────────────────────
 
-    # bundle_count
+    # bundle_count — unchanged
     bc = row.get("bundle_count")
     if bc is not None:
         bc = int(bc)
@@ -169,7 +182,7 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
             score -= 20
             reasons.append(f"bundle_count={bc}-20")
 
-    # sniper_count
+    # sniper_count — unchanged
     sc = row.get("sniper_count")
     if sc is not None:
         sc = int(sc)
@@ -185,7 +198,7 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
             score -= 20
             reasons.append(f"snipers={sc}-20")
 
-    # fake_vol_pct
+    # fake_vol_pct — unchanged
     fvp = row.get("fake_vol_pct")
     if fvp is not None:
         fvp = float(fvp)
@@ -201,7 +214,7 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
             score -= 15
             reasons.append(f"fake_vol={fvp:.1f}%-15")
 
-    # first_20_pct
+    # first_20_pct — unchanged
     f20 = row.get("first_20_pct")
     if f20 is not None:
         f20 = float(f20)
@@ -217,32 +230,30 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
 
     # ── Tier 3: sparse fields ─────────────────────────────────────────────
 
-    # dev_tokens_made
+    # dev_tokens_made — COMPLETELY FLIPPED: high dev_tokens = experienced deployer = runner
+    # No hard caps — they were filtering out the best performers (avg runner has 5,972)
     dtm = row.get("dev_tokens_made")
     if dtm is not None:
         dtm = int(dtm)
         if dtm < 5:
-            score += 10
-            reasons.append(f"dev_tokens={dtm}+10")
-        elif dtm <= 20:
+            pass  # neutral — low dev_tokens = inexperienced, not a runner signal
+        elif dtm <= 50:
             score += 5
             reasons.append(f"dev_tokens={dtm}+5")
-        elif dtm <= 50:
-            pass  # neutral band
-        elif dtm <= 100:
-            score -= 15
-            reasons.append(f"dev_tokens={dtm}-15")
         elif dtm <= 200:
-            score -= 25
-            reasons.append(f"dev_tokens={dtm}-25")
-        elif dtm <= 500:
-            score -= 35
-            reasons.append(f"dev_tokens={dtm}-35")
+            score += 8
+            reasons.append(f"dev_tokens={dtm}+8")
+        elif dtm <= 1000:
+            score += 10
+            reasons.append(f"dev_tokens={dtm}+10")
+        elif dtm <= 5000:
+            score += 12
+            reasons.append(f"dev_tokens={dtm}+12")
         else:
-            score -= 45
-            reasons.append(f"dev_tokens={dtm}-45")
+            score += 8
+            reasons.append(f"dev_tokens={dtm}+8")
 
-    # dev_best_mcap
+    # dev_best_mcap — unchanged
     dbm = row.get("dev_best_mcap")
     if dbm is not None:
         dbm = float(dbm)
@@ -254,7 +265,7 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
             reasons.append(f"dev_best=${dbm/1000:.0f}k+5")
         # < 100k → neutral
 
-    # ── Data confidence penalty ────────────────────────────────────────────
+    # ── Data confidence penalty — unchanged ───────────────────────────────
     available_tier1 = sum(1 for v in [
         row.get("security_flag"),
         row.get("token_age_minutes"),
@@ -269,21 +280,10 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
         score -= 15
         reasons.append("partial_data-15")
 
-    # ── Cross-channel confirmation ─────────────────────────────────────────
+    # ── Cross-channel confirmation — reduced (token already pumped by the time both call)
     if row.get("cross_channel_confirmed"):
-        score += 15
-        reasons.append("cross_channel_confirmed+15")
-
-    # ── Hard cap: serial deployer / rug factory ────────────────────────────
-    dtm_val = row.get("dev_tokens_made")
-    if dtm_val is not None:
-        dtm_val = int(dtm_val)
-        if dtm_val > 2000:
-            score = min(score, 25)
-            reasons.append("rug_factory_cap<=25")
-        elif dtm_val > 500:
-            score = min(score, 40)
-            reasons.append("serial_deployer_cap<=40")
+        score += 5
+        reasons.append("cross_channel_confirmed+5")
 
     return score, reasons
 
