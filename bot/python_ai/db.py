@@ -1441,3 +1441,51 @@ def get_running_totals() -> dict:
         "live_win_rate":  round(int(lv[1]) / live_total  * 100, 1) if live_total  else 0.0,
         "live_pnl":       float(lv[2]),
     }
+
+
+def get_hourly_performance(since=None) -> list:
+    """
+    Hourly win rate and P&L for paper trades (UTC hour).
+
+    Returns a list of dicts sorted by hour:
+        {hour_utc, total, winners, win_rate, pnl}
+
+    Optionally filtered to rows with exit_time >= since (a datetime).
+    """
+    conn = get_conn()
+    with conn.cursor() as cur:
+        date_filter = ""
+        params: list = [True]
+        if since:
+            date_filter = "AND exit_time >= %s"
+            params.append(since)
+
+        cur.execute(
+            f"""
+            SELECT
+                EXTRACT(HOUR FROM exit_time AT TIME ZONE 'UTC')::int AS hour_utc,
+                COUNT(*)                                              AS total,
+                COUNT(CASE WHEN pnl_sol > 0 THEN 1 END)             AS winners,
+                COALESCE(SUM(pnl_sol), 0)                           AS pnl
+            FROM trading_positions
+            WHERE is_simulation = %s
+              AND status = 'closed'
+              {date_filter}
+            GROUP BY 1
+            ORDER BY 1
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+
+    result = []
+    for row in rows:
+        total = int(row[1])
+        result.append({
+            "hour_utc": int(row[0]),
+            "total":    total,
+            "winners":  int(row[2]),
+            "win_rate": round(int(row[2]) / total * 100, 1) if total else 0.0,
+            "pnl":      float(row[3]),
+        })
+    return result

@@ -87,6 +87,14 @@ def open_position(score_result: dict, token_data: dict) -> None:
 
         entry_price = actual_entry or msg_mcap
 
+        quiet_hours_str = os.getenv("QUIET_HOURS_UTC", "")
+        if quiet_hours_str:
+            quiet_hours = [int(h.strip()) for h in quiet_hours_str.split(",") if h.strip()]
+            current_hour = datetime.now(timezone.utc).hour
+            if current_hour in quiet_hours:
+                print(f"[paper] {symbol} SKIPPED — quiet hour (UTC {current_hour})")
+                return
+
         max_slippage = float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "50"))
 
         if actual_entry and msg_mcap > 0:

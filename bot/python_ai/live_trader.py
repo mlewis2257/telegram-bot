@@ -179,6 +179,15 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         print(f"[live] {symbol} skipped — balance check failed: {e}")
         return False
 
+    # ── Quiet hours guard ─────────────────────────────────────────────────────
+    quiet_hours_str = os.getenv("QUIET_HOURS_UTC", "")
+    if quiet_hours_str:
+        quiet_hours  = [int(h.strip()) for h in quiet_hours_str.split(",") if h.strip()]
+        current_hour = datetime.now(timezone.utc).hour
+        if current_hour in quiet_hours:
+            print(f"[live] {symbol} skipped — quiet hour (UTC {current_hour})")
+            return False
+
     # ── Slippage check (before spending SOL) ──────────────────────────────────
     msg_mcap     = float(token_data.get("mcap_at_call") or 0)
     actual_entry = None

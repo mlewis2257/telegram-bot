@@ -99,15 +99,43 @@ def _build_message() -> str:
         f"  Live:  {totals['live_trades']} trades | {totals['live_win_rate']}% win | {_fmt_pnl(totals['live_pnl'])}",
     ])
 
+    # ── Hourly performance ────────────────────────────────────────────────────
+    hourly = db.get_hourly_performance()
+    hourly_block = ""
+    if hourly:
+        by_pnl  = sorted(hourly, key=lambda x: x["pnl"], reverse=True)
+        hot     = [h for h in by_pnl if h["pnl"] > 0][:3]
+        cold    = [h for h in reversed(by_pnl) if h["pnl"] <= 0][:3]
+
+        hourly_lines = ["🕐 <b>Best / Worst Hours (UTC, paper)</b>"]
+        if hot:
+            hourly_lines.append("  🔥 Best:")
+            for h in hot:
+                hourly_lines.append(
+                    f"    {h['hour_utc']:02d}:00 — {_fmt_pnl(h['pnl'])} | "
+                    f"{h['win_rate']:.0f}% ({h['total']} trades)"
+                )
+        if cold:
+            hourly_lines.append("  💤 Worst:")
+            for h in cold:
+                hourly_lines.append(
+                    f"    {h['hour_utc']:02d}:00 — {_fmt_pnl(h['pnl'])} | "
+                    f"{h['win_rate']:.0f}% ({h['total']} trades)"
+                )
+        hourly_block = "\n".join(hourly_lines)
+
     sep = "─" * 21
-    return "\n\n".join([
+    parts = [
         f"📊 <b>DAILY SUMMARY — {today}</b>",
         sep,
         sig_block,
         paper_block,
         live_block,
         totals_block,
-    ])
+    ]
+    if hourly_block:
+        parts.append(hourly_block)
+    return "\n\n".join(parts)
 
 
 async def build_and_send(dry_run: bool = False) -> None:
