@@ -78,10 +78,8 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             label = score_result.get("label")
             if label == "strong_alert":
                 sol_in = SOL_STRONG_ALERT
-            elif label in ("alert", "caution"):
-                sol_in = SOL_ALERT
             else:
-                return  # only paper trade on actionable signals (55+)
+                sol_in = SOL_ALERT
 
             call_id  = score_result.get("call_id")
             msg_mcap = float(token_data.get("mcap_at_call") or 0)
