@@ -210,7 +210,7 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             db.set_call_skip_reason(call_id, "allowed_hours")
             return False
 
-        # ── Slippage check (before spending SOL) ──────────────────────────────
+        # ── Entry gate ─────────────────────────────────────────────────────────
         msg_mcap     = float(token_data.get("mcap_at_call") or 0)
         actual_entry = None
         if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
@@ -223,21 +223,17 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         if actual_entry is None and mint:
             print(f"[live] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
 
-        if actual_entry and msg_mcap > 0:
-            slippage = ((actual_entry - msg_mcap) / msg_mcap) * 100
-            print(f"[live] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
-            if slippage < -30:
-                print(f"[live] {symbol} SKIPPED — price dumped {slippage:.0f}% since message")
-                db.set_call_skip_reason(call_id, "slippage")
-                return False
-            if slippage < 10:
-                print(f"[live] {symbol} SKIPPED — no momentum ({slippage:+.0f}%, need >=+10%)")
-                db.set_call_skip_reason(call_id, "slippage")
-                return False
-            if slippage > 150:
-                print(f"[live] {symbol} SKIPPED — already pumped {slippage:.0f}% since message")
-                db.set_call_skip_reason(call_id, "slippage")
-                return False
+        security_flag = token_data.get("security_flag")
+        if security_flag == "warning":
+            print(f"[live] {symbol} skipped — security=warning")
+            db.set_call_skip_reason(call_id, "security_warning")
+            return False
+
+        max_entry_mcap = float(os.getenv("MAX_ENTRY_MCAP", "50000"))
+        if actual_entry and actual_entry > max_entry_mcap:
+            print(f"[live] {symbol} skipped — mcap ${actual_entry/1000:.0f}k too high (max ${max_entry_mcap/1000:.0f}k)")
+            db.set_call_skip_reason(call_id, "mcap_too_high")
+            return False
 
         # ── Execute buy ────────────────────────────────────────────────────────
         print(

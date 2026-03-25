@@ -100,21 +100,18 @@ async def open_position(score_result: dict, token_data: dict) -> None:
 
             entry_price = actual_entry or msg_mcap
 
-            if actual_entry and msg_mcap > 0:
-                slippage = ((actual_entry - msg_mcap) / msg_mcap) * 100
-                print(f"[paper] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
-                if slippage < -30:
-                    print(f"[paper] {symbol} SKIPPED — price dumped {slippage:.0f}% since message")
-                    db.set_call_skip_reason(call_id, "slippage")
-                    return
-                if slippage < 10:
-                    print(f"[paper] {symbol} SKIPPED — no momentum ({slippage:+.0f}%, need >=+10%)")
-                    db.set_call_skip_reason(call_id, "slippage")
-                    return
-                if slippage > 150:
-                    print(f"[paper] {symbol} SKIPPED — already pumped {slippage:.0f}% since message")
-                    db.set_call_skip_reason(call_id, "slippage")
-                    return
+            # ── Entry gate ────────────────────────────────────────────────────
+            security_flag = token_data.get("security_flag")
+            if security_flag == "warning":
+                print(f"[paper] {symbol} skipped — security=warning")
+                db.set_call_skip_reason(call_id, "security_warning")
+                return
+
+            max_entry_mcap = float(os.getenv("MAX_ENTRY_MCAP", "50000"))
+            if actual_entry and actual_entry > max_entry_mcap:
+                print(f"[paper] {symbol} skipped — mcap ${actual_entry/1000:.0f}k too high (max ${max_entry_mcap/1000:.0f}k)")
+                db.set_call_skip_reason(call_id, "mcap_too_high")
+                return
 
             db.open_paper_position(call_id, entry_price, sol_in)
             print(f"[paper] opened {symbol}  call_id={call_id}  {sol_in} SOL @ {entry_price:.0f}")
