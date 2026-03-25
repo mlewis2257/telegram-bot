@@ -111,7 +111,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     print(f"[paper] {symbol} SKIPPED — no momentum ({slippage:+.0f}%, need >=+10%)")
                     db.set_call_skip_reason(call_id, "slippage")
                     return
-                if slippage > 100:
+                if slippage > 150:
                     print(f"[paper] {symbol} SKIPPED — already pumped {slippage:.0f}% since message")
                     db.set_call_skip_reason(call_id, "slippage")
                     return

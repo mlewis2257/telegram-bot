@@ -223,28 +223,19 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         if actual_entry is None and mint:
             print(f"[live] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
 
-        max_slippage = float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "50"))
         if actual_entry and msg_mcap > 0:
             slippage = ((actual_entry - msg_mcap) / msg_mcap) * 100
             print(f"[live] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
-            if slippage > max_slippage:
-                print(f"[live] {symbol} SKIPPED — slippage {slippage:.0f}% exceeds max {max_slippage:.0f}%")
-                db.set_call_skip_reason(call_id, "slippage")
-                score     = score_result.get("score", 0)
-                label_str = score_result.get("label", "")
-                if label_str in ("alert", "strong_alert"):
-                    await alert_bot.send_slippage_skip_alert(
-                        symbol=symbol,
-                        mint=mint,
-                        score=score,
-                        label=label_str,
-                        msg_mcap=msg_mcap,
-                        actual_mcap=actual_entry,
-                        slippage_pct=slippage,
-                    )
-                return False
             if slippage < -30:
-                print(f"[live] {symbol} SKIPPED — price dropped {slippage:.0f}% since message (dump)")
+                print(f"[live] {symbol} SKIPPED — price dumped {slippage:.0f}% since message")
+                db.set_call_skip_reason(call_id, "slippage")
+                return False
+            if slippage < 10:
+                print(f"[live] {symbol} SKIPPED — no momentum ({slippage:+.0f}%, need >=+10%)")
+                db.set_call_skip_reason(call_id, "slippage")
+                return False
+            if slippage > 150:
+                print(f"[live] {symbol} SKIPPED — already pumped {slippage:.0f}% since message")
                 db.set_call_skip_reason(call_id, "slippage")
                 return False
 
