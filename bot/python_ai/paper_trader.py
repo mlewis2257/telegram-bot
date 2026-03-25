@@ -100,34 +100,19 @@ async def open_position(score_result: dict, token_data: dict) -> None:
 
             entry_price = actual_entry or msg_mcap
 
-            max_slippage = float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "50"))
-
             if actual_entry and msg_mcap > 0:
                 slippage = ((actual_entry - msg_mcap) / msg_mcap) * 100
                 print(f"[paper] {symbol} entry slippage: msg=${msg_mcap/1000:.1f}k actual=${actual_entry/1000:.1f}k ({slippage:+.1f}%)")
-                if slippage > max_slippage:
-                    print(f"[paper] {symbol} SKIPPED — slippage {slippage:.0f}% exceeds max {max_slippage:.0f}%")
-                    db.set_call_skip_reason(call_id, "slippage")
-                    score = score_result.get("score", 0)
-                    label = score_result.get("label", "")
-                    if label in ("alert", "strong_alert"):
-                        try:
-                            asyncio.get_event_loop().create_task(
-                                alert_bot.send_slippage_skip_alert(
-                                    symbol=token_data.get("symbol", "?"),
-                                    mint=token_data.get("mint_address", ""),
-                                    score=score,
-                                    label=label,
-                                    msg_mcap=msg_mcap,
-                                    actual_mcap=actual_entry,
-                                    slippage_pct=slippage,
-                                )
-                            )
-                        except Exception:
-                            pass
-                    return
                 if slippage < -30:
-                    print(f"[paper] {symbol} SKIPPED — price dropped {slippage:.0f}% since message (dump)")
+                    print(f"[paper] {symbol} SKIPPED — price dumped {slippage:.0f}% since message")
+                    db.set_call_skip_reason(call_id, "slippage")
+                    return
+                if slippage < 10:
+                    print(f"[paper] {symbol} SKIPPED — no momentum ({slippage:+.0f}%, need >=+10%)")
+                    db.set_call_skip_reason(call_id, "slippage")
+                    return
+                if slippage > 100:
+                    print(f"[paper] {symbol} SKIPPED — already pumped {slippage:.0f}% since message")
                     db.set_call_skip_reason(call_id, "slippage")
                     return
 
