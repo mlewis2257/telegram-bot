@@ -176,22 +176,23 @@ def parse(text: str) -> dict | None:
         txns_24h = parse_mcap(m.group(1))  # handles K suffix
 
     # ── Mint address ──
-    # Volume alert: mint on same line as "Contract Address:"
-    # Gem + Whale alerts: mint on the line AFTER "Contract Address:"
+    # Try same-line first (all three types may use this format:
+    # "🔗 Contract Address: <mint>"), then fall back to next-line.
     mint_address = None
-    if vip_message_type == 'volume_alert':
-        m = CONTRACT_INLINE_RE.search(text)
-        if m:
-            mint_address = m.group(1)
-    else:
+    for line in text.splitlines():
+        if "Contract Address:" in line:
+            parts = line.split("Contract Address:", 1)
+            candidate = parts[1].strip() if len(parts) > 1 else ""
+            # Strip any leading emoji / punctuation before the base58 address
+            addr_m = re.search(r'[1-9A-HJ-NP-Za-km-z]{32,44}', candidate)
+            if addr_m:
+                mint_address = addr_m.group(0)
+                break
+    if not mint_address:
+        # Next-line format: "Contract Address:\n<mint>"
         m = CONTRACT_NEXT_LINE_RE.search(text)
         if m:
             mint_address = m.group(1)
-        else:
-            # fallback: inline (some messages may omit the newline)
-            m = CONTRACT_INLINE_RE.search(text)
-            if m:
-                mint_address = m.group(1)
 
     # ── Whale-specific fields ──
     whale_wallet_sol = None
