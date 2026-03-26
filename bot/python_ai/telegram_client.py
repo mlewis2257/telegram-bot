@@ -14,6 +14,7 @@ Adding a new channel requires only inserting a row in the channels table.
 No code changes needed.
 """
 
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -918,6 +919,7 @@ def run_listener() -> None:
             elif cfg["channel_type"] == "realtime":
                 status, score_result, extra = handle_realtime(msg, info["caller_id"], cfg["id"], channel_handle=cfg["handle"])
             elif cfg["channel_type"] == "vip":
+                await asyncio.sleep(0.1)  # Give DB commit time to propagate before scoring
                 status, score_result, extra = handle_vip(msg, info["caller_id"], cfg["id"])
             else:
                 return
