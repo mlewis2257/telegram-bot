@@ -285,6 +285,22 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
         score += 5
         reasons.append("cross_channel_confirmed+5")
 
+    # ── VIP tier (only present on VIP channel calls) ───────────────────────
+    vip_tier = row.get("vip_tier")
+    if vip_tier == "safe":
+        score += 15
+        reasons.append("vip_tier=safe+15")
+    elif vip_tier == "gamble_risk":
+        score -= 10
+        reasons.append("vip_tier=gamble_risk-10")
+    elif vip_tier == "high_risk":
+        score -= 20
+        reasons.append("vip_tier=high_risk-20")
+    elif vip_tier == "whale":
+        score += 10
+        reasons.append("vip_tier=whale+10")
+    # gamble / None → neutral (no adjustment)
+
     return score, reasons
 
 
@@ -348,15 +364,20 @@ def _score_lagging(row: dict) -> tuple[int, list[str]]:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def score_call(call_id: int) -> dict:
+def score_call(call_id: int, extra_fields: dict | None = None) -> dict:
     """
     Score a logged call by call_id.
 
     Fetches required fields from DB, applies path-appropriate rules,
     writes conviction_score back to calls.conviction_score, and returns
     a result dict with keys: call_id, score, label, reasons, path.
+
+    extra_fields — optional dict merged into the DB row before scoring.
+    Use this to pass fields not stored in the DB (e.g. vip_tier).
     """
     row = db.get_call_for_scoring(call_id, cross_channel_window_seconds=CROSS_CHANNEL_WINDOW_SECONDS)
+    if row and extra_fields:
+        row = {**row, **extra_fields}
     if not row:
         return {
             "call_id": call_id,

@@ -27,7 +27,7 @@ import data_fetcher
 import tags
 import scorer
 import alert_bot
-from parsers import type_a, type_b
+from parsers import type_a, type_b, type_a_vip
 
 
 def _is_valid_peak_update(
@@ -75,6 +75,8 @@ load_dotenv()
 api_id   = int(os.environ["API_ID"])
 api_hash = os.environ["API_HASH"]
 
+VIP_CHANNEL = int(os.getenv("SOLHOUSE_VIP_CHANNEL", 0)) or None
+
 # ── Last-run state directory ───────────────────────────────────────────────────
 
 _LAST_RUN_DIR = Path(__file__).parent / ".last_run"
@@ -106,7 +108,8 @@ def _write_last_message_id(handle: str, message_id: int) -> None:
 CALL_KEYWORDS = [
     "solana", "$", "pump", "call", "launch", "raydium",
     "bonk", "ca:", "contract", "mint", "ticker", "achiev",
-    "whale",   # catches realtime entry signals, daily stats, leaderboards
+    "whale",   # catches realtime entry signals and VIP whale alerts
+    "gem alert",  # VIP gem alerts
 ]
 
 
@@ -604,6 +607,134 @@ def handle_realtime(message, caller_id: int, channel_id: int, channel_handle: st
     return 'skipped', None, None
 
 
+def handle_vip(message, caller_id: int, channel_id: int | None) -> tuple:
+    """
+    Process one message from the SolHouse VIP channel.
+
+    Delegates entirely to type_a_vip.parse(), then routes on vip_message_type:
+      gem_alert / volume_alert → log call, score, return for alerting
+      whale_alert              → log to whale_alerts table, no scoring
+
+    Returns (status, score_result, token_data) following the same
+    convention as handle_lagging / handle_realtime.
+    """
+    text   = message.text.strip()
+    parsed = type_a_vip.parse(text)
+    if not parsed:
+        return 'noise', None, None
+
+    vip_message_type = parsed["vip_message_type"]
+
+    # ── Gem Alert + Volume Alert → logged call ──────────────────────────────
+    if vip_message_type in ('gem_alert', 'volume_alert'):
+        symbol = parsed.get("symbol")
+        mint   = parsed.get("mint_address")
+
+        mint_resolved = mint is not None
+        if not mint_resolved:
+            mint = f"UNKNOWN:{symbol.upper()}" if symbol else f"UNKNOWN:msg{message.id}"
+
+        token_id = db.upsert_token(
+            mint_address=mint,
+            symbol=symbol,
+            name=parsed.get("token_name"),
+        )
+
+        call_id = db.insert_call(
+            caller_id=caller_id,
+            token_id=token_id,
+            source_platform="telegram",
+            source_message_id=str(message.id),
+            raw_message=text,
+            created_at=message.date,
+            message_type="initial_call",
+            channel_id=channel_id,
+            mcap_at_call=parsed.get("mcap_at_call"),
+            narrative_tags=tags.tag_token(symbol or "", parsed.get("token_name") or "", text),
+        )
+
+        if call_id is None:
+            return 'dupe', None, None
+
+        if mint_resolved:
+            market = data_fetcher.fetch_token_data(mint)
+            if market:
+                db.update_call_market_data(
+                    call_id=call_id,
+                    price_usd=market["price_usd"],
+                    mcap=market["mcap"],
+                    liquidity_usd=market["liquidity_usd"],
+                )
+                if market["name"] or market["symbol"]:
+                    db.upsert_token(
+                        mint_address=mint,
+                        symbol=market["symbol"],
+                        name=market["name"],
+                    )
+
+        db.insert_outcome(call_id)
+
+        linked = db.backfill_whale_alert_call_ids(token_id=token_id, call_id=call_id)
+        if linked:
+            print(f"  [whale-backfill] linked {linked} whale alert(s) to call_id={call_id}")
+
+        vip_tier   = parsed.get("vip_tier")
+        mint_short = mint[:12] + ("..." if len(mint) > 12 else "")
+        status_str = "resolved" if mint_resolved else "UNKNOWN"
+        print(
+            f"  [vip:{vip_message_type}] call_id={call_id} symbol={symbol} "
+            f"mint={mint_short} ({status_str}) "
+            f"mcap={parsed.get('mcap_at_call')} vip_tier={vip_tier}"
+        )
+
+        score_result = None
+        try:
+            score_result = scorer.score_call(
+                call_id,
+                extra_fields={"vip_tier": vip_tier} if vip_tier else None,
+            )
+            print(f"  [score] {symbol} call_id={call_id}  score={score_result['score']}  label={score_result['label']}")
+            print(f"  Reasons: {', '.join(score_result['reasons'])}")
+        except Exception as e:
+            print(f"  [score] error: {e}")
+
+        token_data = {
+            "symbol":            symbol,
+            "mint_address":      mint,
+            "mcap_at_call":      parsed.get("mcap_at_call"),
+            "security_flag":     None,
+            "token_age_minutes": None,
+            "vip_tier":          vip_tier,
+        }
+        return 'logged', score_result, token_data
+
+    # ── Whale Alert → whale_alerts table only, no scoring ───────────────────
+    if vip_message_type == 'whale_alert':
+        symbol = parsed.get("symbol")
+
+        token_id = db.get_token_id_by_symbol(symbol) if symbol else None
+        call_id  = db.get_call_id_by_token_name(symbol) if symbol else None
+
+        whale_id = db.insert_whale_alert(
+            symbol=symbol,
+            sol_amount=parsed.get("whale_sol_spent"),
+            wallet_size_sol=parsed.get("whale_wallet_sol"),
+            mcap_at_whale=parsed.get("mcap_at_call"),
+            signal_count=None,
+            raw_message=text,
+            token_id=token_id,
+            call_id=call_id,
+        )
+        print(
+            f"  [vip:whale_alert] id={whale_id} symbol={symbol} "
+            f"sol={parsed.get('whale_sol_spent')} wallet={parsed.get('whale_wallet_sol')} "
+            f"pct={parsed.get('whale_pct_spent')} call_id={call_id}"
+        )
+        return 'whale_alert', None, None
+
+    return 'noise', None, None
+
+
 # ── Catchup ───────────────────────────────────────────────────────────────────
 
 def _catchup(client, entity, channel_cfg: dict, caller_id: int) -> int:
@@ -644,6 +775,8 @@ def _catchup(client, entity, channel_cfg: dict, caller_id: int) -> int:
             status, *_ = handle_lagging(message, caller_id, c_id)
         elif c_type == "realtime":
             status, *_ = handle_realtime(message, caller_id, c_id)
+        elif c_type == "vip":
+            status, *_ = handle_vip(message, caller_id, c_id)
         else:
             continue
 
@@ -724,6 +857,38 @@ def run_listener() -> None:
             "entity":    entity,
         }
 
+    # ── Optional: SolHouse VIP channel (env-var, not in DB channels table) ──────
+
+    if VIP_CHANNEL:
+        try:
+            vip_entity = client.get_entity(VIP_CHANNEL)
+            vip_handle = "@solhousesignal_vip"
+            _init_stats(vip_handle)
+
+            vip_caller_id = db.upsert_caller(
+                platform="telegram",
+                handle=vip_handle,
+                name=getattr(vip_entity, "title", "SolHouse VIP"),
+            )
+
+            vip_cfg = {"id": None, "channel_type": "vip", "handle": vip_handle}
+
+            vip_highest = _catchup(client, vip_entity, vip_cfg, vip_caller_id)
+            if vip_highest:
+                _write_last_message_id(vip_handle, vip_highest)
+
+            entity_map[normalize_chat_id(vip_entity.id)] = {
+                "cfg":       vip_cfg,
+                "caller_id": vip_caller_id,
+                "handle":    vip_handle,
+                "entity":    vip_entity,
+            }
+            print(f"[listener] VIP channel: ACTIVE ({VIP_CHANNEL})")
+        except Exception as e:
+            print(f"[listener] VIP channel: setup failed: {e}")
+    else:
+        print("[listener] VIP channel: not configured")
+
     if not entity_map:
         print("[listener] No channels could be resolved. Exiting.")
         client.disconnect()
@@ -752,6 +917,8 @@ def run_listener() -> None:
                 status, score_result, extra = handle_lagging(msg, info["caller_id"], cfg["id"])
             elif cfg["channel_type"] == "realtime":
                 status, score_result, extra = handle_realtime(msg, info["caller_id"], cfg["id"], channel_handle=cfg["handle"])
+            elif cfg["channel_type"] == "vip":
+                status, score_result, extra = handle_vip(msg, info["caller_id"], cfg["id"])
             else:
                 return
 
