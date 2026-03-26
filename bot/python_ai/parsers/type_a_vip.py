@@ -17,6 +17,7 @@ parse(text: str) -> dict | None
 """
 
 import re
+import unicodedata
 
 # ── Detection ─────────────────────────────────────────────────────────────────
 
@@ -51,12 +52,12 @@ TXNS_RE = re.compile(r'Txns(?:\s*\(24h\))?\s*:\s*(\S+)', re.IGNORECASE)
 
 # Contract Address: <mint>  — same line (volume alert format)
 CONTRACT_INLINE_RE = re.compile(
-    r'Contract\s+Address\s*:\s*([1-9A-HJ-NP-Za-km-z]{32,44})',
+    r'Contract\s+Address\s*:\s*([1-9A-HJ-NP-Za-km-z]{32,50})',
     re.IGNORECASE,
 )
 # Contract Address:\n<mint>  — next line (gem + whale format)
 CONTRACT_NEXT_LINE_RE = re.compile(
-    r'Contract\s+Address\s*:\s*\n\s*([1-9A-HJ-NP-Za-km-z]{32,44})',
+    r'Contract\s+Address\s*:\s*\n\s*([1-9A-HJ-NP-Za-km-z]{32,50})',
     re.IGNORECASE,
 )
 
@@ -183,8 +184,14 @@ def parse(text: str) -> dict | None:
         if "Contract Address:" in line:
             parts = line.split("Contract Address:", 1)
             candidate = parts[1].strip() if len(parts) > 1 else ""
-            # Strip any leading emoji / punctuation before the base58 address
-            addr_m = re.search(r'[1-9A-HJ-NP-Za-km-z]{32,44}', candidate)
+            # Strip invisible unicode control/format characters (common in
+            # styled Telegram messages) before attempting the base58 match.
+            candidate = ''.join(
+                c for c in candidate
+                if not unicodedata.category(c).startswith('C')
+            )
+            candidate = candidate.strip()
+            addr_m = re.search(r'[1-9A-HJ-NP-Za-km-z]{32,50}', candidate)
             if addr_m:
                 mint_address = addr_m.group(0)
                 break
@@ -192,7 +199,12 @@ def parse(text: str) -> dict | None:
         # Next-line format: "Contract Address:\n<mint>"
         m = CONTRACT_NEXT_LINE_RE.search(text)
         if m:
-            mint_address = m.group(1)
+            raw = m.group(1)
+            raw = ''.join(
+                c for c in raw
+                if not unicodedata.category(c).startswith('C')
+            )
+            mint_address = raw.strip() or None
 
     # ── Whale-specific fields ──
     whale_wallet_sol = None
