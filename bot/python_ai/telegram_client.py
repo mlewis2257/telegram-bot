@@ -22,12 +22,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telethon.sync import TelegramClient
 from telethon import events
+from telethon.tl.types import PeerChannel
 
 import db
 import data_fetcher
 import tags
 import scorer
 import alert_bot
+import paper_trader
 from parsers import type_a, type_b, type_a_vip
 
 
@@ -862,7 +864,7 @@ def run_listener() -> None:
 
     if VIP_CHANNEL:
         try:
-            vip_entity = client.get_entity(VIP_CHANNEL)
+            vip_entity = client.get_entity(PeerChannel(normalize_chat_id(VIP_CHANNEL)))
             vip_handle = "@solhousesignal_vip"
             _init_stats(vip_handle)
 
@@ -933,6 +935,9 @@ def run_listener() -> None:
 
             if score_result and score_result["label"] in ("alert", "strong_alert"):
                 await alert_bot.send_alert(score_result, extra)
+            elif score_result and score_result["label"] not in ("skip",):
+                # caution/watch — paper trade silently, no Telegram alert
+                asyncio.create_task(paper_trader.open_position(score_result, extra))
 
             if status == "milestone" and extra:
                 await alert_bot.send_milestone(**extra)
