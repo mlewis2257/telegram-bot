@@ -708,6 +708,7 @@ def handle_vip(message, caller_id: int, channel_id: int | None) -> tuple:
             "security_flag":     None,
             "token_age_minutes": None,
             "vip_tier":          vip_tier,
+            "channel_tag":       "solhousesignal_vip",
         }
         return 'logged', score_result, token_data
 
