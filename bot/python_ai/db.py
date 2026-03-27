@@ -80,6 +80,19 @@ def get_active_channels():
         return cur.fetchall()
 
 
+def get_channel_by_handle(handle: str) -> dict | None:
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, handle, channel_type FROM channels WHERE handle = %s",
+            (handle,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "handle": row[1], "channel_type": row[2]}
+
+
 # ── Callers ───────────────────────────────────────────────────────────────────
 
 def upsert_caller(platform: str, handle: str, name: str) -> int:
@@ -772,7 +785,7 @@ def get_call_for_scoring(
                 ) >= 2 AS cross_channel_confirmed
             FROM calls c
             JOIN tokens   t  ON t.id  = c.token_id
-            JOIN channels ch ON ch.id = c.channel_id
+            LEFT JOIN channels ch ON ch.id = c.channel_id
             LEFT JOIN outcomes o ON o.call_id = c.id
             WHERE c.id = %s
             """,

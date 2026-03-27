@@ -872,7 +872,12 @@ def run_listener() -> None:
                 name=getattr(vip_entity, "title", "SolHouse VIP"),
             )
 
-            vip_cfg = {"id": None, "channel_type": "vip", "handle": vip_handle}
+            vip_channel_db = db.get_channel_by_handle('solhousesignal_vip')
+            vip_cfg = {
+                "id":           vip_channel_db["id"] if vip_channel_db else None,
+                "channel_type": "vip",
+                "handle":       vip_handle,
+            }
 
             vip_highest = _catchup(client, vip_entity, vip_cfg, vip_caller_id)
             if vip_highest:
