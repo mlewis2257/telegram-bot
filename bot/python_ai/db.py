@@ -743,9 +743,12 @@ def get_call_for_scoring(
     Return a flat dict of every field needed by scorer.py for a single call.
     Joins calls → tokens → channels → outcomes (LEFT).
 
-    Includes cross_channel_confirmed: True when the same token has calls from
-    BOTH solwhaletrending and solearlytrending within cross_channel_window_seconds
-    of this call — used by the realtime scorer's cross-channel bonus rule.
+    Includes cross_channel_confirmed: True when either:
+      - the same token has calls from BOTH solwhaletrending and solearlytrending
+        within cross_channel_window_seconds of this call, OR
+      - solhousesignal_vip AND solhousesignal (free) both called the same token
+        within 4 hours of this call (lagging channel is slower)
+    Used by the realtime scorer's cross-channel bonus rule (+5).
 
     Returns None if the call_id doesn't exist.
     """
@@ -776,13 +779,34 @@ def get_call_for_scoring(
                 o.stated_multiplier,
                 o.mcap_at_result,
                 (
-                    SELECT COUNT(DISTINCT ch2.handle)
-                    FROM calls c2
-                    JOIN channels ch2 ON ch2.id = c2.channel_id
-                    WHERE c2.token_id = t.id
-                      AND ch2.handle IN ('solwhaletrending', 'solearlytrending')
-                      AND ABS(EXTRACT(EPOCH FROM (c2.created_at - c.created_at))) <= %s
-                ) >= 2 AS cross_channel_confirmed
+                    -- Both realtime channels called within window
+                    (
+                        SELECT COUNT(DISTINCT ch2.handle)
+                        FROM calls c2
+                        JOIN channels ch2 ON ch2.id = c2.channel_id
+                        WHERE c2.token_id = t.id
+                          AND ch2.handle IN ('solwhaletrending', 'solearlytrending')
+                          AND ABS(EXTRACT(EPOCH FROM (c2.created_at - c.created_at))) <= %s
+                    ) >= 2
+                    OR
+                    -- VIP + free channel both called within 4 hours
+                    (
+                        EXISTS (
+                            SELECT 1 FROM calls c2
+                            JOIN channels ch2 ON ch2.id = c2.channel_id
+                            WHERE c2.token_id = t.id
+                              AND ch2.handle = 'solhousesignal_vip'
+                              AND ABS(EXTRACT(EPOCH FROM (c2.created_at - c.created_at))) <= 14400
+                        )
+                        AND EXISTS (
+                            SELECT 1 FROM calls c2
+                            JOIN channels ch2 ON ch2.id = c2.channel_id
+                            WHERE c2.token_id = t.id
+                              AND ch2.handle = 'solhousesignal'
+                              AND ABS(EXTRACT(EPOCH FROM (c2.created_at - c.created_at))) <= 14400
+                        )
+                    )
+                ) AS cross_channel_confirmed
             FROM calls c
             JOIN tokens   t  ON t.id  = c.token_id
             LEFT JOIN channels ch ON ch.id = c.channel_id
@@ -1166,6 +1190,25 @@ def has_open_live_position_for_mint(mint_address: str) -> bool:
             LIMIT 1
             """,
             (mint_address,),
+        )
+        return cur.fetchone() is not None
+
+
+def has_open_paper_position_for_mint(mint: str) -> bool:
+    """Check if ANY open paper position exists for this mint address."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM trading_positions tp
+            JOIN calls  c ON c.id = tp.call_id
+            JOIN tokens t ON t.id = c.token_id
+            WHERE t.mint_address = %s
+              AND tp.is_simulation = TRUE
+              AND tp.status = 'open'
+            LIMIT 1
+            """,
+            (mint,),
         )
         return cur.fetchone() is not None
 

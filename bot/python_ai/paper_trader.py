@@ -87,6 +87,12 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             if not call_id or msg_mcap <= 0:
                 return
 
+            if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
+                if db.has_open_paper_position_for_mint(mint):
+                    print(f"[paper] {symbol} skipped — open position already exists for this mint")
+                    db.set_call_skip_reason(call_id, "duplicate")
+                    return
+
             actual_entry = None
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
                 try:
