@@ -30,6 +30,15 @@ import alert_bot
 SOL_STRONG_ALERT = 1.0   # simulated SOL for strong_alert (85+)
 SOL_ALERT        = 0.5   # simulated SOL for alert (70–84)
 
+# ── Per-channel mcap entry limits ──────────────────────────────────────────────
+MCAP_LIMITS = {
+    'solhousesignal_vip': 200_000,
+    'solwhaletrending':   100_000,
+    'solearlytrending':    75_000,
+    'solhousesignal':      50_000,
+}
+DEFAULT_MCAP_LIMIT = 75_000  # fallback for unknown channels
+
 TAKE_PROFIT_5X   = 5.0   # exit at 5x from entry
 TAKE_PROFIT_3X   = 3.0   # exit at 3x from entry
 TRAIL_PEAK_MIN   = 2.0   # trailing stop only arms once peak >= 2x
@@ -113,9 +122,14 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 db.set_call_skip_reason(call_id, "security_warning")
                 return
 
-            max_entry_mcap = float(os.getenv("MAX_ENTRY_MCAP", "50000"))
-            if actual_entry and actual_entry > max_entry_mcap:
-                print(f"[paper] {symbol} skipped — mcap ${actual_entry/1000:.0f}k too high (max ${max_entry_mcap/1000:.0f}k)")
+            channel_handle = (
+                token_data.get("channel_tag") or
+                token_data.get("channel_handle") or
+                ""
+            ).lstrip("@")
+            max_mcap = MCAP_LIMITS.get(channel_handle, DEFAULT_MCAP_LIMIT)
+            if actual_entry and actual_entry > max_mcap:
+                print(f"[paper] {symbol} skipped — mcap ${actual_entry/1000:.0f}k too high for {channel_handle or 'unknown'} (max ${max_mcap/1000:.0f}k)")
                 db.set_call_skip_reason(call_id, "mcap_too_high")
                 return
 

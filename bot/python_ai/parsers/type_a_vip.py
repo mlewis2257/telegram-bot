@@ -133,6 +133,7 @@ def parse(text: str) -> dict | None:
         vip_message_type = 'whale_alert'
     elif IS_VOLUME_ALERT_RE.search(text):
         vip_message_type = 'volume_alert'
+        print(f"[vip:volume_alert debug] text preview: {repr(text[:200])}")
     else:
         return None
 

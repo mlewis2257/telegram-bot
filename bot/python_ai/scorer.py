@@ -53,7 +53,13 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
 
     # ── Tier 1: always applied ─────────────────────────────────────────────
 
+    is_vip = (
+        row.get("channel_tag") == "solhousesignal_vip"
+        or row.get("handle") == "solhousesignal_vip"
+    )
+
     # security_flag — nearly all runners are "safe"
+    # VIP channel curates security itself so missing flag is neutral, not a penalty.
     sf = row.get("security_flag")
     if sf == "safe":
         score += 8
@@ -61,7 +67,7 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     elif sf == "warning":
         score -= 25
         reasons.append("security=warning-25")
-    elif sf == "unknown" or sf is None:
+    elif (sf == "unknown" or sf is None) and not is_vip:
         score -= 15
         reasons.append("security=unknown-15")
 
@@ -274,11 +280,16 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
         row.get("hodl_count"),
     ] if v is not None)
     if available_tier1 < 2:
-        score -= 25
-        reasons.append("low_data_confidence-25")
+        if is_vip:
+            score -= 5   # VIP: small penalty, on-chain data just not in message
+            reasons.append("low_data_confidence(vip)-5")
+        else:
+            score -= 25
+            reasons.append("low_data_confidence-25")
     elif available_tier1 < 4:
-        score -= 15
-        reasons.append("partial_data-15")
+        if not is_vip:   # VIP: partial data is normal, no penalty
+            score -= 15
+            reasons.append("partial_data-15")
 
     # ── Cross-channel confirmation — reduced (token already pumped by the time both call)
     if row.get("cross_channel_confirmed"):
