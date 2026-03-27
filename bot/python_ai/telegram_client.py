@@ -936,9 +936,6 @@ def run_listener() -> None:
 
             if score_result and score_result["label"] in ("alert", "strong_alert"):
                 await alert_bot.send_alert(score_result, extra)
-            elif score_result and score_result["label"] not in ("skip",):
-                # caution/watch — paper trade silently, no Telegram alert
-                asyncio.create_task(paper_trader.open_position(score_result, extra))
 
             if status == "milestone" and extra:
                 await alert_bot.send_milestone(**extra)

@@ -312,6 +312,13 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
         reasons.append("vip_tier=whale+10")
     # gamble / None → neutral (no adjustment)
 
+    # ── Channel floor scores ───────────────────────────────────────────────
+    channel = row.get("handle", "") or row.get("channel_tag", "")
+    if "solhousesignal_vip" in channel:
+        if score < 45:
+            score = 45
+            reasons.append("vip_channel_floor=45")
+
     return score, reasons
 
 
