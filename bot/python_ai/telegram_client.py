@@ -931,6 +931,10 @@ def run_listener() -> None:
             elif cfg["channel_type"] == "vip":
                 await asyncio.sleep(0.1)  # Give DB commit time to propagate before scoring
                 status, score_result, extra = handle_vip(msg, info["caller_id"], cfg["id"])
+                # Skip gamble_risk VIP signals — too many hard stops
+                if extra and extra.get("vip_tier") == "gamble_risk":
+                    print(f"[paper] {extra.get('symbol')} skipped — VIP gamble_risk tier")
+                    score_result = None
             else:
                 return
 
