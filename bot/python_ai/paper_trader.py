@@ -41,7 +41,7 @@ DEFAULT_MCAP_LIMIT = 75_000  # fallback for unknown channels
 
 TAKE_PROFIT_5X   = 5.0   # exit at 5x from entry
 TAKE_PROFIT_3X   = 3.0   # exit at 3x from entry
-TRAIL_PEAK_MIN   = 2.0   # trailing stop only arms once peak >= 2x
+TRAIL_PEAK_MIN   = 2.5   # trailing stop only arms once peak >= 2.5x
 HARD_STOP_PCT    = 0.50  # hard stop fires on 50% loss from entry
 MAX_HOURS        = 24    # time stop after 24 hours open
 
@@ -85,10 +85,14 @@ async def open_position(score_result: dict, token_data: dict) -> None:
     try:
         try:
             label = score_result.get("label")
-            if label == "strong_alert":
-                sol_in = SOL_STRONG_ALERT
+            channel = token_data.get("channel_tag") or token_data.get("channel_handle", "")
+
+            if "solearlytrending" in channel:
+                sol_in = SOL_ALERT  # always 0.5 SOL regardless of score
+            elif label == "strong_alert":
+                sol_in = SOL_STRONG_ALERT  # 1.0 SOL for other channels
             else:
-                sol_in = SOL_ALERT
+                sol_in = SOL_ALERT  # 0.5 SOL
 
             call_id  = score_result.get("call_id")
             msg_mcap = float(token_data.get("mcap_at_call") or 0)
@@ -159,7 +163,7 @@ def check_exits(
     Exit conditions checked in priority order:
       1. 5x take profit
       2. 3x take profit
-      3. Trailing stop  (peak >= 2x; tiered threshold: 25% / 20% / 15%)
+      3. Trailing stop  (peak >= 2.5x; tiered threshold: 25% / 30% / 35%)
       4. Hard stop      (down 50% from entry)
       5. Time stop      (open > 24 hours)
     """
@@ -186,21 +190,18 @@ def check_exits(
         return ExitResult(True, "3x_tp")
 
     # Trailing stop — tiered by how much the token has run.
-    # Base threshold tightens at each tier; tightens a further 5% once
-    # the token has ever peaked at 2x ("half secured").
+    # Only activates at 2.5x+ to avoid exiting on small early bounces.
     if peak_mcap > 0:
         peak_mult = peak_mcap / entry_mcap
-        if peak_mult >= TRAIL_PEAK_MIN:
-            if peak_mult >= 5.0:
-                trail_pct = 0.20
-            elif peak_mult >= 3.0:
-                trail_pct = 0.25
-            else:                       # peak >= 2x
-                trail_pct = 0.30
-            # half_secured: token has ever peaked at 2x (always True here
-            # since TRAIL_PEAK_MIN == 2.0, but explicit for future-proofing)
-            if peak_mult >= 2.0:
-                trail_pct -= 0.05
+        if peak_mult >= 5.0:
+            trail_pct = 0.35
+        elif peak_mult >= 3.0:
+            trail_pct = 0.30
+        elif peak_mult >= TRAIL_PEAK_MIN:   # >= 2.5x
+            trail_pct = 0.25
+        else:
+            trail_pct = None               # below 2.5x — let hard stop handle
+        if trail_pct is not None:
             drawdown = (peak_mcap - current_mcap) / peak_mcap
             if drawdown >= trail_pct:
                 return ExitResult(True, "trail_stop")

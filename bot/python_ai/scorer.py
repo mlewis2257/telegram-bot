@@ -57,6 +57,8 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
         row.get("channel_tag") == "solhousesignal_vip"
         or row.get("handle") == "solhousesignal_vip"
     )
+    channel = row.get("handle", "") or row.get("channel_tag", "")
+    is_realtime = "solearlytrending" in channel or "solwhaletrending" in channel
 
     # security_flag — nearly all runners are "safe"
     # VIP channel curates security itself so missing flag is neutral, not a penalty.
@@ -128,24 +130,35 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
             score -= 15
             reasons.append(f"liq=${liq/1000:.0f}k-15")
 
-    # hodl_count — FLIPPED: high holders = rug indicator
+    # hodl_count — high holders = rug indicator on realtime channels
     hodl = row.get("hodl_count")
     if hodl is not None:
         hodl = int(hodl)
-        if 200 <= hodl <= 450:
-            score += 8
-            reasons.append(f"holders={hodl}+8")
-        elif hodl < 200 and hodl >= 100:
-            score += 4
-            reasons.append(f"holders={hodl}+4")
-        elif hodl <= 600:
-            pass  # neutral band (450-600)
-        elif hodl > 600:
-            score -= 8
-            reasons.append(f"holders={hodl}-8")
+        if is_realtime:
+            # Tighter thresholds: early-stage tokens have very few holders
+            if hodl < 200:
+                score += 8
+                reasons.append(f"holders={hodl}+8")
+            elif hodl <= 300:
+                score += 4
+                reasons.append(f"holders={hodl}+4")
+            elif hodl <= 400:
+                pass  # neutral band
+            else:
+                score -= 8
+                reasons.append(f"holders={hodl}-8")
         else:
-            score -= 8
-            reasons.append(f"holders={hodl}-8")
+            if 200 <= hodl <= 450:
+                score += 8
+                reasons.append(f"holders={hodl}+8")
+            elif hodl < 200 and hodl >= 100:
+                score += 4
+                reasons.append(f"holders={hodl}+4")
+            elif hodl <= 600:
+                pass  # neutral band (450-600)
+            else:
+                score -= 8
+                reasons.append(f"holders={hodl}-8")
 
     # mcap_at_call — strongest runner signal, strengthened
     mcap_entry = row.get("mcap_at_call")
@@ -236,28 +249,45 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
 
     # ── Tier 3: sparse fields ─────────────────────────────────────────────
 
-    # dev_tokens_made — COMPLETELY FLIPPED: high dev_tokens = experienced deployer = runner
-    # No hard caps — they were filtering out the best performers (avg runner has 5,972)
+    # dev_tokens_made — interpretation flips by channel type
+    # Realtime (solearlytrending/solwhaletrending): high dev_tokens = serial rugger
+    # Other channels: high dev_tokens = experienced deployer = runner signal
     dtm = row.get("dev_tokens_made")
     if dtm is not None:
         dtm = int(dtm)
-        if dtm < 5:
-            pass  # neutral — low dev_tokens = inexperienced, not a runner signal
-        elif dtm <= 50:
-            score += 5
-            reasons.append(f"dev_tokens={dtm}+5")
-        elif dtm <= 200:
-            score += 8
-            reasons.append(f"dev_tokens={dtm}+8")
-        elif dtm <= 1000:
-            score += 10
-            reasons.append(f"dev_tokens={dtm}+10")
-        elif dtm <= 5000:
-            score += 12
-            reasons.append(f"dev_tokens={dtm}+12")
+        if is_realtime:
+            if dtm < 5:
+                score += 8
+                reasons.append(f"dev_tokens={dtm}+8")
+            elif dtm <= 20:
+                score += 4
+                reasons.append(f"dev_tokens={dtm}+4")
+            elif dtm <= 50:
+                pass  # neutral band
+            elif dtm <= 200:
+                score -= 10
+                reasons.append(f"dev_tokens={dtm}-10")
+            else:
+                score -= 20
+                reasons.append(f"dev_tokens={dtm}-20")
         else:
-            score += 8
-            reasons.append(f"dev_tokens={dtm}+8")
+            if dtm < 5:
+                pass  # neutral — low dev_tokens = inexperienced, not a runner signal
+            elif dtm <= 50:
+                score += 5
+                reasons.append(f"dev_tokens={dtm}+5")
+            elif dtm <= 200:
+                score += 8
+                reasons.append(f"dev_tokens={dtm}+8")
+            elif dtm <= 1000:
+                score += 10
+                reasons.append(f"dev_tokens={dtm}+10")
+            elif dtm <= 5000:
+                score += 12
+                reasons.append(f"dev_tokens={dtm}+12")
+            else:
+                score += 8
+                reasons.append(f"dev_tokens={dtm}+8")
 
     # dev_best_mcap — unchanged
     dbm = row.get("dev_best_mcap")
@@ -313,7 +343,6 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     # gamble / None → neutral (no adjustment)
 
     # ── Channel floor scores ───────────────────────────────────────────────
-    channel = row.get("handle", "") or row.get("channel_tag", "")
     if "solhousesignal_vip" in channel:
         if score < 45:
             score = 45

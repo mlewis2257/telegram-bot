@@ -654,6 +654,8 @@ def handle_vip(message, caller_id: int, channel_id: int | None) -> tuple:
             channel_id=channel_id,
             mcap_at_call=parsed.get("mcap_at_call"),
             narrative_tags=tags.tag_token(symbol or "", parsed.get("token_name") or "", text),
+            vip_tier=parsed.get("vip_tier"),
+            vip_message_type=parsed.get("vip_message_type"),
         )
 
         if call_id is None:

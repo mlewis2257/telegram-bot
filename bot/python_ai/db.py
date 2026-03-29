@@ -155,6 +155,8 @@ def insert_call(
     channel_id: int = None,
     mcap_at_call: float = None,
     narrative_tags: list = None,
+    vip_tier: str = None,
+    vip_message_type: str = None,
 ) -> int | None:
     """
     Insert a call event. Returns the new call id, or None if the message
@@ -167,8 +169,9 @@ def insert_call(
             INSERT INTO calls
                 (caller_id, token_id, call_type, source_platform,
                  source_message_id, raw_message, created_at,
-                 message_type, channel_id, mcap_at_call, narrative_tags)
-            VALUES (%s, %s, 'reactive', %s, %s, %s, %s, %s, %s, %s, %s)
+                 message_type, channel_id, mcap_at_call, narrative_tags,
+                 vip_tier, vip_message_type)
+            VALUES (%s, %s, 'reactive', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (source_platform, source_message_id)
             WHERE source_message_id IS NOT NULL
             DO NOTHING
@@ -185,6 +188,8 @@ def insert_call(
                 channel_id,
                 mcap_at_call,
                 narrative_tags or [],
+                vip_tier,
+                vip_message_type,
             ),
         )
         conn.commit()
