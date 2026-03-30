@@ -821,6 +821,7 @@ def normalize_chat_id(chat_id: int) -> int:
 
 def run_listener() -> None:
     channels = db.get_active_channels()
+    channels = [c for c in channels if c["handle"] != "solearlytrending"]
     if not channels:
         print("[listener] No active channels found in database. Exiting.")
         return
