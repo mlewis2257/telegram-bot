@@ -419,6 +419,9 @@ def parse(text: str) -> dict | None:
         stated_multiplier = v if _is_valid_multiplier(v) else None  # NULL on parse error
 
     # ── Computed (accurate) multiplier ──
+    # mcap_at_result is the RIGHT side of the arrow (current price when channel posted).
+    # The bot buys at mcap_at_result, not the original LEFT-side entry.
+    # peak_multiplier measures gain from the original entry to current, for display.
     peak_multiplier = None
     if mcap_at_call and mcap_at_result and mcap_at_call > 0:
         peak_multiplier = round(mcap_at_result / mcap_at_call, 2)
@@ -427,8 +430,9 @@ def parse(text: str) -> dict | None:
         "mint":             mint,
         "symbol":           symbol,
         "name":             name,
-        "mcap_at_call":     mcap_at_call,
+        "mcap_at_call":     mcap_at_result,   # RIGHT side = actual buy price
         "mcap_at_result":   mcap_at_result,
+        "original_mcap":    mcap_at_call,     # LEFT side = original signal entry
         "stated_multiplier": stated_multiplier,
         "peak_multiplier":  peak_multiplier,
         "is_lagging":       True,
