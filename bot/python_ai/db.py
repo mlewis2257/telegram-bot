@@ -917,6 +917,7 @@ def update_peak_multiplier(call_id: int, new_peak: float) -> bool:
             """
             UPDATE outcomes SET
                 peak_multiplier = %s,
+                peak_reached_at = NOW(),
                 updated_at      = NOW()
             WHERE call_id = %s
               AND (peak_multiplier IS NULL OR peak_multiplier < %s)

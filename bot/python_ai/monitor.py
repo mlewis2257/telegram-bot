@@ -39,8 +39,8 @@ import wallet as _wallet
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-PASS_INTERVAL        = 60     # seconds between full passes
-INTER_CALL_SLEEP     = 0.3    # seconds between each DexScreener call
+PASS_INTERVAL        = 20     # target; actual interval depends on watchlist size
+INTER_CALL_SLEEP     = 0.5    # seconds between each DexScreener call
 RATE_LIMIT_SLEEP     = 30     # seconds to back off on 429 responses
 MAX_WATCHLIST_SPREAD = 50     # above this, spread calls evenly across the window
 MIN_SCORE            = 55     # minimum conviction_score to include (caution+)
