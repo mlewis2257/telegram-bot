@@ -1,6 +1,7 @@
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -953,11 +954,18 @@ def update_call_conviction_score(call_id: int, score: float) -> None:
 
 # ── Paper trading helpers ──────────────────────────────────────────────────────
 
-def open_paper_position(call_id: int, entry_price: float, sol_in: float) -> None:
+def open_paper_position(
+    call_id: int,
+    entry_price: float,
+    sol_in: float,
+    entry_time: datetime | None = None,
+) -> None:
     """
     Open a simulated paper trade position for a scored call.
     Resolves token_id via subquery. No-ops silently if a simulation
     position already exists for this call (prevents duplicates).
+    entry_time should be captured by the caller before any async operations
+    to avoid exit_time < entry_time race conditions.
     """
     conn = get_conn()
     with conn.cursor() as cur:
@@ -965,7 +973,7 @@ def open_paper_position(call_id: int, entry_price: float, sol_in: float) -> None
             """
             INSERT INTO trading_positions
                 (token_id, call_id, is_simulation, entry_price, sol_in, entry_time, status)
-            SELECT c.token_id, %s, TRUE, %s, %s, NOW(), 'open'
+            SELECT c.token_id, %s, TRUE, %s, %s, %s, 'open'
             FROM calls c
             WHERE c.id = %s
               AND NOT EXISTS (
@@ -973,7 +981,7 @@ def open_paper_position(call_id: int, entry_price: float, sol_in: float) -> None
                 WHERE call_id = %s AND is_simulation = TRUE
               )
             """,
-            (call_id, entry_price, sol_in, call_id, call_id),
+            (call_id, entry_price, sol_in, entry_time or datetime.now(timezone.utc), call_id, call_id),
         )
         conn.commit()
 

@@ -73,6 +73,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
     entry_price = mcap_at_call from token_data.
     Never raises — a paper trade failure must never affect alert delivery.
     """
+    position_entry_time = datetime.now(timezone.utc)  # capture before any async delays
     symbol = token_data.get("symbol", "?")
     mint   = token_data.get("mint_address")
 
@@ -137,7 +138,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 db.set_call_skip_reason(call_id, "mcap_too_high")
                 return
 
-            db.open_paper_position(call_id, entry_price, sol_in)
+            db.open_paper_position(call_id, entry_price, sol_in, entry_time=position_entry_time)
             print(f"[paper] opened {symbol}  call_id={call_id}  {sol_in} SOL @ {entry_price:.0f}")
 
         except Exception as e:
