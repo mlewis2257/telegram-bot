@@ -32,7 +32,7 @@ SOL_ALERT        = 0.5   # simulated SOL for alert (70–84)
 
 # ── Per-channel mcap entry limits ──────────────────────────────────────────────
 MCAP_LIMITS = {
-    'solhousesignal_vip': 200_000,
+    'solhousesignal_vip': 350_000,
     'solwhaletrending':   100_000,
     'solearlytrending':    75_000,
     'solhousesignal':      50_000,

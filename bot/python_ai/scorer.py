@@ -59,18 +59,18 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     )
     channel = row.get("handle", "") or row.get("channel_tag", "")
 
-    # security_flag — nearly all runners are "safe"
+    # security_flag — warning/unknown tokens still produce large runners
     # VIP channel curates security itself so missing flag is neutral, not a penalty.
     sf = row.get("security_flag")
     if sf == "safe":
         score += 8
         reasons.append("security=safe+8")
     elif sf == "warning":
-        score -= 25
-        reasons.append("security=warning-25")
+        score -= 5
+        reasons.append("security=warning-5")
     elif (sf == "unknown" or sf is None) and not is_vip:
-        score -= 15
-        reasons.append("security=unknown-15")
+        score -= 5
+        reasons.append("security=unknown-5")
 
     # token_age_minutes — very early entry is opportunity, not risk
     age = row.get("token_age_minutes")
@@ -109,22 +109,22 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
             score -= 20
             reasons.append(f"bundles_remaining={bpr:.1f}%-20")
 
-    # liq_at_detection — FLIPPED: high liq = rug indicator
+    # liq_at_detection — $20k-$26k is the runner sweet spot
     liq = row.get("liq_at_detection")
     if liq is not None:
         liq = float(liq)
-        if 13_000 <= liq <= 25_000:
-            score += 12
-            reasons.append(f"liq=${liq/1000:.0f}k+12")
-        elif liq <= 50_000:
+        if 20_000 <= liq <= 26_000:
+            score += 15
+            reasons.append(f"liq=${liq/1000:.0f}k+15(sweet_spot)")
+        elif 15_000 <= liq < 20_000:
+            score += 8
+            reasons.append(f"liq=${liq/1000:.0f}k+8")
+        elif 26_000 < liq <= 35_000:
             score += 5
             reasons.append(f"liq=${liq/1000:.0f}k+5")
-        elif liq >= 8_000:
-            score += 3
-            reasons.append(f"liq=${liq/1000:.0f}k+3")
-        elif liq > 50_000:
-            score -= 15
-            reasons.append(f"liq=${liq/1000:.0f}k-15")
+        elif liq > 35_000:
+            score -= 5
+            reasons.append(f"liq=${liq/1000:.0f}k-5")
         else:
             score -= 15
             reasons.append(f"liq=${liq/1000:.0f}k-15")

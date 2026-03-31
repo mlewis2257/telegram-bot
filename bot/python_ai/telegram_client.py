@@ -934,22 +934,21 @@ def run_listener() -> None:
                 status, score_result, extra = handle_vip(msg, info["caller_id"], cfg["id"])
                 # VIP tier-specific thresholds
                 if score_result and extra:
-                    score      = score_result.get("score", 0)
-                    vip_tier   = extra.get("vip_tier")
+                    score       = score_result.get("score", 0)
+                    vip_tier    = extra.get("vip_tier")
                     channel_tag = extra.get("channel_tag", "") or ""
                     if "solhousesignal_vip" in channel_tag:
-                        if vip_tier == "safe" and score >= 55:
-                            # Safe VIP signals trade at 55+; no Telegram alert
+                        if vip_tier == "safe":
+                            # Trade ALL safe tier VIP signals at floor score
                             asyncio.create_task(paper_trader.open_position(score_result, extra))
                             score_result = None
-                        elif vip_tier == "gamble" and score >= 65:
-                            # Gamble VIP signals trade at 65+; no Telegram alert
+                        elif vip_tier == "gamble" and score >= 55:
+                            # Gamble VIP signals trade at 55+
                             asyncio.create_task(paper_trader.open_position(score_result, extra))
                             score_result = None
-                        elif vip_tier in ("gamble_risk", "high_risk"):
+                        elif vip_tier in ("gamble_risk", "high_risk", None):
                             print(f"[paper] {extra.get('symbol')} skipped — VIP {vip_tier} tier")
                             score_result = None
-                        # score >= 70 falls through to standard send_alert
             else:
                 return
 
