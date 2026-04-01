@@ -41,7 +41,7 @@ DEFAULT_MCAP_LIMIT = 75_000  # fallback for unknown channels
 
 TAKE_PROFIT_5X   = 5.0   # exit at 5x from entry
 TAKE_PROFIT_3X   = 3.0   # exit at 3x from entry
-TRAIL_PEAK_MIN   = 2.5   # trailing stop only arms once peak >= 2.5x
+TRAIL_PEAK_MIN   = 2.0   # trailing stop only arms once peak >= 2.0x
 HARD_STOP_PCT    = 0.50  # hard stop fires on 50% loss from entry
 MAX_HOURS        = 24    # time stop after 24 hours open
 
@@ -50,6 +50,10 @@ MAX_HOURS        = 24    # time stop after 24 hours open
 
 _pending_mints: set[str] = set()
 _pending_lock = asyncio.Lock()
+
+# ── Entry volume store (call_id → volume_h1 at open) ──────────────────────────
+_entry_volumes: dict[int, float] = {}
+_position_mints: dict[int, str]  = {}   # call_id → mint (for volume re-fetch in check_exits)
 
 
 # ── Result type ───────────────────────────────────────────────────────────────
@@ -108,11 +112,14 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     return
 
             actual_entry = None
+            entry_volume = None
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
                 try:
                     market = data_fetcher.fetch_token_price(mint)
                     if market and market.get("mcap"):
                         actual_entry = float(market["mcap"])
+                    if market and market.get("volume_h1"):
+                        entry_volume = float(market["volume_h1"])
                 except Exception as e:
                     print(f"[paper] price fetch failed for {symbol}: {e}")
             if actual_entry is None and mint:
@@ -139,6 +146,10 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 return
 
             db.open_paper_position(call_id, entry_price, sol_in, entry_time=position_entry_time)
+            if entry_volume:
+                _entry_volumes[call_id] = entry_volume
+            if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
+                _position_mints[call_id] = mint
             print(f"[paper] opened {symbol}  call_id={call_id}  {sol_in} SOL @ {entry_price:.0f}")
 
         except Exception as e:
@@ -191,21 +202,42 @@ def check_exits(
         return ExitResult(True, "3x_tp")
 
     # Trailing stop — tiered by how much the token has run.
-    # Only activates at 2.5x+ to avoid exiting on small early bounces.
+    # Only activates at 2.0x+ to avoid exiting on small early bounces.
     if peak_mcap > 0:
         peak_mult = peak_mcap / entry_mcap
-        if peak_mult >= 5.0:
-            trail_pct = 0.35
+        if peak_mult >= 10.0:
+            trail_pct = 0.20               # lock in massive gains
+        elif peak_mult >= 5.0:
+            trail_pct = 0.25
         elif peak_mult >= 3.0:
             trail_pct = 0.30
-        elif peak_mult >= TRAIL_PEAK_MIN:   # >= 2.5x
-            trail_pct = 0.25
+        elif peak_mult >= TRAIL_PEAK_MIN:  # >= 2.0x
+            trail_pct = 0.40               # wide — let small moves breathe
         else:
-            trail_pct = None               # below 2.5x — let hard stop handle
+            trail_pct = None               # below 2.0x — let hard stop handle
         if trail_pct is not None:
             drawdown = (peak_mcap - current_mcap) / peak_mcap
             if drawdown >= trail_pct:
-                return ExitResult(True, "trail_stop")
+                # Volume confirmation — only hold if volume still healthy AND below 5x
+                if peak_mult < 5.0:
+                    entry_vol = _entry_volumes.get(call_id)
+                    mint      = _position_mints.get(call_id)
+                    if entry_vol and entry_vol > 0 and mint:
+                        try:
+                            current_market = data_fetcher.fetch_token_price(mint)
+                            current_vol    = (current_market or {}).get("volume_h1") or 0
+                            vol_ratio      = float(current_vol) / entry_vol if current_vol else 0.0
+                            if vol_ratio > 0.4:
+                                pass  # volume still healthy — hold through pullback
+                            else:
+                                return ExitResult(True, "trail_stop")
+                        except Exception:
+                            return ExitResult(True, "trail_stop")
+                    else:
+                        return ExitResult(True, "trail_stop")
+                else:
+                    # 5x+ — protect gains regardless of volume
+                    return ExitResult(True, "trail_stop")
 
     # Hard stop — down 50% from entry (tightened from 60%)
     if current_mult <= (1.0 - HARD_STOP_PCT):

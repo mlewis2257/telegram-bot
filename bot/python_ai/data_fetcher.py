@@ -114,9 +114,12 @@ def _fetch_dexscreener(mint: str) -> Optional[dict]:
 
     best = max(sol_pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
 
-    price_str = best.get("priceUsd")
-    liquidity = (best.get("liquidity") or {}).get("usd")
-    mcap      = best.get("marketCap")
+    price_str  = best.get("priceUsd")
+    liquidity  = (best.get("liquidity") or {}).get("usd")
+    mcap       = best.get("marketCap")
+    volume_h24 = (best.get("volume") or {}).get("h24")
+    volume_h6  = (best.get("volume") or {}).get("h6")
+    volume_h1  = (best.get("volume") or {}).get("h1")
 
     log.debug(f"[fetcher] DexScreener {mint[:8]}... price={price_str} mcap={mcap} liq={liquidity}")
 
@@ -127,6 +130,9 @@ def _fetch_dexscreener(mint: str) -> Optional[dict]:
         "name":          (best.get("baseToken") or {}).get("name"),
         "symbol":        (best.get("baseToken") or {}).get("symbol"),
         "dex_url":       best.get("url"),
+        "volume_h24":    volume_h24,
+        "volume_h6":     volume_h6,
+        "volume_h1":     volume_h1,
     }
 
 
@@ -335,6 +341,7 @@ def fetch_token_price(mint: str) -> Optional[dict]:
             "price_usd":     float(price_str) if price_str else None,
             "mcap":          best.get("marketCap"),
             "liquidity_usd": (best.get("liquidity") or {}).get("usd"),
+            "volume_h1":     (best.get("volume") or {}).get("h1"),
         }
 
     return None
