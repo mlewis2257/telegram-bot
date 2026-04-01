@@ -59,18 +59,18 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     )
     channel = row.get("handle", "") or row.get("channel_tag", "")
 
-    # security_flag — warning/unknown tokens still produce large runners
+    # security_flag — nearly all runners are "safe"
     # VIP channel curates security itself so missing flag is neutral, not a penalty.
     sf = row.get("security_flag")
     if sf == "safe":
         score += 8
         reasons.append("security=safe+8")
     elif sf == "warning":
-        score -= 5
-        reasons.append("security=warning-5")
+        score -= 25
+        reasons.append("security=warning-25")
     elif (sf == "unknown" or sf is None) and not is_vip:
-        score -= 5
-        reasons.append("security=unknown-5")
+        score -= 15
+        reasons.append("security=unknown-15")
 
     # token_age_minutes — very early entry is opportunity, not risk
     age = row.get("token_age_minutes")
