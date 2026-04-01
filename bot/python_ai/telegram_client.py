@@ -956,6 +956,10 @@ def run_listener() -> None:
 
             if score_result and score_result["label"] in ("alert", "strong_alert"):
                 await alert_bot.send_alert(score_result, extra)
+            elif score_result and extra and score_result.get("score", 0) >= 63:
+                channel_tag = (extra.get("channel_tag") or extra.get("channel_handle") or "")
+                if "solhousesignal" in channel_tag and "vip" not in channel_tag:
+                    asyncio.create_task(paper_trader.open_position(score_result, extra))
 
             if status == "milestone" and extra:
                 await alert_bot.send_milestone(**extra)
