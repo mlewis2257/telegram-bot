@@ -59,8 +59,9 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     )
     channel = row.get("handle", "") or row.get("channel_tag", "")
 
-    # security_flag — nearly all runners are "safe"
-    # VIP channel curates security itself so missing flag is neutral, not a penalty.
+    # security_flag
+    # unknown = scanner ran and flagged it — penalise regardless of channel.
+    # None    = scanner never ran (normal for VIP messages) — VIP gets small penalty only.
     sf = row.get("security_flag")
     if sf == "safe":
         score += 8
@@ -68,9 +69,15 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     elif sf == "warning":
         score -= 25
         reasons.append("security=warning-25")
-    elif (sf == "unknown" or sf is None) and not is_vip:
+    elif sf == "unknown":
         score -= 15
         reasons.append("security=unknown-15")
+    elif sf is None and not is_vip:
+        score -= 15
+        reasons.append("security=unknown-15")
+    elif sf is None and is_vip:
+        score -= 5
+        reasons.append("security=no_data(vip)-5")
 
     # token_age_minutes — very early entry is opportunity, not risk
     age = row.get("token_age_minutes")
@@ -282,8 +289,8 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
     ] if v is not None)
     if available_tier1 < 2:
         if is_vip:
-            score -= 5   # VIP: small penalty, on-chain data just not in message
-            reasons.append("low_data_confidence(vip)-5")
+            score -= 15  # VIP: zero on-chain data = unverifiable signal
+            reasons.append("low_data_confidence(vip)-15")
         else:
             score -= 25
             reasons.append("low_data_confidence-25")
