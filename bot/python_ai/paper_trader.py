@@ -16,6 +16,7 @@ close_position(call_id, current_mcap, reason)       -> None
 import asyncio
 import os
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -52,8 +53,10 @@ _pending_mints: set[str] = set()
 _pending_lock = asyncio.Lock()
 
 # ── Entry volume store (call_id → volume_h1 at open) ──────────────────────────
-_entry_volumes: dict[int, float] = {}
-_position_mints: dict[int, str]  = {}   # call_id → mint (for volume re-fetch in check_exits)
+_entry_volumes: dict[int, float]  = {}
+_position_mints: dict[int, str]   = {}   # call_id → mint (for volume re-fetch in check_exits)
+_last_vol_check: dict[int, float] = {}   # call_id → last volume check timestamp
+VOL_CHECK_INTERVAL = 60                  # seconds between volume checks per position
 
 
 # ── Result type ───────────────────────────────────────────────────────────────
@@ -231,20 +234,27 @@ def check_exits(
             if drawdown >= trail_pct:
                 # Volume confirmation — only hold if volume still healthy AND below 5x
                 if peak_mult < 5.0:
-                    entry_vol  = _entry_volumes.get(call_id)
-                    mint_addr  = mint or _position_mints.get(call_id)
+                    entry_vol = _entry_volumes.get(call_id)
+                    mint_addr = mint or _position_mints.get(call_id)
                     if entry_vol and entry_vol > 0 and mint_addr:
-                        try:
-                            current_market = data_fetcher.fetch_token_price(mint_addr)
-                            current_vol    = (current_market or {}).get("volume_h1") or 0
-                            vol_ratio      = float(current_vol) / entry_vol if current_vol else 0.0
-                            print(f"[paper] call_id={call_id} vol_ratio={vol_ratio:.2f} — {'holding' if vol_ratio > 0.4 else 'exiting'}")
-                            if vol_ratio > 0.4:
-                                pass  # volume still healthy — hold through pullback
-                            else:
-                                return ExitResult(True, "trail_stop")
-                        except Exception:
+                        now        = time.monotonic()
+                        last_check = _last_vol_check.get(call_id, 0)
+                        if now - last_check < VOL_CHECK_INTERVAL:
+                            # Too soon — apply trail stop on price alone this cycle
                             return ExitResult(True, "trail_stop")
+                        else:
+                            _last_vol_check[call_id] = now
+                            try:
+                                current_market = data_fetcher.fetch_token_price(mint_addr)
+                                current_vol    = (current_market or {}).get("volume_h1") or 0
+                                vol_ratio      = float(current_vol) / entry_vol if current_vol else 0.0
+                                print(f"[paper] {mint_addr[:8]} vol_ratio={vol_ratio:.2f} — {'holding' if vol_ratio > 0.4 else 'exiting'}")
+                                if vol_ratio > 0.4:
+                                    pass  # volume still healthy — hold through pullback
+                                else:
+                                    return ExitResult(True, "trail_stop")
+                            except Exception:
+                                return ExitResult(True, "trail_stop")
                     else:
                         return ExitResult(True, "trail_stop")
                 else:
