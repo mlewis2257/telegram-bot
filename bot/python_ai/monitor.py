@@ -296,7 +296,7 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
     # ── Paper trade exit check ────────────────────────────────────────────────
     if not dry_run:
         peak_mcap   = active_peak * mcap_at_call
-        exit_result = paper_trader.check_exits(call_id, current_mcap, peak_mcap, mcap_at_call)
+        exit_result = paper_trader.check_exits(call_id, current_mcap, peak_mcap, mcap_at_call, mint=mint)
         if exit_result.should_exit:
             paper_trader.close_position(call_id, current_mcap, exit_result.reason)
             print(f"  [paper] {symbol} closed — {exit_result.reason}")
@@ -441,7 +441,7 @@ async def _check_paper_exits() -> int:
             )
             peak_mcap = stored_peak * entry_price
 
-            exit_result = paper_trader.check_exits(call_id, current_mcap, peak_mcap, entry_price)
+            exit_result = paper_trader.check_exits(call_id, current_mcap, peak_mcap, entry_price, mint=mint)
             if exit_result.should_exit:
                 print(
                     f"[paper] checking exit: {symbol}"

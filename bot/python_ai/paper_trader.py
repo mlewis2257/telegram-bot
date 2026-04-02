@@ -175,6 +175,7 @@ def check_exits(
     current_mcap: float,
     peak_mcap: float,
     entry_mcap: float,
+    mint: str = None,
 ) -> ExitResult:
     """
     Check whether the open paper position for call_id should be exited.
@@ -230,13 +231,14 @@ def check_exits(
             if drawdown >= trail_pct:
                 # Volume confirmation — only hold if volume still healthy AND below 5x
                 if peak_mult < 5.0:
-                    entry_vol = _entry_volumes.get(call_id)
-                    mint      = _position_mints.get(call_id)
-                    if entry_vol and entry_vol > 0 and mint:
+                    entry_vol  = _entry_volumes.get(call_id)
+                    mint_addr  = mint or _position_mints.get(call_id)
+                    if entry_vol and entry_vol > 0 and mint_addr:
                         try:
-                            current_market = data_fetcher.fetch_token_price(mint)
+                            current_market = data_fetcher.fetch_token_price(mint_addr)
                             current_vol    = (current_market or {}).get("volume_h1") or 0
                             vol_ratio      = float(current_vol) / entry_vol if current_vol else 0.0
+                            print(f"[paper] call_id={call_id} vol_ratio={vol_ratio:.2f} — {'holding' if vol_ratio > 0.4 else 'exiting'}")
                             if vol_ratio > 0.4:
                                 pass  # volume still healthy — hold through pullback
                             else:
