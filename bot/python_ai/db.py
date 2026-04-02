@@ -959,6 +959,7 @@ def open_paper_position(
     entry_price: float,
     sol_in: float,
     entry_time: datetime | None = None,
+    entry_volume: float | None = None,
 ) -> None:
     """
     Open a simulated paper trade position for a scored call.
@@ -972,8 +973,9 @@ def open_paper_position(
         cur.execute(
             """
             INSERT INTO trading_positions
-                (token_id, call_id, is_simulation, entry_price, sol_in, entry_time, status)
-            SELECT c.token_id, %s, TRUE, %s, %s, %s, 'open'
+                (token_id, call_id, is_simulation, entry_price, sol_in, entry_time,
+                 entry_volume_h1, status)
+            SELECT c.token_id, %s, TRUE, %s, %s, %s, %s, 'open'
             FROM calls c
             WHERE c.id = %s
               AND NOT EXISTS (
@@ -981,9 +983,27 @@ def open_paper_position(
                 WHERE call_id = %s AND is_simulation = TRUE
               )
             """,
-            (call_id, entry_price, sol_in, entry_time or datetime.now(timezone.utc), call_id, call_id),
+            (call_id, entry_price, sol_in, entry_time or datetime.now(timezone.utc),
+             entry_volume, call_id, call_id),
         )
         conn.commit()
+
+
+def get_paper_position_entry_volume(call_id: int) -> float | None:
+    """Return the entry_volume_h1 stored when the paper position was opened."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT entry_volume_h1
+            FROM trading_positions
+            WHERE call_id = %s
+              AND is_simulation = TRUE
+            """,
+            (call_id,),
+        )
+        row = cur.fetchone()
+        return float(row[0]) if row and row[0] else None
 
 
 def get_open_paper_position(call_id: int) -> dict | None:

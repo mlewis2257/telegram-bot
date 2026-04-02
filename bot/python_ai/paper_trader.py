@@ -52,9 +52,8 @@ MAX_HOURS        = 24    # time stop after 24 hours open
 _pending_mints: set[str] = set()
 _pending_lock = asyncio.Lock()
 
-# ── Entry volume store (call_id → volume_h1 at open) ──────────────────────────
-_entry_volumes: dict[int, float]  = {}
-_position_mints: dict[int, str]   = {}   # call_id → mint (for volume re-fetch in check_exits)
+# ── Position mint store (call_id → mint, for volume re-fetch in check_exits) ──
+_position_mints: dict[int, str]   = {}
 _last_vol_check: dict[int, float] = {}   # call_id → last volume check timestamp
 VOL_CHECK_INTERVAL = 30                  # seconds between volume checks per position
 
@@ -158,9 +157,9 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     db.set_call_skip_reason(call_id, "no_data")
                     return
 
-            db.open_paper_position(call_id, entry_price, sol_in, entry_time=position_entry_time)
-            if entry_volume:
-                _entry_volumes[call_id] = entry_volume
+            db.open_paper_position(call_id, entry_price, sol_in,
+                                   entry_time=position_entry_time,
+                                   entry_volume=entry_volume)
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
                 _position_mints[call_id] = mint
             print(f"[paper] opened {symbol}  call_id={call_id}  {sol_in} SOL @ {entry_price:.0f}")
@@ -234,7 +233,7 @@ def check_exits(
             if drawdown >= trail_pct:
                 # Volume confirmation — only hold if volume still healthy AND below 5x
                 if peak_mult < 5.0:
-                    entry_vol = _entry_volumes.get(call_id)
+                    entry_vol = db.get_paper_position_entry_volume(call_id)
                     mint_addr = mint or _position_mints.get(call_id)
                     if entry_vol and entry_vol > 0 and mint_addr:
                         now        = time.monotonic()
