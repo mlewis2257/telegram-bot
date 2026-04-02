@@ -56,7 +56,7 @@ _pending_lock = asyncio.Lock()
 _entry_volumes: dict[int, float]  = {}
 _position_mints: dict[int, str]   = {}   # call_id → mint (for volume re-fetch in check_exits)
 _last_vol_check: dict[int, float] = {}   # call_id → last volume check timestamp
-VOL_CHECK_INTERVAL = 60                  # seconds between volume checks per position
+VOL_CHECK_INTERVAL = 30                  # seconds between volume checks per position
 
 
 # ── Result type ───────────────────────────────────────────────────────────────
