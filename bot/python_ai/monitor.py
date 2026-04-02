@@ -433,6 +433,12 @@ async def _check_paper_exits() -> int:
             current_mcap = float(market["mcap"])
             current_mult = current_mcap / entry_price
 
+            # Backfill entry_volume_h1 on first successful volume fetch
+            if market.get("volume_h1"):
+                existing_vol = db.get_paper_position_entry_volume(call_id)
+                if existing_vol is None:
+                    db.update_paper_position_entry_volume(call_id, float(market["volume_h1"]))
+
             peak_info   = db.get_call_peak_info(call_id)
             stored_peak = (
                 peak_info["peak_multiplier"]

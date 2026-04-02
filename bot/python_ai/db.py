@@ -1006,6 +1006,23 @@ def get_paper_position_entry_volume(call_id: int) -> float | None:
         return float(row[0]) if row and row[0] else None
 
 
+def update_paper_position_entry_volume(call_id: int, volume: float) -> None:
+    """Backfill entry_volume_h1 on first successful volume fetch."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE trading_positions
+            SET entry_volume_h1 = %s
+            WHERE call_id = %s
+              AND is_simulation = TRUE
+              AND entry_volume_h1 IS NULL
+            """,
+            (volume, call_id),
+        )
+        conn.commit()
+
+
 def get_open_paper_position(call_id: int) -> dict | None:
     """
     Return {entry_price, sol_in, entry_time} for the open simulation
