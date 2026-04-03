@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d solana_signals -v ON_ERROR_STOP=1 -f database/migrate_v3.sql)",
-      "Bash(python3 fix_missing_metadata.py)"
+      "Bash(python3 fix_missing_metadata.py)",
+      "Bash(ls -la /Users/sw33tlew5th/Documents/telegram-bot/*.py /Users/sw33tlew5th/Documents/telegram-bot/*.sh)",
+      "Bash(ls -la /Users/sw33tlew5th/Documents/telegram-bot/*.sh)",
+      "Bash(ls /Users/sw33tlew5th/Documents/telegram-bot/bot/python_ai/*.py)"
     ]
   }
 }

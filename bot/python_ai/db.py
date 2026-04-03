@@ -69,6 +69,7 @@ def get_active_channels():
     Each row is a dict: {id, handle, platform, channel_type, weight}
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
@@ -83,6 +84,7 @@ def get_active_channels():
 
 def get_channel_by_handle(handle: str) -> dict | None:
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             "SELECT id, handle, channel_type FROM channels WHERE handle = %s",
@@ -102,6 +104,7 @@ def upsert_caller(platform: str, handle: str, name: str) -> int:
     Updates the display name if the record already exists.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -125,6 +128,7 @@ def upsert_token(mint_address: str, symbol: str = None, name: str = None) -> int
     Symbol and name are stored if provided; existing values are not overwritten.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -164,6 +168,7 @@ def insert_call(
     was already logged (dedup on source_platform + source_message_id).
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -207,6 +212,7 @@ def get_call_id_by_token_name(token_name: str) -> int | None:
     lookups (e.g. linking whale alerts to any call for that token).
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -232,6 +238,7 @@ def get_call_id_by_token_and_channel(token_name: str, channel_id: int) -> int | 
     call for the same token.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -262,6 +269,7 @@ def update_call_market_data(
     Uses COALESCE so existing values are never overwritten with None.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -284,6 +292,7 @@ def insert_outcome(call_id: int) -> None:
     The backfill job will populate price_1h / price_4h / price_24h later.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -309,6 +318,7 @@ def update_outcome_peak(
     Only writes if the new computed multiplier exceeds the existing one.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -345,6 +355,7 @@ def get_token_supply_and_decimals(mint: str) -> tuple:
     Returns (None, None) if the token is not found or columns are NULL.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             "SELECT total_supply, decimals FROM tokens WHERE mint_address = %s",
@@ -362,6 +373,7 @@ def get_token_id_by_symbol(symbol: str) -> int | None:
     Used to link whale alerts to a known token.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -392,6 +404,7 @@ def insert_whale_alert(
     Returns the new row id.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -414,6 +427,7 @@ def update_token_dexscreener_paid(token_id: int) -> None:
     Only sets the timestamp on the first detection (COALESCE keeps original).
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -433,6 +447,7 @@ def update_token_boost(token_id: int, boost_count: int) -> None:
     Increment boost_count by the purchased amount and update last_boost_at.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -453,6 +468,7 @@ def backfill_whale_alert_call_ids(token_id: int, call_id: int) -> int:
     for the same token. Returns the number of rows updated.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -505,6 +521,7 @@ def upsert_token_realtime_metadata(
     (FALSE for UNKNOWN: synthetic mints, TRUE once a real mint is found).
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -594,6 +611,7 @@ def insert_channel_daily_stats(
     top_performers_db = Json(top_performers) if top_performers is not None else None
 
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -648,6 +666,7 @@ def update_outcome_from_lagging(
     - outcome_label      → always 'runner' for lagging calls (they only post wins)
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -688,6 +707,7 @@ def get_pending_backfill(interval_hours: int, limit: int = 50) -> list[dict]:
     col = {1: "backfilled_1h_at", 4: "backfilled_4h_at", 24: "backfilled_24h_at"}[interval_hours]
 
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -741,6 +761,7 @@ def update_outcome_interval(
         params.insert(-1, outcome_label)   # before call_id
 
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -777,6 +798,7 @@ def get_call_for_scoring(
     Returns None if the call_id doesn't exist.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -849,6 +871,7 @@ def get_call_for_scoring(
 def get_mint_by_call_id(call_id: int) -> str | None:
     """Return the mint_address for the token linked to a call, or None."""
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -871,6 +894,7 @@ def get_active_watchlist(min_score: int = 55, max_age_hours: int = 24) -> list[d
     Ordered by conviction_score DESC so highest-conviction tokens are checked first.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -905,6 +929,7 @@ def get_active_watchlist(min_score: int = 55, max_age_hours: int = 24) -> list[d
 def get_call_peak_info(call_id: int) -> dict | None:
     """Return {peak_multiplier, mcap_at_call} for sanity-checking multiplier updates."""
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -931,6 +956,7 @@ def update_peak_multiplier(call_id: int, new_peak: float) -> bool:
     False if the stored value was already equal or higher.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -962,6 +988,7 @@ def update_peak_multiplier(call_id: int, new_peak: float) -> bool:
 def update_call_conviction_score(call_id: int, score: float) -> None:
     """Write the scorer output back to calls.conviction_score."""
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE calls SET conviction_score = %s WHERE id = %s",
@@ -987,6 +1014,7 @@ def open_paper_position(
     to avoid exit_time < entry_time race conditions.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1010,6 +1038,7 @@ def open_paper_position(
 def get_paper_position_entry_volume(call_id: int) -> float | None:
     """Return the entry_volume_h1 stored when the paper position was opened."""
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1027,6 +1056,7 @@ def get_paper_position_entry_volume(call_id: int) -> float | None:
 def update_paper_position_entry_volume(call_id: int, volume: float) -> None:
     """Backfill entry_volume_h1 on first successful volume fetch."""
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1047,6 +1077,7 @@ def get_open_paper_position(call_id: int) -> dict | None:
     position on this call, or None if no open position exists.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1072,6 +1103,7 @@ def close_paper_position(
 ) -> None:
     """Close an open simulation position with exit data."""
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1096,6 +1128,7 @@ def get_paper_pnl_summary() -> dict:
     plus open count and exit breakdown by reason.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         # Aggregate stats
         cur.execute(
@@ -1154,6 +1187,7 @@ def get_open_paper_positions() -> list[dict]:
     for use in the paper trading report.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1191,6 +1225,7 @@ def open_live_position(
     No-ops silently if a live position already exists for this call.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1217,6 +1252,7 @@ def get_open_live_position(call_id: int) -> dict | None:
     Includes mint_address and symbol for use in close_live_position.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1247,6 +1283,7 @@ def get_open_live_position(call_id: int) -> dict | None:
 def has_open_live_position_for_mint(mint_address: str) -> bool:
     """Check if ANY open live position exists for this mint address."""
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1266,6 +1303,7 @@ def has_open_live_position_for_mint(mint_address: str) -> bool:
 def has_open_paper_position_for_mint(mint: str) -> bool:
     """Check if ANY open paper position exists for this mint address."""
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1285,6 +1323,7 @@ def has_open_paper_position_for_mint(mint: str) -> bool:
 def get_open_live_positions() -> list[dict]:
     """Return all open live positions with symbol and mint for reporting."""
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1311,6 +1350,7 @@ def close_live_position_db(
 ) -> None:
     """Update a live position to closed with exit data."""
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1333,6 +1373,7 @@ def close_live_position_db(
 def get_live_positions_count() -> int:
     """Count of currently open live positions."""
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             "SELECT COUNT(*) FROM trading_positions"
@@ -1347,6 +1388,7 @@ def get_today_live_losses() -> float:
     Returns a positive number representing total SOL lost.
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1364,6 +1406,7 @@ def get_today_live_losses() -> float:
 def get_live_pnl_summary() -> dict:
     """Aggregate P&L stats for all closed live positions."""
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1418,6 +1461,7 @@ def get_live_pnl_summary() -> dict:
 def get_daily_signal_summary() -> list[dict]:
     """Count today's calls grouped by score label."""
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1441,6 +1485,7 @@ def get_daily_signal_summary() -> list[dict]:
 def _daily_position_summary(is_simulation: bool) -> dict:
     """Shared query logic for paper and live daily summaries."""
     conn = get_conn()
+    safe_rollback()
     sim = is_simulation
     with conn.cursor() as cur:
         cur.execute(
@@ -1529,6 +1574,7 @@ def get_daily_live_summary() -> dict:
 def get_running_totals() -> dict:
     """All-time totals for paper and live trading."""
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1578,6 +1624,7 @@ def get_hourly_performance(since=None) -> list:
     Optionally filtered to rows with exit_time >= since (a datetime).
     """
     conn = get_conn()
+    safe_rollback()
     with conn.cursor() as cur:
         date_filter = ""
         params: list = [True]
@@ -1627,6 +1674,7 @@ def set_call_skip_reason(call_id: int, reason: str) -> None:
         return
     try:
         conn = get_conn()
+        safe_rollback()
         with conn.cursor() as cur:
             cur.execute(
                 """
