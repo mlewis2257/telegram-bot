@@ -220,9 +220,9 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
         result["skipped"] = True
         return result
 
-    # Sanity check — mcap can't drop 90%+ in one cycle
-    if mcap_at_call > 0 and current_mcap < mcap_at_call * 0.10:
-        print(f"[monitor] {symbol_pad} suspicious mcap ${current_mcap/1000:.0f}k — skipping")
+    # Sanity check — skip only if mcap is essentially phantom data (< 2% of entry)
+    if mcap_at_call > 0 and current_mcap < mcap_at_call * 0.02:
+        print(f"[monitor] {symbol_pad} suspicious mcap ${current_mcap:,.0f} vs entry ${mcap_at_call:,.0f} — skipping")
         _record_dex_failure(symbol)
         result["skipped"] = True
         return result
