@@ -6,6 +6,7 @@ from DexScreener. Results are cached for 60 seconds.
 """
 
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -18,6 +19,8 @@ log = logging.getLogger(__name__)
 
 DEXSCREENER_URL        = "https://api.dexscreener.com/latest/dex/tokens"
 DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
+JUPITER_PRICE_URL      = "https://price.jup.ag/v6/price"
+SOLANA_RPC_URL         = os.getenv("SOLANA_RPC_URL", "")
 
 REQUEST_TIMEOUT    = 10       # seconds per request
 MAX_RETRIES        = 3
@@ -288,17 +291,10 @@ def fetch_metadata_only(mint: str) -> Optional[dict]:
     return result
 
 
-def fetch_token_price(mint: str) -> Optional[dict]:
+def _try_dexscreener_price(mint: str) -> Optional[dict]:
     """
-    Lightweight DexScreener price fetch for the backfill job.
-
-    Unlike fetch_token_data() this bypasses the 60-second cache so the
-    backfill always gets a fresh snapshot. Retries up to 3 times with
-    a 2-second backoff. On HTTP 429 sleeps 30s then retries once more.
-
-    Returns:
-        {"price_usd": float|None, "mcap": float|None, "liquidity_usd": float|None}
-        or None if the token is not found on DexScreener.
+    Lightweight DexScreener price fetch. Bypasses cache.
+    Returns result dict or None on any failure.
     """
     url = f"{DEXSCREENER_URL}/{mint}"
 
@@ -345,3 +341,91 @@ def fetch_token_price(mint: str) -> Optional[dict]:
         }
 
     return None
+
+
+def _fetch_token_supply_helius(mint: str) -> tuple:
+    """
+    Fetch token supply and decimals from Helius RPC via getTokenSupply.
+    Returns (amount_raw, decimals) or (None, None) on any failure.
+    """
+    if not SOLANA_RPC_URL:
+        return None, None
+    try:
+        resp = requests.post(
+            SOLANA_RPC_URL,
+            json={
+                "jsonrpc": "2.0",
+                "id":      1,
+                "method":  "getTokenSupply",
+                "params":  [mint],
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return None, None
+        data  = resp.json()
+        value = (data.get("result") or {}).get("value") or {}
+        amount   = value.get("amount")
+        decimals = value.get("decimals")
+        if amount is None or decimals is None:
+            return None, None
+        return int(amount), int(decimals)
+    except Exception as e:
+        log.warning(f"[fetcher] Helius supply fetch failed for {mint[:8]}...: {e}")
+        return None, None
+
+
+def _fetch_jupiter_price(mint: str) -> Optional[dict]:
+    """
+    Fallback price fetch from Jupiter Price API when DexScreener is unavailable.
+    Attempts to compute mcap via Helius RPC getTokenSupply.
+    """
+    try:
+        resp = requests.get(
+            JUPITER_PRICE_URL,
+            params={"ids": mint},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return None
+        data       = resp.json()
+        price_data = (data.get("data") or {}).get(mint)
+        if not price_data:
+            return None
+        price = float(price_data.get("price") or 0)
+        if not price:
+            return None
+
+        mcap = None
+        supply, decimals = _fetch_token_supply_helius(mint)
+        if supply and decimals is not None:
+            mcap = price * (supply / (10 ** decimals))
+            log.debug(f"[fetcher] Jupiter+Helius mcap={mcap:.0f} for {mint[:8]}...")
+
+        return {
+            "price_usd":     price,
+            "mcap":          mcap,
+            "liquidity_usd": None,
+            "volume_h1":     None,
+            "source":        "jupiter+helius",
+        }
+    except Exception as e:
+        log.warning(f"[fetcher] Jupiter price fetch failed for {mint[:8]}...: {e}")
+        return None
+
+
+def fetch_token_price(mint: str) -> Optional[dict]:
+    """
+    Lightweight price fetch for monitor/backfill. Bypasses cache.
+    Tries DexScreener first; falls back to Jupiter + Helius on failure.
+
+    Returns:
+        {"price_usd", "mcap", "liquidity_usd", "volume_h1"}
+        or None if all sources fail.
+    """
+    result = _try_dexscreener_price(mint)
+    if result and result.get("mcap"):
+        return result
+
+    log.warning(f"[fetcher] DexScreener failed, trying Jupiter for {mint[:8]}...")
+    return _fetch_jupiter_price(mint)

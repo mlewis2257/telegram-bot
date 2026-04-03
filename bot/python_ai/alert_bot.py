@@ -534,3 +534,16 @@ async def send_slippage_skip_alert(
     except Exception as e:
         print(f"[alert_bot] slippage skip alert failed: {e}")
         return False
+
+
+async def send_system_alert(message: str) -> None:
+    """Send system status alert to Telegram. Never raises."""
+    try:
+        await _get_bot().send_message(
+            chat_id=_chat_id(),
+            text=f"🤖 <b>SYSTEM ALERT</b>\n\n{message}",
+            parse_mode=ParseMode.HTML,
+        )
+        print("[alert_bot] system alert sent")
+    except Exception as e:
+        print(f"[alert_bot] system alert failed: {e}")

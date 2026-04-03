@@ -25,6 +25,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -61,6 +62,41 @@ PEAK_MAX_MULT    = 100.0  # above this, treat as data error and skip
 
 _stale_checks:  dict[int, int] = {}  # call_id -> consecutive zero-balance count
 STALE_THRESHOLD = 3
+
+# ── DexScreener circuit breaker ────────────────────────────────────────────────
+
+_dex_failures: list[float] = []
+DEX_FAILURE_WINDOW    = 60   # seconds
+DEX_FAILURE_THRESHOLD = 5    # consecutive failures before circuit opens
+_dex_circuit_open     = False
+
+
+def _record_dex_failure(symbol: str = "") -> None:
+    global _dex_circuit_open
+    now = time.monotonic()
+    _dex_failures.append(now)
+    recent = [t for t in _dex_failures if now - t < DEX_FAILURE_WINDOW]
+    _dex_failures[:] = recent
+
+    if len(recent) >= DEX_FAILURE_THRESHOLD and not _dex_circuit_open:
+        _dex_circuit_open = True
+        print("[monitor] DexScreener outage — circuit breaker OPEN")
+        asyncio.create_task(alert_bot.send_system_alert(
+            "DexScreener outage detected!\n"
+            "All buys and exits PAUSED until connection restored."
+        ))
+
+
+def _record_dex_success() -> None:
+    global _dex_circuit_open
+    if _dex_circuit_open:
+        _dex_circuit_open = False
+        _dex_failures.clear()
+        print("[monitor] DexScreener recovered — circuit breaker CLOSED")
+        asyncio.create_task(alert_bot.send_system_alert(
+            "DexScreener connection restored.\n"
+            "Bot resuming normal operation."
+        ))
 
 # ── Alert dedup state — persisted across restarts ─────────────────────────────
 # Tracks which alert keys have already been sent per call_id.
@@ -173,10 +209,25 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
 
     market = data_fetcher.fetch_token_price(mint)
     if not market or not market.get("mcap"):
+        _record_dex_failure(symbol)
         result["skipped"] = True
         return result
 
     current_mcap = float(market["mcap"])
+
+    if current_mcap <= 0:
+        _record_dex_failure(symbol)
+        result["skipped"] = True
+        return result
+
+    # Sanity check — mcap can't drop 90%+ in one cycle
+    if mcap_at_call > 0 and current_mcap < mcap_at_call * 0.10:
+        print(f"[monitor] {symbol_pad} suspicious mcap ${current_mcap/1000:.0f}k — skipping")
+        _record_dex_failure(symbol)
+        result["skipped"] = True
+        return result
+
+    _record_dex_success()
     current_mult = current_mcap / mcap_at_call
 
     if current_mult < 0.01:
@@ -400,6 +451,10 @@ async def _check_paper_exits() -> int:
     that aged out of the 24-hour watchlist window before being closed.
     Returns the number of positions closed this sweep.
     """
+    if _dex_circuit_open:
+        print("[monitor] Circuit breaker open — skipping paper exit sweep")
+        return 0
+
     positions = db.get_open_paper_positions()
     if not positions:
         return 0
@@ -476,6 +531,10 @@ async def _check_paper_exits() -> int:
 
 async def run_pass(pass_num: int, dry_run: bool) -> dict:
     """Run one full monitoring pass across the active watchlist."""
+    if _dex_circuit_open:
+        print(f"[monitor] Pass {pass_num} — circuit breaker open, skipping pass")
+        return {"checked": 0, "new_peaks": 0, "alerts_sent": 0, "errors": 0}
+
     watchlist = db.get_active_watchlist(min_score=MIN_SCORE, max_age_hours=MAX_AGE_HOURS)
     count = len(watchlist)
 

@@ -338,6 +338,24 @@ def update_outcome_peak(
         conn.commit()
 
 
+def get_token_supply_and_decimals(mint: str) -> tuple:
+    """
+    Return (total_supply, decimals) for a mint address.
+    Used by data_fetcher to compute mcap from Jupiter price.
+    Returns (None, None) if the token is not found or columns are NULL.
+    """
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT total_supply, decimals FROM tokens WHERE mint_address = %s",
+            (mint,),
+        )
+        row = cur.fetchone()
+        if not row or row[0] is None or row[1] is None:
+            return (None, None)
+        return (float(row[0]), int(row[1]))
+
+
 def get_token_id_by_symbol(symbol: str) -> int | None:
     """
     Look up the most recent token_id by symbol (case-insensitive).

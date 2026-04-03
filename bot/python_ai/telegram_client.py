@@ -30,6 +30,7 @@ import tags
 import scorer
 import alert_bot
 import paper_trader
+import monitor as _monitor
 from parsers import type_a, type_b, type_a_vip
 
 
@@ -922,6 +923,11 @@ def run_listener() -> None:
         msg      = event.message
 
         if not msg.text or not is_candidate(msg.text):
+            return
+
+        if _monitor._dex_circuit_open:
+            symbol = handle
+            print(f"[listener] Circuit breaker open — skipping signal from {handle}")
             return
 
         try:
