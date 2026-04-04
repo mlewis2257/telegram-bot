@@ -28,6 +28,14 @@ BACKOFF_BASE       = 1.0      # seconds; doubles each retry
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 CACHE_TTL_SECONDS  = 60
 
+# ── Dead mint blacklist ───────────────────────────────────────────────────────
+# Mints that reliably fail every request (SSL EOF, delisted, etc).
+# Stopgap until the watchlist query excludes closed-position mints automatically.
+
+DEAD_MINTS: set[str] = {
+    '6tjSq5oLHFmAvZbcznCYRrZRpxQWbkepyFQV8csnpump',  # TAGIDO — SSL EOF on every request
+}
+
 # ── Cache ─────────────────────────────────────────────────────────────────────
 
 _cache: dict[str, tuple[dict, float]] = {}   # mint → (result, epoch_time)
@@ -423,6 +431,9 @@ def fetch_token_price(mint: str) -> Optional[dict]:
         {"price_usd", "mcap", "liquidity_usd", "volume_h1"}
         or None if all sources fail.
     """
+    if mint in DEAD_MINTS:
+        return None
+
     result = _try_dexscreener_price(mint)
     if result and result.get("mcap"):
         return result
