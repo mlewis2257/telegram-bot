@@ -66,13 +66,20 @@ STALE_THRESHOLD = 3
 # ── DexScreener circuit breaker ────────────────────────────────────────────────
 
 _dex_failures: list[float] = []
+_failures_this_pass: set[str] = set()   # deduplicate failures per mint per pass
 DEX_FAILURE_WINDOW    = 60   # seconds
-DEX_FAILURE_THRESHOLD = 5    # consecutive failures before circuit opens
+DEX_FAILURE_THRESHOLD = 8    # failures within window before circuit opens
 _dex_circuit_open     = False
 
 
 def _record_dex_failure(symbol: str = "") -> None:
     global _dex_circuit_open
+    # One mint can only contribute one failure per pass — prevents double-counting
+    # when both the price check and volume check fail for the same token.
+    if symbol and symbol in _failures_this_pass:
+        return
+    if symbol:
+        _failures_this_pass.add(symbol)
     now = time.monotonic()
     _dex_failures.append(now)
     recent = [t for t in _dex_failures if now - t < DEX_FAILURE_WINDOW]
@@ -221,9 +228,9 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
         return result
 
     # Sanity check — skip only if mcap is essentially phantom data (< 2% of entry)
+    # DexScreener returned valid data — the token just rugged. Not a fetcher failure.
     if mcap_at_call > 0 and current_mcap < mcap_at_call * 0.02:
         print(f"[monitor] {symbol_pad} suspicious mcap ${current_mcap:,.0f} vs entry ${mcap_at_call:,.0f} — skipping")
-        _record_dex_failure(symbol)
         result["skipped"] = True
         return result
 
@@ -535,6 +542,7 @@ async def run_pass(pass_num: int, dry_run: bool) -> dict:
         print(f"[monitor] Pass {pass_num} — circuit breaker open, skipping pass")
         return {"checked": 0, "new_peaks": 0, "alerts_sent": 0, "errors": 0}
 
+    _failures_this_pass.clear()
     watchlist = db.get_active_watchlist(min_score=MIN_SCORE, max_age_hours=MAX_AGE_HOURS)
     count = len(watchlist)
 
