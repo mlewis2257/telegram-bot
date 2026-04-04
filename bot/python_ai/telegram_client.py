@@ -925,11 +925,6 @@ def run_listener() -> None:
         if not msg.text or not is_candidate(msg.text):
             return
 
-        if _monitor._dex_circuit_open:
-            symbol = handle
-            print(f"[listener] Circuit breaker open — skipping signal from {handle}")
-            return
-
         try:
             if cfg["channel_type"] == "lagging":
                 status, score_result, extra = handle_lagging(msg, info["caller_id"], cfg["id"])
@@ -938,32 +933,42 @@ def run_listener() -> None:
             elif cfg["channel_type"] == "vip":
                 await asyncio.sleep(0.1)  # Give DB commit time to propagate before scoring
                 status, score_result, extra = handle_vip(msg, info["caller_id"], cfg["id"])
-                # VIP tier-specific thresholds
-                if score_result and extra:
-                    score       = score_result.get("score", 0)
-                    vip_tier    = extra.get("vip_tier")
-                    channel_tag = extra.get("channel_tag", "") or ""
-                    if "solhousesignal_vip" in channel_tag:
-                        if vip_tier is None:
-                            # No tier data — can't validate, skip
-                            print(f"[paper] {extra.get('symbol')} skipped — VIP no tier data")
-                            score_result = None
-                        elif vip_tier == "safe" and score >= 50:
-                            # Safe tier trades at 50+ (filters floor-scored bad data)
-                            asyncio.create_task(paper_trader.open_position(score_result, extra))
-                            score_result = None
-                        elif vip_tier == "gamble" and score >= 55:
-                            # Gamble VIP signals trade at 55+
-                            asyncio.create_task(paper_trader.open_position(score_result, extra))
-                            score_result = None
-                        else:
-                            # gamble_risk, high_risk, low-score gamble — skip
-                            print(f"[paper] {extra.get('symbol')} skipped — VIP {vip_tier} tier")
-                            score_result = None
             else:
                 return
 
             _bump(handle, status)
+
+            # Circuit breaker check — AFTER parsing so every signal is logged to the DB
+            if _monitor._dex_circuit_open:
+                call_id = score_result.get("call_id") if score_result else None
+                if call_id:
+                    db.set_call_skip_reason(call_id, "dex_circuit_open")
+                print(f"[listener] {handle} circuit open — call logged, skipping position")
+                _write_last_message_id(handle, msg.id)
+                return
+
+            # VIP tier-specific position routing
+            if cfg["channel_type"] == "vip" and score_result and extra:
+                score       = score_result.get("score", 0)
+                vip_tier    = extra.get("vip_tier")
+                channel_tag = extra.get("channel_tag", "") or ""
+                if "solhousesignal_vip" in channel_tag:
+                    if vip_tier is None:
+                        # No tier data — can't validate, skip
+                        print(f"[paper] {extra.get('symbol')} skipped — VIP no tier data")
+                        score_result = None
+                    elif vip_tier == "safe" and score >= 50:
+                        # Safe tier trades at 50+ (filters floor-scored bad data)
+                        asyncio.create_task(paper_trader.open_position(score_result, extra))
+                        score_result = None
+                    elif vip_tier == "gamble" and score >= 55:
+                        # Gamble VIP signals trade at 55+
+                        asyncio.create_task(paper_trader.open_position(score_result, extra))
+                        score_result = None
+                    else:
+                        # gamble_risk, high_risk, low-score gamble — skip
+                        print(f"[paper] {extra.get('symbol')} skipped — VIP {vip_tier} tier")
+                        score_result = None
 
             if score_result and score_result["label"] in ("alert", "strong_alert"):
                 await alert_bot.send_alert(score_result, extra)

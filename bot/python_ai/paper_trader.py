@@ -142,8 +142,8 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 ""
             ).lstrip("@")
             max_mcap = MCAP_LIMITS.get(channel_handle, DEFAULT_MCAP_LIMIT)
-            if actual_entry and actual_entry > max_mcap:
-                print(f"[paper] {symbol} skipped — mcap ${actual_entry/1000:.0f}k too high for {channel_handle or 'unknown'} (max ${max_mcap/1000:.0f}k)")
+            if entry_price > max_mcap:
+                print(f"[paper] {symbol} skipped — mcap ${entry_price/1000:.0f}k too high for {channel_handle or 'unknown'} (max ${max_mcap/1000:.0f}k)")
                 db.set_call_skip_reason(call_id, "mcap_too_high")
                 return
 
