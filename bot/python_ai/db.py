@@ -914,10 +914,19 @@ def get_active_watchlist(min_score: int = 55, max_age_hours: int = 24) -> list[d
             JOIN outcomes o  ON o.call_id = c.id
             WHERE c.created_at > NOW() - INTERVAL '1 hour' * %s
               AND c.conviction_score >= %s
+              AND c.skip_reason IS NULL
               AND t.mint_resolved = TRUE
               AND t.mint_address IS NOT NULL
               AND t.mint_address NOT LIKE 'UNKNOWN:%%'
               AND t.mint_address NOT LIKE 'INFERRED:%%'
+              AND t.mint_address NOT IN (
+                  SELECT DISTINCT t2.mint_address
+                  FROM trading_positions tp2
+                  JOIN calls  c2 ON c2.id  = tp2.call_id
+                  JOIN tokens t2 ON t2.id  = c2.token_id
+                  WHERE tp2.status        = 'closed'
+                    AND tp2.is_simulation = TRUE
+              )
             ORDER BY c.conviction_score DESC
             """,
             (max_age_hours, min_score),
