@@ -324,6 +324,9 @@ def update_outcome_peak(
             """
             UPDATE outcomes SET
                 peak_multiplier    = GREATEST(COALESCE(peak_multiplier, 0), %s),
+                peak_reached_at    = CASE
+                    WHEN %s > COALESCE(peak_multiplier, 0)
+                    THEN NOW() ELSE peak_reached_at END,
                 stated_multiplier  = CASE
                     WHEN %s > COALESCE(stated_multiplier, 0)
                     THEN %s ELSE stated_multiplier END,
@@ -338,6 +341,7 @@ def update_outcome_peak(
             WHERE call_id = %s
             """,
             (
+                multiplier_computed,
                 multiplier_computed,
                 multiplier_stated, multiplier_stated,
                 multiplier_computed, current_mcap,
@@ -675,6 +679,7 @@ def update_outcome_from_lagging(
                 result_reported_at = %s,
                 stated_multiplier  = %s,
                 peak_multiplier    = %s,
+                peak_reached_at    = COALESCE(peak_reached_at, NOW()),
                 outcome_label      = %s,
                 updated_at         = NOW()
             WHERE call_id = %s
