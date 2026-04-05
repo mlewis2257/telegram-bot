@@ -326,6 +326,11 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
             score = 45
             reasons.append("vip_channel_floor=45")
 
+    if "solhousesignal_vip" in channel and vip_tier == "safe":
+        if score < 50:
+            score = 50
+            reasons.append("vip_safe_floor=50")
+
     return score, reasons
 
 
