@@ -239,8 +239,8 @@ def check_exits(
                         now        = time.monotonic()
                         last_check = _last_vol_check.get(call_id, 0)
                         if now - last_check < VOL_CHECK_INTERVAL:
-                            # Too soon — apply trail stop on price alone this cycle
-                            return ExitResult(True, "trail_stop")
+                            # Too soon for a fresh volume fetch — hold this cycle
+                            pass
                         else:
                             _last_vol_check[call_id] = now
                             try:

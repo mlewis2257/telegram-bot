@@ -501,13 +501,23 @@ async def _check_paper_exits() -> int:
                 if existing_vol is None:
                     db.update_paper_position_entry_volume(call_id, float(market["volume_h1"]))
 
-            peak_info   = db.get_call_peak_info(call_id)
-            stored_peak = (
-                peak_info["peak_multiplier"]
-                if peak_info and peak_info["peak_multiplier"]
-                else 0.0
-            )
-            peak_mcap = stored_peak * entry_price
+            peak_info      = db.get_call_peak_info(call_id)
+            stored_peak    = (peak_info["peak_multiplier"] if peak_info and peak_info["peak_multiplier"] else 0.0)
+            peak_reached_at = peak_info.get("peak_reached_at") if peak_info else None
+
+            # Only use the stored peak if it was written by the real-time monitor
+            # AFTER this position opened. Lagging-channel calls write peak_multiplier
+            # at parse time (before open), so peak_reached_at will be NULL or pre-entry —
+            # using that historical peak would arm the trail stop immediately on open.
+            pos_entry_time = pos["entry_time"]
+            if pos_entry_time and pos_entry_time.tzinfo is None:
+                pos_entry_time = pos_entry_time.replace(tzinfo=timezone.utc)
+            if peak_reached_at and pos_entry_time:
+                if peak_reached_at.tzinfo is None:
+                    peak_reached_at = peak_reached_at.replace(tzinfo=timezone.utc)
+                peak_mcap = stored_peak * entry_price if peak_reached_at >= pos_entry_time else 0.0
+            else:
+                peak_mcap = 0.0  # no monitor-confirmed peak yet — don't arm trail stop
 
             exit_result = paper_trader.check_exits(call_id, current_mcap, peak_mcap, entry_price, mint=mint)
             if exit_result.should_exit:

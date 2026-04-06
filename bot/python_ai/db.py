@@ -324,9 +324,6 @@ def update_outcome_peak(
             """
             UPDATE outcomes SET
                 peak_multiplier    = GREATEST(COALESCE(peak_multiplier, 0), %s),
-                peak_reached_at    = CASE
-                    WHEN %s > COALESCE(peak_multiplier, 0)
-                    THEN NOW() ELSE peak_reached_at END,
                 stated_multiplier  = CASE
                     WHEN %s > COALESCE(stated_multiplier, 0)
                     THEN %s ELSE stated_multiplier END,
@@ -341,7 +338,6 @@ def update_outcome_peak(
             WHERE call_id = %s
             """,
             (
-                multiplier_computed,
                 multiplier_computed,
                 multiplier_stated, multiplier_stated,
                 multiplier_computed, current_mcap,
@@ -679,7 +675,6 @@ def update_outcome_from_lagging(
                 result_reported_at = %s,
                 stated_multiplier  = %s,
                 peak_multiplier    = %s,
-                peak_reached_at    = COALESCE(peak_reached_at, NOW()),
                 outcome_label      = %s,
                 updated_at         = NOW()
             WHERE call_id = %s
@@ -941,13 +936,13 @@ def get_active_watchlist(min_score: int = 55, max_age_hours: int = 24) -> list[d
 
 
 def get_call_peak_info(call_id: int) -> dict | None:
-    """Return {peak_multiplier, mcap_at_call} for sanity-checking multiplier updates."""
+    """Return {peak_multiplier, mcap_at_call, peak_reached_at} for peak tracking."""
     conn = get_conn()
     safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT c.mcap_at_call, o.peak_multiplier
+            SELECT c.mcap_at_call, o.peak_multiplier, o.peak_reached_at
             FROM calls c
             LEFT JOIN outcomes o ON o.call_id = c.id
             WHERE c.id = %s
@@ -957,8 +952,9 @@ def get_call_peak_info(call_id: int) -> dict | None:
         row = cur.fetchone()
     if not row:
         return None
-    return {"mcap_at_call": float(row[0]) if row[0] else None,
-            "peak_multiplier": float(row[1]) if row[1] else None}
+    return {"mcap_at_call":    float(row[0]) if row[0] else None,
+            "peak_multiplier": float(row[1]) if row[1] else None,
+            "peak_reached_at": row[2]}
 
 
 def update_peak_multiplier(call_id: int, new_peak: float) -> bool:
