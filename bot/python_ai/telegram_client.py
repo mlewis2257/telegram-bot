@@ -132,6 +132,27 @@ _STAT_KEYS = [
 
 _stats: dict[str, dict] = {}
 
+# ── VIP gamble confirmation queue ─────────────────────────────────────────────
+# VIP gamble_risk/gamble signals are held here until solhousesignal independently
+# calls the same mint 5–10 minutes later (confirming the signal is not an instant rug).
+
+_pending_vip_gamble: dict[str, dict] = {}  # mint → {call_id, score_result, extra, timestamp, symbol}
+VIP_CONFIRM_MIN_SECS = 300   # must wait at least 5 minutes for independent confirmation
+VIP_CONFIRM_MAX_SECS = 600   # expire after 10 minutes with no confirmation
+
+
+def _cleanup_stale_vip_gamble() -> None:
+    """Expire pending VIP gamble entries older than 10 minutes, logging skip_reason='unconfirmed'."""
+    now = time.monotonic()
+    expired = [
+        mint for mint, entry in _pending_vip_gamble.items()
+        if now - entry["timestamp"] > VIP_CONFIRM_MAX_SECS
+    ]
+    for mint in expired:
+        entry = _pending_vip_gamble.pop(mint)
+        db.set_call_skip_reason(entry["call_id"], "unconfirmed")
+        print(f"[vip_confirm] {entry['symbol']} expired — no free-channel confirmation within 10 min")
+
 
 def _init_stats(handle: str) -> None:
     _stats[handle] = {k: 0 for k in _STAT_KEYS}
@@ -963,14 +984,44 @@ def run_listener() -> None:
                         asyncio.create_task(paper_trader.open_position(score_result, extra))
                         score_result = None
                     elif vip_tier == "gamble_risk" and mcap_at_call > 0 and mcap_at_call < 25_000 and score >= 50:
-                        # Experimental: gamble_risk at low mcap — 0.25 SOL paper only
-                        extra["sol_in_override"] = paper_trader.SOL_VIP_GAMBLE
-                        asyncio.create_task(paper_trader.open_position(score_result, extra))
+                        # Queue for 5-min free-channel confirmation window — do NOT open immediately
+                        mint_addr  = extra.get("mint_address")
+                        call_id_g  = score_result.get("call_id")
+                        if mint_addr and not mint_addr.startswith(("INFERRED:", "UNKNOWN:")):
+                            extra["sol_in_override"] = paper_trader.SOL_VIP_GAMBLE
+                            extra["vip_tier"]        = vip_tier
+                            _pending_vip_gamble[mint_addr] = {
+                                "call_id":      call_id_g,
+                                "score_result": score_result,
+                                "extra":        extra,
+                                "timestamp":    time.monotonic(),
+                                "symbol":       extra.get("symbol", "?"),
+                            }
+                            print(f"[vip_confirm] {extra.get('symbol', '?')} queued — awaiting solhousesignal confirmation (tier=gamble_risk)")
+                        else:
+                            if call_id_g:
+                                db.set_call_skip_reason(call_id_g, "unconfirmed")
+                            print(f"[vip_confirm] {extra.get('symbol', '?')} no valid mint — cannot queue for confirmation")
                         score_result = None
                     elif vip_tier == "gamble" and mcap_at_call > 0 and mcap_at_call < 40_000 and score >= 50:
-                        # Experimental: gamble at low mcap — 0.25 SOL paper only
-                        extra["sol_in_override"] = paper_trader.SOL_VIP_GAMBLE
-                        asyncio.create_task(paper_trader.open_position(score_result, extra))
+                        # Queue for 5-min free-channel confirmation window — do NOT open immediately
+                        mint_addr  = extra.get("mint_address")
+                        call_id_g  = score_result.get("call_id")
+                        if mint_addr and not mint_addr.startswith(("INFERRED:", "UNKNOWN:")):
+                            extra["sol_in_override"] = paper_trader.SOL_VIP_GAMBLE
+                            extra["vip_tier"]        = vip_tier
+                            _pending_vip_gamble[mint_addr] = {
+                                "call_id":      call_id_g,
+                                "score_result": score_result,
+                                "extra":        extra,
+                                "timestamp":    time.monotonic(),
+                                "symbol":       extra.get("symbol", "?"),
+                            }
+                            print(f"[vip_confirm] {extra.get('symbol', '?')} queued — awaiting solhousesignal confirmation (tier=gamble)")
+                        else:
+                            if call_id_g:
+                                db.set_call_skip_reason(call_id_g, "unconfirmed")
+                            print(f"[vip_confirm] {extra.get('symbol', '?')} no valid mint — cannot queue for confirmation")
                         score_result = None
                     elif vip_tier in ("gamble_risk", "gamble") and mcap_at_call >= (25_000 if vip_tier == "gamble_risk" else 40_000):
                         # Mcap too high for experimental gamble trading
@@ -983,6 +1034,32 @@ def run_listener() -> None:
                         # high_risk, low-score, or unhandled tier — skip
                         print(f"[paper] {extra.get('symbol')} skipped — VIP {vip_tier} tier")
                         score_result = None
+
+            # ── VIP gamble confirmation check (fires on lagging/solhousesignal messages) ──
+            if cfg["channel_type"] == "lagging" and extra and extra.get("mint_address"):
+                _cleanup_stale_vip_gamble()
+                mint_addr = extra["mint_address"]
+                if not mint_addr.startswith(("INFERRED:", "UNKNOWN:")):
+                    pending = _pending_vip_gamble.pop(mint_addr, None)
+                    if pending:
+                        elapsed      = time.monotonic() - pending["timestamp"]
+                        elapsed_mins = elapsed / 60
+                        if elapsed < VIP_CONFIRM_MIN_SECS:
+                            # Too soon — likely same signal propagating, not independent confirmation
+                            db.set_call_skip_reason(pending["call_id"], "unconfirmed")
+                            print(
+                                f"[vip_confirm] {pending['symbol']} discarded — free channel too soon"
+                                f" ({elapsed_mins:.1f} min, need 5+)"
+                            )
+                        else:
+                            # Independent confirmation ≥ 5 min — open 0.25 SOL paper position
+                            print(
+                                f"[vip_confirm] {pending['symbol']} confirmed after {elapsed_mins:.1f} min"
+                                f" — opening 0.25 SOL"
+                            )
+                            asyncio.create_task(
+                                paper_trader.open_position(pending["score_result"], pending["extra"])
+                            )
 
             if score_result and score_result["label"] in ("alert", "strong_alert"):
                 await alert_bot.send_alert(score_result, extra)

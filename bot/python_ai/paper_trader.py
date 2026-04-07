@@ -58,6 +58,15 @@ _position_mints: dict[int, str]   = {}
 _last_vol_check: dict[int, float] = {}   # call_id → last volume check timestamp
 VOL_CHECK_INTERVAL = 30                  # seconds between volume checks per position
 
+# ── Per-position VIP tier store (call_id → vip_tier) ──────────────────────────
+# Populated on open for confirmed VIP gamble_risk/gamble positions so that
+# check_exits can apply tighter hard stop (-35%) and shorter time stop (6h).
+_position_tiers: dict[int, str] = {}
+
+# ── Tier-specific exit thresholds ─────────────────────────────────────────────
+VIP_GAMBLE_HARD_STOP_PCT = 0.35   # tighter: -35% vs default -50%
+VIP_GAMBLE_MAX_HOURS     = 6.0    # shorter: 6h  vs default 24h
+
 
 # ── Result type ───────────────────────────────────────────────────────────────
 
@@ -130,6 +139,24 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             if actual_entry is None and mint:
                 print(f"[paper] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
 
+            # ── VIP gamble-tier filters (gamble_risk / gamble only) ───────────────
+            is_vip_gamble = (token_data.get("sol_in_override") == SOL_VIP_GAMBLE)
+            if is_vip_gamble and actual_entry is not None:
+                # Filter 1 — Momentum check: reject if mcap drifted >20% since signal
+                if actual_entry > msg_mcap * 1.2:
+                    print(f"[paper] {symbol} skipped — mcap pumped since signal (${msg_mcap/1000:.1f}k → ${actual_entry/1000:.1f}k)")
+                    db.set_call_skip_reason(call_id, "momentum_dump")
+                    return
+                if actual_entry < msg_mcap * 0.8:
+                    print(f"[paper] {symbol} skipped — mcap dumped since signal (${msg_mcap/1000:.1f}k → ${actual_entry/1000:.1f}k)")
+                    db.set_call_skip_reason(call_id, "momentum_dump")
+                    return
+                # Filter 2 — Minimum mcap gate
+                if actual_entry < 10_000:
+                    print(f"[paper] {symbol} skipped — mcap ${actual_entry/1000:.1f}k below $10k minimum for vip gamble")
+                    db.set_call_skip_reason(call_id, "mcap_too_low")
+                    return
+
             entry_price = actual_entry or msg_mcap
 
             # ── Entry gate ────────────────────────────────────────────────────
@@ -165,6 +192,9 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                                    entry_volume=entry_volume)
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
                 _position_mints[call_id] = mint
+            vip_tier_val = token_data.get("vip_tier") if is_vip_gamble else None
+            if vip_tier_val in ("gamble_risk", "gamble"):
+                _position_tiers[call_id] = vip_tier_val
             print(f"[paper] opened {symbol}  call_id={call_id}  {sol_in} SOL @ {entry_price:.0f}")
 
         except Exception as e:
@@ -202,7 +232,8 @@ def check_exits(
     if entry_mcap <= 0:
         return ExitResult(False)
 
-    current_mult = current_mcap / entry_mcap
+    current_mult   = current_mcap / entry_mcap
+    is_vip_gamble_pos = _position_tiers.get(call_id) in ("gamble_risk", "gamble")
 
     # 10x take profit — checked first so high runners are labelled correctly
     if current_mult >= 10.0:
@@ -213,8 +244,8 @@ def check_exits(
     if current_mult >= TAKE_PROFIT_5X:
         return ExitResult(True, "5x_tp")
 
-    # 3x take profit
-    if current_mult >= TAKE_PROFIT_3X:
+    # 3x take profit — skipped for VIP gamble tiers (let trail stop maximise runners)
+    if not is_vip_gamble_pos and current_mult >= TAKE_PROFIT_3X:
         return ExitResult(True, "3x_tp")
 
     # Trailing stop — tiered by how much the token has run.
@@ -263,17 +294,19 @@ def check_exits(
                     # 5x+ — protect gains regardless of volume
                     return ExitResult(True, "trail_stop")
 
-    # Hard stop — down 50% from entry (tightened from 60%)
-    if current_mult <= (1.0 - HARD_STOP_PCT):
+    # Hard stop — tighter for VIP gamble tiers (-35%) vs default (-50%)
+    hard_stop_pct = VIP_GAMBLE_HARD_STOP_PCT if is_vip_gamble_pos else HARD_STOP_PCT
+    if current_mult <= (1.0 - hard_stop_pct):
         return ExitResult(True, "hard_stop")
 
-    # Time stop — position open longer than MAX_HOURS
+    # Time stop — shorter for VIP gamble tiers (6h) vs default (24h)
+    max_hours = VIP_GAMBLE_MAX_HOURS if is_vip_gamble_pos else MAX_HOURS
     entry_time = position["entry_time"]
     if entry_time:
         if entry_time.tzinfo is None:
             entry_time = entry_time.replace(tzinfo=timezone.utc)
         age_hours = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
-        if age_hours > MAX_HOURS:
+        if age_hours > max_hours:
             return ExitResult(True, "time_stop")
 
     return ExitResult(False)
