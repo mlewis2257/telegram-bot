@@ -30,6 +30,7 @@ import alert_bot
 
 SOL_STRONG_ALERT = 1.0   # simulated SOL for strong_alert (85+)
 SOL_ALERT        = 0.5   # simulated SOL for alert (70–84)
+SOL_VIP_GAMBLE   = 0.25  # simulated SOL for experimental VIP gamble/gamble_risk entries
 
 # ── Per-channel mcap entry limits ──────────────────────────────────────────────
 MCAP_LIMITS = {
@@ -94,7 +95,9 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             label = score_result.get("label")
             channel = token_data.get("channel_tag") or token_data.get("channel_handle", "")
 
-            if "solearlytrending" in channel:
+            if token_data.get("sol_in_override"):
+                sol_in = float(token_data["sol_in_override"])
+            elif "solearlytrending" in channel:
                 sol_in = SOL_ALERT  # always 0.5 SOL regardless of score
             elif label == "strong_alert":
                 sol_in = SOL_STRONG_ALERT  # 1.0 SOL for other channels

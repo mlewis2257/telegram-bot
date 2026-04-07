@@ -306,19 +306,29 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
 
     # ── VIP tier (only present on VIP channel calls) ───────────────────────
     vip_tier = row.get("vip_tier")
+    mcap     = row.get("mcap_at_call") or 0
     if vip_tier == "safe":
         score += 15
         reasons.append("vip_tier=safe+15")
     elif vip_tier == "gamble_risk":
-        score -= 10
-        reasons.append("vip_tier=gamble_risk-10")
+        if mcap > 0 and mcap < 25_000:
+            score += 10
+            reasons.append("vip_tier=gamble_risk+10(mcap_gated)")
+        else:
+            score -= 10
+            reasons.append("vip_tier=gamble_risk-10")
+    elif vip_tier == "gamble":
+        if mcap > 0 and mcap < 40_000:
+            score += 5
+            reasons.append("vip_tier=gamble+5(mcap_gated)")
+        # else: neutral — no adjustment (mcap too high for experimental trading)
     elif vip_tier == "high_risk":
         score -= 20
         reasons.append("vip_tier=high_risk-20")
     elif vip_tier == "whale":
         score += 10
         reasons.append("vip_tier=whale+10")
-    # gamble / None → neutral (no adjustment)
+    # None → neutral (no adjustment)
 
     # ── Channel floor scores ───────────────────────────────────────────────
     if "solhousesignal_vip" in channel:
@@ -330,6 +340,14 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
         if score < 50:
             score = 50
             reasons.append("vip_safe_floor=50")
+
+    # Mcap-gated gamble tiers get a floor of 50 so they clear the trading minimum
+    if "solhousesignal_vip" in channel and vip_tier in ("gamble_risk", "gamble"):
+        if mcap > 0 and ((vip_tier == "gamble_risk" and mcap < 25_000) or
+                         (vip_tier == "gamble"      and mcap < 40_000)):
+            if score < 50:
+                score = 50
+                reasons.append("vip_gamble_mcap_floor=50")
 
     return score, reasons
 
