@@ -279,7 +279,11 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
             reasons.append(f"dev_best=${dbm/1000:.0f}k+5")
         # < 100k → neutral
 
-    # ── Data confidence penalty — unchanged ───────────────────────────────
+    # ── Hoist VIP tier and mcap_at_call — needed by data confidence block ────
+    vip_tier     = row.get("vip_tier")
+    mcap_at_call = float(row.get("mcap_at_call") or 0)
+
+    # ── Data confidence penalty ────────────────────────────────────────────
     available_tier1 = sum(1 for v in [
         row.get("security_flag"),
         row.get("token_age_minutes"),
@@ -288,10 +292,17 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
         row.get("hodl_count"),
     ] if v is not None)
     if available_tier1 < 2:
-        if is_vip:
+        # Exempt low-mcap gamble/gamble_risk VIP calls — these fire before
+        # scanners have on-chain data, so zero fields is expected, not suspicious.
+        is_low_mcap_gamble = (
+            is_vip and
+            vip_tier in ("gamble_risk", "gamble") and
+            mcap_at_call > 0 and mcap_at_call < 40_000
+        )
+        if is_vip and not is_low_mcap_gamble:
             score -= 15  # VIP: zero on-chain data = unverifiable signal
             reasons.append("low_data_confidence(vip)-15")
-        else:
+        elif not is_vip:
             score -= 25
             reasons.append("low_data_confidence-25")
     elif available_tier1 < 4:
@@ -305,20 +316,18 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
         reasons.append("cross_channel_confirmed+5")
 
     # ── VIP tier (only present on VIP channel calls) ───────────────────────
-    vip_tier = row.get("vip_tier")
-    mcap     = row.get("mcap_at_call") or 0
     if vip_tier == "safe":
         score += 15
         reasons.append("vip_tier=safe+15")
     elif vip_tier == "gamble_risk":
-        if mcap > 0 and mcap < 25_000:
+        if mcap_at_call > 0 and mcap_at_call < 25_000:
             score += 10
             reasons.append("vip_tier=gamble_risk+10(mcap_gated)")
         else:
             score -= 10
             reasons.append("vip_tier=gamble_risk-10")
     elif vip_tier == "gamble":
-        if mcap > 0 and mcap < 40_000:
+        if mcap_at_call > 0 and mcap_at_call < 40_000:
             score += 5
             reasons.append("vip_tier=gamble+5(mcap_gated)")
         # else: neutral — no adjustment (mcap too high for experimental trading)
@@ -343,8 +352,8 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
 
     # Mcap-gated gamble tiers get a floor of 50 so they clear the trading minimum
     if "solhousesignal_vip" in channel and vip_tier in ("gamble_risk", "gamble"):
-        if mcap > 0 and ((vip_tier == "gamble_risk" and mcap < 25_000) or
-                         (vip_tier == "gamble"      and mcap < 40_000)):
+        if mcap_at_call > 0 and ((vip_tier == "gamble_risk" and mcap_at_call < 25_000) or
+                                  (vip_tier == "gamble"      and mcap_at_call < 40_000)):
             if score < 50:
                 score = 50
                 reasons.append("vip_gamble_mcap_floor=50")
