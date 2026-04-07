@@ -140,18 +140,11 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 print(f"[paper] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
 
             # ── VIP gamble-tier filters (gamble_risk / gamble only) ───────────────
+            # Checks run against actual_entry (live DexScreener price at open time),
+            # not msg_mcap (the VIP call price from 5+ minutes ago).
             is_vip_gamble = (token_data.get("sol_in_override") == SOL_VIP_GAMBLE)
             if is_vip_gamble and actual_entry is not None:
-                # Filter 1 — Momentum check: reject if mcap drifted >20% since signal
-                if actual_entry > msg_mcap * 1.2:
-                    print(f"[paper] {symbol} skipped — mcap pumped since signal (${msg_mcap/1000:.1f}k → ${actual_entry/1000:.1f}k)")
-                    db.set_call_skip_reason(call_id, "momentum_dump")
-                    return
-                if actual_entry < msg_mcap * 0.8:
-                    print(f"[paper] {symbol} skipped — mcap dumped since signal (${msg_mcap/1000:.1f}k → ${actual_entry/1000:.1f}k)")
-                    db.set_call_skip_reason(call_id, "momentum_dump")
-                    return
-                # Filter 2 — Minimum mcap gate
+                # Minimum mcap gate — token must be trading above $10k at open time
                 if actual_entry < 10_000:
                     print(f"[paper] {symbol} skipped — mcap ${actual_entry/1000:.1f}k below $10k minimum for vip gamble")
                     db.set_call_skip_reason(call_id, "mcap_too_low")

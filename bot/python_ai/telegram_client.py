@@ -974,6 +974,7 @@ def run_listener() -> None:
                 vip_tier    = extra.get("vip_tier")
                 channel_tag = extra.get("channel_tag", "") or ""
                 mcap_at_call = float(extra.get("mcap_at_call") or 0)
+                print(f"[vip_debug] tier={vip_tier} mcap={mcap_at_call} score={score} symbol={extra.get('symbol')}")
                 if "solhousesignal_vip" in channel_tag:
                     if vip_tier is None:
                         # No tier data — can't validate, skip
