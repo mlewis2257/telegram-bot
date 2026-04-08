@@ -957,12 +957,21 @@ def get_call_peak_info(call_id: int) -> dict | None:
             "peak_reached_at": row[2]}
 
 
-def update_peak_multiplier(call_id: int, new_peak: float) -> bool:
+def update_peak_multiplier(
+    call_id: int,
+    new_peak: float,
+    peak_mult_from_entry: float = None,
+) -> bool:
     """
     Conditionally update peak_multiplier — only when new_peak exceeds the stored value.
     Also promotes outcome_label to 'runner' when new_peak >= 2.0 and it isn't already.
 
-    Returns True if the peak row was actually updated (new_peak was a genuine new high),
+    When peak_mult_from_entry is provided, also conditionally updates
+    peak_multiplier_from_entry (multiplier relative to actual trading entry price).
+    This is only set for calls where a paper position was opened at a price
+    different from mcap_at_call (e.g. VIP gamble confirmation trades).
+
+    Returns True if peak_multiplier was updated (new_peak was a genuine new high),
     False if the stored value was already equal or higher.
     """
     conn = get_conn()
@@ -980,6 +989,18 @@ def update_peak_multiplier(call_id: int, new_peak: float) -> bool:
             (new_peak, call_id, new_peak),
         )
         updated = cur.rowcount > 0
+
+        if peak_mult_from_entry is not None:
+            cur.execute(
+                """
+                UPDATE outcomes SET
+                    peak_multiplier_from_entry = %s,
+                    updated_at                 = NOW()
+                WHERE call_id = %s
+                  AND (peak_multiplier_from_entry IS NULL OR peak_multiplier_from_entry < %s)
+                """,
+                (peak_mult_from_entry, call_id, peak_mult_from_entry),
+            )
 
         if new_peak >= 2.0:
             cur.execute(

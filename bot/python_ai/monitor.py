@@ -505,6 +505,17 @@ async def _check_paper_exits() -> int:
             stored_peak    = (peak_info["peak_multiplier"] if peak_info and peak_info["peak_multiplier"] else 0.0)
             peak_reached_at = peak_info.get("peak_reached_at") if peak_info else None
 
+            # Update peak_multiplier_from_entry — the multiplier relative to the actual
+            # trading entry price (differs from mcap_at_call for VIP confirmation trades).
+            if peak_info and peak_info.get("mcap_at_call"):
+                mcap_at_call_val = float(peak_info["mcap_at_call"])
+                if mcap_at_call_val > 0:
+                    db.update_peak_multiplier(
+                        call_id,
+                        current_mcap / mcap_at_call_val,
+                        peak_mult_from_entry=current_mcap / entry_price,
+                    )
+
             # Only use the stored peak if it was written by the real-time monitor
             # AFTER this position opened. Lagging-channel calls write peak_multiplier
             # at parse time (before open), so peak_reached_at will be NULL or pre-entry —

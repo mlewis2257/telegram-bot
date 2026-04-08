@@ -412,6 +412,8 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> tuple:
         "mcap_at_call":      parsed.get("mcap_at_call"),
         "security_flag":     None,
         "token_age_minutes": None,
+        "channel_tag":       "solhousesignal",
+        "channel_handle":    "solhousesignal",
     }
     return "logged", score_result, token_data
 
@@ -985,44 +987,18 @@ def run_listener() -> None:
                         asyncio.create_task(paper_trader.open_position(score_result, extra))
                         score_result = None
                     elif vip_tier == "gamble_risk" and mcap_at_call > 0 and mcap_at_call < 25_000 and score >= 50:
-                        # Queue for 5-min free-channel confirmation window — do NOT open immediately
-                        mint_addr  = extra.get("mint_address")
-                        call_id_g  = score_result.get("call_id")
-                        if mint_addr and not mint_addr.startswith(("INFERRED:", "UNKNOWN:")):
-                            extra["sol_in_override"] = paper_trader.SOL_VIP_GAMBLE
-                            extra["vip_tier"]        = vip_tier
-                            _pending_vip_gamble[mint_addr] = {
-                                "call_id":      call_id_g,
-                                "score_result": score_result,
-                                "extra":        extra,
-                                "timestamp":    time.monotonic(),
-                                "symbol":       extra.get("symbol", "?"),
-                            }
-                            print(f"[vip_confirm] {extra.get('symbol', '?')} queued — awaiting solhousesignal confirmation (tier=gamble_risk)")
-                        else:
-                            if call_id_g:
-                                db.set_call_skip_reason(call_id_g, "unconfirmed")
-                            print(f"[vip_confirm] {extra.get('symbol', '?')} no valid mint — cannot queue for confirmation")
+                        # Trading suspended — log only for data collection
+                        call_id_g = score_result.get("call_id")
+                        if call_id_g:
+                            db.set_call_skip_reason(call_id_g, "vip_paused")
+                        print(f"[vip_confirm] {extra.get('symbol', '?')} paused — VIP gamble_risk trading suspended")
                         score_result = None
                     elif vip_tier == "gamble" and mcap_at_call > 0 and mcap_at_call < 40_000 and score >= 50:
-                        # Queue for 5-min free-channel confirmation window — do NOT open immediately
-                        mint_addr  = extra.get("mint_address")
-                        call_id_g  = score_result.get("call_id")
-                        if mint_addr and not mint_addr.startswith(("INFERRED:", "UNKNOWN:")):
-                            extra["sol_in_override"] = paper_trader.SOL_VIP_GAMBLE
-                            extra["vip_tier"]        = vip_tier
-                            _pending_vip_gamble[mint_addr] = {
-                                "call_id":      call_id_g,
-                                "score_result": score_result,
-                                "extra":        extra,
-                                "timestamp":    time.monotonic(),
-                                "symbol":       extra.get("symbol", "?"),
-                            }
-                            print(f"[vip_confirm] {extra.get('symbol', '?')} queued — awaiting solhousesignal confirmation (tier=gamble)")
-                        else:
-                            if call_id_g:
-                                db.set_call_skip_reason(call_id_g, "unconfirmed")
-                            print(f"[vip_confirm] {extra.get('symbol', '?')} no valid mint — cannot queue for confirmation")
+                        # Trading suspended — log only for data collection
+                        call_id_g = score_result.get("call_id")
+                        if call_id_g:
+                            db.set_call_skip_reason(call_id_g, "vip_paused")
+                        print(f"[vip_confirm] {extra.get('symbol', '?')} paused — VIP gamble trading suspended")
                         score_result = None
                     elif vip_tier in ("gamble_risk", "gamble") and mcap_at_call >= (25_000 if vip_tier == "gamble_risk" else 40_000):
                         # Mcap too high for experimental gamble trading
