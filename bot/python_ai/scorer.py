@@ -346,9 +346,9 @@ def _score_realtime(row: dict) -> tuple[int, list[str]]:
             reasons.append("vip_channel_floor=45")
 
     if "solhousesignal_vip" in channel and vip_tier == "safe":
-        if score < 50:
-            score = 50
-            reasons.append("vip_safe_floor=50")
+        if score < 45:
+            score = 45
+            reasons.append("vip_safe_floor=45")
 
     # Mcap-gated gamble tiers get a floor of 50 so they clear the trading minimum
     if "solhousesignal_vip" in channel and vip_tier in ("gamble_risk", "gamble"):
