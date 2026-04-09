@@ -19,8 +19,9 @@ log = logging.getLogger(__name__)
 
 DEXSCREENER_URL        = "https://api.dexscreener.com/latest/dex/tokens"
 DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
-JUPITER_PRICE_URL      = "https://price.jup.ag/v6/price"
+JUPITER_PRICE_URL      = "https://api.jup.ag/price/v3"
 SOLANA_RPC_URL         = os.getenv("SOLANA_RPC_URL", "")
+JUPITER_API_KEY        = os.getenv("JUPITER_API_KEY", "")
 
 REQUEST_TIMEOUT    = 10       # seconds per request
 MAX_RETRIES        = 3
@@ -389,18 +390,20 @@ def _fetch_jupiter_price(mint: str) -> Optional[dict]:
     Attempts to compute mcap via Helius RPC getTokenSupply.
     """
     try:
+        headers = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
         resp = requests.get(
             JUPITER_PRICE_URL,
             params={"ids": mint},
+            headers=headers,
             timeout=REQUEST_TIMEOUT,
         )
         if resp.status_code != 200:
             return None
         data       = resp.json()
-        price_data = (data.get("data") or {}).get(mint)
+        price_data = data.get(mint)
         if not price_data:
             return None
-        price = float(price_data.get("price") or 0)
+        price = float(price_data.get("usdPrice") or 0)
         if not price:
             return None
 
