@@ -181,16 +181,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     db.set_call_skip_reason(call_id, "mcap_too_high")
                     return
 
-            # ── Free channel data confidence check ────────────────────────────
-            if "solhousesignal" in channel_handle and "vip" not in channel_handle:
-                token_age = token_data.get("token_age_minutes")
-                hodl      = token_data.get("hodl_count")
-                liq       = token_data.get("liq_at_detection")
-                if token_age is None and hodl is None and liq is None:
-                    print(f"[paper] {symbol} skipped — solhousesignal no on-chain data")
-                    db.set_call_skip_reason(call_id, "no_data")
-                    return
-
             db.open_paper_position(call_id, entry_price, sol_in,
                                    entry_time=position_entry_time,
                                    entry_volume=entry_volume)
