@@ -891,7 +891,12 @@ def get_mint_by_call_id(call_id: int) -> str | None:
 def get_active_watchlist(min_score: int = 55, max_age_hours: int = 24) -> list[dict]:
     """
     Return calls that are recent, resolved, and scored high enough to monitor.
-    Ordered by conviction_score DESC so highest-conviction tokens are checked first.
+
+    Two groups are returned, regular rows first:
+      data_only=False  — normal calls: peak tracking + alerts + exit logic
+      data_only=True   — VIP paused calls: peak tracking only, no exits/alerts
+
+    Ordered regular-first (data_only ASC) then conviction_score DESC within each group.
     """
     conn = get_conn()
     safe_rollback()
@@ -907,7 +912,8 @@ def get_active_watchlist(min_score: int = 55, max_age_hours: int = 24) -> list[d
                 c.created_at,
                 c.source_message_id,
                 ch.handle           AS channel_handle,
-                o.peak_multiplier
+                o.peak_multiplier,
+                FALSE               AS data_only
             FROM calls    c
             JOIN tokens   t  ON t.id      = c.token_id
             JOIN channels ch ON ch.id     = c.channel_id
@@ -927,7 +933,33 @@ def get_active_watchlist(min_score: int = 55, max_age_hours: int = 24) -> list[d
                   WHERE tp2.status        = 'closed'
                     AND tp2.is_simulation = TRUE
               )
-            ORDER BY c.conviction_score DESC
+
+            UNION ALL
+
+            -- VIP paused calls: peak tracking only for data collection
+            SELECT
+                c.id                AS call_id,
+                t.symbol,
+                t.mint_address,
+                c.mcap_at_call,
+                c.conviction_score,
+                c.created_at,
+                c.source_message_id,
+                ch.handle           AS channel_handle,
+                o.peak_multiplier,
+                TRUE                AS data_only
+            FROM calls    c
+            JOIN tokens   t  ON t.id      = c.token_id
+            JOIN channels ch ON ch.id     = c.channel_id
+            JOIN outcomes o  ON o.call_id = c.id
+            WHERE c.skip_reason = 'vip_paused'
+              AND c.created_at > NOW() - INTERVAL '24 hours'
+              AND t.mint_resolved = TRUE
+              AND t.mint_address IS NOT NULL
+              AND t.mint_address NOT LIKE 'UNKNOWN:%%'
+              AND t.mint_address NOT LIKE 'INFERRED:%%'
+
+            ORDER BY data_only ASC, conviction_score DESC
             """,
             (max_age_hours, min_score),
         )

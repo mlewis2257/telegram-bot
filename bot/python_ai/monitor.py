@@ -200,6 +200,9 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
     """
     Fetch current price for one token, update peak if higher, fire any alerts.
     Returns {new_peak: bool, alerts_sent: int, skipped: bool}.
+
+    Rows with data_only=True (VIP paused calls) only update peak_multiplier.
+    All alert, exit, and circuit-breaker logic is skipped for them.
     """
     call_id      = row["call_id"]
     symbol       = row["symbol"] or "?"
@@ -207,6 +210,7 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
     mint         = row["mint_address"]
     mcap_at_call = float(row["mcap_at_call"]) if row["mcap_at_call"] else 0.0
     stored_peak  = float(row["peak_multiplier"]) if row["peak_multiplier"] else 0.0
+    data_only    = bool(row.get("data_only", False))
 
     result = {"new_peak": False, "alerts_sent": 0, "skipped": False}
 
@@ -216,14 +220,16 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
 
     market = data_fetcher.fetch_token_price(mint)
     if not market or not market.get("mcap"):
-        _record_dex_failure(symbol)
+        if not data_only:
+            _record_dex_failure(symbol)
         result["skipped"] = True
         return result
 
     current_mcap = float(market["mcap"])
 
     if current_mcap <= 0:
-        _record_dex_failure(symbol)
+        if not data_only:
+            _record_dex_failure(symbol)
         result["skipped"] = True
         return result
 
@@ -234,7 +240,8 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
         result["skipped"] = True
         return result
 
-    _record_dex_success()
+    if not data_only:
+        _record_dex_success()
     current_mult = current_mcap / mcap_at_call
 
     if current_mult < 0.01:
@@ -254,16 +261,22 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
             db.update_peak_multiplier(call_id, current_mult)
         active_peak = current_mult
         result["new_peak"] = True
+        tag = "[data]" if data_only else "[monitor]"
         print(
-            f"[monitor] {symbol_pad} call_id={call_id}"
+            f"{tag} {symbol_pad} call_id={call_id}"
             f"  NEW PEAK {_fmt_mult(current_mult)} ↑"
         )
     else:
         active_peak = stored_peak
-        print(
-            f"[monitor] {symbol_pad} call_id={call_id}"
-            f"  {_fmt_mult(current_mult)} (peak: {_fmt_mult(active_peak)})"
-        )
+        if not data_only:
+            print(
+                f"[monitor] {symbol_pad} call_id={call_id}"
+                f"  {_fmt_mult(current_mult)} (peak: {_fmt_mult(active_peak)})"
+            )
+
+    # Data-only rows: peak tracking done — skip all alerts and exit logic
+    if data_only:
+        return result
 
     created_at = row.get("created_at")
     recently_created = (
