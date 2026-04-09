@@ -63,6 +63,11 @@ PEAK_MAX_MULT    = 100.0  # above this, treat as data error and skip
 _stale_checks:  dict[int, int] = {}  # call_id -> consecutive zero-balance count
 STALE_THRESHOLD = 3
 
+# ── Data-only fetch throttle ───────────────────────────────────────────────────
+# VIP paused calls only need price checks every 60s, not every 20s.
+_data_only_last_fetch: dict[int, float] = {}
+DATA_ONLY_FETCH_INTERVAL = 60  # seconds between DexScreener fetches for data_only rows
+
 # ── DexScreener circuit breaker ────────────────────────────────────────────────
 
 _dex_failures: list[float] = []
@@ -588,6 +593,13 @@ async def run_pass(pass_num: int, dry_run: bool) -> dict:
 
     for row in watchlist:
         try:
+            if row.get("data_only"):
+                now  = time.monotonic()
+                last = _data_only_last_fetch.get(row["call_id"], 0)
+                if now - last < DATA_ONLY_FETCH_INTERVAL:
+                    continue
+                _data_only_last_fetch[row["call_id"]] = now
+
             result = await _process_token(row, dry_run)
             await asyncio.sleep(sleep_per_call)
 
