@@ -165,6 +165,8 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 ""
             ).lstrip("@")
             max_mcap = MCAP_LIMITS.get(channel_handle, DEFAULT_MCAP_LIMIT)
+            if channel_handle == "solhousesignal" and score_result and score_result.get("score", 0) == 63:
+                max_mcap = 100_000  # score 63 signals get higher mcap allowance
             if entry_price > max_mcap:
                 print(f"[paper] {symbol} skipped — mcap ${entry_price/1000:.0f}k too high for {channel_handle or 'unknown'} (max ${max_mcap/1000:.0f}k)")
                 db.set_call_skip_reason(call_id, "mcap_too_high")
