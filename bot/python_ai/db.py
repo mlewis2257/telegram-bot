@@ -985,6 +985,33 @@ def get_active_watchlist(min_score: int = 55, max_age_hours: int = 24) -> list[d
               AND t.mint_address NOT LIKE 'UNKNOWN:%%'
               AND t.mint_address NOT LIKE 'INFERRED:%%'
 
+            UNION ALL
+
+            -- VIP safe tier calls with no skip_reason: peak tracking only for analysis
+            SELECT
+                c.id                AS call_id,
+                t.symbol,
+                t.mint_address,
+                c.mcap_at_call,
+                c.conviction_score,
+                c.created_at,
+                c.source_message_id,
+                ch.handle           AS channel_handle,
+                o.peak_multiplier,
+                TRUE                AS data_only
+            FROM calls    c
+            JOIN tokens   t  ON t.id      = c.token_id
+            JOIN channels ch ON ch.id     = c.channel_id
+            JOIN outcomes o  ON o.call_id = c.id
+            WHERE ch.handle = 'solhousesignal_vip'
+              AND c.vip_tier = 'safe'
+              AND c.skip_reason IS NULL
+              AND c.created_at > NOW() - INTERVAL '24 hours'
+              AND t.mint_resolved = TRUE
+              AND t.mint_address IS NOT NULL
+              AND t.mint_address NOT LIKE 'UNKNOWN:%%'
+              AND t.mint_address NOT LIKE 'INFERRED:%%'
+
             ORDER BY data_only ASC, conviction_score DESC
             """,
             (max_age_hours, min_score),
