@@ -46,10 +46,10 @@ MCAP_LIMITS = {
 }
 DEFAULT_MCAP_LIMIT = 75_000  # fallback for unknown channels
 
-TAKE_PROFIT_2X   = 2.0   # exit at 2x from entry
-TRAIL_PEAK_MIN   = 1.5   # trailing stop arms once peak >= 1.5x
+TAKE_PROFIT_3X   = 3.0   # exit at 3x from entry (no 5x/10x — let trail stop handle runners)
+TRAIL_PEAK_MIN   = 2.0   # trailing stop arms once peak >= 2.0x
 TRAIL_PCT        = 0.25  # flat 25% drawdown from peak (no tiers)
-HARD_STOP_PCT    = 0.35  # hard stop fires on 35% loss from entry
+HARD_STOP_PCT    = 0.35  # hard stop fires on 35% loss from entry (tighter than A's 50%)
 MAX_HOURS        = 24    # time stop after 24 hours open
 
 
@@ -195,9 +195,9 @@ def check_exits(
     Strategy B exit logic.
 
     Exit conditions checked in priority order:
-      1. 2x take profit
-      2. Trailing stop  (peak >= 1.5x; flat 25% drawdown — no volume check)
-      3. Hard stop      (down 35% from entry)
+      1. 3x take profit (no 5x/10x — trail stop captures runners above 3x)
+      2. Trailing stop  (peak >= 2.0x; flat 25% drawdown — no volume check, no tiers)
+      3. Hard stop      (down 35% from entry — tighter than Strategy A's 50%)
       4. Time stop      (open > 24 hours)
     """
     position = db.get_open_paper_position(call_id, is_strategy_b=True)
@@ -209,11 +209,11 @@ def check_exits(
 
     current_mult = current_mcap / entry_mcap
 
-    # 2x take profit
-    if current_mult >= TAKE_PROFIT_2X:
-        return ExitResult(True, "2x_tp")
+    # 3x take profit
+    if current_mult >= TAKE_PROFIT_3X:
+        return ExitResult(True, "3x_tp")
 
-    # Trailing stop — flat 25% from peak once peak >= 1.5x. No volume check.
+    # Trailing stop — flat 25% from peak once peak >= 2.0x. No volume check, no tiers.
     if peak_mcap > 0:
         peak_mult = peak_mcap / entry_mcap
         if peak_mult >= TRAIL_PEAK_MIN:

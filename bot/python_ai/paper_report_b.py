@@ -110,7 +110,7 @@ def main() -> None:
         print()
         print("Exit breakdown:")
         bd = s["exit_breakdown"]
-        print(f"  2x take profit:  {bd.get('2x_tp', 0)} trades")
+        print(f"  3x take profit:  {bd.get('3x_tp', 0)} trades")
         print(f"  Trailing stop:   {bd.get('trail_stop', 0)} trades")
         print(f"  Hard stop:       {bd.get('hard_stop', 0)} trades")
         print(f"  Time stop:       {bd.get('time_stop', 0)} trades")
