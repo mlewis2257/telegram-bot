@@ -43,6 +43,9 @@ TRAIL_PCT        = 0.25  # flat 25% drawdown from peak (no tiers)
 HARD_STOP_PCT    = 0.35  # hard stop fires on 35% loss from entry (tighter than A's 50%)
 MAX_HOURS        = 24    # time stop after 24 hours open
 
+# ── VIP gamble tier exit thresholds ───────────────────────────────────────────
+VIP_GAMBLE_HARD_STOP_PCT = 0.30   # tighter: -30% for gamble_risk positions
+
 
 # ── In-flight mint guard ───────────────────────────────────────────────────────
 
@@ -191,10 +194,15 @@ def check_exits(
     if entry_mcap <= 0:
         return ExitResult(False)
 
-    current_mult = current_mcap / entry_mcap
+    current_mult      = current_mcap / entry_mcap
+    is_vip_gamble_pos = _position_tiers_b.get(call_id) in ("gamble_risk", "gamble")
 
-    # 3x take profit
-    if current_mult >= TAKE_PROFIT_3X:
+    # 10x take profit — safety net for VIP gamble runners (no 3x_tp for those positions)
+    if current_mult >= 10.0:
+        return ExitResult(True, "10x_tp")
+
+    # 3x take profit — skipped for VIP gamble tiers
+    if not is_vip_gamble_pos and current_mult >= TAKE_PROFIT_3X:
         return ExitResult(True, "3x_tp")
 
     # Trailing stop — flat 25% from peak once peak >= 2.0x. No volume check, no tiers.
@@ -205,8 +213,9 @@ def check_exits(
             if drawdown >= TRAIL_PCT:
                 return ExitResult(True, "trail_stop")
 
-    # Hard stop — -35% from entry
-    if current_mult <= (1.0 - HARD_STOP_PCT):
+    # Hard stop — tighter for VIP gamble positions (-30%) vs standard (-35%)
+    hard_stop_pct = VIP_GAMBLE_HARD_STOP_PCT if is_vip_gamble_pos else HARD_STOP_PCT
+    if current_mult <= (1.0 - hard_stop_pct):
         return ExitResult(True, "hard_stop")
 
     # Time stop — 24 hours

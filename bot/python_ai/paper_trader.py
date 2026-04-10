@@ -55,8 +55,8 @@ VOL_CHECK_INTERVAL = 30                  # seconds between volume checks per pos
 _position_tiers: dict[int, str] = {}
 
 # ── Tier-specific exit thresholds ─────────────────────────────────────────────
-VIP_GAMBLE_HARD_STOP_PCT = 0.35   # tighter: -35% vs default -50%
-VIP_GAMBLE_MAX_HOURS     = 6.0    # shorter: 6h  vs default 24h
+VIP_GAMBLE_HARD_STOP_PCT = 0.30   # tighter: -30% vs default -50%
+VIP_GAMBLE_MAX_HOURS     = 24.0   # same as default 24h
 
 
 # ── Result type ───────────────────────────────────────────────────────────────
