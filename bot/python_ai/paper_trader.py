@@ -32,15 +32,6 @@ SOL_STRONG_ALERT = 1.0   # simulated SOL for strong_alert (85+)
 SOL_ALERT        = 0.5   # simulated SOL for alert (70–84)
 SOL_VIP_GAMBLE   = 0.25  # simulated SOL for experimental VIP gamble/gamble_risk entries
 
-# ── Per-channel mcap entry limits ──────────────────────────────────────────────
-MCAP_LIMITS = {
-    'solhousesignal_vip': 350_000,
-    'solwhaletrending':   100_000,
-    'solearlytrending':    75_000,
-    'solhousesignal':      50_000,
-}
-DEFAULT_MCAP_LIMIT = 75_000  # fallback for unknown channels
-
 TAKE_PROFIT_5X   = 5.0   # exit at 5x from entry
 TAKE_PROFIT_3X   = 3.0   # exit at 3x from entry
 TRAIL_PEAK_MIN   = 2.0   # trailing stop only arms once peak >= 2.0x
@@ -164,14 +155,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 token_data.get("channel_handle") or
                 ""
             ).lstrip("@")
-            max_mcap = MCAP_LIMITS.get(channel_handle, DEFAULT_MCAP_LIMIT)
-            if "solhousesignal" in channel_handle and "vip" not in channel_handle and score_result and int(score_result.get("score", 0)) in (63, 64):
-                max_mcap = 100_000  # score 63/64 signals get higher mcap allowance
-            if entry_price > max_mcap:
-                print(f"[paper] {symbol} skipped — mcap ${entry_price/1000:.0f}k too high for {channel_handle or 'unknown'} (max ${max_mcap/1000:.0f}k)")
-                db.set_call_skip_reason(call_id, "mcap_too_high")
-                return
-
             # ── VIP safe tier mcap range gate ─────────────────────────────────
             if channel_handle == "solhousesignal_vip" and token_data.get("vip_tier") == "safe":
                 if entry_price < 15_000:
