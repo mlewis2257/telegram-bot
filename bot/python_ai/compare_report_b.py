@@ -7,19 +7,17 @@ Usage:
     python3 compare_report_b.py --days 7     # last 7 days
 """
 
+import db
+from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
 import os
 import sys
 import argparse
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from dotenv import load_dotenv
 
 load_dotenv()
-
-from datetime import datetime, timedelta, timezone
-
-import db
 
 
 def get_stats_b(is_simulation: bool, since=None) -> dict:
@@ -97,7 +95,7 @@ def get_stats_b(is_simulation: bool, since=None) -> dict:
 def print_comparison_b(paper: dict, live: dict, label: str) -> None:
     """Print Strategy B paper and live stats side by side."""
     print(f"{'=' * 60}")
-    print(f"  STRATEGY B (PAPER) vs LIVE — {label}")
+    print(f"  STRATEGY B (PAPER) vs STRATEGY A (PAPER) — {label}")
     print(f"{'=' * 60}")
     print()
     print(f"{'Metric':<20} {'Strategy B':>15} {'Live':>15}")
@@ -106,11 +104,16 @@ def print_comparison_b(paper: dict, live: dict, label: str) -> None:
     print(f"{'Open positions':<20} {paper['open']:>15} {live['open']:>15}")
     print(f"{'Winners':<20} {paper['winners']:>15} {live['winners']:>15}")
     print(f"{'Losers':<20} {paper['losers']:>15} {live['losers']:>15}")
-    print(f"{'Win rate':<20} {paper['win_rate']:>14.1f}% {live['win_rate']:>14.1f}%")
-    print(f"{'Total P&L (SOL)':<20} {paper['total_pnl']:>+14.4f} {live['total_pnl']:>+14.4f}")
-    print(f"{'Avg P&L %':<20} {paper['avg_pnl_pct']:>+14.1f}% {live['avg_pnl_pct']:>+14.1f}%")
-    print(f"{'Best trade %':<20} {paper['best_pct']:>+14.1f}% {live['best_pct']:>+14.1f}%")
-    print(f"{'Worst trade %':<20} {paper['worst_pct']:>+14.1f}% {live['worst_pct']:>+14.1f}%")
+    print(
+        f"{'Win rate':<20} {paper['win_rate']:>14.1f}% {live['win_rate']:>14.1f}%")
+    print(
+        f"{'Total P&L (SOL)':<20} {paper['total_pnl']:>+14.4f} {live['total_pnl']:>+14.4f}")
+    print(
+        f"{'Avg P&L %':<20} {paper['avg_pnl_pct']:>+14.1f}% {live['avg_pnl_pct']:>+14.1f}%")
+    print(
+        f"{'Best trade %':<20} {paper['best_pct']:>+14.1f}% {live['best_pct']:>+14.1f}%")
+    print(
+        f"{'Worst trade %':<20} {paper['worst_pct']:>+14.1f}% {live['worst_pct']:>+14.1f}%")
     print()
 
     all_reasons = sorted(
@@ -128,7 +131,8 @@ def print_comparison_b(paper: dict, live: dict, label: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Strategy B paper vs live performance comparison")
+    parser = argparse.ArgumentParser(
+        description="Strategy B paper vs live performance comparison")
     parser.add_argument("--today", action="store_true", help="Today only")
     parser.add_argument("--days", type=int, default=None, help="Last N days")
     args = parser.parse_args()
@@ -146,7 +150,7 @@ def main() -> None:
         label = "All Time"
 
     paper = get_stats_b(is_simulation=True,  since=since)
-    live  = get_stats_b(is_simulation=False, since=since)
+    live = get_stats_b(is_simulation=False, since=since)
     print_comparison_b(paper, live, label)
 
 
