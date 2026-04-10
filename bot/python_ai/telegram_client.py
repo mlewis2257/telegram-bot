@@ -30,6 +30,7 @@ import tags
 import scorer
 import alert_bot
 import paper_trader
+import paper_trader_b
 import monitor as _monitor
 from parsers import type_a, type_b, type_a_vip
 
@@ -985,6 +986,7 @@ def run_listener() -> None:
                     elif vip_tier == "safe" and score >= 50:
                         # Safe tier trades at 50+
                         asyncio.create_task(paper_trader.open_position(score_result, extra))
+                        asyncio.create_task(paper_trader_b.open_position(score_result, extra))
                         score_result = None
                     elif vip_tier == "gamble_risk" and mcap_at_call > 0 and mcap_at_call < 25_000 and score >= 50:
                         # Trading suspended — log only for data collection
@@ -1037,6 +1039,9 @@ def run_listener() -> None:
                             asyncio.create_task(
                                 paper_trader.open_position(pending["score_result"], pending["extra"])
                             )
+                            asyncio.create_task(
+                                paper_trader_b.open_position(pending["score_result"], pending["extra"])
+                            )
 
             if score_result and score_result["label"] in ("alert", "strong_alert"):
                 await alert_bot.send_alert(score_result, extra)
@@ -1044,6 +1049,7 @@ def run_listener() -> None:
                 channel_tag = (extra.get("channel_tag") or extra.get("channel_handle") or "")
                 if "solhousesignal" in channel_tag and "vip" not in channel_tag:
                     asyncio.create_task(paper_trader.open_position(score_result, extra))
+                    asyncio.create_task(paper_trader_b.open_position(score_result, extra))
 
             if status == "milestone" and extra:
                 await alert_bot.send_milestone(**extra)

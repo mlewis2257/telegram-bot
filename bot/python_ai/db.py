@@ -1068,6 +1068,7 @@ def open_paper_position(
     sol_in: float,
     entry_time: datetime | None = None,
     entry_volume: float | None = None,
+    is_strategy_b: bool = False,
 ) -> None:
     """
     Open a simulated paper trade position for a scored call.
@@ -1082,23 +1083,24 @@ def open_paper_position(
         cur.execute(
             """
             INSERT INTO trading_positions
-                (token_id, call_id, is_simulation, entry_price, sol_in, entry_time,
-                 entry_volume_h1, status)
-            SELECT c.token_id, %s, TRUE, %s, %s, %s, %s, 'open'
+                (token_id, call_id, is_simulation, is_strategy_b, entry_price, sol_in,
+                 entry_time, entry_volume_h1, status)
+            SELECT c.token_id, %s, TRUE, %s, %s, %s, %s, %s, 'open'
             FROM calls c
             WHERE c.id = %s
               AND NOT EXISTS (
                 SELECT 1 FROM trading_positions
-                WHERE call_id = %s AND is_simulation = TRUE
+                WHERE call_id = %s AND is_simulation = TRUE AND is_strategy_b = %s
               )
             """,
-            (call_id, entry_price, sol_in, entry_time or datetime.now(timezone.utc),
-             entry_volume, call_id, call_id),
+            (call_id, is_strategy_b, entry_price, sol_in,
+             entry_time or datetime.now(timezone.utc),
+             entry_volume, call_id, call_id, is_strategy_b),
         )
         conn.commit()
 
 
-def get_paper_position_entry_volume(call_id: int) -> float | None:
+def get_paper_position_entry_volume(call_id: int, is_strategy_b: bool = False) -> float | None:
     """Return the entry_volume_h1 stored when the paper position was opened."""
     conn = get_conn()
     safe_rollback()
@@ -1109,14 +1111,15 @@ def get_paper_position_entry_volume(call_id: int) -> float | None:
             FROM trading_positions
             WHERE call_id = %s
               AND is_simulation = TRUE
+              AND is_strategy_b = %s
             """,
-            (call_id,),
+            (call_id, is_strategy_b),
         )
         row = cur.fetchone()
         return float(row[0]) if row and row[0] else None
 
 
-def update_paper_position_entry_volume(call_id: int, volume: float) -> None:
+def update_paper_position_entry_volume(call_id: int, volume: float, is_strategy_b: bool = False) -> None:
     """Backfill entry_volume_h1 on first successful volume fetch."""
     conn = get_conn()
     safe_rollback()
@@ -1127,14 +1130,15 @@ def update_paper_position_entry_volume(call_id: int, volume: float) -> None:
             SET entry_volume_h1 = %s
             WHERE call_id = %s
               AND is_simulation = TRUE
+              AND is_strategy_b = %s
               AND entry_volume_h1 IS NULL
             """,
-            (volume, call_id),
+            (volume, call_id, is_strategy_b),
         )
         conn.commit()
 
 
-def get_open_paper_position(call_id: int) -> dict | None:
+def get_open_paper_position(call_id: int, is_strategy_b: bool = False) -> dict | None:
     """
     Return {entry_price, sol_in, entry_time} for the open simulation
     position on this call, or None if no open position exists.
@@ -1148,9 +1152,10 @@ def get_open_paper_position(call_id: int) -> dict | None:
             FROM trading_positions
             WHERE call_id = %s
               AND is_simulation = TRUE
+              AND is_strategy_b = %s
               AND status = 'open'
             """,
-            (call_id,),
+            (call_id, is_strategy_b),
         )
         row = cur.fetchone()
         if not row:
@@ -1163,6 +1168,7 @@ def close_paper_position(
     exit_price: float,
     sol_out: float,
     exit_reason: str,
+    is_strategy_b: bool = False,
 ) -> None:
     """Close an open simulation position with exit data."""
     conn = get_conn()
@@ -1178,9 +1184,10 @@ def close_paper_position(
                 status      = 'closed'
             WHERE call_id      = %s
               AND is_simulation = TRUE
+              AND is_strategy_b = %s
               AND status        = 'open'
             """,
-            (exit_price, sol_out, exit_reason, call_id),
+            (exit_price, sol_out, exit_reason, call_id, is_strategy_b),
         )
         conn.commit()
 
@@ -1244,7 +1251,7 @@ def get_paper_pnl_summary() -> dict:
     return summary
 
 
-def get_open_paper_positions() -> list[dict]:
+def get_open_paper_positions(is_strategy_b: bool = False) -> list[dict]:
     """
     Return all open simulation positions with symbol and mint_address
     for use in the paper trading report.
@@ -1265,9 +1272,11 @@ def get_open_paper_positions() -> list[dict]:
             JOIN calls  c ON c.id       = tp.call_id
             JOIN tokens t ON t.id       = c.token_id
             WHERE tp.is_simulation = TRUE
+              AND tp.is_strategy_b  = %s
               AND tp.status        = 'open'
             ORDER BY tp.entry_time DESC
-            """
+            """,
+            (is_strategy_b,),
         )
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -1363,7 +1372,7 @@ def has_open_live_position_for_mint(mint_address: str) -> bool:
         return cur.fetchone() is not None
 
 
-def has_open_paper_position_for_mint(mint: str) -> bool:
+def has_open_paper_position_for_mint(mint: str, is_strategy_b: bool = False) -> bool:
     """Check if ANY open paper position exists for this mint address."""
     conn = get_conn()
     safe_rollback()
@@ -1375,10 +1384,11 @@ def has_open_paper_position_for_mint(mint: str) -> bool:
             JOIN tokens t ON t.id = c.token_id
             WHERE t.mint_address = %s
               AND tp.is_simulation = TRUE
+              AND tp.is_strategy_b = %s
               AND tp.status = 'open'
             LIMIT 1
             """,
-            (mint,),
+            (mint, is_strategy_b),
         )
         return cur.fetchone() is not None
 

@@ -34,6 +34,7 @@ import db
 import data_fetcher
 import alert_bot
 import paper_trader
+import paper_trader_b
 import live_trader
 import jupiter
 import wallet as _wallet
@@ -377,6 +378,11 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
             paper_trader.close_position(call_id, current_mcap, exit_result.reason)
             print(f"  [paper] {symbol} closed — {exit_result.reason}")
 
+        exit_result_b = paper_trader_b.check_exits(call_id, current_mcap, peak_mcap, mcap_at_call, mint=mint)
+        if exit_result_b.should_exit:
+            paper_trader_b.close_position(call_id, current_mcap, exit_result_b.reason)
+            print(f"  [paper_b] {symbol} closed — {exit_result_b.reason}")
+
         # ── Live trade exit check ──────────────────────────────────────────────
         try:
             live_exit = live_trader.check_live_exits(call_id, current_mcap, peak_mcap, mcap_at_call)
@@ -507,6 +513,7 @@ async def _check_paper_exits() -> int:
                     if hours_open > 4:
                         print(f"[paper] {symbol} delisted — force closed after {hours_open:.1f}h")
                         paper_trader.close_position(call_id, 0, "hard_stop")
+                        paper_trader_b.close_position(call_id, 0, "hard_stop")
                         closed += 1
                 continue
 
@@ -518,6 +525,9 @@ async def _check_paper_exits() -> int:
                 existing_vol = db.get_paper_position_entry_volume(call_id)
                 if existing_vol is None:
                     db.update_paper_position_entry_volume(call_id, float(market["volume_h1"]))
+                existing_vol_b = db.get_paper_position_entry_volume(call_id, is_strategy_b=True)
+                if existing_vol_b is None:
+                    db.update_paper_position_entry_volume(call_id, float(market["volume_h1"]), is_strategy_b=True)
 
             peak_info      = db.get_call_peak_info(call_id)
             stored_peak    = (peak_info["peak_multiplier"] if peak_info and peak_info["peak_multiplier"] else 0.0)
@@ -556,6 +566,14 @@ async def _check_paper_exits() -> int:
                 )
                 paper_trader.close_position(call_id, current_mcap, exit_result.reason)
                 closed += 1
+
+            exit_result_b = paper_trader_b.check_exits(call_id, current_mcap, peak_mcap, entry_price, mint=mint)
+            if exit_result_b.should_exit:
+                print(
+                    f"[paper_b] checking exit: {symbol}"
+                    f"  current={current_mult:.2f}x → closing ({exit_result_b.reason})"
+                )
+                paper_trader_b.close_position(call_id, current_mcap, exit_result_b.reason)
 
             # ── Live position exit check ───────────────────────────────────────
             try:
