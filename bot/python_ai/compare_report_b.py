@@ -1,10 +1,10 @@
 """
-compare_report.py — Paper vs live performance comparison.
+compare_report_b.py — Strategy B paper vs live performance comparison.
 
 Usage:
-    python3 compare_report.py              # all-time
-    python3 compare_report.py --today      # today only
-    python3 compare_report.py --days 7     # last 7 days
+    python3 compare_report_b.py              # all-time
+    python3 compare_report_b.py --today      # today only
+    python3 compare_report_b.py --days 7     # last 7 days
 """
 
 import os
@@ -22,15 +22,13 @@ from datetime import datetime, timedelta, timezone
 import db
 
 
-def get_stats(is_simulation: bool, since=None, is_strategy_b: bool = False) -> dict:
-    """Get trading stats for paper or live, optionally filtered by date."""
+def get_stats_b(is_simulation: bool, since=None) -> dict:
+    """Get trading stats for Strategy B paper or live, optionally filtered by date."""
     conn = db.get_conn()
     with conn.cursor() as cur:
         date_filter = ""
-        strat_filter = "AND is_strategy_b = %s" if is_simulation else ""
+        strat_filter = "AND is_strategy_b = TRUE" if is_simulation else ""
         params = [is_simulation]
-        if is_simulation:
-            params.append(is_strategy_b)
         if since:
             date_filter = "AND exit_time >= %s"
             params.append(since)
@@ -56,10 +54,7 @@ def get_stats(is_simulation: bool, since=None, is_strategy_b: bool = False) -> d
         row = cur.fetchone()
 
         open_params = [is_simulation]
-        open_strat_filter = ""
-        if is_simulation:
-            open_strat_filter = "AND is_strategy_b = %s"
-            open_params.append(is_strategy_b)
+        open_strat_filter = "AND is_strategy_b = TRUE" if is_simulation else ""
         cur.execute(
             f"""
             SELECT COUNT(*) FROM trading_positions
@@ -99,13 +94,13 @@ def get_stats(is_simulation: bool, since=None, is_strategy_b: bool = False) -> d
     }
 
 
-def print_comparison(paper: dict, live: dict, label: str, strategy: str = "A") -> None:
-    """Print paper and live stats side by side."""
+def print_comparison_b(paper: dict, live: dict, label: str) -> None:
+    """Print Strategy B paper and live stats side by side."""
     print(f"{'=' * 60}")
-    print(f"  STRATEGY {strategy} (PAPER) vs LIVE — {label}")
+    print(f"  STRATEGY B (PAPER) vs LIVE — {label}")
     print(f"{'=' * 60}")
     print()
-    print(f"{'Metric':<20} {'Paper':>15} {'Live':>15}")
+    print(f"{'Metric':<20} {'Strategy B':>15} {'Live':>15}")
     print(f"{'-' * 50}")
     print(f"{'Closed trades':<20} {paper['total']:>15} {live['total']:>15}")
     print(f"{'Open positions':<20} {paper['open']:>15} {live['open']:>15}")
@@ -122,7 +117,7 @@ def print_comparison(paper: dict, live: dict, label: str, strategy: str = "A") -
         set(list(paper["breakdown"].keys()) + list(live["breakdown"].keys()))
     )
     if all_reasons:
-        print(f"{'Exit Breakdown':<20} {'Paper':>15} {'Live':>15}")
+        print(f"{'Exit Breakdown':<20} {'Strategy B':>15} {'Live':>15}")
         print(f"{'-' * 50}")
         for reason in all_reasons:
             p = paper["breakdown"].get(reason, 0)
@@ -133,7 +128,7 @@ def print_comparison(paper: dict, live: dict, label: str, strategy: str = "A") -
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Paper vs live performance comparison")
+    parser = argparse.ArgumentParser(description="Strategy B paper vs live performance comparison")
     parser.add_argument("--today", action="store_true", help="Today only")
     parser.add_argument("--days", type=int, default=None, help="Last N days")
     args = parser.parse_args()
@@ -150,9 +145,9 @@ def main() -> None:
         since = None
         label = "All Time"
 
-    paper = get_stats(is_simulation=True,  since=since, is_strategy_b=False)
-    live  = get_stats(is_simulation=False, since=since)
-    print_comparison(paper, live, label, strategy="A")
+    paper = get_stats_b(is_simulation=True,  since=since)
+    live  = get_stats_b(is_simulation=False, since=since)
+    print_comparison_b(paper, live, label)
 
 
 if __name__ == "__main__":

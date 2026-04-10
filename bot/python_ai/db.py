@@ -1192,7 +1192,7 @@ def close_paper_position(
         conn.commit()
 
 
-def get_paper_pnl_summary() -> dict:
+def get_paper_pnl_summary(is_strategy_b: bool = False) -> dict:
     """
     Return aggregate P&L stats for all closed simulation positions,
     plus open count and exit breakdown by reason.
@@ -1213,8 +1213,10 @@ def get_paper_pnl_summary() -> dict:
                 MIN(pnl_pct)                                     AS worst_pct
             FROM trading_positions
             WHERE is_simulation = TRUE
+              AND is_strategy_b = %s
               AND status = 'closed'
-            """
+            """,
+            (is_strategy_b,),
         )
         row = cur.fetchone()
         summary = {
@@ -1229,7 +1231,11 @@ def get_paper_pnl_summary() -> dict:
 
         # Open count
         cur.execute(
-            "SELECT COUNT(*) FROM trading_positions WHERE is_simulation = TRUE AND status = 'open'"
+            """
+            SELECT COUNT(*) FROM trading_positions
+            WHERE is_simulation = TRUE AND is_strategy_b = %s AND status = 'open'
+            """,
+            (is_strategy_b,),
         )
         summary["open"] = int(cur.fetchone()[0])
 
@@ -1238,9 +1244,12 @@ def get_paper_pnl_summary() -> dict:
             """
             SELECT exit_reason, COUNT(*) AS n
             FROM trading_positions
-            WHERE is_simulation = TRUE AND status = 'closed'
+            WHERE is_simulation = TRUE
+              AND is_strategy_b = %s
+              AND status = 'closed'
             GROUP BY exit_reason
-            """
+            """,
+            (is_strategy_b,),
         )
         breakdown = {"10x_tp": 0, "5x_tp": 0, "3x_tp": 0, "trail_stop": 0, "hard_stop": 0, "time_stop": 0}
         for reason, count in cur.fetchall():

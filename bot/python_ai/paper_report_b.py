@@ -1,8 +1,8 @@
 """
-paper_report.py — Print a summary of simulated paper trading performance.
+paper_report_b.py — Print a summary of Strategy B simulated paper trading performance.
 
 Usage:
-    python3 paper_report.py
+    python3 paper_report_b.py
 """
 
 import os
@@ -48,7 +48,7 @@ def _get_best_worst() -> tuple[dict | None, dict | None]:
             JOIN calls  c ON c.id  = tp.call_id
             JOIN tokens t ON t.id  = c.token_id
             WHERE tp.is_simulation = TRUE
-              AND tp.is_strategy_b = FALSE
+              AND tp.is_strategy_b = TRUE
               AND tp.status        = 'closed'
               AND tp.pnl_pct IS NOT NULL
             ORDER BY tp.pnl_pct DESC
@@ -65,7 +65,7 @@ def _get_best_worst() -> tuple[dict | None, dict | None]:
             JOIN calls  c ON c.id  = tp.call_id
             JOIN tokens t ON t.id  = c.token_id
             WHERE tp.is_simulation = TRUE
-              AND tp.is_strategy_b = FALSE
+              AND tp.is_strategy_b = TRUE
               AND tp.status        = 'closed'
               AND tp.pnl_pct IS NOT NULL
             ORDER BY tp.pnl_pct ASC
@@ -79,16 +79,16 @@ def _get_best_worst() -> tuple[dict | None, dict | None]:
 
 
 def main() -> None:
-    s    = db.get_paper_pnl_summary(is_strategy_b=False)
+    s    = db.get_paper_pnl_summary(is_strategy_b=True)
     best, worst = _get_best_worst()
-    open_positions = db.get_open_paper_positions(is_strategy_b=False)
+    open_positions = db.get_open_paper_positions(is_strategy_b=True)
 
     total = s["open"] + s["closed"]
     win_rate = (s["winners"] / s["closed"] * 100) if s["closed"] > 0 else 0.0
     avg_pnl_sol = (s["total_pnl"] / s["closed"]) if s["closed"] > 0 else 0.0
 
     print("=" * 40)
-    print("  PAPER TRADING REPORT")
+    print("  STRATEGY B REPORT")
     print("=" * 40)
     print(f"Open positions:    {s['open']}")
     print(f"Closed positions:  {s['closed']}")
@@ -110,9 +110,7 @@ def main() -> None:
         print()
         print("Exit breakdown:")
         bd = s["exit_breakdown"]
-        print(f"  10x take profit: {bd.get('10x_tp', 0)} trades")
-        print(f"  5x take profit:  {bd.get('5x_tp', 0)} trades")
-        print(f"  3x take profit:  {bd.get('3x_tp', 0)} trades")
+        print(f"  2x take profit:  {bd.get('2x_tp', 0)} trades")
         print(f"  Trailing stop:   {bd.get('trail_stop', 0)} trades")
         print(f"  Hard stop:       {bd.get('hard_stop', 0)} trades")
         print(f"  Time stop:       {bd.get('time_stop', 0)} trades")
