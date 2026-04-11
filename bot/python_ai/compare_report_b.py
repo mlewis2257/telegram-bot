@@ -66,8 +66,7 @@ def get_stats_b(is_simulation: bool, since=None) -> dict:
             f"""
             SELECT exit_reason, COUNT(*)
             FROM trading_positions
-            WHERE is_simulation = %s
-              {strat_filter}
+            WHERE is_simulation = %s AND is_strategy_b = TRUE
               AND status = 'closed'
               {date_filter}
             GROUP BY exit_reason
