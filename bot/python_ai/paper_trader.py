@@ -111,7 +111,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 return
 
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
-                if db.has_open_paper_position_for_mint(mint):
+                if db.has_open_paper_position_for_mint(mint, is_strategy_b=False):
                     print(f"[paper] {symbol} skipped — open position already exists for this mint")
                     db.set_call_skip_reason(call_id, "duplicate")
                     return
@@ -205,7 +205,7 @@ def check_exits(
       4. Hard stop      (down 50% from entry)
       5. Time stop      (open > 24 hours)
     """
-    position = db.get_open_paper_position(call_id)
+    position = db.get_open_paper_position(call_id, is_strategy_b=False)
     if not position:
         return ExitResult(False)
 
@@ -301,7 +301,7 @@ def close_position(call_id: int, current_mcap: float, reason: str) -> None:
     Never raises.
     """
     try:
-        position = db.get_open_paper_position(call_id)
+        position = db.get_open_paper_position(call_id, is_strategy_b=False)
         if not position:
             return
 
@@ -312,7 +312,7 @@ def close_position(call_id: int, current_mcap: float, reason: str) -> None:
             return
 
         sol_out = sol_in * (current_mcap / entry_price)
-        db.close_paper_position(call_id, current_mcap, sol_out, reason)
+        db.close_paper_position(call_id, current_mcap, sol_out, reason, is_strategy_b=False)
         pnl = sol_out - sol_in
         print(
             f"[paper] closed  call_id={call_id}  reason={reason}"
