@@ -28,7 +28,7 @@ import alert_bot
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-SOL_STRONG_ALERT = 1.0   # simulated SOL for strong_alert (85+)
+SOL_STRONG_ALERT = 0.5   # simulated SOL for strong_alert (85+)
 SOL_ALERT        = 0.5   # simulated SOL for alert (70–84)
 SOL_VIP_GAMBLE   = 0.25  # simulated SOL for experimental VIP gamble/gamble_risk entries
 
