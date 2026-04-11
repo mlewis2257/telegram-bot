@@ -166,12 +166,13 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     db.set_call_skip_reason(call_id, "mcap_too_high")
                     return
 
+            vip_tier_val = token_data.get("vip_tier") if is_vip_gamble else None
             db.open_paper_position(call_id, entry_price, sol_in,
                                    entry_time=position_entry_time,
-                                   entry_volume=entry_volume)
+                                   entry_volume=entry_volume,
+                                   vip_tier=vip_tier_val)
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
                 _position_mints[call_id] = mint
-            vip_tier_val = token_data.get("vip_tier") if is_vip_gamble else None
             if vip_tier_val in ("gamble_risk", "gamble"):
                 _position_tiers[call_id] = vip_tier_val
             print(f"[paper] opened {symbol}  call_id={call_id}  {sol_in} SOL @ {entry_price:.0f}")
@@ -211,8 +212,8 @@ def check_exits(
     if entry_mcap <= 0:
         return ExitResult(False)
 
-    current_mult   = current_mcap / entry_mcap
-    is_vip_gamble_pos = _position_tiers.get(call_id) in ("gamble_risk", "gamble")
+    current_mult      = current_mcap / entry_mcap
+    is_vip_gamble_pos = position.get("vip_tier") in ("gamble_risk", "gamble")
 
     # 10x take profit — checked first so high runners are labelled correctly
     if current_mult >= 10.0:

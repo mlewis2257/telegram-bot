@@ -1122,6 +1122,7 @@ def open_paper_position(
     entry_time: datetime | None = None,
     entry_volume: float | None = None,
     is_strategy_b: bool = False,
+    vip_tier: str | None = None,
 ) -> None:
     """
     Open a simulated paper trade position for a scored call.
@@ -1137,8 +1138,8 @@ def open_paper_position(
             """
             INSERT INTO trading_positions
                 (token_id, call_id, is_simulation, is_strategy_b, entry_price, sol_in,
-                 entry_time, entry_volume_h1, status)
-            SELECT c.token_id, %s, TRUE, %s, %s, %s, %s, %s, 'open'
+                 entry_time, entry_volume_h1, vip_tier, status)
+            SELECT c.token_id, %s, TRUE, %s, %s, %s, %s, %s, %s, 'open'
             FROM calls c
             WHERE c.id = %s
               AND NOT EXISTS (
@@ -1148,7 +1149,7 @@ def open_paper_position(
             """,
             (call_id, is_strategy_b, entry_price, sol_in,
              entry_time or datetime.now(timezone.utc),
-             entry_volume, call_id, call_id, is_strategy_b),
+             entry_volume, vip_tier, call_id, call_id, is_strategy_b),
         )
         conn.commit()
 
@@ -1193,7 +1194,7 @@ def update_paper_position_entry_volume(call_id: int, volume: float, is_strategy_
 
 def get_open_paper_position(call_id: int, is_strategy_b: bool = False) -> dict | None:
     """
-    Return {entry_price, sol_in, entry_time} for the open simulation
+    Return {entry_price, sol_in, entry_time, vip_tier} for the open simulation
     position on this call, or None if no open position exists.
     """
     conn = get_conn()
@@ -1201,7 +1202,7 @@ def get_open_paper_position(call_id: int, is_strategy_b: bool = False) -> dict |
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT entry_price, sol_in, entry_time
+            SELECT entry_price, sol_in, entry_time, vip_tier
             FROM trading_positions
             WHERE call_id = %s
               AND is_simulation = TRUE
@@ -1213,7 +1214,7 @@ def get_open_paper_position(call_id: int, is_strategy_b: bool = False) -> dict |
         row = cur.fetchone()
         if not row:
             return None
-        return {"entry_price": float(row[0]), "sol_in": float(row[1]), "entry_time": row[2]}
+        return {"entry_price": float(row[0]), "sol_in": float(row[1]), "entry_time": row[2], "vip_tier": row[3]}
 
 
 def close_paper_position(
