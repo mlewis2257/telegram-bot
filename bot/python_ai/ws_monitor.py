@@ -13,6 +13,7 @@ Usage:
 """
 
 import asyncio
+import datetime as _dt
 import json
 import os
 import sys
@@ -191,15 +192,24 @@ async def handle_log_notification(ws, mint: str, call_id: int) -> None:
         peak_info = db.get_call_peak_info(call_id)
     except Exception:
         peak_info = None
-    peak_mult = (peak_info["peak_multiplier"] or 0.0) if peak_info else 0.0
+    stored_peak     = (peak_info["peak_multiplier"] or 0.0) if peak_info else 0.0
+    peak_reached_at = peak_info.get("peak_reached_at") if peak_info else None
+    if peak_reached_at and peak_reached_at.tzinfo is None:
+        peak_reached_at = peak_reached_at.replace(tzinfo=_dt.timezone.utc)
 
     # ── Strategy A check ──────────────────────────────────────────────────────
     a_done = False
     try:
         position_a = db.get_open_paper_position(call_id, is_strategy_b=False)
         if position_a:
-            entry_price = position_a["entry_price"]
-            peak_mcap   = peak_mult * entry_price
+            entry_price    = position_a["entry_price"]
+            pos_entry_time = position_a["entry_time"]
+            if pos_entry_time and pos_entry_time.tzinfo is None:
+                pos_entry_time = pos_entry_time.replace(tzinfo=_dt.timezone.utc)
+            if peak_reached_at and pos_entry_time and peak_reached_at >= pos_entry_time:
+                peak_mcap = stored_peak * entry_price
+            else:
+                peak_mcap = 0.0
             result_a    = paper_trader.check_exits(
                 call_id, current_mcap, peak_mcap, entry_price, mint=mint
             )
@@ -220,10 +230,16 @@ async def handle_log_notification(ws, mint: str, call_id: int) -> None:
     try:
         position_b = db.get_open_paper_position(call_id, is_strategy_b=True)
         if position_b:
-            entry_price = position_b["entry_price"]
-            peak_mcap   = peak_mult * entry_price
+            entry_price      = position_b["entry_price"]
+            pos_entry_time_b = position_b["entry_time"]
+            if pos_entry_time_b and pos_entry_time_b.tzinfo is None:
+                pos_entry_time_b = pos_entry_time_b.replace(tzinfo=_dt.timezone.utc)
+            if peak_reached_at and pos_entry_time_b and peak_reached_at >= pos_entry_time_b:
+                peak_mcap_b = stored_peak * entry_price
+            else:
+                peak_mcap_b = 0.0
             result_b    = paper_trader_b.check_exits(
-                call_id, current_mcap, peak_mcap, entry_price, mint=mint
+                call_id, current_mcap, peak_mcap_b, entry_price, mint=mint
             )
             if result_b.should_exit:
                 paper_trader_b.close_position(call_id, current_mcap, result_b.reason)

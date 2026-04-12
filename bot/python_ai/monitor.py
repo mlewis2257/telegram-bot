@@ -567,13 +567,24 @@ async def _check_paper_exits() -> int:
                 paper_trader.close_position(call_id, current_mcap, exit_result.reason)
                 closed += 1
 
-            exit_result_b = paper_trader_b.check_exits(call_id, current_mcap, peak_mcap, entry_price, mint=mint)
-            if exit_result_b.should_exit:
-                print(
-                    f"[paper_b] checking exit: {symbol}"
-                    f"  current={current_mult:.2f}x → closing ({exit_result_b.reason})"
-                )
-                paper_trader_b.close_position(call_id, current_mcap, exit_result_b.reason)
+            pos_b = db.get_open_paper_position(call_id, is_strategy_b=True)
+            if pos_b:
+                entry_price_b = pos_b["entry_price"]
+                pos_entry_time_b = pos_b["entry_time"]
+                if pos_entry_time_b and pos_entry_time_b.tzinfo is None:
+                    pos_entry_time_b = pos_entry_time_b.replace(tzinfo=timezone.utc)
+                pr_b = peak_reached_at  # already tz-normalised above
+                if pr_b and pos_entry_time_b:
+                    peak_mcap_b = stored_peak * entry_price_b if pr_b >= pos_entry_time_b else 0.0
+                else:
+                    peak_mcap_b = 0.0
+                exit_result_b = paper_trader_b.check_exits(call_id, current_mcap, peak_mcap_b, entry_price_b, mint=mint)
+                if exit_result_b.should_exit:
+                    print(
+                        f"[paper_b] checking exit: {symbol}"
+                        f"  current={current_mcap/entry_price_b:.2f}x → closing ({exit_result_b.reason})"
+                    )
+                    paper_trader_b.close_position(call_id, current_mcap, exit_result_b.reason)
 
             # ── Live position exit check ───────────────────────────────────────
             try:
