@@ -45,7 +45,7 @@ PASS_INTERVAL        = 20     # target; actual interval depends on watchlist siz
 INTER_CALL_SLEEP     = 0.5    # seconds between each DexScreener call
 RATE_LIMIT_SLEEP     = 30     # seconds to back off on 429 responses
 MAX_WATCHLIST_SPREAD = 50     # above this, spread calls evenly across the window
-MIN_SCORE            = 55     # minimum conviction_score to include (caution+)
+MIN_SCORE            = 45     # minimum conviction_score to include (vip_safe floor)
 MAX_AGE_HOURS        = 24     # only monitor calls from the last N hours
 
 MILESTONE_THRESHOLDS    = [2.0, 5.0, 10.0]  # send alert on first crossing of each

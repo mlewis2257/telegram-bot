@@ -888,7 +888,7 @@ def get_mint_by_call_id(call_id: int) -> str | None:
 
 # ── Monitor helpers ───────────────────────────────────────────────────────────
 
-def get_active_watchlist(min_score: int = 55, max_age_hours: int = 24) -> list[dict]:
+def get_active_watchlist(min_score: int = 45, max_age_hours: int = 24) -> list[dict]:
     """
     Return calls that are recent, resolved, and scored high enough to monitor.
 
