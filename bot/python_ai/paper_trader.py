@@ -166,6 +166,17 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     db.set_call_skip_reason(call_id, "mcap_too_high")
                     return
 
+            # ── Free solhousesignal mcap range gate ───────────────────────────
+            if "solhousesignal" in channel_handle and "vip" not in channel_handle:
+                if entry_price < 20_000:
+                    print(f"[paper] {symbol} skipped — solhousesignal mcap ${entry_price/1000:.1f}k below $20k minimum")
+                    db.set_call_skip_reason(call_id, "mcap_too_low")
+                    return
+                if entry_price > 80_000:
+                    print(f"[paper] {symbol} skipped — solhousesignal mcap ${entry_price/1000:.0f}k above $80k maximum")
+                    db.set_call_skip_reason(call_id, "mcap_too_high")
+                    return
+
             vip_tier_val = token_data.get("vip_tier") if is_vip_gamble else None
             db.open_paper_position(call_id, entry_price, sol_in,
                                    entry_time=position_entry_time,
