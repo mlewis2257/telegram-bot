@@ -1478,6 +1478,35 @@ def get_call_id_for_open_mint(mint: str, is_strategy_b: bool = False) -> int | N
         return row[0] if row else None
 
 
+def get_token_onchain_data(mint_address: str) -> dict:
+    """Return on-chain security data for a token by mint address."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT security_flag, bundle_pct_remaining,
+                   dev_tokens_made, hodl_count, sniper_count,
+                   fake_vol_pct, liq_at_detection
+            FROM tokens
+            WHERE mint_address = %s
+            """,
+            (mint_address,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {}
+        return {
+            "security_flag":        row[0],
+            "bundle_pct_remaining": float(row[1]) if row[1] is not None else None,
+            "dev_tokens_made":      int(row[2])   if row[2] is not None else None,
+            "hodl_count":           int(row[3])   if row[3] is not None else None,
+            "sniper_count":         int(row[4])   if row[4] is not None else None,
+            "fake_vol_pct":         float(row[5]) if row[5] is not None else None,
+            "liq_at_detection":     float(row[6]) if row[6] is not None else None,
+        }
+
+
 def get_open_live_positions() -> list[dict]:
     """Return all open live positions with symbol and mint for reporting."""
     conn = get_conn()

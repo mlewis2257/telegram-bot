@@ -151,9 +151,11 @@ async def open_position(score_result: dict, token_data: dict) -> None:
 
             # ── gamble_risk on-chain data filters ─────────────────────────────
             if token_data.get("vip_tier") == "gamble_risk":
-                security_flag = token_data.get("security_flag")
-                bundle_pct    = token_data.get("bundle_pct_remaining")
-                dev_tokens    = token_data.get("dev_tokens_made")
+                # Fetch fresh on-chain data from DB — token_data always has None for VIP signals
+                token_onchain = db.get_token_onchain_data(mint) if mint else {}
+                security_flag = token_onchain.get("security_flag")
+                bundle_pct    = token_onchain.get("bundle_pct_remaining")
+                dev_tokens    = token_onchain.get("dev_tokens_made")
                 if security_flag is None:
                     print(f"[paper_b] {symbol} skipped — gamble_risk no security data")
                     return

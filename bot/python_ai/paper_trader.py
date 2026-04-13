@@ -46,8 +46,6 @@ _pending_lock = asyncio.Lock()
 
 # ── Position mint store (call_id → mint, for volume re-fetch in check_exits) ──
 _position_mints: dict[int, str]   = {}
-_last_vol_check: dict[int, float] = {}   # call_id → last volume check timestamp
-VOL_CHECK_INTERVAL = 30                  # seconds between volume checks per position
 
 # ── Per-position VIP tier store (call_id → vip_tier) ──────────────────────────
 # Populated on open for confirmed VIP gamble_risk/gamble positions so that
@@ -164,9 +162,11 @@ async def open_position(score_result: dict, token_data: dict) -> None:
 
             # ── gamble_risk on-chain data filters ─────────────────────────────
             if token_data.get("vip_tier") == "gamble_risk":
-                security_flag = token_data.get("security_flag")
-                bundle_pct    = token_data.get("bundle_pct_remaining")
-                dev_tokens    = token_data.get("dev_tokens_made")
+                # Fetch fresh on-chain data from DB — token_data always has None for VIP signals
+                token_onchain = db.get_token_onchain_data(mint) if mint else {}
+                security_flag = token_onchain.get("security_flag")
+                bundle_pct    = token_onchain.get("bundle_pct_remaining")
+                dev_tokens    = token_onchain.get("dev_tokens_made")
                 if security_flag is None:
                     print(f"[paper] {symbol} skipped — gamble_risk no security data")
                     db.set_call_skip_reason(call_id, "no_data")
@@ -299,34 +299,7 @@ def check_exits(
         if trail_pct is not None:
             drawdown = (peak_mcap - current_mcap) / peak_mcap
             if drawdown >= trail_pct:
-                # Volume confirmation — only hold if volume still healthy AND below 5x
-                if peak_mult < 5.0:
-                    entry_vol = db.get_paper_position_entry_volume(call_id)
-                    mint_addr = mint or _position_mints.get(call_id)
-                    if entry_vol and entry_vol > 0 and mint_addr:
-                        now        = time.monotonic()
-                        last_check = _last_vol_check.get(call_id, 0)
-                        if now - last_check < VOL_CHECK_INTERVAL:
-                            # Too soon for a fresh volume fetch — hold this cycle
-                            pass
-                        else:
-                            _last_vol_check[call_id] = now
-                            try:
-                                current_market = data_fetcher.fetch_token_price(mint_addr)
-                                current_vol    = (current_market or {}).get("volume_h1") or 0
-                                vol_ratio      = float(current_vol) / entry_vol if current_vol else 0.0
-                                print(f"[paper] {mint_addr[:8]} vol_ratio={vol_ratio:.2f} — {'holding' if vol_ratio > 0.4 else 'exiting'}")
-                                if vol_ratio > 0.4:
-                                    pass  # volume still healthy — hold through pullback
-                                else:
-                                    return ExitResult(True, "trail_stop")
-                            except Exception:
-                                return ExitResult(True, "trail_stop")
-                    else:
-                        return ExitResult(True, "trail_stop")
-                else:
-                    # 5x+ — protect gains regardless of volume
-                    return ExitResult(True, "trail_stop")
+                return ExitResult(True, "trail_stop")
 
     # Hard stop — tighter for VIP gamble tiers (-35%) vs default (-50%)
     hard_stop_pct = VIP_GAMBLE_HARD_STOP_PCT if is_vip_gamble_pos else HARD_STOP_PCT
