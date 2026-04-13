@@ -162,6 +162,28 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     db.set_call_skip_reason(call_id, "mcap_too_low")
                     return
 
+            # ── gamble_risk on-chain data filters ─────────────────────────────
+            if token_data.get("vip_tier") == "gamble_risk":
+                security_flag = token_data.get("security_flag")
+                bundle_pct    = token_data.get("bundle_pct_remaining")
+                dev_tokens    = token_data.get("dev_tokens_made")
+                if security_flag is None:
+                    print(f"[paper] {symbol} skipped — gamble_risk no security data")
+                    db.set_call_skip_reason(call_id, "no_data")
+                    return
+                if security_flag == "warning":
+                    print(f"[paper] {symbol} skipped — gamble_risk security=warning")
+                    db.set_call_skip_reason(call_id, "security_warning")
+                    return
+                if bundle_pct is not None and bundle_pct > 10.0:
+                    print(f"[paper] {symbol} skipped — gamble_risk bundle {bundle_pct:.1f}% too high")
+                    db.set_call_skip_reason(call_id, "high_bundle")
+                    return
+                if dev_tokens is not None and dev_tokens > 10:
+                    print(f"[paper] {symbol} skipped — gamble_risk dev made {dev_tokens} tokens")
+                    db.set_call_skip_reason(call_id, "serial_rugger")
+                    return
+
             entry_price = actual_entry or msg_mcap
 
             # ── Entry gate ────────────────────────────────────────────────────
