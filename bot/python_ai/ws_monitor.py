@@ -314,7 +314,13 @@ async def poll_new_positions(ws_ref: list) -> None:
         if ws is None:
             continue
         try:
-            positions  = db.get_open_paper_positions(is_strategy_b=False)
+            positions_a = db.get_open_paper_positions(is_strategy_b=False)
+            positions_b = db.get_open_paper_positions(is_strategy_b=True)
+            all_positions = {p["call_id"]: p for p in positions_a}
+            for p in positions_b:
+                if p["call_id"] not in all_positions:
+                    all_positions[p["call_id"]] = p
+            positions  = list(all_positions.values())
             open_mints = set()
             for pos in positions:
                 mint    = pos.get("mint_address") or ""
@@ -390,7 +396,13 @@ async def main() -> None:
 
     # Seed subscriptions from currently open positions on startup
     try:
-        positions = db.get_open_paper_positions(is_strategy_b=False)
+        positions_a = db.get_open_paper_positions(is_strategy_b=False)
+        positions_b = db.get_open_paper_positions(is_strategy_b=True)
+        all_positions = {p["call_id"]: p for p in positions_a}
+        for p in positions_b:
+            if p["call_id"] not in all_positions:
+                all_positions[p["call_id"]] = p
+        positions = list(all_positions.values())
         seeded = 0
         for pos in positions:
             mint = pos.get("mint_address") or ""
