@@ -35,7 +35,7 @@ SOL_VIP_GAMBLE   = 0.25  # simulated SOL for experimental VIP gamble/gamble_risk
 TAKE_PROFIT_5X   = 5.0   # exit at 5x from entry
 TAKE_PROFIT_3X   = 3.0   # exit at 3x from entry
 TRAIL_PEAK_MIN   = 2.0   # trailing stop only arms once peak >= 2.0x
-HARD_STOP_PCT    = 0.50  # hard stop fires on 50% loss from entry
+HARD_STOP_PCT    = 0.35  # hard stop fires on 35% loss from entry
 MAX_HOURS        = 24    # time stop after 24 hours open
 
 
@@ -112,9 +112,30 @@ async def open_position(score_result: dict, token_data: dict) -> None:
 
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
                 if db.has_open_paper_position_for_mint(mint, is_strategy_b=False):
-                    print(f"[paper] {symbol} skipped — open position already exists for this mint")
-                    db.set_call_skip_reason(call_id, "duplicate")
-                    return
+                    if "solwhaletrending" in channel:
+                        existing_call_id = db.get_call_id_for_open_mint(mint, is_strategy_b=False)
+                        if existing_call_id:
+                            existing_pos = db.get_open_paper_position(existing_call_id, is_strategy_b=False)
+                            if existing_pos:
+                                current_mult = (entry_price / existing_pos["entry_price"]) if existing_pos["entry_price"] > 0 else 1.0
+                                if current_mult >= 1.5:
+                                    print(f"[paper] {symbol} PYRAMID — solwhaletrending confirms at {current_mult:.2f}x, adding {sol_in} SOL")
+                                    db.set_call_skip_reason(call_id, None)
+                                    # fall through to open_paper_position
+                                else:
+                                    print(f"[paper] {symbol} skipped — open position exists but only at {current_mult:.2f}x (need 1.5x for pyramid)")
+                                    db.set_call_skip_reason(call_id, "duplicate")
+                                    return
+                            else:
+                                db.set_call_skip_reason(call_id, "duplicate")
+                                return
+                        else:
+                            db.set_call_skip_reason(call_id, "duplicate")
+                            return
+                    else:
+                        print(f"[paper] {symbol} skipped — open position already exists for this mint")
+                        db.set_call_skip_reason(call_id, "duplicate")
+                        return
 
             actual_entry = None
             entry_volume = None

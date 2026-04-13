@@ -109,8 +109,25 @@ async def open_position(score_result: dict, token_data: dict) -> None:
 
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
                 if db.has_open_paper_position_for_mint(mint, is_strategy_b=True):
-                    print(f"[paper_b] {symbol} skipped — open position already exists for this mint")
-                    return
+                    if "solwhaletrending" in channel:
+                        existing_call_id = db.get_call_id_for_open_mint(mint, is_strategy_b=True)
+                        if existing_call_id:
+                            existing_pos = db.get_open_paper_position(existing_call_id, is_strategy_b=True)
+                            if existing_pos:
+                                current_mult = (entry_price / existing_pos["entry_price"]) if existing_pos["entry_price"] > 0 else 1.0
+                                if current_mult >= 1.5:
+                                    print(f"[paper_b] {symbol} PYRAMID — solwhaletrending confirms at {current_mult:.2f}x, adding {sol_in} SOL")
+                                    # fall through to open_paper_position
+                                else:
+                                    print(f"[paper_b] {symbol} skipped — open position exists but only at {current_mult:.2f}x (need 1.5x for pyramid)")
+                                    return
+                            else:
+                                return
+                        else:
+                            return
+                    else:
+                        print(f"[paper_b] {symbol} skipped — open position already exists for this mint")
+                        return
 
             actual_entry = None
             entry_volume = None

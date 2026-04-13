@@ -1456,6 +1456,28 @@ def has_open_paper_position_for_mint(mint: str, is_strategy_b: bool = False) -> 
         return cur.fetchone() is not None
 
 
+def get_call_id_for_open_mint(mint: str, is_strategy_b: bool = False) -> int | None:
+    """Return call_id of open paper position for this mint, or None."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT c.id FROM trading_positions tp
+            JOIN calls  c ON c.id = tp.call_id
+            JOIN tokens t ON t.id = c.token_id
+            WHERE t.mint_address = %s
+              AND tp.is_simulation = TRUE
+              AND tp.is_strategy_b = %s
+              AND tp.status = 'open'
+            LIMIT 1
+            """,
+            (mint, is_strategy_b),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
 def get_open_live_positions() -> list[dict]:
     """Return all open live positions with symbol and mint for reporting."""
     conn = get_conn()
