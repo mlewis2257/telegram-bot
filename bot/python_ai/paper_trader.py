@@ -164,23 +164,23 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             if token_data.get("vip_tier") == "gamble_risk":
                 # Fetch fresh on-chain data from DB — token_data always has None for VIP signals
                 token_onchain = db.get_token_onchain_data(mint) if mint else {}
-                security_flag = token_onchain.get("security_flag")
                 bundle_pct    = token_onchain.get("bundle_pct_remaining")
                 dev_tokens    = token_onchain.get("dev_tokens_made")
-                if security_flag is None:
-                    print(f"[paper] {symbol} skipped — gamble_risk no security data")
-                    db.set_call_skip_reason(call_id, "no_data")
-                    return
+                security_flag = token_onchain.get("security_flag")
+
+                # VIP gamble_risk messages contain no security data — vip_tier is the classification
                 if security_flag == "warning":
                     print(f"[paper] {symbol} skipped — gamble_risk security=warning")
                     db.set_call_skip_reason(call_id, "security_warning")
                     return
-                if bundle_pct is not None and bundle_pct > 10.0:
-                    print(f"[paper] {symbol} skipped — gamble_risk bundle {bundle_pct:.1f}% too high")
+
+                # Only apply bundle/dev filters if data exists
+                if bundle_pct is not None and bundle_pct >= 10:
+                    print(f"[paper] {symbol} skipped — gamble_risk bundle_pct={bundle_pct}")
                     db.set_call_skip_reason(call_id, "high_bundle")
                     return
-                if dev_tokens is not None and dev_tokens > 10:
-                    print(f"[paper] {symbol} skipped — gamble_risk dev made {dev_tokens} tokens")
+                if dev_tokens is not None and dev_tokens >= 10:
+                    print(f"[paper] {symbol} skipped — gamble_risk dev_tokens={dev_tokens}")
                     db.set_call_skip_reason(call_id, "serial_rugger")
                     return
 
@@ -245,6 +245,7 @@ def check_exits(
     peak_mcap: float,
     entry_mcap: float,
     mint: str = None,
+    is_strategy_b: bool = False,
 ) -> ExitResult:
     """
     Check whether the open paper position for call_id should be exited.
@@ -259,7 +260,7 @@ def check_exits(
       4. Hard stop      (down 50% from entry)
       5. Time stop      (open > 24 hours)
     """
-    position = db.get_open_paper_position(call_id, is_strategy_b=False)
+    position = db.get_open_paper_position(call_id, is_strategy_b=is_strategy_b)
     if not position:
         return ExitResult(False)
 
@@ -319,7 +320,12 @@ def check_exits(
     return ExitResult(False)
 
 
-def close_position(call_id: int, current_mcap: float, reason: str) -> None:
+def close_position(
+    call_id: int,
+    current_mcap: float,
+    reason: str,
+    is_strategy_b: bool = False,
+) -> None:
     """
     Close an open paper trade position at current_mcap.
 
@@ -328,7 +334,7 @@ def close_position(call_id: int, current_mcap: float, reason: str) -> None:
     Never raises.
     """
     try:
-        position = db.get_open_paper_position(call_id, is_strategy_b=False)
+        position = db.get_open_paper_position(call_id, is_strategy_b=is_strategy_b)
         if not position:
             return
 
@@ -339,7 +345,7 @@ def close_position(call_id: int, current_mcap: float, reason: str) -> None:
             return
 
         sol_out = sol_in * (current_mcap / entry_price)
-        db.close_paper_position(call_id, current_mcap, sol_out, reason, is_strategy_b=False)
+        db.close_paper_position(call_id, current_mcap, sol_out, reason, is_strategy_b=is_strategy_b)
         pnl = sol_out - sol_in
         print(
             f"[paper] closed  call_id={call_id}  reason={reason}"

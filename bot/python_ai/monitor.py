@@ -373,14 +373,18 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
     # ── Paper trade exit check ────────────────────────────────────────────────
     if not dry_run:
         peak_mcap   = active_peak * mcap_at_call
-        exit_result = paper_trader.check_exits(call_id, current_mcap, peak_mcap, mcap_at_call, mint=mint)
+        exit_result = paper_trader.check_exits(
+            call_id, current_mcap, peak_mcap, mcap_at_call, mint=mint, is_strategy_b=False
+        )
         if exit_result.should_exit:
-            paper_trader.close_position(call_id, current_mcap, exit_result.reason)
+            paper_trader.close_position(call_id, current_mcap, exit_result.reason, is_strategy_b=False)
             print(f"  [paper] {symbol} closed — {exit_result.reason}")
 
-        exit_result_b = paper_trader_b.check_exits(call_id, current_mcap, peak_mcap, mcap_at_call, mint=mint)
+        exit_result_b = paper_trader_b.check_exits(
+            call_id, current_mcap, peak_mcap, mcap_at_call, mint=mint, is_strategy_b=True
+        )
         if exit_result_b.should_exit:
-            paper_trader_b.close_position(call_id, current_mcap, exit_result_b.reason)
+            paper_trader_b.close_position(call_id, current_mcap, exit_result_b.reason, is_strategy_b=True)
             print(f"  [paper_b] {symbol} closed — {exit_result_b.reason}")
 
         # ── Live trade exit check ──────────────────────────────────────────────
@@ -520,9 +524,9 @@ async def _check_paper_exits() -> int:
                             tag = "[paper]" if strategy == "A" else "[paper_b]"
                             print(f"{tag} {symbol} delisted — force closed after {hours_open:.1f}h")
                             if strategy == "A":
-                                paper_trader.close_position(call_id, 0, "hard_stop")
+                                paper_trader.close_position(call_id, 0, "hard_stop", is_strategy_b=False)
                             else:
-                                paper_trader_b.close_position(call_id, 0, "hard_stop")
+                                paper_trader_b.close_position(call_id, 0, "hard_stop", is_strategy_b=True)
                             closed += 1
                 continue
 
@@ -575,22 +579,26 @@ async def _check_paper_exits() -> int:
                     peak_mcap = 0.0
 
                 if strategy == "A":
-                    exit_result = paper_trader.check_exits(call_id, current_mcap, peak_mcap, entry_price, mint=mint)
+                    exit_result = paper_trader.check_exits(
+                        call_id, current_mcap, peak_mcap, entry_price, mint=mint, is_strategy_b=False
+                    )
                     if exit_result.should_exit:
                         print(
                             f"[paper] checking exit: {symbol}"
                             f"  current={current_mult:.2f}x → closing ({exit_result.reason})"
                         )
-                        paper_trader.close_position(call_id, current_mcap, exit_result.reason)
+                        paper_trader.close_position(call_id, current_mcap, exit_result.reason, is_strategy_b=False)
                         closed += 1
                 else:
-                    exit_result = paper_trader_b.check_exits(call_id, current_mcap, peak_mcap, entry_price, mint=mint)
+                    exit_result = paper_trader_b.check_exits(
+                        call_id, current_mcap, peak_mcap, entry_price, mint=mint, is_strategy_b=True
+                    )
                     if exit_result.should_exit:
                         print(
                             f"[paper_b] checking exit: {symbol}"
                             f"  current={current_mult:.2f}x → closing ({exit_result.reason})"
                         )
-                        paper_trader_b.close_position(call_id, current_mcap, exit_result.reason)
+                        paper_trader_b.close_position(call_id, current_mcap, exit_result.reason, is_strategy_b=True)
                         closed += 1
 
             # ── Live position exit check ───────────────────────────────────────

@@ -211,10 +211,10 @@ async def handle_log_notification(ws, mint: str, call_id: int) -> None:
             else:
                 peak_mcap = 0.0
             result_a    = paper_trader.check_exits(
-                call_id, current_mcap, peak_mcap, entry_price, mint=mint
+                call_id, current_mcap, peak_mcap, entry_price, mint=mint, is_strategy_b=False
             )
             if result_a.should_exit:
-                paper_trader.close_position(call_id, current_mcap, result_a.reason)
+                paper_trader.close_position(call_id, current_mcap, result_a.reason, is_strategy_b=False)
                 print(
                     f"[ws_monitor] {mint[:8]} A closed — {result_a.reason}"
                     f" @ ${current_mcap/1000:.1f}k"
@@ -239,10 +239,10 @@ async def handle_log_notification(ws, mint: str, call_id: int) -> None:
             else:
                 peak_mcap_b = 0.0
             result_b    = paper_trader_b.check_exits(
-                call_id, current_mcap, peak_mcap_b, entry_price, mint=mint
+                call_id, current_mcap, peak_mcap_b, entry_price, mint=mint, is_strategy_b=True
             )
             if result_b.should_exit:
-                paper_trader_b.close_position(call_id, current_mcap, result_b.reason)
+                paper_trader_b.close_position(call_id, current_mcap, result_b.reason, is_strategy_b=True)
                 print(
                     f"[ws_monitor] {mint[:8]} B closed — {result_b.reason}"
                     f" @ ${current_mcap/1000:.1f}k"
