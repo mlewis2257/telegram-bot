@@ -244,10 +244,6 @@ def check_exits(
     current_mult      = current_mcap / entry_mcap
     is_vip_gamble_pos = position.get("vip_tier") in ("gamble_risk", "gamble")
 
-    # 10x take profit — safety net for VIP gamble runners (no 3x_tp for those positions)
-    if current_mult >= 10.0:
-        return ExitResult(True, "10x_tp")
-
     # 3x take profit — skipped for VIP gamble tiers
     if not is_vip_gamble_pos and current_mult >= TAKE_PROFIT_3X:
         return ExitResult(True, "3x_tp")
