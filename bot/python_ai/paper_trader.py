@@ -219,7 +219,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             # Block the known low-quality combo on solhousesignal channels.
             is_bad_bundle = (bundle_pct is None) or (bundle_pct >= 10)
             is_bad_fake   = (fake_pct is None) or (fake_pct >= 5)
-            if "solhousesignal" in channel_handle and is_bad_bundle and is_bad_fake:
+            if channel_handle == "solhousesignal" and is_bad_bundle and is_bad_fake:
                 print(
                     f"[paper] {symbol} skipped — low_quality_bucket "
                     f"(bundle={bundle_pct}, fake={fake_pct}, score={score_val:.1f})"
