@@ -163,8 +163,97 @@ def main() -> None:
             limit=args.limit,
         )
 
-        # 4) Missed runners (calls not traded OR skipped) with peak >= 2x
+        # 4) Coverage diagnostics: outcome/peak availability
         if peak_col:
+            cur.execute(
+                f"""
+                WITH traded AS (
+                    SELECT DISTINCT tp.call_id
+                    FROM trading_positions tp
+                    WHERE tp.is_simulation = TRUE
+                )
+                SELECT
+                    CASE WHEN tr.call_id IS NULL THEN 'not_traded' ELSE 'traded' END AS trade_state,
+                    COUNT(*) AS calls,
+                    COUNT(CASE WHEN o.{peak_col} IS NOT NULL THEN 1 END) AS peak_present,
+                    COUNT(CASE WHEN o.{peak_col} >= 2 THEN 1 END) AS peak_ge_2
+                FROM calls c
+                LEFT JOIN outcomes o ON o.call_id = c.id
+                LEFT JOIN traded tr ON tr.call_id = c.id
+                WHERE c.created_at >= %s AND c.created_at < %s
+                GROUP BY 1
+                ORDER BY 1
+                """,
+                (start_utc, end_utc),
+            )
+            _print_table(
+                "Outcome / Peak Coverage",
+                ["trade_state", "calls", "peak_present", "peak_ge_2"],
+                cur.fetchall(),
+            )
+
+        # 5) Missed runners (calls not traded OR skipped) with robust runner calc
+        if peak_col:
+            cur.execute(
+                f"""
+                WITH traded AS (
+                    SELECT DISTINCT tp.call_id
+                    FROM trading_positions tp
+                    WHERE tp.is_simulation = TRUE
+                ),
+                base AS (
+                    SELECT
+                        c.id AS call_id,
+                        c.created_at,
+                        ch.handle,
+                        COALESCE(c.vip_tier, 'none') AS vip_tier,
+                        ROUND(COALESCE(c.conviction_score, 0)::numeric, 1) AS score,
+                        COALESCE(c.skip_reason, 'none') AS skip_reason,
+                        ROUND(COALESCE(t.bundle_pct_remaining, -1)::numeric, 2) AS bundle_pct,
+                        ROUND(COALESCE(t.fake_vol_pct, -1)::numeric, 2) AS fake_pct,
+                        tr.call_id AS traded_call_id,
+                        CASE
+                            WHEN c.mcap_at_call IS NULL OR c.mcap_at_call <= 0 THEN NULL
+                            ELSE GREATEST(
+                                COALESCE(o.{peak_col}, 0),
+                                COALESCE(o.mcap_at_result / NULLIF(c.mcap_at_call, 0), 0),
+                                COALESCE(o.mcap_1h / NULLIF(c.mcap_at_call, 0), 0),
+                                COALESCE(o.mcap_4h / NULLIF(c.mcap_at_call, 0), 0),
+                                COALESCE(o.mcap_24h / NULLIF(c.mcap_at_call, 0), 0)
+                            )
+                        END AS derived_peak_mult
+                    FROM calls c
+                    JOIN channels ch ON ch.id = c.channel_id
+                    JOIN tokens t ON t.id = c.token_id
+                    LEFT JOIN outcomes o ON o.call_id = c.id
+                    LEFT JOIN traded tr ON tr.call_id = c.id
+                    WHERE c.created_at >= %s AND c.created_at < %s
+                )
+                SELECT
+                    call_id,
+                    created_at,
+                    handle,
+                    vip_tier,
+                    score,
+                    skip_reason,
+                    bundle_pct,
+                    fake_pct,
+                    ROUND(COALESCE(derived_peak_mult, 0)::numeric, 2) AS peak_mult
+                FROM base
+                WHERE derived_peak_mult >= 2
+                  AND (traded_call_id IS NULL OR skip_reason <> 'none')
+                ORDER BY derived_peak_mult DESC, created_at DESC
+                """,
+                (start_utc, end_utc),
+            )
+            _print_table(
+                "Missed Runners (derived peak>=2x, skipped or not traded)",
+                ["call_id", "created_at", "channel", "vip_tier", "score", "skip_reason", "bundle_pct", "fake_pct", "peak_mult"],
+                cur.fetchall(),
+                limit=args.limit,
+            )
+
+            # 6) High-score calls not traded (helps detect pipeline drops)
             cur.execute(
                 f"""
                 WITH traded AS (
@@ -176,32 +265,28 @@ def main() -> None:
                     c.id AS call_id,
                     c.created_at,
                     ch.handle,
-                    COALESCE(c.vip_tier, 'none') AS vip_tier,
                     ROUND(COALESCE(c.conviction_score, 0)::numeric, 1) AS score,
                     COALESCE(c.skip_reason, 'none') AS skip_reason,
-                    ROUND(COALESCE(t.bundle_pct_remaining, -1)::numeric, 2) AS bundle_pct,
-                    ROUND(COALESCE(t.fake_vol_pct, -1)::numeric, 2) AS fake_pct,
-                    ROUND(o.{peak_col}::numeric, 2) AS peak_mult
+                    ROUND(COALESCE(o.{peak_col}, 0)::numeric, 2) AS peak_mult
                 FROM calls c
                 JOIN channels ch ON ch.id = c.channel_id
-                JOIN tokens t ON t.id = c.token_id
-                JOIN outcomes o ON o.call_id = c.id
+                LEFT JOIN outcomes o ON o.call_id = c.id
                 LEFT JOIN traded tr ON tr.call_id = c.id
                 WHERE c.created_at >= %s AND c.created_at < %s
-                  AND o.{peak_col} >= 2
-                  AND (tr.call_id IS NULL OR c.skip_reason IS NOT NULL)
-                ORDER BY o.{peak_col} DESC, c.created_at DESC
+                  AND COALESCE(c.conviction_score, 0) >= 70
+                  AND tr.call_id IS NULL
+                ORDER BY c.conviction_score DESC, c.created_at DESC
                 """,
                 (start_utc, end_utc),
             )
             _print_table(
-                "Missed Runners (peak>=2x, skipped or not traded)",
-                ["call_id", "created_at", "channel", "vip_tier", "score", "skip_reason", "bundle_pct", "fake_pct", "peak_mult"],
+                "High-Score Calls Not Traded (score>=70)",
+                ["call_id", "created_at", "channel", "score", "skip_reason", "peak_mult"],
                 cur.fetchall(),
                 limit=args.limit,
             )
 
-            # 5) Traded runners for context
+            # 7) Traded runners for context
             cur.execute(
                 f"""
                 WITH traded AS (
