@@ -102,8 +102,9 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             else:
                 sol_in = SOL_ALERT  # 0.5 SOL
 
-            call_id  = score_result.get("call_id")
-            msg_mcap = float(token_data.get("mcap_at_call") or 0)
+            call_id    = score_result.get("call_id")
+            score_val  = float(score_result.get("score") or 0)
+            msg_mcap   = float(token_data.get("mcap_at_call") or 0)
 
             if not call_id or msg_mcap <= 0:
                 return
@@ -198,6 +199,43 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 token_data.get("channel_handle") or
                 ""
             ).lstrip("@")
+
+            # ── Bucket quality filters (data-driven) ─────────────────────────
+            bundle_pct = token_data.get("bundle_pct_remaining")
+            fake_pct   = token_data.get("fake_vol_pct")
+            if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")) and (bundle_pct is None or fake_pct is None):
+                token_onchain = db.get_token_onchain_data(mint) or {}
+                if bundle_pct is None:
+                    bundle_pct = token_onchain.get("bundle_pct_remaining")
+                if fake_pct is None:
+                    fake_pct = token_onchain.get("fake_vol_pct")
+
+            # VIP low-score bucket underperformed heavily; hard block for now.
+            if channel_handle == "solhousesignal_vip" and score_val < 63:
+                print(f"[paper] {symbol} skipped — vip score {score_val:.1f} < 63")
+                db.set_call_skip_reason(call_id, "vip_low_score")
+                return
+
+            # Block the known low-quality combo on solhousesignal channels.
+            is_bad_bundle = (bundle_pct is None) or (bundle_pct >= 10)
+            is_bad_fake   = (fake_pct is None) or (fake_pct >= 5)
+            if "solhousesignal" in channel_handle and is_bad_bundle and is_bad_fake:
+                print(
+                    f"[paper] {symbol} skipped — low_quality_bucket "
+                    f"(bundle={bundle_pct}, fake={fake_pct}, score={score_val:.1f})"
+                )
+                db.set_call_skip_reason(call_id, "low_quality_bucket")
+                return
+
+            # Positive pocket marker for observability (sizing unchanged for now).
+            if (
+                channel_handle == "solhousesignal"
+                and 70 <= score_val < 75
+                and bundle_pct is not None and bundle_pct < 10
+                and fake_pct is not None and fake_pct < 5
+            ):
+                print(f"[paper] {symbol} priority_bucket matched (70-74, bundle<10, fake<5)")
+
             # ── VIP safe tier mcap range gate ─────────────────────────────────
             if channel_handle == "solhousesignal_vip" and token_data.get("vip_tier") == "safe":
                 if entry_price < 15_000:
