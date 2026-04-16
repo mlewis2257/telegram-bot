@@ -1051,7 +1051,19 @@ def run_listener() -> None:
                             )
 
             if score_result and score_result["label"] in ("alert", "strong_alert"):
+                # Alert delivery should not gate trade execution.
                 await alert_bot.send_alert(score_result, extra)
+                if extra:
+                    channel_tag = (extra.get("channel_tag") or extra.get("channel_handle") or "")
+                    # VIP entries are already routed above; avoid double-open.
+                    if "solhousesignal_vip" not in channel_tag:
+                        asyncio.create_task(paper_trader.open_position(score_result, extra))
+                        asyncio.create_task(paper_trader_b.open_position(score_result, extra))
+                        try:
+                            import live_trader
+                            asyncio.create_task(live_trader.open_live_position(score_result, extra))
+                        except Exception as le:
+                            print(f"[live_trader] open failed: {le}")
             elif score_result and extra and score_result.get("score", 0) >= 63:
                 channel_tag = (extra.get("channel_tag") or extra.get("channel_handle") or "")
                 if "solhousesignal" in channel_tag and "vip" not in channel_tag:

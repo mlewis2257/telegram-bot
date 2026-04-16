@@ -214,7 +214,6 @@ async def send_alert(score_result: dict, token_data: dict) -> bool:
 
     Returns True on success, False on failure. Never raises.
     """
-    sent_ok = False
     try:
         text = _build_alert(score_result, token_data)
         await _get_bot().send_message(
@@ -227,33 +226,10 @@ async def send_alert(score_result: dict, token_data: dict) -> bool:
             f"[alert_bot] sent  symbol={token_data.get('symbol', '?')}"
             f"  score={score_result.get('score')}  label={score_result.get('label')}"
         )
-        sent_ok = True
+        return True
     except Exception as e:
-        # Keep trading path independent from Telegram delivery health.
         print(f"[alert_bot] failed: {e}")
-
-    try:
-        import paper_trader
-        asyncio.create_task(paper_trader.open_position(score_result, token_data))
-    except Exception as pe:
-        print(f"[paper_trader] open_position failed: {pe}")
-    try:
-        import paper_trader_b
-        asyncio.create_task(paper_trader_b.open_position(score_result, token_data))
-    except Exception as pe:
-        print(f"[paper_trader_b] open_position failed: {pe}")
-    # Live trading integration
-    try:
-        import live_trader
-        asyncio.create_task(
-            live_trader.open_live_position(
-                score_result, token_data
-            )
-        )
-    except Exception as le:
-        print(f"[live_trader] open failed: {le}")
-
-    return sent_ok
+        return False
 
 
 async def send_milestone(
