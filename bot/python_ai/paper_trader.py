@@ -106,7 +106,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             score_val  = float(score_result.get("score") or 0)
             msg_mcap   = float(token_data.get("mcap_at_call") or 0)
 
-            if not call_id or msg_mcap <= 0:
+            if not call_id:
                 return
 
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
@@ -186,6 +186,10 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     return
 
             entry_price = actual_entry or msg_mcap
+            if entry_price <= 0:
+                print(f"[paper] {symbol} skipped — no usable entry mcap (msg={msg_mcap}, fetched={actual_entry})")
+                db.set_call_skip_reason(call_id, "no_entry_mcap")
+                return
 
             # ── Entry gate ────────────────────────────────────────────────────
             security_flag = token_data.get("security_flag")
