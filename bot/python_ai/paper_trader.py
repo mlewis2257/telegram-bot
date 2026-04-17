@@ -105,6 +105,11 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             call_id    = score_result.get("call_id")
             score_val  = float(score_result.get("score") or 0)
             msg_mcap   = float(token_data.get("mcap_at_call") or 0)
+            channel_handle = (
+                token_data.get("channel_tag") or
+                token_data.get("channel_handle") or
+                ""
+            ).lstrip("@")
 
             if not call_id:
                 return
@@ -138,6 +143,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
 
             actual_entry = None
             entry_volume = None
+            token_onchain = {}
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
                 try:
                     market = data_fetcher.fetch_token_price(mint)
@@ -145,6 +151,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                         actual_entry = float(market["mcap"])
                     if market and market.get("volume_h1"):
                         entry_volume = float(market["volume_h1"])
+                    token_onchain = db.get_token_onchain_data(mint) or {}
                 except Exception as e:
                     print(f"[paper] price fetch failed for {symbol}: {e}")
             if actual_entry is None and mint:
@@ -161,30 +168,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     db.set_call_skip_reason(call_id, "mcap_too_low")
                     return
 
-            # ── gamble_risk on-chain data filters ─────────────────────────────
-            if token_data.get("vip_tier") == "gamble_risk":
-                # Fetch fresh on-chain data from DB — token_data always has None for VIP signals
-                token_onchain = db.get_token_onchain_data(mint) if mint else {}
-                bundle_pct    = token_onchain.get("bundle_pct_remaining")
-                dev_tokens    = token_onchain.get("dev_tokens_made")
-                security_flag = token_onchain.get("security_flag")
-
-                # VIP gamble_risk messages contain no security data — vip_tier is the classification
-                if security_flag == "warning":
-                    print(f"[paper] {symbol} skipped — gamble_risk security=warning")
-                    db.set_call_skip_reason(call_id, "security_warning")
-                    return
-
-                # Only apply bundle/dev filters if data exists
-                if bundle_pct is not None and bundle_pct >= 10:
-                    print(f"[paper] {symbol} skipped — gamble_risk bundle_pct={bundle_pct}")
-                    db.set_call_skip_reason(call_id, "high_bundle")
-                    return
-                if dev_tokens is not None and dev_tokens >= 10:
-                    print(f"[paper] {symbol} skipped — gamble_risk dev_tokens={dev_tokens}")
-                    db.set_call_skip_reason(call_id, "serial_rugger")
-                    return
-
             entry_price = actual_entry or msg_mcap
             if entry_price <= 0:
                 print(f"[paper] {symbol} skipped — no usable entry mcap (msg={msg_mcap}, fetched={actual_entry})")
@@ -198,27 +181,14 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 db.set_call_skip_reason(call_id, "security_warning")
                 return
 
-            channel_handle = (
-                token_data.get("channel_tag") or
-                token_data.get("channel_handle") or
-                ""
-            ).lstrip("@")
-
             # ── Bucket quality filters (data-driven) ─────────────────────────
             bundle_pct = token_data.get("bundle_pct_remaining")
             fake_pct   = token_data.get("fake_vol_pct")
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")) and (bundle_pct is None or fake_pct is None):
-                token_onchain = db.get_token_onchain_data(mint) or {}
                 if bundle_pct is None:
                     bundle_pct = token_onchain.get("bundle_pct_remaining")
                 if fake_pct is None:
                     fake_pct = token_onchain.get("fake_vol_pct")
-
-            # VIP low-score bucket underperformed heavily; hard block for now.
-            if channel_handle == "solhousesignal_vip" and score_val < 63:
-                print(f"[paper] {symbol} skipped — vip score {score_val:.1f} < 63")
-                db.set_call_skip_reason(call_id, "vip_low_score")
-                return
 
             # Block the known low-quality combo on solhousesignal channels.
             is_bad_bundle = (bundle_pct is not None and bundle_pct >= 10)
@@ -230,6 +200,60 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 )
                 db.set_call_skip_reason(call_id, "low_quality_bucket")
                 return
+
+            # ── VIP tier gates (A only; B has separate file/logic) ───────────
+            if channel_handle == "solhousesignal_vip":
+                vip_tier = token_data.get("vip_tier")
+                security_flag_onchain = token_onchain.get("security_flag")
+                dev_tokens = token_onchain.get("dev_tokens_made")
+                has_bundle_fake = (bundle_pct is not None and fake_pct is not None)
+
+                # Global VIP floor: low-score buckets underperformed.
+                if score_val < 63:
+                    print(f"[paper] {symbol} skipped — vip score {score_val:.1f} < 63")
+                    db.set_call_skip_reason(call_id, "vip_mcap_gate")
+                    return
+
+                if vip_tier == "safe":
+                    # Safe entries need minimum on-chain quality context.
+                    if not has_bundle_fake:
+                        print(f"[paper] {symbol} skipped — VIP safe missing bundle/fake data")
+                        db.set_call_skip_reason(call_id, "vip_mcap_gate")
+                        return
+                    if is_bad_bundle and is_bad_fake:
+                        print(f"[paper] {symbol} skipped — VIP safe low-quality combo (bundle={bundle_pct}, fake={fake_pct})")
+                        db.set_call_skip_reason(call_id, "vip_mcap_gate")
+                        return
+
+                elif vip_tier == "gamble":
+                    # Gamble is medium strict: allow nulls, but block explicit bad combo.
+                    if is_bad_bundle and is_bad_fake:
+                        print(f"[paper] {symbol} skipped — VIP gamble low-quality combo (bundle={bundle_pct}, fake={fake_pct})")
+                        db.set_call_skip_reason(call_id, "vip_mcap_gate")
+                        return
+
+                elif vip_tier == "gamble_risk":
+                    # Strictest tier: require stronger score and quality data.
+                    if score_val < 70:
+                        print(f"[paper] {symbol} skipped — VIP gamble_risk score {score_val:.1f} < 70")
+                        db.set_call_skip_reason(call_id, "vip_mcap_gate")
+                        return
+                    if not has_bundle_fake:
+                        print(f"[paper] {symbol} skipped — VIP gamble_risk missing bundle/fake data")
+                        db.set_call_skip_reason(call_id, "vip_mcap_gate")
+                        return
+                    if security_flag_onchain == "warning":
+                        print(f"[paper] {symbol} skipped — gamble_risk security=warning")
+                        db.set_call_skip_reason(call_id, "security_warning")
+                        return
+                    if (bundle_pct is not None and bundle_pct >= 10) or (fake_pct is not None and fake_pct >= 5):
+                        print(f"[paper] {symbol} skipped — gamble_risk risk gate (bundle={bundle_pct}, fake={fake_pct})")
+                        db.set_call_skip_reason(call_id, "vip_mcap_gate")
+                        return
+                    if dev_tokens is not None and dev_tokens >= 10:
+                        print(f"[paper] {symbol} skipped — gamble_risk dev_tokens={dev_tokens}")
+                        db.set_call_skip_reason(call_id, "serial_rugger")
+                        return
 
             # Positive pocket marker for observability (sizing unchanged for now).
             if (
