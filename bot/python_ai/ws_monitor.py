@@ -45,6 +45,8 @@ RECONNECT_BACKOFF_MAX = 60    # max reconnect delay in seconds
 # ── Rate-limit state ──────────────────────────────────────────────────────────
 
 _last_fetch: dict[str, float] = {}   # mint → monotonic time of last price fetch
+# Strategy A-only realtime peak cache (call_id -> peak mcap since A entry).
+_a_realtime_peak_mcap: dict[int, float] = {}
 
 
 # ── Subscription manager ──────────────────────────────────────────────────────
@@ -207,20 +209,36 @@ async def handle_log_notification(ws, mint: str, call_id: int) -> None:
             if pos_entry_time and pos_entry_time.tzinfo is None:
                 pos_entry_time = pos_entry_time.replace(tzinfo=_dt.timezone.utc)
             if peak_reached_at and pos_entry_time and peak_reached_at >= pos_entry_time:
-                peak_mcap = stored_peak * entry_price
+                peak_mcap_db = stored_peak * entry_price
             else:
-                peak_mcap = 0.0
+                peak_mcap_db = 0.0
+
+            cached_peak_mcap = _a_realtime_peak_mcap.get(call_id, 0.0)
+            peak_mcap = max(peak_mcap_db, cached_peak_mcap)
+            if current_mcap > peak_mcap:
+                peak_mcap = current_mcap
+                _a_realtime_peak_mcap[call_id] = current_mcap
+                current_mult = (current_mcap / entry_price) if entry_price else 0.0
+                print(
+                    f"[ws_monitor] {mint[:8]} A realtime peak"
+                    f" call_id={call_id}"
+                    f" mcap=${current_mcap/1000:.1f}k"
+                    f" mult={current_mult:.2f}x"
+                )
+
             result_a    = paper_trader.check_exits(
                 call_id, current_mcap, peak_mcap, entry_price, mint=mint, is_strategy_b=False
             )
             if result_a.should_exit:
                 paper_trader.close_position(call_id, current_mcap, result_a.reason, is_strategy_b=False)
+                _a_realtime_peak_mcap.pop(call_id, None)
                 print(
                     f"[ws_monitor] {mint[:8]} A closed — {result_a.reason}"
                     f" @ ${current_mcap/1000:.1f}k"
                 )
                 a_done = True
         else:
+            _a_realtime_peak_mcap.pop(call_id, None)
             a_done = True  # no open A position
     except Exception as e:
         print(f"[ws_monitor] A exit check error {mint[:8]}: {e}")
