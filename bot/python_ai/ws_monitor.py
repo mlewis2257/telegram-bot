@@ -167,6 +167,37 @@ class SubscriptionManager:
 _mgr = SubscriptionManager()
 
 
+# ── Subscription sync helper ──────────────────────────────────────────────────
+
+async def sync_open_positions(ws) -> None:
+    """
+    Sync websocket subscriptions to current open paper positions immediately.
+
+    - Subscribe to mints with open positions that are not currently tracked.
+    - Unsubscribe mints that no longer have any open position.
+    """
+    positions_a = db.get_open_paper_positions(is_strategy_b=False)
+    positions_b = db.get_open_paper_positions(is_strategy_b=True)
+    all_positions = {p["call_id"]: p for p in positions_a}
+    for p in positions_b:
+        if p["call_id"] not in all_positions:
+            all_positions[p["call_id"]] = p
+
+    open_mints = set()
+    for pos in all_positions.values():
+        mint = pos.get("mint_address") or ""
+        call_id = pos["call_id"]
+        if not mint or mint.startswith(("INFERRED:", "UNKNOWN:")):
+            continue
+        open_mints.add(mint)
+        if mint not in _mgr.known_mints:
+            await _mgr.subscribe(ws, mint, call_id)
+
+    for mint in list(_mgr.known_mints):
+        if mint not in open_mints:
+            await _mgr.unsubscribe(ws, mint)
+
+
 # ── Exit handler ──────────────────────────────────────────────────────────────
 
 async def handle_log_notification(ws, mint: str, call_id: int) -> None:
@@ -332,27 +363,7 @@ async def poll_new_positions(ws_ref: list) -> None:
         if ws is None:
             continue
         try:
-            positions_a = db.get_open_paper_positions(is_strategy_b=False)
-            positions_b = db.get_open_paper_positions(is_strategy_b=True)
-            all_positions = {p["call_id"]: p for p in positions_a}
-            for p in positions_b:
-                if p["call_id"] not in all_positions:
-                    all_positions[p["call_id"]] = p
-            positions  = list(all_positions.values())
-            open_mints = set()
-            for pos in positions:
-                mint    = pos.get("mint_address") or ""
-                call_id = pos["call_id"]
-                if not mint or mint.startswith(("INFERRED:", "UNKNOWN:")):
-                    continue
-                open_mints.add(mint)
-                if mint not in _mgr.known_mints:
-                    await _mgr.subscribe(ws, mint, call_id)
-
-            # Unsubscribe stale mints (position closed externally)
-            for mint in list(_mgr.known_mints):
-                if mint not in open_mints:
-                    await _mgr.unsubscribe(ws, mint)
+            await sync_open_positions(ws)
 
         except Exception as e:
             print(f"[ws_monitor] poll error: {e}")
@@ -390,6 +401,8 @@ async def connect_with_retry() -> None:
                     print(f"[ws_monitor] connected — {WS_URL[:50]}...")
 
                     await _mgr.resubscribe_all(ws)
+                    await sync_open_positions(ws)
+                    print("[ws_monitor] reconnect sync complete")
 
                     hb_task = asyncio.create_task(heartbeat(ws))
                     try:
