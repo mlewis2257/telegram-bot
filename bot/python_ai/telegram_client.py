@@ -1003,11 +1003,18 @@ def run_listener() -> None:
                             print(f"[vip] {extra.get('symbol', '?')} skipped — no valid mint for gamble_risk")
                         score_result = None
                     elif vip_tier == "gamble" and mcap_at_call > 0 and mcap_at_call < 40_000 and score >= 50:
-                        # Trading suspended — log only for data collection
-                        call_id_g = score_result.get("call_id")
-                        if call_id_g:
-                            db.set_call_skip_reason(call_id_g, "vip_paused")
-                        print(f"[vip_confirm] {extra.get('symbol', '?')} paused — VIP gamble trading suspended")
+                        # Strategy A only: allow gamble tier through A filters; keep B paused as control.
+                        mint_addr = extra.get("mint_address")
+                        if mint_addr and not mint_addr.startswith(("INFERRED:", "UNKNOWN:")):
+                            extra["sol_in_override"] = paper_trader.SOL_VIP_GAMBLE  # 0.25 SOL
+                            extra["vip_tier"] = vip_tier
+                            asyncio.create_task(paper_trader.open_position(score_result, extra))
+                            print(f"[vip] {extra.get('symbol', '?')} opening gamble position — A only (B paused)")
+                        else:
+                            call_id_g = score_result.get("call_id")
+                            if call_id_g:
+                                db.set_call_skip_reason(call_id_g, "unconfirmed")
+                            print(f"[vip] {extra.get('symbol', '?')} skipped — no valid mint for gamble")
                         score_result = None
                     elif vip_tier in ("gamble_risk", "gamble") and mcap_at_call >= (25_000 if vip_tier == "gamble_risk" else 40_000):
                         # Mcap too high for experimental gamble trading
