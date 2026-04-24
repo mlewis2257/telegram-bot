@@ -36,7 +36,6 @@ import wallet as _wallet
 from paper_trader import (
     ExitResult,
     TAKE_PROFIT_5X,
-    TAKE_PROFIT_3X,
     TRAIL_PEAK_MIN,
     HARD_STOP_PCT,
     MAX_HOURS,
@@ -431,7 +430,7 @@ def check_live_exits(
     if current_mult >= TAKE_PROFIT_5X:
         return ExitResult(True, "5x_tp")
 
-    if current_mult >= TAKE_PROFIT_3X:
+    if current_mult >= 3.0:
         return ExitResult(True, "3x_tp")
 
     if peak_mcap > 0:
