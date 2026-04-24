@@ -146,6 +146,14 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 db.set_call_skip_reason(call_id, "no_entry_mcap")
                 return
 
+            # Strategy A: solwhaletrending only allowed as pyramid on existing positions
+            if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")) and "solwhaletrending" in channel:
+                existing_call_id = db.get_call_id_for_open_mint(mint, is_strategy_b=False)
+                if not existing_call_id:
+                    print(f"[paper] {symbol} skipped — solwhaletrending standalone (no existing position)")
+                    db.set_call_skip_reason(call_id, "no_base_position")
+                    return
+
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
                 if db.has_open_paper_position_for_mint(mint, is_strategy_b=False):
                     if "solwhaletrending" in channel:
@@ -207,21 +215,28 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 dev_tokens = token_onchain.get("dev_tokens_made")
                 has_bundle_fake = (bundle_pct is not None and fake_pct is not None)
 
-                # Global VIP floor: low-score buckets underperformed.
-                if score_val < 63:
+                # Global VIP floor for gamble/gamble_risk — safe tier uses its own lower threshold.
+                if vip_tier != "safe" and score_val < 63:
                     print(f"[paper] {symbol} skipped — vip score {score_val:.1f} < 63")
                     db.set_call_skip_reason(call_id, "vip_mcap_gate")
                     return
 
                 if vip_tier == "safe":
-                    # Safe entries need minimum on-chain quality context.
-                    if not has_bundle_fake:
-                        print(f"[paper] {symbol} skipped — VIP safe missing bundle/fake data")
-                        db.set_call_skip_reason(call_id, "vip_mcap_gate")
+                    if score_val < 50:
+                        print(f"[paper] {symbol} skipped — VIP safe score {score_val:.1f} < 50")
+                        db.set_call_skip_reason(call_id, "vip_low_score")
                         return
-                    if is_bad_bundle and is_bad_fake:
-                        print(f"[paper] {symbol} skipped — VIP safe low-quality combo (bundle={bundle_pct}, fake={fake_pct})")
-                        db.set_call_skip_reason(call_id, "vip_mcap_gate")
+                    if entry_price < 20_000:
+                        print(f"[paper] {symbol} skipped — VIP safe mcap ${entry_price/1000:.1f}k below $20k minimum")
+                        db.set_call_skip_reason(call_id, "vip_mcap_too_low")
+                        return
+                    if bundle_pct is not None and bundle_pct > 10:
+                        print(f"[paper] {symbol} skipped — VIP safe bundle {bundle_pct:.1f}% too high")
+                        db.set_call_skip_reason(call_id, "high_bundle")
+                        return
+                    if fake_pct is not None and fake_pct > 4:
+                        print(f"[paper] {symbol} skipped — VIP safe fake vol {fake_pct:.1f}% too high")
+                        db.set_call_skip_reason(call_id, "high_fake_vol")
                         return
 
                 elif vip_tier == "gamble":
@@ -265,10 +280,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
 
             # ── VIP safe tier mcap range gate ─────────────────────────────────
             if channel_handle == "solhousesignal_vip" and token_data.get("vip_tier") == "safe":
-                if entry_price < 15_000:
-                    print(f"[paper] {symbol} skipped — VIP safe mcap ${entry_price/1000:.1f}k below $15k minimum")
-                    db.set_call_skip_reason(call_id, "mcap_too_low")
-                    return
                 if entry_price > 150_000:
                     print(f"[paper] {symbol} skipped — VIP safe mcap ${entry_price/1000:.0f}k above $150k maximum")
                     db.set_call_skip_reason(call_id, "mcap_too_high")
