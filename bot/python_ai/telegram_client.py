@@ -15,7 +15,9 @@ No code changes needed.
 """
 
 import asyncio
+import atexit
 import os
+import signal
 import time
 from pathlib import Path
 
@@ -81,6 +83,88 @@ api_id   = int(os.environ["API_ID"])
 api_hash = os.environ["API_HASH"]
 
 VIP_CHANNEL = int(os.getenv("SOLHOUSE_VIP_CHANNEL", 0)) or None
+
+# ── Single-process guard ──────────────────────────────────────────────────────
+
+_PID_LOCK_PATH = Path(__file__).parent / ".telegram_client.pid"
+_PID_LOCK_OWNER: int | None = None
+
+
+def _process_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _release_pid_lock(pid: int | None = None) -> None:
+    global _PID_LOCK_OWNER
+
+    owner = pid or _PID_LOCK_OWNER
+    try:
+        existing = _PID_LOCK_PATH.read_text().strip()
+        if owner is not None and existing != str(owner):
+            return
+        _PID_LOCK_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    finally:
+        if owner == _PID_LOCK_OWNER:
+            _PID_LOCK_OWNER = None
+
+
+def _handle_shutdown_signal(signum, _frame) -> None:
+    raise KeyboardInterrupt
+
+
+def _acquire_pid_lock() -> None:
+    global _PID_LOCK_OWNER
+
+    current_pid = os.getpid()
+    while True:
+        try:
+            fd = os.open(
+                _PID_LOCK_PATH,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o644,
+            )
+        except FileExistsError:
+            try:
+                existing_pid = int(_PID_LOCK_PATH.read_text().strip())
+            except (FileNotFoundError, ValueError):
+                existing_pid = 0
+
+            if _process_is_running(existing_pid):
+                print(
+                    f"[error] Already running as PID {existing_pid}. "
+                    f"Kill it first or delete {_PID_LOCK_PATH.name}"
+                )
+                raise SystemExit(1)
+
+            try:
+                _PID_LOCK_PATH.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f"[error] Could not remove stale PID lock {_PID_LOCK_PATH}: {e}")
+                raise SystemExit(1)
+            continue
+
+        with os.fdopen(fd, "w") as lock_file:
+            lock_file.write(f"{current_pid}\n")
+
+        _PID_LOCK_OWNER = current_pid
+        atexit.register(_release_pid_lock, current_pid)
+        signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+        return
+
 
 # ── Last-run state directory ───────────────────────────────────────────────────
 
@@ -1132,4 +1216,8 @@ def run_listener() -> None:
 
 
 if __name__ == "__main__":
-    run_listener()
+    _acquire_pid_lock()
+    try:
+        run_listener()
+    finally:
+        _release_pid_lock()

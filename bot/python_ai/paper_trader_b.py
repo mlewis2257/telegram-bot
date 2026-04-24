@@ -108,6 +108,33 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             if not call_id:
                 return
 
+            actual_entry = None
+            entry_volume = None
+            if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
+                try:
+                    market = data_fetcher.fetch_token_price(mint)
+                    if market and market.get("mcap"):
+                        actual_entry = float(market["mcap"])
+                    if market and market.get("volume_h1"):
+                        entry_volume = float(market["volume_h1"])
+                except Exception as e:
+                    print(f"[paper_b] price fetch failed for {symbol}: {e}")
+            if actual_entry is None and mint:
+                print(f"[paper_b] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
+
+            is_vip_gamble = (token_data.get("sol_in_override") == SOL_VIP_GAMBLE)
+            if is_vip_gamble and actual_entry is not None:
+                if actual_entry < 10_000:
+                    print(f"[paper_b] {symbol} skipped — mcap ${actual_entry/1000:.1f}k below $10k minimum for vip gamble")
+                    db.set_call_skip_reason(call_id, "mcap_too_low")
+                    return
+
+            entry_price = actual_entry or msg_mcap
+            if entry_price <= 0:
+                print(f"[paper_b] {symbol} skipped — no usable entry mcap (msg={msg_mcap}, fetched={actual_entry})")
+                db.set_call_skip_reason(call_id, "no_entry_mcap")
+                return
+
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
                 if db.has_open_paper_position_for_mint(mint, is_strategy_b=True):
                     if "solwhaletrending" in channel:
@@ -129,26 +156,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     else:
                         print(f"[paper_b] {symbol} skipped — open position already exists for this mint")
                         return
-
-            actual_entry = None
-            entry_volume = None
-            if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
-                try:
-                    market = data_fetcher.fetch_token_price(mint)
-                    if market and market.get("mcap"):
-                        actual_entry = float(market["mcap"])
-                    if market and market.get("volume_h1"):
-                        entry_volume = float(market["volume_h1"])
-                except Exception as e:
-                    print(f"[paper_b] price fetch failed for {symbol}: {e}")
-            if actual_entry is None and mint:
-                print(f"[paper_b] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
-
-            is_vip_gamble = (token_data.get("sol_in_override") == SOL_VIP_GAMBLE)
-            if is_vip_gamble and actual_entry is not None:
-                if actual_entry < 10_000:
-                    print(f"[paper_b] {symbol} skipped — mcap ${actual_entry/1000:.1f}k below $10k minimum for vip gamble")
-                    return
 
             # ── gamble_risk on-chain data filters ─────────────────────────────
             if token_data.get("vip_tier") == "gamble_risk":
@@ -173,12 +180,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     print(f"[paper_b] {symbol} skipped — gamble_risk dev_tokens={dev_tokens}")
                     db.set_call_skip_reason(call_id, "serial_rugger")
                     return
-
-            entry_price = actual_entry or msg_mcap
-            if entry_price <= 0:
-                print(f"[paper_b] {symbol} skipped — no usable entry mcap (msg={msg_mcap}, fetched={actual_entry})")
-                db.set_call_skip_reason(call_id, "no_entry_mcap")
-                return
 
             security_flag = token_data.get("security_flag")
             if security_flag == "warning":

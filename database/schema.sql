@@ -150,6 +150,14 @@ CREATE TABLE IF NOT EXISTS calls (
     conviction_score  NUMERIC(5,2),                   -- 0–100, scoring engine output
     alert_sent        BOOLEAN     NOT NULL DEFAULT FALSE,
     alert_sent_at     TIMESTAMPTZ,
+    skip_reason       TEXT CHECK (skip_reason IN (
+        'slippage', 'quiet_hours', 'low_score', 'duplicate',
+        'balance', 'allowed_hours', 'security_warning',
+        'mcap_too_high', 'no_data', 'dex_circuit_open', 'vip_mcap_gate',
+        'momentum_dump', 'mcap_too_low', 'unconfirmed', 'vip_paused',
+        'high_bundle', 'serial_rugger', 'low_quality_bucket',
+        'vip_low_score', 'no_entry_mcap'
+    )),
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

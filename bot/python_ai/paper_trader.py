@@ -33,7 +33,6 @@ SOL_ALERT        = 0.5   # simulated SOL for alert (70–84)
 SOL_VIP_GAMBLE   = 0.25  # simulated SOL for experimental VIP gamble/gamble_risk entries
 
 TAKE_PROFIT_5X   = 5.0   # exit at 5x from entry
-TAKE_PROFIT_3X   = 3.0   # exit at 3x from entry
 TRAIL_PEAK_MIN   = 2.0   # trailing stop only arms once peak >= 2.0x
 HARD_STOP_PCT    = 0.35  # hard stop fires on 35% loss from entry
 MAX_HOURS        = 24    # time stop after 24 hours open
@@ -114,33 +113,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             if not call_id:
                 return
 
-            if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
-                if db.has_open_paper_position_for_mint(mint, is_strategy_b=False):
-                    if "solwhaletrending" in channel:
-                        existing_call_id = db.get_call_id_for_open_mint(mint, is_strategy_b=False)
-                        if existing_call_id:
-                            existing_pos = db.get_open_paper_position(existing_call_id, is_strategy_b=False)
-                            if existing_pos:
-                                current_mult = (entry_price / existing_pos["entry_price"]) if existing_pos["entry_price"] > 0 else 1.0
-                                if current_mult >= 1.5:
-                                    print(f"[paper] {symbol} PYRAMID — solwhaletrending confirms at {current_mult:.2f}x, adding {sol_in} SOL")
-                                    db.set_call_skip_reason(call_id, None)
-                                    # fall through to open_paper_position
-                                else:
-                                    print(f"[paper] {symbol} skipped — open position exists but only at {current_mult:.2f}x (need 1.5x for pyramid)")
-                                    db.set_call_skip_reason(call_id, "duplicate")
-                                    return
-                            else:
-                                db.set_call_skip_reason(call_id, "duplicate")
-                                return
-                        else:
-                            db.set_call_skip_reason(call_id, "duplicate")
-                            return
-                    else:
-                        print(f"[paper] {symbol} skipped — open position already exists for this mint")
-                        db.set_call_skip_reason(call_id, "duplicate")
-                        return
-
             actual_entry = None
             entry_volume = None
             token_onchain = {}
@@ -173,6 +145,33 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 print(f"[paper] {symbol} skipped — no usable entry mcap (msg={msg_mcap}, fetched={actual_entry})")
                 db.set_call_skip_reason(call_id, "no_entry_mcap")
                 return
+
+            if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
+                if db.has_open_paper_position_for_mint(mint, is_strategy_b=False):
+                    if "solwhaletrending" in channel:
+                        existing_call_id = db.get_call_id_for_open_mint(mint, is_strategy_b=False)
+                        if existing_call_id:
+                            existing_pos = db.get_open_paper_position(existing_call_id, is_strategy_b=False)
+                            if existing_pos:
+                                current_mult = (entry_price / existing_pos["entry_price"]) if existing_pos["entry_price"] > 0 else 1.0
+                                if current_mult >= 1.5:
+                                    print(f"[paper] {symbol} PYRAMID — solwhaletrending confirms at {current_mult:.2f}x, adding {sol_in} SOL")
+                                    db.set_call_skip_reason(call_id, None)
+                                    # fall through to open_paper_position
+                                else:
+                                    print(f"[paper] {symbol} skipped — open position exists but only at {current_mult:.2f}x (need 1.5x for pyramid)")
+                                    db.set_call_skip_reason(call_id, "duplicate")
+                                    return
+                            else:
+                                db.set_call_skip_reason(call_id, "duplicate")
+                                return
+                        else:
+                            db.set_call_skip_reason(call_id, "duplicate")
+                            return
+                    else:
+                        print(f"[paper] {symbol} skipped — open position already exists for this mint")
+                        db.set_call_skip_reason(call_id, "duplicate")
+                        return
 
             # ── Entry gate ────────────────────────────────────────────────────
             security_flag = token_data.get("security_flag")
@@ -281,8 +280,8 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     print(f"[paper] {symbol} skipped — solhousesignal mcap ${entry_price/1000:.1f}k below $20k minimum")
                     db.set_call_skip_reason(call_id, "mcap_too_low")
                     return
-                if entry_price > 80_000:
-                    print(f"[paper] {symbol} skipped — solhousesignal mcap ${entry_price/1000:.0f}k above $80k maximum")
+                if entry_price > 175_000:
+                    print(f"[paper] {symbol} skipped — solhousesignal mcap ${entry_price/1000:.0f}k above $175k maximum")
                     db.set_call_skip_reason(call_id, "mcap_too_high")
                     return
 
@@ -340,14 +339,8 @@ def check_exits(
     if current_mult >= 10.0:
         return ExitResult(True, "10x_tp")
 
-    # 5x take profit — checked before 3x so a position that bypassed
-    # the 3x check is labelled correctly
     if current_mult >= TAKE_PROFIT_5X:
         return ExitResult(True, "5x_tp")
-
-    # 3x take profit — skipped for VIP gamble tiers (let trail stop maximise runners)
-    if not is_vip_gamble_pos and current_mult >= TAKE_PROFIT_3X:
-        return ExitResult(True, "3x_tp")
 
     # Trailing stop — tiered by how much the token has run.
     # Only activates at 2.0x+ to avoid exiting on small early bounces.

@@ -12,6 +12,7 @@ __pycache__/
 # Telethon session files (contain auth tokens)
 *.session
 *.session-journal
+.telegram_client.pid
 
 # Node
 node_modules/

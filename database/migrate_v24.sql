@@ -1,5 +1,8 @@
--- migrate_v23.sql
--- Add current paper-trader skip reasons to skip_reason CHECK constraint.
+-- migrate_v24.sql
+-- Align calls.skip_reason CHECK constraint with all current code paths.
+
+ALTER TABLE calls
+    ADD COLUMN IF NOT EXISTS skip_reason TEXT;
 
 ALTER TABLE calls DROP CONSTRAINT IF EXISTS calls_skip_reason_check;
 ALTER TABLE calls ADD CONSTRAINT calls_skip_reason_check
