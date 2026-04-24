@@ -358,13 +358,13 @@ def check_exits(
     if peak_mcap > 0:
         peak_mult = peak_mcap / entry_mcap
         if peak_mult >= 10.0:
-            trail_pct = 0.20               # lock in massive gains
+            trail_pct = 0.12               # capital preservation for proven runners
         elif peak_mult >= 5.0:
-            trail_pct = 0.25
+            trail_pct = 0.15
         elif peak_mult >= 3.0:
-            trail_pct = 0.30
+            trail_pct = 0.22
         elif peak_mult >= TRAIL_PEAK_MIN:  # >= 2.0x
-            trail_pct = 0.40               # wide — let small moves breathe
+            trail_pct = 0.25
         else:
             trail_pct = None               # below 2.0x — let hard stop handle
         if trail_pct is not None:
