@@ -19,6 +19,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -36,6 +37,8 @@ TAKE_PROFIT_5X   = 5.0   # exit at 5x from entry
 TRAIL_PEAK_MIN   = 2.0   # trailing stop only arms once peak >= 2.0x
 HARD_STOP_PCT    = 0.35  # hard stop fires on 35% loss from entry
 MAX_HOURS        = 24    # time stop after 24 hours open
+LOCAL_TZ         = ZoneInfo("America/Los_Angeles")
+QUIET_HOURS_PST  = {4, 9, 14}
 
 
 # ── In-flight mint guard (prevents race-condition duplicate buys) ──────────────
@@ -111,6 +114,12 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             ).lstrip("@")
 
             if not call_id:
+                return
+
+            local_hour = position_entry_time.astimezone(LOCAL_TZ).hour
+            if local_hour in QUIET_HOURS_PST:
+                print(f"[paper] {symbol} skipped — quiet hour {local_hour:02d}:00 America/Los_Angeles")
+                db.set_call_skip_reason(call_id, "quiet_hours")
                 return
 
             actual_entry = None
@@ -216,14 +225,14 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 has_bundle_fake = (bundle_pct is not None and fake_pct is not None)
 
                 # Global VIP floor for gamble/gamble_risk — safe tier uses its own lower threshold.
-                if vip_tier != "safe" and score_val < 63:
+                if vip_tier not in ("safe", "gamble", "gamble_risk") and score_val < 63:
                     print(f"[paper] {symbol} skipped — vip score {score_val:.1f} < 63")
                     db.set_call_skip_reason(call_id, "vip_mcap_gate")
                     return
 
                 if vip_tier == "safe":
-                    if score_val < 50:
-                        print(f"[paper] {symbol} skipped — VIP safe score {score_val:.1f} < 50")
+                    if score_val < 45:
+                        print(f"[paper] {symbol} skipped — VIP safe score {score_val:.1f} < 45")
                         db.set_call_skip_reason(call_id, "vip_low_score")
                         return
                     if entry_price < 20_000:

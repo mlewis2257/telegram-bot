@@ -298,6 +298,9 @@ CREATE TABLE IF NOT EXISTS trading_positions (
     entry_time       TIMESTAMPTZ,
     sol_in           NUMERIC     NOT NULL,             -- SOL spent
     tokens_received  NUMERIC,
+    peak_mcap        NUMERIC,                          -- highest observed mcap after entry
+    peak_multiplier  NUMERIC(10,4),                   -- highest observed multiplier from entry
+    peak_at          TIMESTAMPTZ,                      -- when peak_mcap / peak_multiplier were seen
 
     -- Exit
     exit_price       NUMERIC,                          -- SOL per token at sell

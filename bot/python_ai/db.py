@@ -1194,7 +1194,7 @@ def update_paper_position_entry_volume(call_id: int, volume: float, is_strategy_
 
 def get_open_paper_position(call_id: int, is_strategy_b: bool = False) -> dict | None:
     """
-    Return {entry_price, sol_in, entry_time, vip_tier} for the open simulation
+    Return {entry_price, sol_in, entry_time, vip_tier, peak_*} for the open simulation
     position on this call, or None if no open position exists.
     """
     conn = get_conn()
@@ -1202,7 +1202,7 @@ def get_open_paper_position(call_id: int, is_strategy_b: bool = False) -> dict |
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT entry_price, sol_in, entry_time, vip_tier
+            SELECT entry_price, sol_in, entry_time, vip_tier, peak_mcap, peak_multiplier, peak_at
             FROM trading_positions
             WHERE call_id = %s
               AND is_simulation = TRUE
@@ -1214,7 +1214,48 @@ def get_open_paper_position(call_id: int, is_strategy_b: bool = False) -> dict |
         row = cur.fetchone()
         if not row:
             return None
-        return {"entry_price": float(row[0]), "sol_in": float(row[1]), "entry_time": row[2], "vip_tier": row[3]}
+        return {
+            "entry_price": float(row[0]),
+            "sol_in": float(row[1]),
+            "entry_time": row[2],
+            "vip_tier": row[3],
+            "peak_mcap": float(row[4]) if row[4] is not None else None,
+            "peak_multiplier": float(row[5]) if row[5] is not None else None,
+            "peak_at": row[6],
+        }
+
+
+def update_paper_position_peak(
+    call_id: int,
+    current_mcap: float,
+    current_mult: float,
+    is_strategy_b: bool = False,
+) -> bool:
+    """
+    Persist the highest observed post-entry peak for one open paper position.
+
+    Returns True only when this write established a genuine new per-position peak.
+    """
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE trading_positions
+            SET peak_mcap = %s,
+                peak_multiplier = %s,
+                peak_at = NOW(),
+                updated_at = NOW()
+            WHERE call_id = %s
+              AND is_simulation = TRUE
+              AND is_strategy_b = %s
+              AND status = 'open'
+              AND (peak_multiplier IS NULL OR peak_multiplier < %s)
+            """,
+            (current_mcap, current_mult, call_id, is_strategy_b, current_mult),
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 def close_paper_position(
@@ -1330,7 +1371,10 @@ def get_open_paper_positions(is_strategy_b: bool = False) -> list[dict]:
                 t.mint_address,
                 tp.entry_price,
                 tp.sol_in,
-                tp.entry_time
+                tp.entry_time,
+                tp.peak_mcap,
+                tp.peak_multiplier,
+                tp.peak_at
             FROM trading_positions tp
             JOIN calls  c ON c.id       = tp.call_id
             JOIN tokens t ON t.id       = c.token_id

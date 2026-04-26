@@ -543,21 +543,15 @@ async def _check_paper_exits() -> int:
                     if existing_vol_b is None:
                         db.update_paper_position_entry_volume(call_id, float(market["volume_h1"]), is_strategy_b=True)
 
-            peak_info       = db.get_call_peak_info(call_id)
-            stored_peak     = (peak_info["peak_multiplier"] if peak_info and peak_info["peak_multiplier"] else 0.0)
-            peak_reached_at = peak_info.get("peak_reached_at") if peak_info else None
+            peak_info = db.get_call_peak_info(call_id)
 
-            # Update peak_multiplier_from_entry — the multiplier relative to the actual
-            # trading entry price (differs from mcap_at_call for VIP confirmation trades).
+            # Keep the call-level peak for eventual signal analysis, but record
+            # per-position observed peaks on trading_positions for clean A/B comparisons.
             ref_entry_price = float((ref or {}).get("entry_price") or 0.0)
             if peak_info and peak_info.get("mcap_at_call") and ref_entry_price > 0:
                 mcap_at_call_val = float(peak_info["mcap_at_call"])
                 if mcap_at_call_val > 0:
-                    db.update_peak_multiplier(
-                        call_id,
-                        current_mcap / mcap_at_call_val,
-                        peak_mult_from_entry=current_mcap / ref_entry_price,
-                    )
+                    db.update_peak_multiplier(call_id, current_mcap / mcap_at_call_val)
 
             for strategy, pos in (("A", pos_a), ("B", pos_b)):
                 if not pos:
@@ -566,17 +560,18 @@ async def _check_paper_exits() -> int:
                 if entry_price <= 0:
                     continue
                 current_mult = current_mcap / entry_price
-
-                # Only use stored peak if monitor wrote it after this position opened.
-                pos_entry_time = pos["entry_time"]
-                if pos_entry_time and pos_entry_time.tzinfo is None:
-                    pos_entry_time = pos_entry_time.replace(tzinfo=timezone.utc)
-                if peak_reached_at and pos_entry_time:
-                    if peak_reached_at.tzinfo is None:
-                        peak_reached_at = peak_reached_at.replace(tzinfo=timezone.utc)
-                    peak_mcap = stored_peak * entry_price if peak_reached_at >= pos_entry_time else 0.0
-                else:
-                    peak_mcap = 0.0
+                peak_mcap = float(pos.get("peak_mcap") or 0.0)
+                peak_mult = float(pos.get("peak_multiplier") or 0.0)
+                if current_mult > peak_mult:
+                    db.update_paper_position_peak(
+                        call_id,
+                        current_mcap,
+                        current_mult,
+                        is_strategy_b=(strategy == "B"),
+                    )
+                    peak_mcap = current_mcap
+                    pos["peak_mcap"] = current_mcap
+                    pos["peak_multiplier"] = current_mult
 
                 if strategy == "A":
                     exit_result = paper_trader.check_exits(
@@ -604,15 +599,7 @@ async def _check_paper_exits() -> int:
             # ── Live position exit check ───────────────────────────────────────
             try:
                 live_entry_price = float((pos_a or ref or {}).get("entry_price") or 0.0)
-                live_peak_mcap = 0.0
-                if pos_a and peak_reached_at and pos_a.get("entry_time"):
-                    entry_time_a = pos_a["entry_time"]
-                    if entry_time_a.tzinfo is None:
-                        entry_time_a = entry_time_a.replace(tzinfo=timezone.utc)
-                    if peak_reached_at.tzinfo is None:
-                        peak_reached_at = peak_reached_at.replace(tzinfo=timezone.utc)
-                    if peak_reached_at >= entry_time_a and live_entry_price > 0:
-                        live_peak_mcap = stored_peak * live_entry_price
+                live_peak_mcap = float((pos_a or {}).get("peak_mcap") or 0.0)
                 live_exit = live_trader.check_live_exits(call_id, current_mcap, live_peak_mcap, live_entry_price)
                 if live_exit.should_exit:
                     await live_trader.close_live_position(call_id, current_mcap, live_exit.reason)

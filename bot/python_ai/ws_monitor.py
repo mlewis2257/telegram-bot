@@ -225,10 +225,13 @@ async def handle_log_notification(ws, mint: str, call_id: int) -> None:
         peak_info = db.get_call_peak_info(call_id)
     except Exception:
         peak_info = None
-    stored_peak     = (peak_info["peak_multiplier"] or 0.0) if peak_info else 0.0
-    peak_reached_at = peak_info.get("peak_reached_at") if peak_info else None
-    if peak_reached_at and peak_reached_at.tzinfo is None:
-        peak_reached_at = peak_reached_at.replace(tzinfo=_dt.timezone.utc)
+    if peak_info and peak_info.get("mcap_at_call"):
+        try:
+            mcap_at_call_val = float(peak_info["mcap_at_call"])
+            if mcap_at_call_val > 0:
+                db.update_peak_multiplier(call_id, current_mcap / mcap_at_call_val)
+        except Exception:
+            pass
 
     # ── Strategy A check ──────────────────────────────────────────────────────
     a_done = False
@@ -236,20 +239,18 @@ async def handle_log_notification(ws, mint: str, call_id: int) -> None:
         position_a = db.get_open_paper_position(call_id, is_strategy_b=False)
         if position_a:
             entry_price    = position_a["entry_price"]
-            pos_entry_time = position_a["entry_time"]
-            if pos_entry_time and pos_entry_time.tzinfo is None:
-                pos_entry_time = pos_entry_time.replace(tzinfo=_dt.timezone.utc)
-            if peak_reached_at and pos_entry_time and peak_reached_at >= pos_entry_time:
-                peak_mcap_db = stored_peak * entry_price
-            else:
-                peak_mcap_db = 0.0
+            peak_mcap_db   = float(position_a.get("peak_mcap") or 0.0)
+            peak_mult_db   = float(position_a.get("peak_multiplier") or 0.0)
+            current_mult   = (current_mcap / entry_price) if entry_price else 0.0
+            if current_mult > peak_mult_db:
+                db.update_paper_position_peak(call_id, current_mcap, current_mult, is_strategy_b=False)
+                peak_mcap_db = current_mcap
 
             cached_peak_mcap = _a_realtime_peak_mcap.get(call_id, 0.0)
             peak_mcap = max(peak_mcap_db, cached_peak_mcap)
             if current_mcap > peak_mcap:
                 peak_mcap = current_mcap
                 _a_realtime_peak_mcap[call_id] = current_mcap
-                current_mult = (current_mcap / entry_price) if entry_price else 0.0
                 print(
                     f"[ws_monitor] {mint[:8]} A realtime peak"
                     f" call_id={call_id}"
@@ -280,13 +281,12 @@ async def handle_log_notification(ws, mint: str, call_id: int) -> None:
         position_b = db.get_open_paper_position(call_id, is_strategy_b=True)
         if position_b:
             entry_price      = position_b["entry_price"]
-            pos_entry_time_b = position_b["entry_time"]
-            if pos_entry_time_b and pos_entry_time_b.tzinfo is None:
-                pos_entry_time_b = pos_entry_time_b.replace(tzinfo=_dt.timezone.utc)
-            if peak_reached_at and pos_entry_time_b and peak_reached_at >= pos_entry_time_b:
-                peak_mcap_b = stored_peak * entry_price
-            else:
-                peak_mcap_b = 0.0
+            peak_mcap_b      = float(position_b.get("peak_mcap") or 0.0)
+            peak_mult_b      = float(position_b.get("peak_multiplier") or 0.0)
+            current_mult_b   = (current_mcap / entry_price) if entry_price else 0.0
+            if current_mult_b > peak_mult_b:
+                db.update_paper_position_peak(call_id, current_mcap, current_mult_b, is_strategy_b=True)
+                peak_mcap_b = current_mcap
             result_b    = paper_trader_b.check_exits(
                 call_id, current_mcap, peak_mcap_b, entry_price, mint=mint, is_strategy_b=True
             )
