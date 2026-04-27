@@ -25,6 +25,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -42,6 +43,8 @@ TRAIL_PEAK_MIN   = 2.0   # trailing stop arms once peak >= 2.0x
 TRAIL_PCT        = 0.25  # flat 25% drawdown from peak (no tiers)
 HARD_STOP_PCT    = 0.35  # hard stop fires on 35% loss from entry (tighter than A's 50%)
 MAX_HOURS        = 24    # time stop after 24 hours open
+LOCAL_TZ         = ZoneInfo("America/Los_Angeles")
+QUIET_HOURS_PST  = {4, 9, 14, 21}
 
 # ── VIP gamble tier exit thresholds ───────────────────────────────────────────
 VIP_GAMBLE_HARD_STOP_PCT = 0.30   # tighter: -30% for gamble_risk positions
@@ -106,6 +109,12 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             msg_mcap   = float(token_data.get("mcap_at_call") or 0)
 
             if not call_id:
+                return
+
+            local_hour = position_entry_time.astimezone(LOCAL_TZ).hour
+            if local_hour in QUIET_HOURS_PST:
+                print(f"[paper_b] {symbol} skipped — quiet hour {local_hour:02d}:00 America/Los_Angeles")
+                db.set_call_skip_reason(call_id, "quiet_hours")
                 return
 
             actual_entry = None
