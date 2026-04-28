@@ -44,7 +44,7 @@ TRAIL_PCT        = 0.25  # flat 25% drawdown from peak (no tiers)
 HARD_STOP_PCT    = 0.35  # hard stop fires on 35% loss from entry (tighter than A's 50%)
 MAX_HOURS        = 24    # time stop after 24 hours open
 LOCAL_TZ         = ZoneInfo("America/Los_Angeles")
-QUIET_HOURS_PST  = {4, 9, 14, 21}
+QUIET_HOURS_PST  = {4, 9, 14}
 
 # ── VIP gamble tier exit thresholds ───────────────────────────────────────────
 VIP_GAMBLE_HARD_STOP_PCT = 0.30   # tighter: -30% for gamble_risk positions

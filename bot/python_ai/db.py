@@ -1194,7 +1194,7 @@ def update_paper_position_entry_volume(call_id: int, volume: float, is_strategy_
 
 def get_open_paper_position(call_id: int, is_strategy_b: bool = False) -> dict | None:
     """
-    Return {entry_price, sol_in, entry_time, vip_tier, peak_*} for the open simulation
+    Return {entry_price, sol_in, entry_time, vip_tier, channel_handle, peak_*} for the open simulation
     position on this call, or None if no open position exists.
     """
     conn = get_conn()
@@ -1202,12 +1202,15 @@ def get_open_paper_position(call_id: int, is_strategy_b: bool = False) -> dict |
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT entry_price, sol_in, entry_time, vip_tier, peak_mcap, peak_multiplier, peak_at
-            FROM trading_positions
-            WHERE call_id = %s
-              AND is_simulation = TRUE
-              AND is_strategy_b = %s
-              AND status = 'open'
+            SELECT tp.entry_price, tp.sol_in, tp.entry_time, tp.vip_tier,
+                   ch.handle, tp.peak_mcap, tp.peak_multiplier, tp.peak_at
+            FROM trading_positions tp
+            JOIN calls c ON c.id = tp.call_id
+            LEFT JOIN channels ch ON ch.id = c.channel_id
+            WHERE tp.call_id = %s
+              AND tp.is_simulation = TRUE
+              AND tp.is_strategy_b = %s
+              AND tp.status = 'open'
             """,
             (call_id, is_strategy_b),
         )
@@ -1219,9 +1222,10 @@ def get_open_paper_position(call_id: int, is_strategy_b: bool = False) -> dict |
             "sol_in": float(row[1]),
             "entry_time": row[2],
             "vip_tier": row[3],
-            "peak_mcap": float(row[4]) if row[4] is not None else None,
-            "peak_multiplier": float(row[5]) if row[5] is not None else None,
-            "peak_at": row[6],
+            "channel_handle": row[4],
+            "peak_mcap": float(row[5]) if row[5] is not None else None,
+            "peak_multiplier": float(row[6]) if row[6] is not None else None,
+            "peak_at": row[7],
         }
 
 
@@ -1346,7 +1350,7 @@ def get_paper_pnl_summary(is_strategy_b: bool = False) -> dict:
             """,
             (is_strategy_b,),
         )
-        breakdown = {"10x_tp": 0, "5x_tp": 0, "3x_tp": 0, "trail_stop": 0, "hard_stop": 0, "time_stop": 0}
+        breakdown = {"10x_tp": 0, "5x_tp": 0, "3x_tp": 0, "profit_floor": 0, "trail_stop": 0, "hard_stop": 0, "time_stop": 0}
         for reason, count in cur.fetchall():
             if reason in breakdown:
                 breakdown[reason] = int(count)

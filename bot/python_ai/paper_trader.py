@@ -117,7 +117,8 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 return
 
             local_hour = position_entry_time.astimezone(LOCAL_TZ).hour
-            if local_hour in QUIET_HOURS_PST:
+            quiet_hours_override = (channel_handle == "solhousesignal" and score_val >= 70)
+            if local_hour in QUIET_HOURS_PST and not quiet_hours_override:
                 print(f"[paper] {symbol} skipped — quiet hour {local_hour:02d}:00 America/Los_Angeles")
                 db.set_call_skip_reason(call_id, "quiet_hours")
                 return
@@ -354,6 +355,8 @@ def check_exits(
 
     current_mult      = current_mcap / entry_mcap
     is_vip_gamble_pos = position.get("vip_tier") in ("gamble_risk", "gamble")
+    channel_handle    = (position.get("channel_handle") or "").lstrip("@")
+    is_free_solhouse  = channel_handle == "solhousesignal"
 
     # 10x take profit — checked first so high runners are labelled correctly
     if current_mult >= 10.0:
@@ -361,6 +364,15 @@ def check_exits(
 
     if current_mult >= TAKE_PROFIT_5X:
         return ExitResult(True, "5x_tp")
+
+    if is_free_solhouse and peak_mcap > 0:
+        peak_mult = peak_mcap / entry_mcap
+        if peak_mult >= 10.0 and current_mult <= 4.0:
+            return ExitResult(True, "profit_floor")
+        if peak_mult >= 5.0 and current_mult <= 2.5:
+            return ExitResult(True, "profit_floor")
+        if peak_mult >= 3.0 and current_mult <= 1.75:
+            return ExitResult(True, "profit_floor")
 
     # Trailing stop — tiered by how much the token has run.
     # Only activates at 2.0x+ to avoid exiting on small early bounces.
