@@ -65,6 +65,7 @@ VIP_GAMBLE_MAX_HOURS     = 24.0   # same as default 24h
 class ExitResult:
     should_exit: bool
     reason: str | None = None
+    exit_mcap: float | None = None
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -368,11 +369,11 @@ def check_exits(
     if is_free_solhouse and peak_mcap > 0:
         peak_mult = peak_mcap / entry_mcap
         if peak_mult >= 10.0 and current_mult <= 4.0:
-            return ExitResult(True, "profit_floor")
+            return ExitResult(True, "profit_floor", exit_mcap=entry_mcap * 4.0)
         if peak_mult >= 5.0 and current_mult <= 2.5:
-            return ExitResult(True, "profit_floor")
+            return ExitResult(True, "profit_floor", exit_mcap=entry_mcap * 2.5)
         if peak_mult >= 3.0 and current_mult <= 1.75:
-            return ExitResult(True, "profit_floor")
+            return ExitResult(True, "profit_floor", exit_mcap=entry_mcap * 1.75)
 
     # Trailing stop — tiered by how much the token has run.
     # Only activates at 2.0x+ to avoid exiting on small early bounces.
@@ -391,7 +392,7 @@ def check_exits(
         if trail_pct is not None:
             drawdown = (peak_mcap - current_mcap) / peak_mcap
             if drawdown >= trail_pct:
-                return ExitResult(True, "trail_stop")
+                return ExitResult(True, "trail_stop", exit_mcap=peak_mcap * (1.0 - trail_pct))
 
     # Hard stop — tighter for VIP gamble tiers (-35%) vs default (-50%)
     hard_stop_pct = VIP_GAMBLE_HARD_STOP_PCT if is_vip_gamble_pos else HARD_STOP_PCT

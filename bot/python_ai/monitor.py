@@ -578,22 +578,24 @@ async def _check_paper_exits() -> int:
                         call_id, current_mcap, peak_mcap, entry_price, mint=mint, is_strategy_b=False
                     )
                     if exit_result.should_exit:
+                        exit_mcap = exit_result.exit_mcap or current_mcap
                         print(
                             f"[paper] checking exit: {symbol}"
                             f"  current={current_mult:.2f}x → closing ({exit_result.reason})"
                         )
-                        paper_trader.close_position(call_id, current_mcap, exit_result.reason, is_strategy_b=False)
+                        paper_trader.close_position(call_id, exit_mcap, exit_result.reason, is_strategy_b=False)
                         closed += 1
                 else:
                     exit_result = paper_trader_b.check_exits(
                         call_id, current_mcap, peak_mcap, entry_price, mint=mint, is_strategy_b=True
                     )
                     if exit_result.should_exit:
+                        exit_mcap = exit_result.exit_mcap or current_mcap
                         print(
                             f"[paper_b] checking exit: {symbol}"
                             f"  current={current_mult:.2f}x → closing ({exit_result.reason})"
                         )
-                        paper_trader_b.close_position(call_id, current_mcap, exit_result.reason, is_strategy_b=True)
+                        paper_trader_b.close_position(call_id, exit_mcap, exit_result.reason, is_strategy_b=True)
                         closed += 1
 
             # ── Live position exit check ───────────────────────────────────────

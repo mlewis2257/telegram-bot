@@ -69,6 +69,7 @@ _position_tiers_b: dict[int, str] = {}
 class ExitResult:
     should_exit: bool
     reason: str | None = None
+    exit_mcap: float | None = None
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -311,7 +312,7 @@ def check_exits(
         if peak_mult >= TRAIL_PEAK_MIN:
             drawdown = (peak_mcap - current_mcap) / peak_mcap
             if drawdown >= TRAIL_PCT:
-                return ExitResult(True, "trail_stop")
+                return ExitResult(True, "trail_stop", exit_mcap=peak_mcap * (1.0 - TRAIL_PCT))
 
     # Hard stop — tighter for VIP gamble positions (-30%) vs standard (-35%)
     hard_stop_pct = VIP_GAMBLE_HARD_STOP_PCT if is_vip_gamble_pos else HARD_STOP_PCT

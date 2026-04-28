@@ -38,7 +38,7 @@ if not _rpc_url:
 WS_URL = _rpc_url.replace("https://", "wss://").replace("http://", "ws://")
 
 HEARTBEAT_INTERVAL    = 30    # seconds between pings
-POLL_INTERVAL         = 10    # seconds between new-position polls
+POLL_INTERVAL         = 2     # seconds between new-position polls
 FETCH_COOLDOWN        = 2.0   # min seconds between DexScreener fetches per mint
 RECONNECT_BACKOFF_MAX = 60    # max reconnect delay in seconds
 
@@ -262,11 +262,12 @@ async def handle_log_notification(ws, mint: str, call_id: int) -> None:
                 call_id, current_mcap, peak_mcap, entry_price, mint=mint, is_strategy_b=False
             )
             if result_a.should_exit:
-                paper_trader.close_position(call_id, current_mcap, result_a.reason, is_strategy_b=False)
+                exit_mcap = result_a.exit_mcap or current_mcap
+                paper_trader.close_position(call_id, exit_mcap, result_a.reason, is_strategy_b=False)
                 _a_realtime_peak_mcap.pop(call_id, None)
                 print(
                     f"[ws_monitor] {mint[:8]} A closed — {result_a.reason}"
-                    f" @ ${current_mcap/1000:.1f}k"
+                    f" @ ${exit_mcap/1000:.1f}k"
                 )
                 a_done = True
         else:
@@ -291,10 +292,11 @@ async def handle_log_notification(ws, mint: str, call_id: int) -> None:
                 call_id, current_mcap, peak_mcap_b, entry_price, mint=mint, is_strategy_b=True
             )
             if result_b.should_exit:
-                paper_trader_b.close_position(call_id, current_mcap, result_b.reason, is_strategy_b=True)
+                exit_mcap = result_b.exit_mcap or current_mcap
+                paper_trader_b.close_position(call_id, exit_mcap, result_b.reason, is_strategy_b=True)
                 print(
                     f"[ws_monitor] {mint[:8]} B closed — {result_b.reason}"
-                    f" @ ${current_mcap/1000:.1f}k"
+                    f" @ ${exit_mcap/1000:.1f}k"
                 )
                 b_done = True
         else:
