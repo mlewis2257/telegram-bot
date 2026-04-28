@@ -28,6 +28,9 @@ MAX_RETRIES        = 3
 BACKOFF_BASE       = 1.0      # seconds; doubles each retry
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 CACHE_TTL_SECONDS  = 60
+PRICE_CACHE_TTL_SECONDS = 2.0
+STALE_PRICE_GRACE_SECONDS = 8.0
+DEX_RATE_LIMIT_COOLDOWN_SECONDS = 5.0
 
 # ── Dead mint blacklist ───────────────────────────────────────────────────────
 # Mints that reliably fail every request (SSL EOF, delisted, etc).
@@ -40,6 +43,8 @@ DEAD_MINTS: set[str] = {
 # ── Cache ─────────────────────────────────────────────────────────────────────
 
 _cache: dict[str, tuple[dict, float]] = {}   # mint → (result, epoch_time)
+_price_cache: dict[str, tuple[dict, float]] = {}   # mint → (result, monotonic_time)
+_dex_rate_limited_until = 0.0
 
 
 def _cache_get(mint: str) -> Optional[dict]:
@@ -52,6 +57,17 @@ def _cache_get(mint: str) -> Optional[dict]:
 
 def _cache_set(mint: str, data: dict) -> None:
     _cache[mint] = (data, time.monotonic())
+
+
+def _price_cache_get(mint: str, max_age: float = PRICE_CACHE_TTL_SECONDS) -> Optional[dict]:
+    entry = _price_cache.get(mint)
+    if entry and (time.monotonic() - entry[1]) < max_age:
+        return entry[0]
+    return None
+
+
+def _price_cache_set(mint: str, data: dict) -> None:
+    _price_cache[mint] = (data, time.monotonic())
 
 
 # ── HTTP helper ───────────────────────────────────────────────────────────────
@@ -305,6 +321,11 @@ def _try_dexscreener_price(mint: str) -> Optional[dict]:
     Lightweight DexScreener price fetch. Bypasses cache.
     Returns result dict or None on any failure.
     """
+    global _dex_rate_limited_until
+
+    if time.monotonic() < _dex_rate_limited_until:
+        return None
+
     url = f"{DEXSCREENER_URL}/{mint}"
 
     for attempt in range(1, MAX_RETRIES + 2):   # +1 extra slot for the 429 retry
@@ -315,9 +336,12 @@ def _try_dexscreener_price(mint: str) -> Optional[dict]:
                 return None
 
             if resp.status_code == 429:
-                log.warning(f"[fetcher] 429 rate-limited on {mint[:8]}... sleeping 30s")
-                time.sleep(30)
-                continue
+                _dex_rate_limited_until = time.monotonic() + DEX_RATE_LIMIT_COOLDOWN_SECONDS
+                log.warning(
+                    f"[fetcher] 429 rate-limited on {mint[:8]}... "
+                    f"cooling down DexScreener for {DEX_RATE_LIMIT_COOLDOWN_SECONDS:.0f}s"
+                )
+                return None
 
             if resp.status_code in RETRY_STATUS_CODES:
                 if attempt <= MAX_RETRIES:
@@ -427,7 +451,10 @@ def _fetch_jupiter_price(mint: str) -> Optional[dict]:
 
 def fetch_token_price(mint: str) -> Optional[dict]:
     """
-    Lightweight price fetch for monitor/backfill. Bypasses cache.
+    Lightweight price fetch for monitor/backfill.
+
+    Uses a short-lived shared in-process cache so monitor and websocket exit
+    checks can reuse the same fresh snapshot instead of hammering DexScreener.
     Tries DexScreener first; falls back to Jupiter + Helius on failure.
 
     Returns:
@@ -437,9 +464,21 @@ def fetch_token_price(mint: str) -> Optional[dict]:
     if mint in DEAD_MINTS:
         return None
 
+    cached = _price_cache_get(mint)
+    if cached:
+        return cached
+
     result = _try_dexscreener_price(mint)
     if result and result.get("mcap"):
+        _price_cache_set(mint, result)
         return result
 
+    stale = _price_cache_get(mint, max_age=STALE_PRICE_GRACE_SECONDS)
+    if stale:
+        return stale
+
     log.warning(f"[fetcher] DexScreener failed, trying Jupiter for {mint[:8]}...")
-    return _fetch_jupiter_price(mint)
+    result = _fetch_jupiter_price(mint)
+    if result and result.get("mcap"):
+        _price_cache_set(mint, result)
+    return result

@@ -47,6 +47,7 @@ RATE_LIMIT_SLEEP     = 30     # seconds to back off on 429 responses
 MAX_WATCHLIST_SPREAD = 50     # above this, spread calls evenly across the window
 MIN_SCORE            = 45     # minimum conviction_score to include (vip_safe floor)
 MAX_AGE_HOURS        = 24     # only monitor calls from the last N hours
+PAPER_EXIT_SWEEP_EVERY_PASSES = 3  # websocket monitor owns primary protection; poll sweep is fallback
 
 MILESTONE_THRESHOLDS    = [2.0, 5.0, 10.0]  # send alert on first crossing of each
 SUPPRESS_HISTORICAL_HOURS = 2  # don't fire milestones/drawdowns for stored peaks on old tokens
@@ -478,17 +479,21 @@ async def _check_live_stale(dry_run: bool) -> None:
 
 # ── Paper position exit sweep ─────────────────────────────────────────────────
 
-async def _check_paper_exits() -> int:
+async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
     """
     Exit sweep for all open paper positions, independent of watchlist age.
 
     Runs once per pass AFTER the main watchlist loop to catch positions
     that aged out of the 24-hour watchlist window before being closed.
     Returns the number of positions closed this sweep.
+    `skip_call_ids` avoids re-fetching positions already checked earlier in the
+    same monitor pass.
     """
     if _dex_circuit_open:
         print("[monitor] Circuit breaker open — skipping paper exit sweep")
         return 0
+
+    skip_call_ids = skip_call_ids or set()
 
     positions_a = {p["call_id"]: p for p in db.get_open_paper_positions(is_strategy_b=False)}
     positions_b = {p["call_id"]: p for p in db.get_open_paper_positions(is_strategy_b=True)}
@@ -498,6 +503,8 @@ async def _check_paper_exits() -> int:
 
     closed = 0
     for call_id in call_ids:
+        if call_id in skip_call_ids:
+            continue
         pos_a = positions_a.get(call_id)
         pos_b = positions_b.get(call_id)
         ref   = pos_a or pos_b
@@ -633,17 +640,20 @@ async def run_pass(pass_num: int, dry_run: bool) -> dict:
     sleep_per_call = _inter_call_sleep(count) if count > 0 else INTER_CALL_SLEEP
     stats   = {"checked": 0, "new_peaks": 0, "alerts_sent": 0, "errors": 0}
     skipped = 0
+    checked_call_ids: set[int] = set()
 
     for row in watchlist:
         try:
+            call_id = row["call_id"]
             if row.get("data_only"):
                 now  = time.monotonic()
-                last = _data_only_last_fetch.get(row["call_id"], 0)
+                last = _data_only_last_fetch.get(call_id, 0)
                 if now - last < DATA_ONLY_FETCH_INTERVAL:
                     continue
-                _data_only_last_fetch[row["call_id"]] = now
+                _data_only_last_fetch[call_id] = now
 
             result = await _process_token(row, dry_run)
+            checked_call_ids.add(call_id)
             await asyncio.sleep(sleep_per_call)
 
             if result["skipped"]:
@@ -665,8 +675,8 @@ async def run_pass(pass_num: int, dry_run: bool) -> dict:
         print(f"[monitor] WARNING: DexScreener returned no data for any of the {count} token(s)")
 
     # ── Paper trade exit sweep (all open positions, age-independent) ──────────
-    if not dry_run:
-        paper_closed = await _check_paper_exits()
+    if not dry_run and (pass_num % PAPER_EXIT_SWEEP_EVERY_PASSES == 0):
+        paper_closed = await _check_paper_exits(skip_call_ids=checked_call_ids)
         if paper_closed:
             print(f"[paper] exit sweep closed {paper_closed} position(s)")
 
