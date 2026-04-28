@@ -17,6 +17,7 @@ CHECK (exit_reason IN (
     'trail_stop',
     'hard_stop',
     'time_stop',
+    'data_error',
     'manual',
     'rug'
 ));

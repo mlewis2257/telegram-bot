@@ -323,7 +323,7 @@ CREATE TABLE IF NOT EXISTS trading_positions (
     exit_reason      TEXT CHECK (exit_reason IN (
                          'take_profit', 'stop_loss', 'manual', 'timeout', 'rug',
                          '3x_tp', '5x_tp', '10x_tp', 'profit_floor',
-                         'trail_stop', 'hard_stop', 'time_stop'
+                         'trail_stop', 'hard_stop', 'time_stop', 'data_error'
                      )),
 
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
