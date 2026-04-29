@@ -165,6 +165,20 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     db.set_call_skip_reason(call_id, "no_base_position")
                     return
 
+            # Strategy A: only trade the first free solhousesignal call for a mint.
+            if (
+                mint and not mint.startswith(("INFERRED:", "UNKNOWN:"))
+                and channel_handle == "solhousesignal"
+            ):
+                first_free_call_id = db.get_first_call_id_for_mint_on_channel(mint, "solhousesignal")
+                if first_free_call_id and first_free_call_id != call_id:
+                    print(
+                        f"[paper] {symbol} skipped — later free solhousesignal repeat "
+                        f"(first free call_id={first_free_call_id}, current={call_id})"
+                    )
+                    db.set_call_skip_reason(call_id, "duplicate")
+                    return
+
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
                 if db.has_open_paper_position_for_mint(mint, is_strategy_b=False):
                     if "solwhaletrending" in channel:

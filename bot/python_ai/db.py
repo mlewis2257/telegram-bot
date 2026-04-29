@@ -1526,6 +1526,28 @@ def get_call_id_for_open_mint(mint: str, is_strategy_b: bool = False) -> int | N
         return row[0] if row else None
 
 
+def get_first_call_id_for_mint_on_channel(mint: str, channel_handle: str) -> int | None:
+    """Return the earliest call_id seen for this mint on the given channel handle."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT c.id
+            FROM calls c
+            JOIN tokens t   ON t.id = c.token_id
+            JOIN channels ch ON ch.id = c.channel_id
+            WHERE t.mint_address = %s
+              AND ch.handle = %s
+            ORDER BY c.created_at ASC, c.id ASC
+            LIMIT 1
+            """,
+            (mint, channel_handle),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
 def get_token_onchain_data(mint_address: str) -> dict:
     """Return on-chain security data for a token by mint address."""
     conn = get_conn()
