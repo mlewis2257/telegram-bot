@@ -39,6 +39,8 @@ HARD_STOP_PCT    = 0.35  # hard stop fires on 35% loss from entry
 MAX_HOURS        = 24    # time stop after 24 hours open
 LOCAL_TZ         = ZoneInfo("America/Los_Angeles")
 QUIET_HOURS_PST  = {4, 9, 14}
+FREE_SOLHOUSE_QUIET_HOURS_PST = {9, 12, 14, 16, 19, 20}
+VIP_GAMBLE_QUIET_HOURS_PST = {0, 6, 10, 21}
 
 
 # ── In-flight mint guard (prevents race-condition duplicate buys) ──────────────
@@ -118,6 +120,26 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 return
 
             local_hour = position_entry_time.astimezone(LOCAL_TZ).hour
+            if (
+                channel_handle == "solhousesignal_vip"
+                and token_data.get("vip_tier") == "gamble"
+                and local_hour in VIP_GAMBLE_QUIET_HOURS_PST
+            ):
+                print(
+                    f"[paper] {symbol} skipped — VIP gamble weak hour "
+                    f"{local_hour:02d}:00 America/Los_Angeles"
+                )
+                db.set_call_skip_reason(call_id, "quiet_hours")
+                return
+
+            if channel_handle == "solhousesignal" and local_hour in FREE_SOLHOUSE_QUIET_HOURS_PST:
+                print(
+                    f"[paper] {symbol} skipped — free solhousesignal weak hour "
+                    f"{local_hour:02d}:00 America/Los_Angeles"
+                )
+                db.set_call_skip_reason(call_id, "quiet_hours")
+                return
+
             quiet_hours_override = (channel_handle == "solhousesignal" and score_val >= 70)
             if local_hour in QUIET_HOURS_PST and not quiet_hours_override:
                 print(f"[paper] {symbol} skipped — quiet hour {local_hour:02d}:00 America/Los_Angeles")
