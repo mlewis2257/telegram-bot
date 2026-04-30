@@ -1063,14 +1063,22 @@ def run_listener() -> None:
                 mcap_at_call = float(extra.get("mcap_at_call") or 0)
                 print(f"[vip_debug] tier={vip_tier} mcap={mcap_at_call} score={score} symbol={extra.get('symbol')}")
                 if "solhousesignal_vip" in channel_tag:
+                    call_id = score_result.get("call_id")
                     if vip_tier is None:
-                        # No tier data — can't validate, skip
+                        # No tier data — can't validate, skip explicitly for analysis.
+                        if call_id:
+                            db.set_call_skip_reason(call_id, "vip_missing_tier")
                         print(f"[paper] {extra.get('symbol')} skipped — VIP no tier data")
                         score_result = None
-                    elif vip_tier == "safe" and score >= 50:
-                        # Safe tier trades at 50+
+                    elif vip_tier == "safe" and score >= 45:
+                        # Safe tier trades at 45+ to match Strategy A entry logic.
                         asyncio.create_task(paper_trader.open_position(score_result, extra))
                         asyncio.create_task(paper_trader_b.open_position(score_result, extra))
+                        score_result = None
+                    elif vip_tier == "safe":
+                        if call_id:
+                            db.set_call_skip_reason(call_id, "vip_low_score")
+                        print(f"[paper] {extra.get('symbol')} skipped — VIP safe score {score:.1f} < 45")
                         score_result = None
                     elif vip_tier == "gamble_risk" and mcap_at_call > 0 and mcap_at_call < 25_000 and score >= 50:
                         mint_addr = extra.get("mint_address")
@@ -1102,13 +1110,19 @@ def run_listener() -> None:
                         score_result = None
                     elif vip_tier in ("gamble_risk", "gamble") and mcap_at_call >= (25_000 if vip_tier == "gamble_risk" else 40_000):
                         # Mcap too high for experimental gamble trading
-                        call_id = score_result.get("call_id")
                         if call_id:
                             db.set_call_skip_reason(call_id, "vip_mcap_gate")
                         print(f"[paper] {extra.get('symbol')} skipped — VIP {vip_tier} mcap ${mcap_at_call/1000:.0f}k over gate")
                         score_result = None
+                    elif vip_tier in ("gamble_risk", "gamble"):
+                        if call_id:
+                            db.set_call_skip_reason(call_id, "vip_low_score")
+                        print(f"[paper] {extra.get('symbol')} skipped — VIP {vip_tier} score {score:.1f} < 50")
+                        score_result = None
                     else:
-                        # high_risk, low-score, or unhandled tier — skip
+                        # high_risk or unhandled VIP tier — skip explicitly for analysis.
+                        if call_id:
+                            db.set_call_skip_reason(call_id, "vip_unhandled_tier")
                         print(f"[paper] {extra.get('symbol')} skipped — VIP {vip_tier} tier")
                         score_result = None
 

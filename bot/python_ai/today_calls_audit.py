@@ -1,10 +1,12 @@
 """
-today_calls_audit.py — Audit all calls in a local-day window and show missed runners.
+today_calls_audit.py — Audit calls in a local-day or rolling-hours window and
+show missed runners.
 
 Usage:
     python3 today_calls_audit.py
     python3 today_calls_audit.py --tz America/Los_Angeles
     python3 today_calls_audit.py --date 2026-04-15
+    python3 today_calls_audit.py --hours 48
 """
 
 import argparse
@@ -39,17 +41,32 @@ def _get_peak_column() -> str | None:
         return row[0] if row else None
 
 
-def _resolve_window(day_str: str | None, tz_name: str) -> tuple[datetime, datetime, str]:
+def _resolve_window(
+    day_str: str | None,
+    tz_name: str,
+    hours: int | None,
+) -> tuple[datetime, datetime, str]:
     tz = ZoneInfo(tz_name)
-    if day_str:
+    if hours is not None:
+        now_local = datetime.now(tz)
+        local_end = now_local
+        local_start = now_local - timedelta(hours=hours)
+        start_utc = local_start.astimezone(timezone.utc)
+        end_utc = local_end.astimezone(timezone.utc)
+        label = f"Last {hours}h ({tz_name})"
+    elif day_str:
         local_day = datetime.strptime(day_str, "%Y-%m-%d").replace(tzinfo=tz)
+        local_end = local_day + timedelta(days=1)
+        start_utc = local_day.astimezone(timezone.utc)
+        end_utc = local_end.astimezone(timezone.utc)
+        label = f"{local_day.strftime('%Y-%m-%d')} ({tz_name})"
     else:
         now_local = datetime.now(tz)
         local_day = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    local_end = local_day + timedelta(days=1)
-    start_utc = local_day.astimezone(timezone.utc)
-    end_utc = local_end.astimezone(timezone.utc)
-    label = f"{local_day.strftime('%Y-%m-%d')} ({tz_name})"
+        local_end = local_day + timedelta(days=1)
+        start_utc = local_day.astimezone(timezone.utc)
+        end_utc = local_end.astimezone(timezone.utc)
+        label = f"{local_day.strftime('%Y-%m-%d')} ({tz_name})"
     return start_utc, end_utc, label
 
 
@@ -75,17 +92,18 @@ def _print_table(title: str, headers: list[str], rows: list[tuple], limit: int |
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Audit today's calls vs traded outcomes")
+    parser = argparse.ArgumentParser(description="Audit calls vs traded outcomes")
     parser.add_argument("--tz", default="America/Los_Angeles", help="Local timezone name")
     parser.add_argument("--date", default=None, help="Local date YYYY-MM-DD (defaults to today)")
+    parser.add_argument("--hours", type=int, default=None, help="Rolling local-hour window (overrides --date)")
     parser.add_argument("--limit", type=int, default=50, help="Row limit for detailed sections")
     args = parser.parse_args()
 
-    start_utc, end_utc, label = _resolve_window(args.date, args.tz)
+    start_utc, end_utc, label = _resolve_window(args.date, args.tz, args.hours)
     peak_col = _get_peak_column()
 
     print("=" * 96)
-    print(f"Today Calls Audit — {label}")
+    print(f"Calls Audit — {label}")
     print(f"Window UTC: {start_utc.isoformat()}  ->  {end_utc.isoformat()}")
     print("=" * 96)
     print()
@@ -249,6 +267,117 @@ def main() -> None:
             _print_table(
                 "Missed Runners (derived peak>=2x, skipped or not traded)",
                 ["call_id", "created_at", "channel", "vip_tier", "score", "skip_reason", "bundle_pct", "fake_pct", "peak_mult"],
+                cur.fetchall(),
+                limit=args.limit,
+            )
+
+            cur.execute(
+                f"""
+                WITH traded AS (
+                    SELECT DISTINCT tp.call_id
+                    FROM trading_positions tp
+                    WHERE tp.is_simulation = TRUE
+                ),
+                base AS (
+                    SELECT
+                        c.id AS call_id,
+                        EXTRACT(HOUR FROM c.created_at AT TIME ZONE %s)::int AS hour_local,
+                        ch.handle,
+                        COALESCE(c.vip_tier, 'none') AS vip_tier,
+                        CASE
+                            WHEN c.conviction_score >= 85 THEN '85+'
+                            WHEN c.conviction_score >= 75 THEN '75-84'
+                            WHEN c.conviction_score >= 70 THEN '70-74'
+                            WHEN c.conviction_score >= 63 THEN '63-69'
+                            ELSE '<63'
+                        END AS score_band,
+                        COALESCE(c.skip_reason, 'none') AS skip_reason,
+                        tr.call_id AS traded_call_id,
+                        CASE
+                            WHEN c.mcap_at_call IS NULL OR c.mcap_at_call <= 0 THEN NULL
+                            ELSE GREATEST(
+                                COALESCE(o.{peak_col}, 0),
+                                COALESCE(o.mcap_at_result / NULLIF(c.mcap_at_call, 0), 0),
+                                COALESCE(o.mcap_1h / NULLIF(c.mcap_at_call, 0), 0),
+                                COALESCE(o.mcap_4h / NULLIF(c.mcap_at_call, 0), 0),
+                                COALESCE(o.mcap_24h / NULLIF(c.mcap_at_call, 0), 0)
+                            )
+                        END AS derived_peak_mult
+                    FROM calls c
+                    JOIN channels ch ON ch.id = c.channel_id
+                    LEFT JOIN outcomes o ON o.call_id = c.id
+                    LEFT JOIN traded tr ON tr.call_id = c.id
+                    WHERE c.created_at >= %s AND c.created_at < %s
+                )
+                SELECT
+                    hour_local,
+                    score_band,
+                    skip_reason,
+                    COUNT(*) AS calls,
+                    ROUND(AVG(derived_peak_mult)::numeric, 2) AS avg_peak,
+                    ROUND(MAX(derived_peak_mult)::numeric, 2) AS max_peak
+                FROM base
+                WHERE derived_peak_mult >= 2
+                  AND (traded_call_id IS NULL OR skip_reason <> 'none')
+                GROUP BY 1,2,3
+                ORDER BY calls DESC, max_peak DESC, hour_local ASC
+                """,
+                (args.tz, start_utc, end_utc),
+            )
+            _print_table(
+                "Missed Runners by Hour / Score / Skip",
+                ["hour", "score_band", "skip_reason", "calls", "avg_peak", "max_peak"],
+                cur.fetchall(),
+                limit=args.limit,
+            )
+
+            cur.execute(
+                f"""
+                WITH traded AS (
+                    SELECT DISTINCT tp.call_id
+                    FROM trading_positions tp
+                    WHERE tp.is_simulation = TRUE
+                ),
+                base AS (
+                    SELECT
+                        ch.handle,
+                        COALESCE(c.vip_tier, 'none') AS vip_tier,
+                        COALESCE(c.skip_reason, 'none') AS skip_reason,
+                        tr.call_id AS traded_call_id,
+                        CASE
+                            WHEN c.mcap_at_call IS NULL OR c.mcap_at_call <= 0 THEN NULL
+                            ELSE GREATEST(
+                                COALESCE(o.{peak_col}, 0),
+                                COALESCE(o.mcap_at_result / NULLIF(c.mcap_at_call, 0), 0),
+                                COALESCE(o.mcap_1h / NULLIF(c.mcap_at_call, 0), 0),
+                                COALESCE(o.mcap_4h / NULLIF(c.mcap_at_call, 0), 0),
+                                COALESCE(o.mcap_24h / NULLIF(c.mcap_at_call, 0), 0)
+                            )
+                        END AS derived_peak_mult
+                    FROM calls c
+                    JOIN channels ch ON ch.id = c.channel_id
+                    LEFT JOIN outcomes o ON o.call_id = c.id
+                    LEFT JOIN traded tr ON tr.call_id = c.id
+                    WHERE c.created_at >= %s AND c.created_at < %s
+                )
+                SELECT
+                    handle,
+                    vip_tier,
+                    skip_reason,
+                    COUNT(*) AS calls,
+                    ROUND(AVG(derived_peak_mult)::numeric, 2) AS avg_peak,
+                    ROUND(MAX(derived_peak_mult)::numeric, 2) AS max_peak
+                FROM base
+                WHERE derived_peak_mult >= 2
+                  AND (traded_call_id IS NULL OR skip_reason <> 'none')
+                GROUP BY 1,2,3
+                ORDER BY calls DESC, max_peak DESC
+                """,
+                (start_utc, end_utc),
+            )
+            _print_table(
+                "Missed Runners by Channel / Tier / Skip",
+                ["channel", "vip_tier", "skip_reason", "calls", "avg_peak", "max_peak"],
                 cur.fetchall(),
                 limit=args.limit,
             )
