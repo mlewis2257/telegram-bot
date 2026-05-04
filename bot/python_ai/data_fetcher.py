@@ -30,7 +30,10 @@ RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 CACHE_TTL_SECONDS  = 60
 PRICE_CACHE_TTL_SECONDS = 2.0
 STALE_PRICE_GRACE_SECONDS = 8.0
+FAILOVER_STALE_GRACE_SECONDS = 30.0
 DEX_RATE_LIMIT_COOLDOWN_SECONDS = 5.0
+DEX_MINT_FAILURE_BASE_COOLDOWN_SECONDS = 10.0
+DEX_MINT_FAILURE_MAX_COOLDOWN_SECONDS = 60.0
 
 # ── Dead mint blacklist ───────────────────────────────────────────────────────
 # Mints that reliably fail every request (SSL EOF, delisted, etc).
@@ -45,6 +48,8 @@ DEAD_MINTS: set[str] = {
 _cache: dict[str, tuple[dict, float]] = {}   # mint → (result, epoch_time)
 _price_cache: dict[str, tuple[dict, float]] = {}   # mint → (result, monotonic_time)
 _dex_rate_limited_until = 0.0
+_dex_mint_cooldowns: dict[str, float] = {}   # mint -> monotonic deadline
+_dex_mint_failures: dict[str, int] = {}      # mint -> consecutive Dex failure count
 
 
 def _cache_get(mint: str) -> Optional[dict]:
@@ -68,6 +73,21 @@ def _price_cache_get(mint: str, max_age: float = PRICE_CACHE_TTL_SECONDS) -> Opt
 
 def _price_cache_set(mint: str, data: dict) -> None:
     _price_cache[mint] = (data, time.monotonic())
+
+
+def _set_dex_mint_cooldown(mint: str) -> None:
+    failures = _dex_mint_failures.get(mint, 0) + 1
+    _dex_mint_failures[mint] = failures
+    cooldown = min(
+        DEX_MINT_FAILURE_BASE_COOLDOWN_SECONDS * (2 ** (failures - 1)),
+        DEX_MINT_FAILURE_MAX_COOLDOWN_SECONDS,
+    )
+    _dex_mint_cooldowns[mint] = time.monotonic() + cooldown
+
+
+def _clear_dex_mint_cooldown(mint: str) -> None:
+    _dex_mint_failures.pop(mint, None)
+    _dex_mint_cooldowns.pop(mint, None)
 
 
 # ── HTTP helper ───────────────────────────────────────────────────────────────
@@ -325,6 +345,8 @@ def _try_dexscreener_price(mint: str) -> Optional[dict]:
 
     if time.monotonic() < _dex_rate_limited_until:
         return None
+    if time.monotonic() < _dex_mint_cooldowns.get(mint, 0.0):
+        return None
 
     url = f"{DEXSCREENER_URL}/{mint}"
 
@@ -333,10 +355,12 @@ def _try_dexscreener_price(mint: str) -> Optional[dict]:
             resp = requests.get(url, timeout=REQUEST_TIMEOUT)
 
             if resp.status_code == 404:
+                _set_dex_mint_cooldown(mint)
                 return None
 
             if resp.status_code == 429:
                 _dex_rate_limited_until = time.monotonic() + DEX_RATE_LIMIT_COOLDOWN_SECONDS
+                _set_dex_mint_cooldown(mint)
                 log.warning(
                     f"[fetcher] 429 rate-limited on {mint[:8]}... "
                     f"cooling down DexScreener for {DEX_RATE_LIMIT_COOLDOWN_SECONDS:.0f}s"
@@ -347,6 +371,7 @@ def _try_dexscreener_price(mint: str) -> Optional[dict]:
                 if attempt <= MAX_RETRIES:
                     time.sleep(2)
                     continue
+                _set_dex_mint_cooldown(mint)
                 return None
 
             resp.raise_for_status()
@@ -357,21 +382,25 @@ def _try_dexscreener_price(mint: str) -> Optional[dict]:
             if attempt <= MAX_RETRIES:
                 time.sleep(2)
                 continue
+            _set_dex_mint_cooldown(mint)
             return None
 
         pairs = data.get("pairs") or []
         sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
         if not sol_pairs:
+            _set_dex_mint_cooldown(mint)
             return None
 
         best = max(sol_pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
         price_str = best.get("priceUsd")
-        return {
+        result = {
             "price_usd":     float(price_str) if price_str else None,
             "mcap":          best.get("marketCap"),
             "liquidity_usd": (best.get("liquidity") or {}).get("usd"),
             "volume_h1":     (best.get("volume") or {}).get("h1"),
         }
+        _clear_dex_mint_cooldown(mint)
+        return result
 
     return None
 
@@ -449,6 +478,39 @@ def _fetch_jupiter_price(mint: str) -> Optional[dict]:
         return None
 
 
+def _blend_stale_dex_with_jupiter(stale: dict, fresh: dict) -> Optional[dict]:
+    """
+    Preserve Dex-derived market-cap context during outages by scaling the last
+    known Dex mcap by the fresh Jupiter price ratio when possible.
+    """
+    if not stale or not fresh:
+        return None
+
+    stale_price = stale.get("price_usd")
+    stale_mcap = stale.get("mcap")
+    fresh_price = fresh.get("price_usd")
+    fresh_mcap = fresh.get("mcap")
+
+    blended_mcap = None
+    if stale_price and stale_mcap and fresh_price:
+        blended_mcap = stale_mcap * (fresh_price / stale_price)
+    elif fresh_mcap:
+        blended_mcap = fresh_mcap
+    elif stale_mcap:
+        blended_mcap = stale_mcap
+
+    if not blended_mcap:
+        return None
+
+    return {
+        "price_usd": fresh_price or stale_price,
+        "mcap": blended_mcap,
+        "liquidity_usd": stale.get("liquidity_usd"),
+        "volume_h1": stale.get("volume_h1"),
+        "source": "jupiter+stale_dex",
+    }
+
+
 def fetch_token_price(mint: str) -> Optional[dict]:
     """
     Lightweight price fetch for monitor/backfill.
@@ -477,8 +539,25 @@ def fetch_token_price(mint: str) -> Optional[dict]:
     if stale:
         return stale
 
+    extended_stale = None
+    if time.monotonic() < _dex_mint_cooldowns.get(mint, 0.0):
+        extended_stale = _price_cache_get(mint, max_age=FAILOVER_STALE_GRACE_SECONDS)
+        if extended_stale:
+            jupiter = _fetch_jupiter_price(mint)
+            blended = _blend_stale_dex_with_jupiter(extended_stale, jupiter) if jupiter else None
+            if blended:
+                _price_cache_set(mint, blended)
+                return blended
+            return extended_stale
+
     log.warning(f"[fetcher] DexScreener failed, trying Jupiter for {mint[:8]}...")
     result = _fetch_jupiter_price(mint)
+    if result and extended_stale:
+        blended = _blend_stale_dex_with_jupiter(extended_stale, result)
+        if blended:
+            _price_cache_set(mint, blended)
+            return blended
+
     if result and result.get("mcap"):
         _price_cache_set(mint, result)
     return result
