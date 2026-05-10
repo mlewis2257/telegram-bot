@@ -273,8 +273,8 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                         print(f"[paper] {symbol} skipped — VIP safe score {score_val:.1f} < 45")
                         db.set_call_skip_reason(call_id, "vip_low_score")
                         return
-                    if entry_price < 20_000:
-                        print(f"[paper] {symbol} skipped — VIP safe mcap ${entry_price/1000:.1f}k below $20k minimum")
+                    if entry_price < 15_000:
+                        print(f"[paper] {symbol} skipped — VIP safe mcap ${entry_price/1000:.1f}k below $15k minimum")
                         db.set_call_skip_reason(call_id, "vip_mcap_too_low")
                         return
                     if bundle_pct is not None and bundle_pct > 10:
