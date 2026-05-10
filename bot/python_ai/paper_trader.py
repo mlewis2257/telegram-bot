@@ -41,6 +41,7 @@ LOCAL_TZ         = ZoneInfo("America/Los_Angeles")
 QUIET_HOURS_PST  = {4, 9, 14}
 FREE_SOLHOUSE_QUIET_HOURS_PST = {9, 12, 14, 16, 19, 20}
 VIP_GAMBLE_QUIET_HOURS_PST = {0, 6, 10, 21}
+VIP_GAMBLE_WEAK_15K_25K_HOURS_PST = {8, 11, 13, 15, 16}
 
 
 # ── In-flight mint guard (prevents race-condition duplicate buys) ──────────────
@@ -287,6 +288,16 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                         return
 
                 elif vip_tier == "gamble":
+                    if (
+                        15_000 <= entry_price < 25_000
+                        and local_hour in VIP_GAMBLE_WEAK_15K_25K_HOURS_PST
+                    ):
+                        print(
+                            f"[paper] {symbol} skipped — VIP gamble weak 15k-25k pocket "
+                            f"at {local_hour:02d}:00 America/Los_Angeles"
+                        )
+                        db.set_call_skip_reason(call_id, "quiet_hours")
+                        return
                     # Gamble is medium strict: allow nulls, but block explicit bad combo.
                     if is_bad_bundle and is_bad_fake:
                         print(f"[paper] {symbol} skipped — VIP gamble low-quality combo (bundle={bundle_pct}, fake={fake_pct})")
