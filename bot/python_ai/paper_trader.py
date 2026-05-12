@@ -39,8 +39,9 @@ HARD_STOP_PCT    = 0.35  # hard stop fires on 35% loss from entry
 MAX_HOURS        = 24    # time stop after 24 hours open
 LOCAL_TZ         = ZoneInfo("America/Los_Angeles")
 QUIET_HOURS_PST  = {4, 9, 14}
-FREE_SOLHOUSE_QUIET_HOURS_PST = {9, 12, 14, 16, 19, 20}
-VIP_GAMBLE_QUIET_HOURS_PST = {0, 6, 10, 21}
+FREE_SOLHOUSE_QUIET_HOURS_PST = {12, 16, 19, 20}
+FREE_SOLHOUSE_GLOBAL_QUIET_EXEMPT_HOURS_PST = {9, 14}
+VIP_GAMBLE_QUIET_HOURS_PST = {0, 6, 10}
 VIP_GAMBLE_WEAK_15K_25K_HOURS_PST = {8, 11, 13, 15, 16}
 
 
@@ -52,13 +53,8 @@ _pending_lock = asyncio.Lock()
 # ── Position mint store (call_id → mint, for volume re-fetch in check_exits) ──
 _position_mints: dict[int, str]   = {}
 
-# ── Per-position VIP tier store (call_id → vip_tier) ──────────────────────────
-# Populated on open for confirmed VIP gamble_risk/gamble positions so that
-# check_exits can apply tighter hard stop (-35%) and shorter time stop (6h).
-_position_tiers: dict[int, str] = {}
-
 # ── Tier-specific exit thresholds ─────────────────────────────────────────────
-VIP_GAMBLE_HARD_STOP_PCT = 0.30   # tighter: -30% vs default -50%
+VIP_GAMBLE_HARD_STOP_PCT = 0.30   # tighter: -30% vs default -35%
 VIP_GAMBLE_MAX_HOURS     = 24.0   # same as default 24h
 
 
@@ -78,7 +74,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
     Open a simulated paper trade position when an alert fires.
 
     Position size:
-      strong_alert → 1.0 SOL simulated
+      strong_alert → 0.5 SOL simulated
       alert        → 0.5 SOL simulated
 
     entry_price = mcap_at_call from token_data.
@@ -104,7 +100,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             elif "solearlytrending" in channel:
                 sol_in = SOL_ALERT  # always 0.5 SOL regardless of score
             elif label == "strong_alert":
-                sol_in = SOL_STRONG_ALERT  # 1.0 SOL for other channels
+                sol_in = SOL_STRONG_ALERT  # 0.5 SOL for other channels
             else:
                 sol_in = SOL_ALERT  # 0.5 SOL
 
@@ -142,7 +138,15 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 return
 
             quiet_hours_override = (channel_handle == "solhousesignal" and score_val >= 70)
-            if local_hour in QUIET_HOURS_PST and not quiet_hours_override:
+            free_solhouse_global_quiet_exempt = (
+                channel_handle == "solhousesignal"
+                and local_hour in FREE_SOLHOUSE_GLOBAL_QUIET_EXEMPT_HOURS_PST
+            )
+            if (
+                local_hour in QUIET_HOURS_PST
+                and not quiet_hours_override
+                and not free_solhouse_global_quiet_exempt
+            ):
                 print(f"[paper] {symbol} skipped — quiet hour {local_hour:02d}:00 America/Los_Angeles")
                 db.set_call_skip_reason(call_id, "quiet_hours")
                 return
@@ -263,10 +267,10 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 dev_tokens = token_onchain.get("dev_tokens_made")
                 has_bundle_fake = (bundle_pct is not None and fake_pct is not None)
 
-                # Global VIP floor for gamble/gamble_risk — safe tier uses its own lower threshold.
-                if vip_tier not in ("safe", "gamble", "gamble_risk") and score_val < 63:
-                    print(f"[paper] {symbol} skipped — vip score {score_val:.1f} < 63")
-                    db.set_call_skip_reason(call_id, "vip_mcap_gate")
+                if vip_tier not in ("safe", "gamble", "gamble_risk"):
+                    skip_reason = "vip_missing_tier" if not vip_tier else "vip_unhandled_tier"
+                    print(f"[paper] {symbol} skipped — unsupported vip tier {vip_tier!r}")
+                    db.set_call_skip_reason(call_id, skip_reason)
                     return
 
                 if vip_tier == "safe":
@@ -274,8 +278,8 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                         print(f"[paper] {symbol} skipped — VIP safe score {score_val:.1f} < 45")
                         db.set_call_skip_reason(call_id, "vip_low_score")
                         return
-                    if entry_price < 15_000:
-                        print(f"[paper] {symbol} skipped — VIP safe mcap ${entry_price/1000:.1f}k below $15k minimum")
+                    if entry_price < 20_000:
+                        print(f"[paper] {symbol} skipped — VIP safe mcap ${entry_price/1000:.1f}k below $20k minimum")
                         db.set_call_skip_reason(call_id, "vip_mcap_too_low")
                         return
                     if bundle_pct is not None and bundle_pct > 10:
@@ -296,7 +300,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                             f"[paper] {symbol} skipped — VIP gamble weak 15k-25k pocket "
                             f"at {local_hour:02d}:00 America/Los_Angeles"
                         )
-                        db.set_call_skip_reason(call_id, "quiet_hours")
+                        db.set_call_skip_reason(call_id, "vip_gamble_weak_pocket")
                         return
                     # Gamble is medium strict: allow nulls, but block explicit bad combo.
                     if is_bad_bundle and is_bad_fake:
@@ -361,8 +365,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                                    vip_tier=vip_tier_val)
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
                 _position_mints[call_id] = mint
-            if vip_tier_val in ("gamble_risk", "gamble"):
-                _position_tiers[call_id] = vip_tier_val
             print(f"[paper] opened {symbol}  call_id={call_id}  {sol_in} SOL @ {entry_price:.0f}")
 
         except Exception as e:
@@ -388,11 +390,12 @@ def check_exits(
     exists — safe to call unconditionally on every monitor pass.
 
     Exit conditions checked in priority order:
-      1. 5x take profit
-      2. 3x take profit
-      3. Trailing stop  (peak >= 2.5x; tiered threshold: 25% / 30% / 35%)
-      4. Hard stop      (down 50% from entry)
-      5. Time stop      (open > 24 hours)
+      1. 10x take profit
+      2. 5x take profit
+      3. Free solhousesignal profit-floor exit
+      4. Trailing stop  (arms at 2.0x+, with tighter tiers as peak grows)
+      5. Hard stop      (down 35% from entry, or 30% for VIP gamble)
+      6. Time stop      (open > 24 hours)
     """
     position = db.get_open_paper_position(call_id, is_strategy_b=is_strategy_b)
     if not position:
@@ -441,12 +444,12 @@ def check_exits(
             if drawdown >= trail_pct:
                 return ExitResult(True, "trail_stop", exit_mcap=peak_mcap * (1.0 - trail_pct))
 
-    # Hard stop — tighter for VIP gamble tiers (-35%) vs default (-50%)
+    # Hard stop — tighter for VIP gamble tiers (-30%) vs default (-35%)
     hard_stop_pct = VIP_GAMBLE_HARD_STOP_PCT if is_vip_gamble_pos else HARD_STOP_PCT
     if current_mult <= (1.0 - hard_stop_pct):
         return ExitResult(True, "hard_stop")
 
-    # Time stop — shorter for VIP gamble tiers (6h) vs default (24h)
+    # Time stop — currently 24h for both standard and VIP gamble positions
     max_hours = VIP_GAMBLE_MAX_HOURS if is_vip_gamble_pos else MAX_HOURS
     entry_time = position["entry_time"]
     if entry_time:
