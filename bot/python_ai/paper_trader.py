@@ -85,11 +85,13 @@ async def open_position(score_result: dict, token_data: dict) -> None:
     position_entry_time = datetime.now(timezone.utc)  # capture before any async delays
     symbol = token_data.get("symbol", "?")
     mint   = token_data.get("mint_address")
+    call_id = score_result.get("call_id") if score_result else None
 
     # ── In-flight mint guard ───────────────────────────────────────────────────
     async with _pending_lock:
         if mint in _pending_mints:
             print(f"[paper] {symbol} ({(mint or '')[:8]}...) skipped — buy already in-flight for this mint")
+            db.set_call_skip_reason(call_id, "pending_duplicate")
             return
         _pending_mints.add(mint)
     try:
@@ -106,7 +108,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             else:
                 sol_in = SOL_ALERT  # 0.5 SOL
 
-            call_id    = score_result.get("call_id")
             score_val  = float(score_result.get("score") or 0)
             msg_mcap   = float(token_data.get("mcap_at_call") or 0)
             channel_handle = (
@@ -365,6 +366,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
 
         except Exception as e:
             db.safe_rollback()
+            db.set_call_skip_reason(call_id, "paper_open_failed")
             print(f"[paper_trader] open_position failed: {e}")
     finally:
         async with _pending_lock:

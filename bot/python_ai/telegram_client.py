@@ -1165,6 +1165,20 @@ def run_listener() -> None:
                 if "solhousesignal" in channel_tag and "vip" not in channel_tag:
                     asyncio.create_task(paper_trader.open_position(score_result, extra))
                     asyncio.create_task(paper_trader_b.open_position(score_result, extra))
+            elif score_result and extra:
+                channel_tag = (extra.get("channel_tag") or extra.get("channel_handle") or "")
+                call_id = score_result.get("call_id")
+                score = float(score_result.get("score", 0) or 0)
+                if (
+                    call_id
+                    and (
+                        "solhousesignal" in channel_tag
+                        or "solwhaletrending" in channel_tag
+                    )
+                    and "vip" not in channel_tag
+                ):
+                    db.set_call_skip_reason(call_id, "low_score")
+                    print(f"[paper] {extra.get('symbol')} skipped — score {score:.1f} < 63")
 
             if status == "milestone" and extra:
                 await alert_bot.send_milestone(**extra)

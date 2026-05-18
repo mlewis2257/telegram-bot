@@ -85,10 +85,12 @@ async def open_position(score_result: dict, token_data: dict) -> None:
     position_entry_time = datetime.now(timezone.utc)
     symbol = token_data.get("symbol", "?")
     mint   = token_data.get("mint_address")
+    call_id = score_result.get("call_id") if score_result else None
 
     async with _pending_lock_b:
         if mint in _pending_mints_b:
             print(f"[paper_b] {symbol} ({(mint or '')[:8]}...) skipped — buy already in-flight for this mint")
+            db.set_call_skip_reason(call_id, "pending_duplicate")
             return
         _pending_mints_b.add(mint)
     try:
@@ -105,7 +107,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             else:
                 sol_in = SOL_ALERT
 
-            call_id    = score_result.get("call_id")
             score_val  = float(score_result.get("score") or 0)
             msg_mcap   = float(token_data.get("mcap_at_call") or 0)
 
@@ -158,13 +159,17 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                                     # fall through to open_paper_position
                                 else:
                                     print(f"[paper_b] {symbol} skipped — open position exists but only at {current_mult:.2f}x (need 1.5x for pyramid)")
+                                    db.set_call_skip_reason(call_id, "duplicate")
                                     return
                             else:
+                                db.set_call_skip_reason(call_id, "duplicate")
                                 return
                         else:
+                            db.set_call_skip_reason(call_id, "duplicate")
                             return
                     else:
                         print(f"[paper_b] {symbol} skipped — open position already exists for this mint")
+                        db.set_call_skip_reason(call_id, "duplicate")
                         return
 
             # ── gamble_risk on-chain data filters ─────────────────────────────
@@ -269,6 +274,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
 
         except Exception as e:
             db.safe_rollback()
+            db.set_call_skip_reason(call_id, "paper_open_failed")
             print(f"[paper_trader_b] open_position failed: {e}")
     finally:
         async with _pending_lock_b:
