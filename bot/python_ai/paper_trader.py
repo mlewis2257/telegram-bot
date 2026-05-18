@@ -41,7 +41,8 @@ LOCAL_TZ         = ZoneInfo("America/Los_Angeles")
 QUIET_HOURS_PST  = {4, 9, 14}
 FREE_SOLHOUSE_QUIET_HOURS_PST = {12, 16, 19, 20}
 FREE_SOLHOUSE_GLOBAL_QUIET_EXEMPT_HOURS_PST = {9, 14}
-VIP_GAMBLE_QUIET_HOURS_PST = {0, 6, 10}
+VIP_SAFE_ALLOWED_HOURS_PST = {13, 15, 16, 17, 18, 22}
+VIP_GAMBLE_ALLOWED_HOURS_PST = {12, 15, 20, 21, 22, 23}
 VIP_GAMBLE_WEAK_15K_25K_HOURS_PST = {8, 11, 13, 15, 16}
 
 
@@ -77,7 +78,8 @@ async def open_position(score_result: dict, token_data: dict) -> None:
       strong_alert → 0.5 SOL simulated
       alert        → 0.5 SOL simulated
 
-    entry_price = mcap_at_call from token_data.
+    entry_price prefers the live fetched mcap at open time, falling back to
+    mcap_at_call from token_data when live data is unavailable.
     Never raises — a paper trade failure must never affect alert delivery.
     """
     position_entry_time = datetime.now(timezone.utc)  # capture before any async delays
@@ -117,18 +119,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 return
 
             local_hour = position_entry_time.astimezone(LOCAL_TZ).hour
-            if (
-                channel_handle == "solhousesignal_vip"
-                and token_data.get("vip_tier") == "gamble"
-                and local_hour in VIP_GAMBLE_QUIET_HOURS_PST
-            ):
-                print(
-                    f"[paper] {symbol} skipped — VIP gamble weak hour "
-                    f"{local_hour:02d}:00 America/Los_Angeles"
-                )
-                db.set_call_skip_reason(call_id, "quiet_hours")
-                return
-
             if channel_handle == "solhousesignal" and local_hour in FREE_SOLHOUSE_QUIET_HOURS_PST:
                 print(
                     f"[paper] {symbol} skipped — free solhousesignal weak hour "
@@ -167,9 +157,9 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             if actual_entry is None and mint:
                 print(f"[paper] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
 
-            # ── VIP gamble-tier filters (gamble_risk / gamble only) ───────────────
-            # Checks run against actual_entry (live DexScreener price at open time),
-            # not msg_mcap (the VIP call price from 5+ minutes ago).
+            # ── Live mcap gate for VIP gamble-sized entries ───────────────────────
+            # Checks run against actual_entry (live market price at open time),
+            # not msg_mcap (the VIP call price from minutes earlier).
             is_vip_gamble = (token_data.get("sol_in_override") == SOL_VIP_GAMBLE)
             if is_vip_gamble and actual_entry is not None:
                 # Minimum mcap gate — token must be trading above $10k at open time
@@ -183,14 +173,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 print(f"[paper] {symbol} skipped — no usable entry mcap (msg={msg_mcap}, fetched={actual_entry})")
                 db.set_call_skip_reason(call_id, "no_entry_mcap")
                 return
-
-            # Strategy A: solwhaletrending only allowed as pyramid on existing positions
-            if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")) and "solwhaletrending" in channel:
-                existing_call_id = db.get_call_id_for_open_mint(mint, is_strategy_b=False)
-                if not existing_call_id:
-                    print(f"[paper] {symbol} skipped — solwhaletrending standalone (no existing position)")
-                    db.set_call_skip_reason(call_id, "no_base_position")
-                    return
 
             # Strategy A: only trade the first free solhousesignal call for a mint.
             if (
@@ -274,6 +256,13 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     return
 
                 if vip_tier == "safe":
+                    if local_hour not in VIP_SAFE_ALLOWED_HOURS_PST:
+                        print(
+                            f"[paper] {symbol} skipped — VIP safe allowed hours only "
+                            f"({local_hour:02d}:00 America/Los_Angeles)"
+                        )
+                        db.set_call_skip_reason(call_id, "vip_safe_allowed_hours")
+                        return
                     if score_val < 45:
                         print(f"[paper] {symbol} skipped — VIP safe score {score_val:.1f} < 45")
                         db.set_call_skip_reason(call_id, "vip_low_score")
@@ -292,6 +281,13 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                         return
 
                 elif vip_tier == "gamble":
+                    if local_hour not in VIP_GAMBLE_ALLOWED_HOURS_PST:
+                        print(
+                            f"[paper] {symbol} skipped — VIP gamble allowed hours only "
+                            f"({local_hour:02d}:00 America/Los_Angeles)"
+                        )
+                        db.set_call_skip_reason(call_id, "vip_gamble_allowed_hours")
+                        return
                     if (
                         15_000 <= entry_price < 25_000
                         and local_hour in VIP_GAMBLE_WEAK_15K_25K_HOURS_PST
