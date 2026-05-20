@@ -70,8 +70,11 @@ SPENT_RE = re.compile(r'([\d.]+)\s*SOL\s*[→>]\s*([\d.]+)%')
 # HIGH RISK flag (volume alert)
 HIGH_RISK_RE = re.compile(r'HIGH\s+RISK', re.IGNORECASE)
 
-# VIP tier emoji line (gem alert)
-VIP_TIER_RE = re.compile(r'(🟢\s*Safe|🔴\s*Gamble\s+Risk|🔵\s*Gamble)', re.IGNORECASE)
+# VIP tier emoji / label line (gem alert)
+VIP_TIER_RE = re.compile(
+    r'(🟢\s*Safe|🔴\s*Gamble\s+Risk|🔵\s*Gamble|💎\s*Diamond)',
+    re.IGNORECASE,
+)
 
 
 # ── Value converter ───────────────────────────────────────────────────────────
@@ -110,6 +113,8 @@ def _parse_vip_tier_line(text: str) -> str | None:
         return None
     raw = m.group(1)
     if '🟢' in raw:
+        return 'safe'
+    if '💎' in raw or 'Diamond' in raw:
         return 'safe'
     if 'Risk' in raw or 'risk' in raw:
         return 'gamble_risk'

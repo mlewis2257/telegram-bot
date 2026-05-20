@@ -133,10 +133,12 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 channel_handle == "solhousesignal"
                 and local_hour in FREE_SOLHOUSE_GLOBAL_QUIET_EXEMPT_HOURS_PST
             )
+            vip_uses_lane_allowlist = (channel_handle == "solhousesignal_vip")
             if (
                 local_hour in QUIET_HOURS_PST
                 and not quiet_hours_override
                 and not free_solhouse_global_quiet_exempt
+                and not vip_uses_lane_allowlist
             ):
                 print(f"[paper] {symbol} skipped — quiet hour {local_hour:02d}:00 America/Los_Angeles")
                 db.set_call_skip_reason(call_id, "quiet_hours")

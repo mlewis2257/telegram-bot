@@ -1117,6 +1117,18 @@ def run_listener() -> None:
                         print(f"[paper] {extra.get('symbol')} skipped — VIP {vip_tier} tier")
                         score_result = None
 
+            if cfg["channel_type"] == "vip" and score_result and extra:
+                channel_tag = extra.get("channel_tag", "") or ""
+                if "solhousesignal_vip" in channel_tag:
+                    call_id = score_result.get("call_id")
+                    if call_id:
+                        db.set_call_skip_reason(call_id, "vip_route_fallthrough")
+                    print(
+                        f"[paper] {extra.get('symbol')} skipped — VIP routing fallthrough "
+                        f"(tier={extra.get('vip_tier')}, score={score_result.get('score', 0):.1f})"
+                    )
+                    score_result = None
+
             # ── VIP gamble confirmation check (fires on lagging/solhousesignal messages) ──
             if cfg["channel_type"] == "lagging" and extra and extra.get("mint_address"):
                 _cleanup_stale_vip_gamble()
