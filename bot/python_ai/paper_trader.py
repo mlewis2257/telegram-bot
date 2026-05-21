@@ -39,8 +39,20 @@ HARD_STOP_PCT    = 0.35  # hard stop fires on 35% loss from entry
 MAX_HOURS        = 24    # time stop after 24 hours open
 LOCAL_TZ         = ZoneInfo("America/Los_Angeles")
 QUIET_HOURS_PST  = {4, 9, 14}
-FREE_SOLHOUSE_QUIET_HOURS_PST = {12, 16, 19, 20}
-FREE_SOLHOUSE_GLOBAL_QUIET_EXEMPT_HOURS_PST = {9, 14}
+FREE_SOLHOUSE_ALLOWED_MCAP_BUCKETS_BY_HOUR_PST = {
+    2: {"30k-50k"},
+    3: {"20k-30k"},
+    5: {"30k-50k", "50k-100k"},
+    6: {"20k-30k", "50k-100k"},
+    7: {"20k-30k", "30k-50k"},
+    10: {"20k-30k", "30k-50k"},
+    11: {"50k-100k", "100k+"},
+    15: {"20k-30k"},
+    17: {"20k-30k"},
+    18: {"20k-30k", "50k-100k"},
+    22: {"50k-100k"},
+    23: {"20k-30k", "30k-50k", "50k-100k"},
+}
 VIP_SAFE_ALLOWED_HOURS_PST = {13, 15, 16, 17, 18, 22}
 VIP_GAMBLE_ALLOWED_HOURS_PST = {12, 15, 20, 21, 22, 23}
 VIP_GAMBLE_WEAK_15K_25K_HOURS_PST = {8, 11, 13, 15, 16}
@@ -66,6 +78,18 @@ class ExitResult:
     should_exit: bool
     reason: str | None = None
     exit_mcap: float | None = None
+
+
+def _free_solhouse_mcap_bucket(entry_price: float) -> str | None:
+    if entry_price < 20_000:
+        return None
+    if entry_price < 30_000:
+        return "20k-30k"
+    if entry_price < 50_000:
+        return "30k-50k"
+    if entry_price < 100_000:
+        return "50k-100k"
+    return "100k+"
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -120,24 +144,13 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 return
 
             local_hour = position_entry_time.astimezone(LOCAL_TZ).hour
-            if channel_handle == "solhousesignal" and local_hour in FREE_SOLHOUSE_QUIET_HOURS_PST:
-                print(
-                    f"[paper] {symbol} skipped — free solhousesignal weak hour "
-                    f"{local_hour:02d}:00 America/Los_Angeles"
-                )
-                db.set_call_skip_reason(call_id, "quiet_hours")
-                return
-
             quiet_hours_override = (channel_handle == "solhousesignal" and score_val >= 70)
-            free_solhouse_global_quiet_exempt = (
-                channel_handle == "solhousesignal"
-                and local_hour in FREE_SOLHOUSE_GLOBAL_QUIET_EXEMPT_HOURS_PST
-            )
+            free_uses_allow_matrix = (channel_handle == "solhousesignal")
             vip_uses_lane_allowlist = (channel_handle == "solhousesignal_vip")
             if (
                 local_hour in QUIET_HOURS_PST
                 and not quiet_hours_override
-                and not free_solhouse_global_quiet_exempt
+                and not free_uses_allow_matrix
                 and not vip_uses_lane_allowlist
             ):
                 print(f"[paper] {symbol} skipped — quiet hour {local_hour:02d}:00 America/Los_Angeles")
@@ -175,6 +188,34 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             if entry_price <= 0:
                 print(f"[paper] {symbol} skipped — no usable entry mcap (msg={msg_mcap}, fetched={actual_entry})")
                 db.set_call_skip_reason(call_id, "no_entry_mcap")
+                return
+
+            if (
+                channel_handle == "solhousesignal"
+            ):
+                free_bucket = _free_solhouse_mcap_bucket(entry_price)
+                allowed_free_buckets = FREE_SOLHOUSE_ALLOWED_MCAP_BUCKETS_BY_HOUR_PST.get(local_hour, set())
+                if (
+                    local_hour not in FREE_SOLHOUSE_ALLOWED_MCAP_BUCKETS_BY_HOUR_PST
+                    or free_bucket not in allowed_free_buckets
+                ):
+                    bucket_label = free_bucket or "under_20k"
+                    print(
+                        f"[paper] {symbol} skipped — free solhousesignal hour/bucket "
+                        f"{local_hour:02d}:00 {bucket_label} not in allowlist"
+                    )
+                    db.set_call_skip_reason(call_id, "free_allowed_bucket")
+                    return
+
+            if (
+                channel_handle == "solhousesignal"
+                and entry_price >= 175_000
+            ):
+                print(
+                    f"[paper] {symbol} skipped — free solhousesignal mcap "
+                    f"${entry_price/1000:.1f}k above $175k cap"
+                )
+                db.set_call_skip_reason(call_id, "mcap_too_high")
                 return
 
             # Strategy A: only trade the first free solhousesignal call for a mint.
