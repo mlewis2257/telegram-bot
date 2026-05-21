@@ -256,6 +256,48 @@ def _print_final_stats() -> None:
     print("[listener] ────────────────────────────────────────────────────")
 
 
+def _track_task(task: asyncio.Task, label: str) -> None:
+    def _done(done_task: asyncio.Task) -> None:
+        try:
+            exc = done_task.exception()
+        except asyncio.CancelledError:
+            print(f"[paper_dispatch] cancelled {label}")
+            return
+        except Exception as e:
+            print(f"[paper_dispatch] could not inspect {label}: {e}")
+            return
+        if exc:
+            print(f"[paper_dispatch] task failed {label}: {exc}")
+
+    task.add_done_callback(_done)
+
+
+async def _dispatch_paper_open(
+    score_result: dict,
+    extra: dict,
+    *,
+    is_strategy_b: bool,
+    fallback_reason: str | None = None,
+) -> None:
+    trader = paper_trader_b if is_strategy_b else paper_trader
+    call_id = score_result.get("call_id") if score_result else None
+
+    await trader.open_position(score_result, extra)
+
+    if not call_id:
+        return
+    if db.has_paper_position_for_call(call_id, is_strategy_b=is_strategy_b):
+        return
+    if db.get_call_skip_reason(call_id) is not None:
+        return
+    if fallback_reason:
+        db.set_call_skip_reason(call_id, fallback_reason)
+        print(
+            f"[paper_dispatch] call_id={call_id} symbol={extra.get('symbol')} "
+            f"fell through dispatch without trade/skip — stamped {fallback_reason}"
+        )
+
+
 # ── Per-channel-type handlers ─────────────────────────────────────────────────
 
 def handle_lagging(message, caller_id: int, channel_id: int) -> tuple:
@@ -1072,8 +1114,27 @@ def run_listener() -> None:
                         score_result = None
                     elif vip_tier == "safe" and score >= 45:
                         # Safe tier trades at 45+ to match Strategy A entry logic.
-                        asyncio.create_task(paper_trader.open_position(score_result, extra))
-                        asyncio.create_task(paper_trader_b.open_position(score_result, extra))
+                        _track_task(
+                            asyncio.create_task(
+                                _dispatch_paper_open(
+                                    score_result,
+                                    extra,
+                                    is_strategy_b=False,
+                                    fallback_reason="paper_dispatch_fallthrough",
+                                )
+                            ),
+                            f"A VIP safe call_id={call_id}",
+                        )
+                        _track_task(
+                            asyncio.create_task(
+                                _dispatch_paper_open(
+                                    score_result,
+                                    extra,
+                                    is_strategy_b=True,
+                                )
+                            ),
+                            f"B VIP safe call_id={call_id}",
+                        )
                         score_result = None
                     elif vip_tier == "safe":
                         if call_id:
@@ -1091,7 +1152,17 @@ def run_listener() -> None:
                         if mint_addr and not mint_addr.startswith(("INFERRED:", "UNKNOWN:")):
                             extra["sol_in_override"] = paper_trader.SOL_VIP_GAMBLE  # 0.25 SOL
                             extra["vip_tier"] = vip_tier
-                            asyncio.create_task(paper_trader.open_position(score_result, extra))
+                            _track_task(
+                                asyncio.create_task(
+                                    _dispatch_paper_open(
+                                        score_result,
+                                        extra,
+                                        is_strategy_b=False,
+                                        fallback_reason="paper_dispatch_fallthrough",
+                                    )
+                                ),
+                                f"A VIP gamble call_id={call_id}",
+                            )
                             print(f"[vip] {extra.get('symbol', '?')} opening gamble position — A only (B paused)")
                         else:
                             call_id_g = score_result.get("call_id")
@@ -1151,11 +1222,26 @@ def run_listener() -> None:
                                 f"[vip_confirm] {pending['symbol']} confirmed after {elapsed_mins:.1f} min"
                                 f" — opening 0.25 SOL"
                             )
-                            asyncio.create_task(
-                                paper_trader.open_position(pending["score_result"], pending["extra"])
+                            _track_task(
+                                asyncio.create_task(
+                                    _dispatch_paper_open(
+                                        pending["score_result"],
+                                        pending["extra"],
+                                        is_strategy_b=False,
+                                        fallback_reason="paper_dispatch_fallthrough",
+                                    )
+                                ),
+                                f"A VIP confirm call_id={pending['call_id']}",
                             )
-                            asyncio.create_task(
-                                paper_trader_b.open_position(pending["score_result"], pending["extra"])
+                            _track_task(
+                                asyncio.create_task(
+                                    _dispatch_paper_open(
+                                        pending["score_result"],
+                                        pending["extra"],
+                                        is_strategy_b=True,
+                                    )
+                                ),
+                                f"B VIP confirm call_id={pending['call_id']}",
                             )
 
             if score_result and score_result["label"] in ("alert", "strong_alert"):
@@ -1165,8 +1251,28 @@ def run_listener() -> None:
                     channel_tag = (extra.get("channel_tag") or extra.get("channel_handle") or "")
                     # VIP entries are already routed above; avoid double-open.
                     if "solhousesignal_vip" not in channel_tag:
-                        asyncio.create_task(paper_trader.open_position(score_result, extra))
-                        asyncio.create_task(paper_trader_b.open_position(score_result, extra))
+                        call_id = score_result.get("call_id")
+                        _track_task(
+                            asyncio.create_task(
+                                _dispatch_paper_open(
+                                    score_result,
+                                    extra,
+                                    is_strategy_b=False,
+                                    fallback_reason="paper_dispatch_fallthrough",
+                                )
+                            ),
+                            f"A alert call_id={call_id}",
+                        )
+                        _track_task(
+                            asyncio.create_task(
+                                _dispatch_paper_open(
+                                    score_result,
+                                    extra,
+                                    is_strategy_b=True,
+                                )
+                            ),
+                            f"B alert call_id={call_id}",
+                        )
                         try:
                             import live_trader
                             asyncio.create_task(live_trader.open_live_position(score_result, extra))
@@ -1175,8 +1281,28 @@ def run_listener() -> None:
             elif score_result and extra and score_result.get("score", 0) >= 63:
                 channel_tag = (extra.get("channel_tag") or extra.get("channel_handle") or "")
                 if "solhousesignal" in channel_tag and "vip" not in channel_tag:
-                    asyncio.create_task(paper_trader.open_position(score_result, extra))
-                    asyncio.create_task(paper_trader_b.open_position(score_result, extra))
+                    call_id = score_result.get("call_id")
+                    _track_task(
+                        asyncio.create_task(
+                            _dispatch_paper_open(
+                                score_result,
+                                extra,
+                                is_strategy_b=False,
+                                fallback_reason="paper_dispatch_fallthrough",
+                            )
+                        ),
+                        f"A score>=63 call_id={call_id}",
+                    )
+                    _track_task(
+                        asyncio.create_task(
+                            _dispatch_paper_open(
+                                score_result,
+                                extra,
+                                is_strategy_b=True,
+                            )
+                        ),
+                        f"B score>=63 call_id={call_id}",
+                    )
             elif score_result and extra:
                 channel_tag = (extra.get("channel_tag") or extra.get("channel_handle") or "")
                 call_id = score_result.get("call_id")

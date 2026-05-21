@@ -1946,3 +1946,43 @@ def set_call_skip_reason(call_id: int, reason: str) -> None:
     except Exception as e:
         safe_rollback()
         print(f"[db] set_call_skip_reason failed call_id={call_id} reason={reason}: {e}")
+
+
+def get_call_skip_reason(call_id: int) -> str | None:
+    """Return the current skip_reason for a call, or None if unset/missing."""
+    if not call_id:
+        return None
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT skip_reason
+            FROM calls
+            WHERE id = %s
+            """,
+            (call_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def has_paper_position_for_call(call_id: int, is_strategy_b: bool = False) -> bool:
+    """Return True if any paper position row exists for this call/strategy."""
+    if not call_id:
+        return False
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+            FROM trading_positions
+            WHERE call_id = %s
+              AND is_simulation = TRUE
+              AND is_strategy_b = %s
+            LIMIT 1
+            """,
+            (call_id, is_strategy_b),
+        )
+        return cur.fetchone() is not None
