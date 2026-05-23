@@ -26,6 +26,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 import db
 import data_fetcher
 import alert_bot
+from strategy_config import STRATEGY_A_V2026_05_22
+from strategy_engine import StrategyCallContext, evaluate_strategy_a_entry
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -38,24 +40,12 @@ TRAIL_PEAK_MIN   = 2.0   # trailing stop only arms once peak >= 2.0x
 HARD_STOP_PCT    = 0.35  # hard stop fires on 35% loss from entry
 MAX_HOURS        = 24    # time stop after 24 hours open
 LOCAL_TZ         = ZoneInfo("America/Los_Angeles")
-QUIET_HOURS_PST  = {4, 9, 14}
-FREE_SOLHOUSE_ALLOWED_MCAP_BUCKETS_BY_HOUR_PST = {
-    2: {"30k-50k"},
-    3: {"20k-30k"},
-    5: {"30k-50k", "50k-100k"},
-    6: {"20k-30k", "50k-100k"},
-    7: {"20k-30k", "30k-50k"},
-    10: {"20k-30k", "30k-50k"},
-    11: {"50k-100k", "100k+"},
-    15: {"20k-30k"},
-    17: {"20k-30k"},
-    18: {"20k-30k", "50k-100k"},
-    22: {"50k-100k"},
-    23: {"20k-30k", "30k-50k", "50k-100k"},
-}
-VIP_SAFE_ALLOWED_HOURS_PST = {13, 15, 16, 17, 18, 22}
-VIP_GAMBLE_ALLOWED_HOURS_PST = {12, 15, 20, 21, 22, 23}
-VIP_GAMBLE_WEAK_15K_25K_HOURS_PST = {8, 11, 13, 15, 16}
+QUIET_HOURS_PST  = set(STRATEGY_A_V2026_05_22.quiet_hours_pst)
+FREE_SOLHOUSE_BLOCKED_HOURS_PST = set(STRATEGY_A_V2026_05_22.free_blocked_hours_pst)
+FREE_SOLHOUSE_WEAK_30K_50K_HOURS_PST = set(STRATEGY_A_V2026_05_22.free_weak_30k_50k_hours_pst)
+VIP_SAFE_ALLOWED_HOURS_PST = set(STRATEGY_A_V2026_05_22.vip_safe_allowed_hours_pst)
+VIP_GAMBLE_ALLOWED_HOURS_PST = set(STRATEGY_A_V2026_05_22.vip_gamble_allowed_hours_pst)
+VIP_GAMBLE_WEAK_15K_25K_HOURS_PST = set(STRATEGY_A_V2026_05_22.vip_gamble_weak_15k_25k_hours_pst)
 
 
 # ── In-flight mint guard (prevents race-condition duplicate buys) ──────────────
@@ -78,19 +68,6 @@ class ExitResult:
     should_exit: bool
     reason: str | None = None
     exit_mcap: float | None = None
-
-
-def _free_solhouse_mcap_bucket(entry_price: float) -> str | None:
-    if entry_price < 20_000:
-        return None
-    if entry_price < 30_000:
-        return "20k-30k"
-    if entry_price < 50_000:
-        return "30k-50k"
-    if entry_price < 100_000:
-        return "50k-100k"
-    return "100k+"
-
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -144,13 +121,11 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 return
 
             local_hour = position_entry_time.astimezone(LOCAL_TZ).hour
-            quiet_hours_override = (channel_handle == "solhousesignal" and score_val >= 70)
-            free_uses_allow_matrix = (channel_handle == "solhousesignal")
+            free_uses_custom_filters = (channel_handle == "solhousesignal")
             vip_uses_lane_allowlist = (channel_handle == "solhousesignal_vip")
             if (
                 local_hour in QUIET_HOURS_PST
-                and not quiet_hours_override
-                and not free_uses_allow_matrix
+                and not free_uses_custom_filters
                 and not vip_uses_lane_allowlist
             ):
                 print(f"[paper] {symbol} skipped — quiet hour {local_hour:02d}:00 America/Los_Angeles")
@@ -188,34 +163,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             if entry_price <= 0:
                 print(f"[paper] {symbol} skipped — no usable entry mcap (msg={msg_mcap}, fetched={actual_entry})")
                 db.set_call_skip_reason(call_id, "no_entry_mcap")
-                return
-
-            if (
-                channel_handle == "solhousesignal"
-            ):
-                free_bucket = _free_solhouse_mcap_bucket(entry_price)
-                allowed_free_buckets = FREE_SOLHOUSE_ALLOWED_MCAP_BUCKETS_BY_HOUR_PST.get(local_hour, set())
-                if (
-                    local_hour not in FREE_SOLHOUSE_ALLOWED_MCAP_BUCKETS_BY_HOUR_PST
-                    or free_bucket not in allowed_free_buckets
-                ):
-                    bucket_label = free_bucket or "under_20k"
-                    print(
-                        f"[paper] {symbol} skipped — free solhousesignal hour/bucket "
-                        f"{local_hour:02d}:00 {bucket_label} not in allowlist"
-                    )
-                    db.set_call_skip_reason(call_id, "free_allowed_bucket")
-                    return
-
-            if (
-                channel_handle == "solhousesignal"
-                and entry_price >= 175_000
-            ):
-                print(
-                    f"[paper] {symbol} skipped — free solhousesignal mcap "
-                    f"${entry_price/1000:.1f}k above $175k cap"
-                )
-                db.set_call_skip_reason(call_id, "mcap_too_high")
                 return
 
             # Strategy A: only trade the first free solhousesignal call for a mint.
@@ -259,13 +206,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                         db.set_call_skip_reason(call_id, "duplicate")
                         return
 
-            # ── Entry gate ────────────────────────────────────────────────────
-            security_flag = token_data.get("security_flag")
-            if security_flag == "warning":
-                print(f"[paper] {symbol} skipped — security=warning")
-                db.set_call_skip_reason(call_id, "security_warning")
-                return
-
             # ── Bucket quality filters (data-driven) ─────────────────────────
             bundle_pct = token_data.get("bundle_pct_remaining")
             fake_pct   = token_data.get("fake_vol_pct")
@@ -274,102 +214,35 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                     bundle_pct = token_onchain.get("bundle_pct_remaining")
                 if fake_pct is None:
                     fake_pct = token_onchain.get("fake_vol_pct")
-
-            # Block the known low-quality combo on solhousesignal channels.
-            is_bad_bundle = (bundle_pct is not None and bundle_pct >= 10)
-            is_bad_fake   = (fake_pct is not None and fake_pct >= 5)
-            if channel_handle == "solhousesignal" and is_bad_bundle and is_bad_fake:
-                print(
-                    f"[paper] {symbol} skipped — low_quality_bucket "
-                    f"(bundle={bundle_pct}, fake={fake_pct}, score={score_val:.1f})"
+            if channel_handle in {"solhousesignal", "solhousesignal_vip"}:
+                decision = evaluate_strategy_a_entry(
+                    StrategyCallContext(
+                        call_id=call_id,
+                        strategy_name="A",
+                        channel_handle=channel_handle,
+                        vip_tier=token_data.get("vip_tier"),
+                        score=score_val,
+                        local_hour_pst=local_hour,
+                        entry_mcap=entry_price,
+                        bundle_pct=float(bundle_pct) if bundle_pct is not None else None,
+                        fake_pct=float(fake_pct) if fake_pct is not None else None,
+                        security_flag=(token_data.get("security_flag") or token_onchain.get("security_flag")),
+                        dev_tokens_made=token_onchain.get("dev_tokens_made"),
+                        symbol=symbol,
+                    ),
+                    STRATEGY_A_V2026_05_22,
                 )
-                db.set_call_skip_reason(call_id, "low_quality_bucket")
-                return
-
-            # ── VIP tier gates (A only; B has separate file/logic) ───────────
-            if channel_handle == "solhousesignal_vip":
-                vip_tier = token_data.get("vip_tier")
-                security_flag_onchain = token_onchain.get("security_flag")
-                dev_tokens = token_onchain.get("dev_tokens_made")
-                has_bundle_fake = (bundle_pct is not None and fake_pct is not None)
-
-                if vip_tier not in ("safe", "gamble", "gamble_risk"):
-                    skip_reason = "vip_missing_tier" if not vip_tier else "vip_unhandled_tier"
-                    print(f"[paper] {symbol} skipped — unsupported vip tier {vip_tier!r}")
-                    db.set_call_skip_reason(call_id, skip_reason)
+                if not decision.should_trade:
+                    print(f"[paper] {symbol} skipped — {decision.reason}")
+                    db.set_call_skip_reason(call_id, decision.reason)
                     return
 
-                if vip_tier == "safe":
-                    if local_hour not in VIP_SAFE_ALLOWED_HOURS_PST:
-                        print(
-                            f"[paper] {symbol} skipped — VIP safe allowed hours only "
-                            f"({local_hour:02d}:00 America/Los_Angeles)"
-                        )
-                        db.set_call_skip_reason(call_id, "vip_safe_allowed_hours")
-                        return
-                    if score_val < 45:
-                        print(f"[paper] {symbol} skipped — VIP safe score {score_val:.1f} < 45")
-                        db.set_call_skip_reason(call_id, "vip_low_score")
-                        return
-                    if entry_price < 20_000:
-                        print(f"[paper] {symbol} skipped — VIP safe mcap ${entry_price/1000:.1f}k below $20k minimum")
-                        db.set_call_skip_reason(call_id, "vip_mcap_too_low")
-                        return
-                    if bundle_pct is not None and bundle_pct > 10:
-                        print(f"[paper] {symbol} skipped — VIP safe bundle {bundle_pct:.1f}% too high")
-                        db.set_call_skip_reason(call_id, "high_bundle")
-                        return
-                    if fake_pct is not None and fake_pct > 4:
-                        print(f"[paper] {symbol} skipped — VIP safe fake vol {fake_pct:.1f}% too high")
-                        db.set_call_skip_reason(call_id, "high_fake_vol")
-                        return
-
-                elif vip_tier == "gamble":
-                    if local_hour not in VIP_GAMBLE_ALLOWED_HOURS_PST:
-                        print(
-                            f"[paper] {symbol} skipped — VIP gamble allowed hours only "
-                            f"({local_hour:02d}:00 America/Los_Angeles)"
-                        )
-                        db.set_call_skip_reason(call_id, "vip_gamble_allowed_hours")
-                        return
-                    if (
-                        15_000 <= entry_price < 25_000
-                        and local_hour in VIP_GAMBLE_WEAK_15K_25K_HOURS_PST
-                    ):
-                        print(
-                            f"[paper] {symbol} skipped — VIP gamble weak 15k-25k pocket "
-                            f"at {local_hour:02d}:00 America/Los_Angeles"
-                        )
-                        db.set_call_skip_reason(call_id, "vip_gamble_weak_pocket")
-                        return
-                    # Gamble is medium strict: allow nulls, but block explicit bad combo.
-                    if is_bad_bundle and is_bad_fake:
-                        print(f"[paper] {symbol} skipped — VIP gamble low-quality combo (bundle={bundle_pct}, fake={fake_pct})")
-                        db.set_call_skip_reason(call_id, "vip_mcap_gate")
-                        return
-
-                elif vip_tier == "gamble_risk":
-                    # Strictest tier: require stronger score and quality data.
-                    if score_val < 70:
-                        print(f"[paper] {symbol} skipped — VIP gamble_risk score {score_val:.1f} < 70")
-                        db.set_call_skip_reason(call_id, "vip_mcap_gate")
-                        return
-                    if not has_bundle_fake:
-                        print(f"[paper] {symbol} skipped — VIP gamble_risk missing bundle/fake data")
-                        db.set_call_skip_reason(call_id, "vip_mcap_gate")
-                        return
-                    if security_flag_onchain == "warning":
-                        print(f"[paper] {symbol} skipped — gamble_risk security=warning")
-                        db.set_call_skip_reason(call_id, "security_warning")
-                        return
-                    if (bundle_pct is not None and bundle_pct >= 10) or (fake_pct is not None and fake_pct >= 5):
-                        print(f"[paper] {symbol} skipped — gamble_risk risk gate (bundle={bundle_pct}, fake={fake_pct})")
-                        db.set_call_skip_reason(call_id, "vip_mcap_gate")
-                        return
-                    if dev_tokens is not None and dev_tokens >= 10:
-                        print(f"[paper] {symbol} skipped — gamble_risk dev_tokens={dev_tokens}")
-                        db.set_call_skip_reason(call_id, "serial_rugger")
-                        return
+            # ── Entry gate ────────────────────────────────────────────────────
+            security_flag = token_data.get("security_flag")
+            if security_flag == "warning":
+                print(f"[paper] {symbol} skipped — security=warning")
+                db.set_call_skip_reason(call_id, "security_warning")
+                return
 
             # Positive pocket marker for observability (sizing unchanged for now).
             if (
@@ -379,24 +252,6 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 and fake_pct is not None and fake_pct < 5
             ):
                 print(f"[paper] {symbol} priority_bucket matched (70-74, bundle<10, fake<5)")
-
-            # ── VIP safe tier mcap range gate ─────────────────────────────────
-            if channel_handle == "solhousesignal_vip" and token_data.get("vip_tier") == "safe":
-                if entry_price > 150_000:
-                    print(f"[paper] {symbol} skipped — VIP safe mcap ${entry_price/1000:.0f}k above $150k maximum")
-                    db.set_call_skip_reason(call_id, "mcap_too_high")
-                    return
-
-            # ── Free solhousesignal mcap range gate ───────────────────────────
-            if "solhousesignal" in channel_handle and "vip" not in channel_handle:
-                if entry_price < 20_000:
-                    print(f"[paper] {symbol} skipped — solhousesignal mcap ${entry_price/1000:.1f}k below $20k minimum")
-                    db.set_call_skip_reason(call_id, "mcap_too_low")
-                    return
-                if entry_price > 175_000:
-                    print(f"[paper] {symbol} skipped — solhousesignal mcap ${entry_price/1000:.0f}k above $175k maximum")
-                    db.set_call_skip_reason(call_id, "mcap_too_high")
-                    return
 
             vip_tier_val = token_data.get("vip_tier") if channel_handle == "solhousesignal_vip" else None
             db.open_paper_position(call_id, entry_price, sol_in,
