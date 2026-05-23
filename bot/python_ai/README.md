@@ -48,9 +48,9 @@ for live paper trading alone.
 
 ### Strategy A
 
-- Free `solhousesignal` uses simplified filtering:
-  - blocks hour `14`
-  - blocks `30k-50k` at hours `8`, `11`, `18`
+- Free `solhousesignal` uses the relaxed filtering baseline:
+  - no hour-specific free block
+  - no `30k-50k` weak-pocket block
   - still applies min/max mcap and low-quality bundle/fake checks
 - VIP `safe` and `gamble` use lane-specific allowed-hour logic
 - VIP `gamble_risk` is paused
