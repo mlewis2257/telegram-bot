@@ -133,7 +133,7 @@ def _evaluate(strategy: str, config, ctx: StrategyCallContext):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Replay calls against versioned strategy config")
-    parser.add_argument("--strategy", default="a", choices=["a", "b"])
+    parser.add_argument("--strategy", default="a", help="Strategy/config key: a, a_matrix, a_no_h14, a_no_weak, b")
     parser.add_argument("--days", type=int, default=None)
     parser.add_argument("--date-from", dest="date_from", default=None)
     parser.add_argument("--date-to", dest="date_to", default=None)

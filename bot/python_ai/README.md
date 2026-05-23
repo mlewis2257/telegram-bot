@@ -97,6 +97,8 @@ Useful strategy keys:
 - `a`
 - `a_simplified`
 - `a_matrix`
+- `a_no_h14`
+- `a_no_weak`
 - `b`
 
 ## Reporting workflow

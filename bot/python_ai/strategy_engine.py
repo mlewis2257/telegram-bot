@@ -70,6 +70,13 @@ def evaluate_strategy_a_entry(
     if ctx.security_flag == "warning":
         return StrategyDecision(False, "security_warning", config.version, metadata)
 
+    if channel == "solwhaletrending":
+        if ctx.local_hour_pst in config.quiet_hours_pst:
+            return StrategyDecision(False, "quiet_hours", config.version, metadata)
+        if ctx.score < config.whale_min_score:
+            return StrategyDecision(False, "low_score", config.version, metadata)
+        return StrategyDecision(True, "trade", config.version, metadata)
+
     if channel == "solhousesignal":
         if ctx.score < config.free_min_score:
             return StrategyDecision(False, "low_score", config.version, metadata)
