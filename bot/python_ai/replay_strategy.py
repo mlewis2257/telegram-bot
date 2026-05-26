@@ -136,7 +136,7 @@ def main() -> None:
     parser.add_argument(
         "--strategy",
         default="a",
-        help="Strategy/config key: a, a_matrix, a_no_h14, a_no_weak, a_no_h14_no_weak, a_vip_tight_b, b",
+        help="Strategy/config key: a, a_relaxed_free, a_matrix, a_no_h14, a_no_weak, a_no_h14_no_weak, a_vip_tight_b, a_vip_soft, b",
     )
     parser.add_argument("--days", type=int, default=None)
     parser.add_argument("--date-from", dest="date_from", default=None)

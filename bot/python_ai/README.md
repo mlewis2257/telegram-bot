@@ -48,11 +48,15 @@ for live paper trading alone.
 
 ### Strategy A
 
-- Free `solhousesignal` uses the relaxed filtering baseline:
+- Free `solhousesignal` keeps the relaxed filtering baseline:
   - no hour-specific free block
   - no `30k-50k` weak-pocket block
   - still applies min/max mcap and low-quality bundle/fake checks
-- VIP `safe` and `gamble` use lane-specific allowed-hour logic
+- VIP is now tightened in the live baseline:
+  - `safe` requires score `>= 63`
+  - `gamble` requires score `>= 70`
+  - `gamble` mcap band tightened to `15k-30k`
+  - lane-specific allowed-hour logic still applies
 - VIP `gamble_risk` is paused
 - Additional fallthrough protections stamp explicit skip reasons instead of
   leaving silent `none` cases where possible
@@ -96,11 +100,13 @@ Useful strategy keys:
 
 - `a`
 - `a_simplified`
+- `a_relaxed_free`
 - `a_matrix`
 - `a_no_h14`
 - `a_no_weak`
 - `a_no_h14_no_weak`
 - `a_vip_tight_b`
+- `a_vip_soft`
 - `b`
 
 ## Reporting workflow

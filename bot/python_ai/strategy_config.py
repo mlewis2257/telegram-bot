@@ -34,7 +34,7 @@ class StrategyConfig:
     vip_gamble_weak_15k_25k_hours_pst: frozenset[int] = field(default_factory=frozenset)
 
 
-STRATEGY_A_V2026_05_22 = StrategyConfig(
+STRATEGY_A_V2026_05_23_RELAXED_FREE = StrategyConfig(
     strategy_name="A",
     version="a_2026_05_23_relaxed_free",
     quiet_hours_pst=frozenset({4, 9, 14}),
@@ -42,6 +42,22 @@ STRATEGY_A_V2026_05_22 = StrategyConfig(
     free_weak_30k_50k_hours_pst=frozenset(),
     vip_safe_allowed_hours_pst=frozenset({13, 15, 16, 17, 18, 22}),
     vip_gamble_allowed_hours_pst=frozenset({12, 15, 20, 21, 22, 23}),
+    vip_gamble_weak_15k_25k_hours_pst=frozenset({8, 11, 13, 15, 16}),
+)
+
+
+STRATEGY_A_V2026_05_22 = StrategyConfig(
+    strategy_name="A",
+    version="a_2026_05_26_live_vip_tight_b",
+    quiet_hours_pst=frozenset({4, 9, 14}),
+    free_blocked_hours_pst=frozenset(),
+    free_weak_30k_50k_hours_pst=frozenset(),
+    vip_safe_allowed_hours_pst=frozenset({13, 15, 16, 17, 18, 22}),
+    vip_safe_min_score=63.0,
+    vip_gamble_allowed_hours_pst=frozenset({12, 15, 20, 21, 22, 23}),
+    vip_gamble_min_score=70.0,
+    vip_gamble_min_entry_mcap=15_000,
+    vip_gamble_max_entry_mcap=30_000,
     vip_gamble_weak_15k_25k_hours_pst=frozenset({8, 11, 13, 15, 16}),
 )
 
@@ -122,6 +138,22 @@ STRATEGY_A_V2026_05_26_VIP_TIGHT_B = StrategyConfig(
 )
 
 
+STRATEGY_A_V2026_05_26_VIP_SOFT = StrategyConfig(
+    strategy_name="A",
+    version="a_2026_05_26_vip_soft",
+    quiet_hours_pst=frozenset({4, 9, 14}),
+    free_blocked_hours_pst=frozenset(),
+    free_weak_30k_50k_hours_pst=frozenset(),
+    vip_safe_allowed_hours_pst=frozenset({13, 15, 16, 17, 18, 22}),
+    vip_safe_min_score=63.0,
+    vip_gamble_allowed_hours_pst=frozenset({12, 15, 20, 21, 22, 23}),
+    vip_gamble_min_score=63.0,
+    vip_gamble_min_entry_mcap=15_000,
+    vip_gamble_max_entry_mcap=30_000,
+    vip_gamble_weak_15k_25k_hours_pst=frozenset({8, 11, 13, 15, 16}),
+)
+
+
 STRATEGY_B_V2026_05_22 = StrategyConfig(
     strategy_name="B",
     version="b_2026_05_22",
@@ -139,6 +171,8 @@ def get_strategy_config(strategy: str) -> StrategyConfig:
     key = strategy.strip().lower()
     if key in {"a", "a_simplified", STRATEGY_A_V2026_05_22.version}:
         return STRATEGY_A_V2026_05_22
+    if key in {"a_relaxed_free", "a_2026_05_23_relaxed_free", STRATEGY_A_V2026_05_23_RELAXED_FREE.version}:
+        return STRATEGY_A_V2026_05_23_RELAXED_FREE
     if key in {"a_matrix", STRATEGY_A_V2026_05_20_MATRIX.version}:
         return STRATEGY_A_V2026_05_20_MATRIX
     if key in {"a_no_h14", STRATEGY_A_V2026_05_22_NO_H14.version}:
@@ -147,8 +181,14 @@ def get_strategy_config(strategy: str) -> StrategyConfig:
         return STRATEGY_A_V2026_05_22_NO_WEAK
     if key in {"a_no_h14_no_weak", STRATEGY_A_V2026_05_22_NO_H14_NO_WEAK.version}:
         return STRATEGY_A_V2026_05_22_NO_H14_NO_WEAK
-    if key in {"a_vip_tight_b", "a_tight_vip_b", STRATEGY_A_V2026_05_26_VIP_TIGHT_B.version}:
+    if key in {
+        "a_vip_tight_b",
+        "a_tight_vip_b",
+        STRATEGY_A_V2026_05_26_VIP_TIGHT_B.version,
+    }:
         return STRATEGY_A_V2026_05_26_VIP_TIGHT_B
+    if key in {"a_vip_soft", "a_soft_vip", STRATEGY_A_V2026_05_26_VIP_SOFT.version}:
+        return STRATEGY_A_V2026_05_26_VIP_SOFT
     if key in {"b", STRATEGY_B_V2026_05_22.version}:
         return STRATEGY_B_V2026_05_22
     raise ValueError(f"Unknown strategy {strategy!r}")
