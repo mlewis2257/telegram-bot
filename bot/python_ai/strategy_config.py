@@ -106,6 +106,22 @@ STRATEGY_A_V2026_05_22_NO_H14_NO_WEAK = StrategyConfig(
 )
 
 
+STRATEGY_A_V2026_05_26_VIP_TIGHT_B = StrategyConfig(
+    strategy_name="A",
+    version="a_2026_05_26_vip_tight_b",
+    quiet_hours_pst=frozenset({4, 9, 14}),
+    free_blocked_hours_pst=frozenset(),
+    free_weak_30k_50k_hours_pst=frozenset(),
+    vip_safe_allowed_hours_pst=frozenset({13, 15, 16, 17, 18, 22}),
+    vip_safe_min_score=63.0,
+    vip_gamble_allowed_hours_pst=frozenset({12, 15, 20, 21, 22, 23}),
+    vip_gamble_min_score=70.0,
+    vip_gamble_min_entry_mcap=15_000,
+    vip_gamble_max_entry_mcap=30_000,
+    vip_gamble_weak_15k_25k_hours_pst=frozenset({8, 11, 13, 15, 16}),
+)
+
+
 STRATEGY_B_V2026_05_22 = StrategyConfig(
     strategy_name="B",
     version="b_2026_05_22",
@@ -131,6 +147,8 @@ def get_strategy_config(strategy: str) -> StrategyConfig:
         return STRATEGY_A_V2026_05_22_NO_WEAK
     if key in {"a_no_h14_no_weak", STRATEGY_A_V2026_05_22_NO_H14_NO_WEAK.version}:
         return STRATEGY_A_V2026_05_22_NO_H14_NO_WEAK
+    if key in {"a_vip_tight_b", "a_tight_vip_b", STRATEGY_A_V2026_05_26_VIP_TIGHT_B.version}:
+        return STRATEGY_A_V2026_05_26_VIP_TIGHT_B
     if key in {"b", STRATEGY_B_V2026_05_22.version}:
         return STRATEGY_B_V2026_05_22
     raise ValueError(f"Unknown strategy {strategy!r}")
