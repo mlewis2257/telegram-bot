@@ -33,6 +33,7 @@ from strategy_engine import StrategyCallContext, evaluate_strategy_a_entry
 
 SOL_STRONG_ALERT = 0.5   # simulated SOL for strong_alert (85+)
 SOL_ALERT        = 0.5   # simulated SOL for alert (70–84)
+SOL_SOLHOUSE_70_74 = 0.25  # smaller size for weaker free solhousesignal alerts
 SOL_VIP_GAMBLE   = 0.25  # simulated SOL for experimental VIP gamble/gamble_risk entries
 
 TAKE_PROFIT_5X   = 5.0   # exit at 5x from entry
@@ -100,22 +101,25 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             label = score_result.get("label")
             channel = token_data.get("channel_tag") or token_data.get("channel_handle", "")
 
-            if token_data.get("sol_in_override"):
-                sol_in = float(token_data["sol_in_override"])
-            elif "solearlytrending" in channel:
-                sol_in = SOL_ALERT  # always 0.5 SOL regardless of score
-            elif label == "strong_alert":
-                sol_in = SOL_STRONG_ALERT  # 0.5 SOL for other channels
-            else:
-                sol_in = SOL_ALERT  # 0.5 SOL
-
             score_val  = float(score_result.get("score") or 0)
-            msg_mcap   = float(token_data.get("mcap_at_call") or 0)
             channel_handle = (
                 token_data.get("channel_tag") or
                 token_data.get("channel_handle") or
                 ""
             ).lstrip("@")
+
+            if token_data.get("sol_in_override"):
+                sol_in = float(token_data["sol_in_override"])
+            elif "solearlytrending" in channel:
+                sol_in = SOL_ALERT  # always 0.5 SOL regardless of score
+            elif channel_handle == "solhousesignal" and 70 <= score_val < 75:
+                sol_in = SOL_SOLHOUSE_70_74
+            elif label == "strong_alert":
+                sol_in = SOL_STRONG_ALERT  # 0.5 SOL for other channels
+            else:
+                sol_in = SOL_ALERT  # 0.5 SOL
+
+            msg_mcap   = float(token_data.get("mcap_at_call") or 0)
 
             if not call_id:
                 return
