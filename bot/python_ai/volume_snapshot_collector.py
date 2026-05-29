@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -54,6 +55,8 @@ def _collect_snapshot_minute(
     min_mcap: float,
     require_market_context: bool,
     selection: str,
+    max_unique_mints: int,
+    fetch_delay_ms: int,
 ) -> tuple[int, int, int]:
     due_rows = db.get_due_volume_snapshot_calls(
         snapshot_minutes,
@@ -65,6 +68,7 @@ def _collect_snapshot_minute(
     inserted = 0
     skipped = 0
     market_cache: dict[str, dict | None] = {}
+    unique_mints_fetched = 0
 
     for row in due_rows:
         mint = (row.get("mint_address") or "").strip()
@@ -73,7 +77,13 @@ def _collect_snapshot_minute(
             continue
 
         if mint not in market_cache:
+            if max_unique_mints > 0 and unique_mints_fetched >= max_unique_mints:
+                skipped += 1
+                continue
             market_cache[mint] = data_fetcher.fetch_token_price(mint)
+            unique_mints_fetched += 1
+            if fetch_delay_ms > 0:
+                time.sleep(fetch_delay_ms / 1000.0)
         market = market_cache[mint]
         if not market:
             skipped += 1
@@ -138,7 +148,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Capture scheduled volume snapshots for recent calls")
     parser.add_argument("--minutes", default=None, help="Comma-separated snapshot offsets, e.g. 0,5,15,30,60")
     parser.add_argument("--since-hours", type=int, default=48, help="Only consider calls newer than this")
-    parser.add_argument("--limit", type=int, default=500, help="Per-snapshot fetch limit")
+    parser.add_argument("--limit", type=int, default=50, help="Per-snapshot candidate row limit")
     parser.add_argument(
         "--selection",
         choices=["traded", "not_skipped", "all"],
@@ -146,6 +156,18 @@ def main() -> None:
         help="Which calls to snapshot: traded (default), not_skipped, or all",
     )
     parser.add_argument("--min-mcap", type=float, default=0.0, help="Skip snapshots when fetched mcap is below this")
+    parser.add_argument(
+        "--max-unique-mints",
+        type=int,
+        default=25,
+        help="Maximum unique mints to fetch per snapshot minute (0 disables cap)",
+    )
+    parser.add_argument(
+        "--fetch-delay-ms",
+        type=int,
+        default=150,
+        help="Delay between unique market fetches in milliseconds",
+    )
     parser.add_argument(
         "--allow-empty-market",
         action="store_true",
@@ -178,6 +200,8 @@ def main() -> None:
             min_mcap=args.min_mcap,
             require_market_context=not args.allow_empty_market,
             selection=args.selection,
+            max_unique_mints=args.max_unique_mints,
+            fetch_delay_ms=args.fetch_delay_ms,
         )
         total_due += due
         total_inserted += inserted
