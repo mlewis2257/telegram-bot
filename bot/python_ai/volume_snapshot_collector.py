@@ -36,13 +36,24 @@ def _parse_minutes(raw: str | None) -> list[int]:
     return sorted(set(values))
 
 
+def _has_meaningful_market_data(market: dict | None) -> bool:
+    if not market:
+        return False
+    return any(
+        market.get(key) not in (None, 0, 0.0, "")
+        for key in ("mcap", "liquidity_usd", "volume_h1")
+    )
+
+
 def _collect_snapshot_minute(
     snapshot_minutes: int,
     *,
     since_hours: int,
     limit: int,
     dry_run: bool,
-) -> tuple[int, int]:
+    min_mcap: float,
+    require_market_context: bool,
+) -> tuple[int, int, int]:
     due_rows = db.get_due_volume_snapshot_calls(
         snapshot_minutes,
         since_hours=since_hours,
@@ -50,14 +61,26 @@ def _collect_snapshot_minute(
     )
     snapshot_label = f"t_plus_{snapshot_minutes:02d}m"
     inserted = 0
+    skipped = 0
 
     for row in due_rows:
         mint = (row.get("mint_address") or "").strip()
         if not mint or mint.startswith(("INFERRED:", "UNKNOWN:")):
+            skipped += 1
             continue
 
         market = data_fetcher.fetch_token_price(mint)
         if not market:
+            skipped += 1
+            continue
+
+        if require_market_context and not _has_meaningful_market_data(market):
+            skipped += 1
+            continue
+
+        mcap = market.get("mcap")
+        if min_mcap > 0 and mcap is not None and float(mcap) < min_mcap:
+            skipped += 1
             continue
 
         if dry_run:
@@ -83,8 +106,10 @@ def _collect_snapshot_minute(
             market=market,
         ):
             inserted += 1
+        else:
+            skipped += 1
 
-    return len(due_rows), inserted
+    return len(due_rows), inserted, skipped
 
 
 def _print_summary(days: int) -> None:
@@ -109,6 +134,12 @@ def main() -> None:
     parser.add_argument("--minutes", default=None, help="Comma-separated snapshot offsets, e.g. 0,5,15,30,60")
     parser.add_argument("--since-hours", type=int, default=48, help="Only consider calls newer than this")
     parser.add_argument("--limit", type=int, default=500, help="Per-snapshot fetch limit")
+    parser.add_argument("--min-mcap", type=float, default=0.0, help="Skip snapshots when fetched mcap is below this")
+    parser.add_argument(
+        "--allow-empty-market",
+        action="store_true",
+        help="Store snapshots even when mcap/liquidity/volume are all missing or zero",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print what would be inserted without writing")
     parser.add_argument("--summary", action="store_true", help="Print recent snapshot coverage and exit")
     parser.add_argument("--summary-days", type=int, default=3, help="Window for --summary")
@@ -126,18 +157,22 @@ def main() -> None:
     print("=" * 72)
     total_due = 0
     total_inserted = 0
+    total_skipped = 0
     for minute in snapshot_minutes:
-        due, inserted = _collect_snapshot_minute(
+        due, inserted, skipped = _collect_snapshot_minute(
             minute,
             since_hours=args.since_hours,
             limit=args.limit,
             dry_run=args.dry_run,
+            min_mcap=args.min_mcap,
+            require_market_context=not args.allow_empty_market,
         )
         total_due += due
         total_inserted += inserted
-        print(f"t+{minute:02d}m  due={due}  inserted={inserted}")
+        total_skipped += skipped
+        print(f"t+{minute:02d}m  due={due}  inserted={inserted}  skipped={skipped}")
     print("-" * 72)
-    print(f"total_due={total_due}  total_inserted={total_inserted}")
+    print(f"total_due={total_due}  total_inserted={total_inserted}  total_skipped={total_skipped}")
 
 
 if __name__ == "__main__":
