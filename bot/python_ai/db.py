@@ -1598,6 +1598,196 @@ def get_open_live_positions() -> list[dict]:
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
+# ── Volume snapshots ─────────────────────────────────────────────────────────
+
+def ensure_token_volume_snapshots_table() -> None:
+    """
+    Create the token_volume_snapshots table if it does not already exist.
+
+    This is intentionally lightweight so research scripts can bootstrap the
+    table in environments where a formal migration has not been applied yet.
+    """
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS token_volume_snapshots (
+                id BIGSERIAL PRIMARY KEY,
+                call_id BIGINT NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+                token_id BIGINT NOT NULL REFERENCES tokens(id) ON DELETE CASCADE,
+                mint_address TEXT NOT NULL,
+                snapshot_label TEXT NOT NULL,
+                minutes_since_call INTEGER NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                age_minutes REAL,
+                channel_handle TEXT,
+                vip_tier TEXT,
+                conviction_score REAL,
+                mcap NUMERIC,
+                liquidity_usd NUMERIC,
+                volume_h1 NUMERIC,
+                price_usd NUMERIC,
+                source TEXT,
+                market_json JSONB,
+                UNIQUE (call_id, snapshot_label)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_token_volume_snapshots_call_id
+                ON token_volume_snapshots(call_id)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_token_volume_snapshots_observed_at
+                ON token_volume_snapshots(observed_at DESC)
+            """
+        )
+        conn.commit()
+
+
+def get_due_volume_snapshot_calls(
+    snapshot_minutes: int,
+    *,
+    since_hours: int = 48,
+    limit: int = 500,
+) -> list[dict]:
+    """
+    Return recent calls old enough for the requested snapshot offset and not yet
+    recorded for that call/snapshot label.
+    """
+    conn = get_conn()
+    safe_rollback()
+    snapshot_label = f"t_plus_{snapshot_minutes:02d}m"
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                c.id AS call_id,
+                c.token_id,
+                c.created_at,
+                c.vip_tier,
+                c.conviction_score,
+                t.mint_address,
+                t.symbol,
+                ch.handle AS channel_handle,
+                EXTRACT(EPOCH FROM (NOW() - c.created_at)) / 60.0 AS age_minutes
+            FROM calls c
+            JOIN tokens t ON t.id = c.token_id
+            LEFT JOIN channels ch ON ch.id = c.channel_id
+            WHERE c.created_at >= NOW() - (%s * INTERVAL '1 hour')
+              AND c.created_at <= NOW() - (%s * INTERVAL '1 minute')
+              AND t.mint_address IS NOT NULL
+              AND t.mint_address <> ''
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM token_volume_snapshots tvs
+                  WHERE tvs.call_id = c.id
+                    AND tvs.snapshot_label = %s
+              )
+            ORDER BY c.created_at ASC
+            LIMIT %s
+            """,
+            (since_hours, snapshot_minutes, snapshot_label, limit),
+        )
+        return cur.fetchall()
+
+
+def insert_token_volume_snapshot(
+    *,
+    call_id: int,
+    token_id: int,
+    mint_address: str,
+    snapshot_label: str,
+    minutes_since_call: int,
+    created_at,
+    age_minutes: float | None,
+    channel_handle: str | None,
+    vip_tier: str | None,
+    conviction_score: float | None,
+    market: dict | None,
+) -> bool:
+    """
+    Insert one token volume snapshot. Returns True only when a row was inserted.
+    """
+    conn = get_conn()
+    safe_rollback()
+    market = market or {}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO token_volume_snapshots (
+                call_id,
+                token_id,
+                mint_address,
+                snapshot_label,
+                minutes_since_call,
+                created_at,
+                age_minutes,
+                channel_handle,
+                vip_tier,
+                conviction_score,
+                mcap,
+                liquidity_usd,
+                volume_h1,
+                price_usd,
+                source,
+                market_json
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (call_id, snapshot_label) DO NOTHING
+            """,
+            (
+                call_id,
+                token_id,
+                mint_address,
+                snapshot_label,
+                minutes_since_call,
+                created_at,
+                age_minutes,
+                channel_handle,
+                vip_tier,
+                conviction_score,
+                market.get("mcap"),
+                market.get("liquidity_usd"),
+                market.get("volume_h1"),
+                market.get("price_usd"),
+                market.get("source"),
+                Json(market),
+            ),
+        )
+        inserted = cur.rowcount > 0
+        conn.commit()
+        return inserted
+
+
+def get_recent_volume_snapshot_counts(days: int = 3) -> list[dict]:
+    """Return snapshot coverage counts by label for the last N days of calls."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                snapshot_label,
+                COUNT(*) AS snapshots,
+                ROUND(AVG(age_minutes)::numeric, 1) AS avg_age_minutes
+            FROM token_volume_snapshots
+            WHERE created_at >= NOW() - (%s * INTERVAL '1 day')
+            GROUP BY snapshot_label
+            ORDER BY snapshot_label
+            """,
+            (days,),
+        )
+        return cur.fetchall()
+
+
 def close_live_position_db(
     call_id: int,
     exit_price: float,
