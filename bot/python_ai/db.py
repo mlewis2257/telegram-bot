@@ -1655,6 +1655,7 @@ def get_due_volume_snapshot_calls(
     *,
     since_hours: int = 48,
     limit: int = 500,
+    selection: str = "traded",
 ) -> list[dict]:
     """
     Return recent calls old enough for the requested snapshot offset and not yet
@@ -1663,9 +1664,27 @@ def get_due_volume_snapshot_calls(
     conn = get_conn()
     safe_rollback()
     snapshot_label = f"t_plus_{snapshot_minutes:02d}m"
+    selection_clauses = {
+        "traded": """
+            AND EXISTS (
+                SELECT 1
+                FROM trading_positions tp
+                WHERE tp.call_id = c.id
+                  AND tp.is_simulation = TRUE
+                  AND tp.is_strategy_b = FALSE
+            )
+        """,
+        "not_skipped": """
+            AND COALESCE(c.skip_reason, '') IN ('', 'none')
+        """,
+        "all": "",
+    }
+    if selection not in selection_clauses:
+        raise ValueError(f"Unsupported volume snapshot selection: {selection!r}")
+    selection_sql = selection_clauses[selection]
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            """
+            f"""
             SELECT
                 c.id AS call_id,
                 c.token_id,
@@ -1683,6 +1702,7 @@ def get_due_volume_snapshot_calls(
               AND c.created_at <= NOW() - (%s * INTERVAL '1 minute')
               AND t.mint_address IS NOT NULL
               AND t.mint_address <> ''
+              {selection_sql}
               AND NOT EXISTS (
                   SELECT 1
                   FROM token_volume_snapshots tvs

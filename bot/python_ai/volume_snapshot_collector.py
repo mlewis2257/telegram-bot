@@ -53,15 +53,18 @@ def _collect_snapshot_minute(
     dry_run: bool,
     min_mcap: float,
     require_market_context: bool,
+    selection: str,
 ) -> tuple[int, int, int]:
     due_rows = db.get_due_volume_snapshot_calls(
         snapshot_minutes,
         since_hours=since_hours,
         limit=limit,
+        selection=selection,
     )
     snapshot_label = f"t_plus_{snapshot_minutes:02d}m"
     inserted = 0
     skipped = 0
+    market_cache: dict[str, dict | None] = {}
 
     for row in due_rows:
         mint = (row.get("mint_address") or "").strip()
@@ -69,7 +72,9 @@ def _collect_snapshot_minute(
             skipped += 1
             continue
 
-        market = data_fetcher.fetch_token_price(mint)
+        if mint not in market_cache:
+            market_cache[mint] = data_fetcher.fetch_token_price(mint)
+        market = market_cache[mint]
         if not market:
             skipped += 1
             continue
@@ -134,6 +139,12 @@ def main() -> None:
     parser.add_argument("--minutes", default=None, help="Comma-separated snapshot offsets, e.g. 0,5,15,30,60")
     parser.add_argument("--since-hours", type=int, default=48, help="Only consider calls newer than this")
     parser.add_argument("--limit", type=int, default=500, help="Per-snapshot fetch limit")
+    parser.add_argument(
+        "--selection",
+        choices=["traded", "not_skipped", "all"],
+        default="traded",
+        help="Which calls to snapshot: traded (default), not_skipped, or all",
+    )
     parser.add_argument("--min-mcap", type=float, default=0.0, help="Skip snapshots when fetched mcap is below this")
     parser.add_argument(
         "--allow-empty-market",
@@ -166,6 +177,7 @@ def main() -> None:
             dry_run=args.dry_run,
             min_mcap=args.min_mcap,
             require_market_context=not args.allow_empty_market,
+            selection=args.selection,
         )
         total_due += due
         total_inserted += inserted
