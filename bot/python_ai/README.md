@@ -24,6 +24,13 @@ reporting scripts, and the first pieces of a strategy research workflow.
   - Strategy A vs B daily comparison report.
 - `today_calls_audit.py`
   - Daily call audit with skip reasons, missed runners, and coverage checks.
+- `ml_dataset_export.py`
+  - First-pass AI/ML dataset exporter.
+  - Produces one CSV row per call with:
+    - call-time features from `calls` and `tokens`
+    - Strategy A / B paper-trade labels
+    - `t+0`, `t+30`, `t+60` volume snapshot features
+    - derived label fields like `signal_peak_ge_2x` and `a_hard_stop`
 
 ## Strategy research layer
 
@@ -116,6 +123,16 @@ Common scripts:
 ```bash
 .venv/bin/python3 bot/python_ai/compare_report_b.py --today
 .venv/bin/python3 bot/python_ai/today_calls_audit.py --tz America/Los_Angeles
+.venv/bin/python3 bot/python_ai/ml_dataset_export.py --days 30
+```
+
+Example ML dataset export:
+
+```bash
+.venv/bin/python3 bot/python_ai/ml_dataset_export.py \
+  --date-from 2026-05-01 \
+  --date-to 2026-05-30 \
+  --output bot/python_ai/exports/ml_dataset_may.csv
 ```
 
 These are still useful, but the direction of travel is:
