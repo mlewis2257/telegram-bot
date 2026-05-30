@@ -14,6 +14,8 @@ Current intended cohort:
 Usage:
     python3 ml_train_hard_stop.py exports/ml_dataset_20260530_005300.csv
     python3 ml_train_hard_stop.py exports/file.csv --epochs 30 --learning-rate 0.03
+    python3 ml_train_hard_stop.py exports/file.csv --drop-categorical skip_reason
+    python3 ml_train_hard_stop.py exports/file.csv --preset no_leak
 """
 
 from __future__ import annotations
@@ -44,6 +46,11 @@ CATEGORICAL_FEATURES = [
 TARGET_COLUMN = "label_a_hard_stop"
 ROW_ID_COLUMN = "call_id"
 TIME_COLUMN = "created_at"
+PRESET_DROPS = {
+    "none": set(),
+    "no_skip_reason": {"skip_reason"},
+    "no_leak": {"skip_reason", "vip_message_type"},
+}
 
 
 @dataclass
@@ -74,39 +81,50 @@ def _log1p_or_zero(value: float | None) -> float:
     return math.log1p(value)
 
 
-def _build_features(row: dict[str, str]) -> dict[str, float]:
+def _build_features(
+    row: dict[str, str],
+    *,
+    drop_numeric: set[str],
+    drop_categorical: set[str],
+) -> dict[str, float]:
     feats: dict[str, float] = {}
 
     score = _safe_float(row.get("conviction_score"))
-    if score is not None:
-        feats["num:conviction_score"] = score / 100.0
-    else:
-        feats["missing:conviction_score"] = 1.0
+    if "conviction_score" not in drop_numeric:
+        if score is not None:
+            feats["num:conviction_score"] = score / 100.0
+        else:
+            feats["missing:conviction_score"] = 1.0
 
     mcap = _safe_float(row.get("mcap_at_call"))
-    if mcap is not None:
-        feats["num:log_mcap_at_call"] = _log1p_or_zero(mcap)
-    else:
-        feats["missing:mcap_at_call"] = 1.0
+    if "mcap_at_call" not in drop_numeric:
+        if mcap is not None:
+            feats["num:log_mcap_at_call"] = _log1p_or_zero(mcap)
+        else:
+            feats["missing:mcap_at_call"] = 1.0
 
     local_hour = _safe_float(row.get("local_hour_pst"))
-    if local_hour is not None:
-        # cyclical encoding
-        angle = 2.0 * math.pi * (local_hour / 24.0)
-        feats["num:hour_sin"] = math.sin(angle)
-        feats["num:hour_cos"] = math.cos(angle)
-    else:
-        feats["missing:local_hour_pst"] = 1.0
+    if "local_hour_pst" not in drop_numeric:
+        if local_hour is not None:
+            # cyclical encoding
+            angle = 2.0 * math.pi * (local_hour / 24.0)
+            feats["num:hour_sin"] = math.sin(angle)
+            feats["num:hour_cos"] = math.cos(angle)
+        else:
+            feats["missing:local_hour_pst"] = 1.0
 
     local_dow = _safe_float(row.get("local_dow_pst"))
-    if local_dow is not None:
-        angle = 2.0 * math.pi * (local_dow / 7.0)
-        feats["num:dow_sin"] = math.sin(angle)
-        feats["num:dow_cos"] = math.cos(angle)
-    else:
-        feats["missing:local_dow_pst"] = 1.0
+    if "local_dow_pst" not in drop_numeric:
+        if local_dow is not None:
+            angle = 2.0 * math.pi * (local_dow / 7.0)
+            feats["num:dow_sin"] = math.sin(angle)
+            feats["num:dow_cos"] = math.cos(angle)
+        else:
+            feats["missing:local_dow_pst"] = 1.0
 
     for name in CATEGORICAL_FEATURES:
+        if name in drop_categorical:
+            continue
         value = (row.get(name) or "").strip()
         if value == "":
             value = "__missing__"
@@ -115,7 +133,12 @@ def _build_features(row: dict[str, str]) -> dict[str, float]:
     return feats
 
 
-def _load_examples(path: str) -> list[Example]:
+def _load_examples(
+    path: str,
+    *,
+    drop_numeric: set[str],
+    drop_categorical: set[str],
+) -> list[Example]:
     examples: list[Example] = []
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -123,7 +146,11 @@ def _load_examples(path: str) -> list[Example]:
             label_raw = row.get(TARGET_COLUMN)
             if label_raw not in ("0", "1"):
                 continue
-            features = _build_features(row)
+            features = _build_features(
+                row,
+                drop_numeric=drop_numeric,
+                drop_categorical=drop_categorical,
+            )
             examples.append(
                 Example(
                     row_id=row.get(ROW_ID_COLUMN) or "",
@@ -259,9 +286,36 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--top-features", type=int, default=12)
     parser.add_argument("--predictions-out", default=None, help="Optional CSV path for test-set predictions")
+    parser.add_argument(
+        "--preset",
+        choices=sorted(PRESET_DROPS.keys()),
+        default="none",
+        help="Predefined feature drops for leak checks",
+    )
+    parser.add_argument(
+        "--drop-categorical",
+        action="append",
+        default=[],
+        choices=CATEGORICAL_FEATURES,
+        help="Categorical feature name to exclude; repeatable",
+    )
+    parser.add_argument(
+        "--drop-numeric",
+        action="append",
+        default=[],
+        choices=NUMERIC_FEATURES,
+        help="Numeric feature name to exclude; repeatable",
+    )
     args = parser.parse_args()
 
-    examples = _load_examples(args.path)
+    drop_categorical = set(args.drop_categorical) | PRESET_DROPS[args.preset]
+    drop_numeric = set(args.drop_numeric)
+
+    examples = _load_examples(
+        args.path,
+        drop_numeric=drop_numeric,
+        drop_categorical=drop_categorical,
+    )
     train_rows, test_rows = _split_examples(examples, args.test_ratio)
     weights, bias = _train_logreg(
         train_rows,
@@ -290,6 +344,9 @@ def main() -> None:
     print(f"target={TARGET_COLUMN}")
     print(f"epochs={args.epochs}  learning_rate={args.learning_rate}  l2={args.l2}")
     print(f"threshold={args.threshold}")
+    print(f"preset={args.preset}")
+    print(f"drop_categorical={sorted(drop_categorical) if drop_categorical else []}")
+    print(f"drop_numeric={sorted(drop_numeric) if drop_numeric else []}")
     print(f"train_positive_rate={sum(label for label, _ in train_scores) * 100.0 / len(train_scores):.1f}%")
     print(f"test_positive_rate={sum(label for label, _ in test_scores) * 100.0 / len(test_scores):.1f}%")
     print()
