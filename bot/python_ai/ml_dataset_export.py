@@ -10,6 +10,8 @@ Examples:
     python3 ml_dataset_export.py --days 30
     python3 ml_dataset_export.py --date-from 2026-05-01 --date-to 2026-05-30
     python3 ml_dataset_export.py --days 14 --output exports/ml_dataset_last14d.csv
+    python3 ml_dataset_export.py --days 30 --subset a_traded
+    python3 ml_dataset_export.py --days 30 --subset a_candidates --min-score 63
 """
 
 from __future__ import annotations
@@ -44,7 +46,13 @@ def _default_output_path() -> str:
     return os.path.join(base_dir, f"ml_dataset_{stamp}.csv")
 
 
-def _load_rows(since: datetime | None, until: datetime | None) -> list[dict]:
+def _load_rows(
+    since: datetime | None,
+    until: datetime | None,
+    *,
+    subset: str,
+    min_score: float | None,
+) -> list[dict]:
     conn = db.get_conn()
     params: list[object] = []
     clauses: list[str] = []
@@ -54,6 +62,48 @@ def _load_rows(since: datetime | None, until: datetime | None) -> list[dict]:
     if until:
         clauses.append("c.created_at < %s")
         params.append(until)
+
+    subset_clauses = {
+        "all": [],
+        "a_traded": [
+            """
+            EXISTS (
+                SELECT 1
+                FROM trading_positions tp_sub
+                WHERE tp_sub.call_id = c.id
+                  AND tp_sub.is_simulation = TRUE
+                  AND tp_sub.is_strategy_b = FALSE
+            )
+            """
+        ],
+        "a_candidates": [
+            "ch.handle IN ('solhousesignal', 'solhousesignal_vip', 'solwhaletrending')",
+            "COALESCE(c.skip_reason, '') IN ('', 'none', 'low_score', 'vip_low_score')",
+        ],
+        "a_traded_or_candidate": [
+            "ch.handle IN ('solhousesignal', 'solhousesignal_vip', 'solwhaletrending')",
+            """
+            (
+                COALESCE(c.skip_reason, '') IN ('', 'none', 'low_score', 'vip_low_score')
+                OR EXISTS (
+                    SELECT 1
+                    FROM trading_positions tp_sub
+                    WHERE tp_sub.call_id = c.id
+                      AND tp_sub.is_simulation = TRUE
+                      AND tp_sub.is_strategy_b = FALSE
+                )
+            )
+            """,
+        ],
+    }
+    if subset not in subset_clauses:
+        raise ValueError(f"Unsupported subset: {subset!r}")
+    clauses.extend(subset_clauses[subset])
+
+    if min_score is not None:
+        clauses.append("COALESCE(c.conviction_score, 0) >= %s")
+        params.append(min_score)
+
     where_sql = ""
     if clauses:
         where_sql = "WHERE " + " AND ".join(clauses)
@@ -316,6 +366,13 @@ def main() -> None:
     parser.add_argument("--days", type=int, default=None, help="Trailing day window")
     parser.add_argument("--date-from", dest="date_from", default=None, help="UTC date/datetime start")
     parser.add_argument("--date-to", dest="date_to", default=None, help="UTC date/datetime end (exclusive)")
+    parser.add_argument(
+        "--subset",
+        choices=["all", "a_traded", "a_candidates", "a_traded_or_candidate"],
+        default="all",
+        help="Filter to a smaller training cohort",
+    )
+    parser.add_argument("--min-score", type=float, default=None, help="Optional minimum conviction score")
     parser.add_argument("--output", default=None, help="CSV output path")
     args = parser.parse_args()
 
@@ -329,7 +386,12 @@ def main() -> None:
         until = _parse_dt(args.date_to)
 
     output_path = args.output or _default_output_path()
-    raw_rows = _load_rows(since, until)
+    raw_rows = _load_rows(
+        since,
+        until,
+        subset=args.subset,
+        min_score=args.min_score,
+    )
     rows = [_augment_row(row) for row in raw_rows]
     _write_csv(rows, output_path)
 
@@ -337,6 +399,8 @@ def main() -> None:
     print("ML Dataset Export")
     print("=" * 72)
     print(f"rows={len(rows)}")
+    print(f"subset={args.subset}")
+    print(f"min_score={args.min_score if args.min_score is not None else 'none'}")
     print(f"output={output_path}")
     if rows:
         a_traded = sum(int(row.get("label_a_traded", 0)) for row in rows)
