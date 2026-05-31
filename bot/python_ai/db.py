@@ -1808,6 +1808,121 @@ def get_recent_volume_snapshot_counts(days: int = 3) -> list[dict]:
         return cur.fetchall()
 
 
+# ── Websocket market observations ────────────────────────────────────────────
+
+def ensure_ws_market_observations_table() -> None:
+    """
+    Create a lightweight audit table for websocket market snapshots.
+
+    These rows let us compare Helius transaction-derived prices against fallback
+    market sources without changing the exit behavior itself.
+    """
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ws_market_observations (
+                id BIGSERIAL PRIMARY KEY,
+                call_id BIGINT NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+                mint_address TEXT NOT NULL,
+                signature TEXT,
+                source TEXT,
+                price_usd NUMERIC,
+                mcap NUMERIC,
+                liquidity_usd NUMERIC,
+                volume_h1 NUMERIC,
+                observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                market_json JSONB
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ws_market_observations_call_id
+                ON ws_market_observations(call_id, observed_at DESC)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ws_market_observations_signature
+                ON ws_market_observations(signature)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ws_market_observations_observed_at
+                ON ws_market_observations(observed_at DESC)
+            """
+        )
+        conn.commit()
+
+
+def insert_ws_market_observation(
+    *,
+    call_id: int,
+    mint_address: str,
+    signature: str | None,
+    market: dict,
+) -> None:
+    """Persist one websocket market snapshot for later exit-path analysis."""
+    conn = get_conn()
+    safe_rollback()
+    market = market or {}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO ws_market_observations (
+                call_id,
+                mint_address,
+                signature,
+                source,
+                price_usd,
+                mcap,
+                liquidity_usd,
+                volume_h1,
+                market_json
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                call_id,
+                mint_address,
+                signature,
+                market.get("source") or market.get("price_source"),
+                market.get("price_usd"),
+                market.get("mcap"),
+                market.get("liquidity_usd"),
+                market.get("volume_h1"),
+                Json(market),
+            ),
+        )
+        conn.commit()
+
+
+def get_recent_ws_market_observation_counts(hours: int = 24) -> list[dict]:
+    """Return recent websocket market observation counts by source."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                COALESCE(source, 'unknown') AS source,
+                COUNT(*) AS observations,
+                COUNT(DISTINCT call_id) AS calls,
+                ROUND(AVG(mcap)::numeric, 2) AS avg_mcap,
+                MAX(observed_at) AS last_seen
+            FROM ws_market_observations
+            WHERE observed_at >= NOW() - (%s * INTERVAL '1 hour')
+            GROUP BY COALESCE(source, 'unknown')
+            ORDER BY observations DESC
+            """,
+            (hours,),
+        )
+        return cur.fetchall()
+
+
 def close_live_position_db(
     call_id: int,
     exit_price: float,

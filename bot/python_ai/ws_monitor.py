@@ -278,6 +278,16 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
     current_mcap = float(market["mcap"])
 
     try:
+        db.insert_ws_market_observation(
+            call_id=call_id,
+            mint_address=mint,
+            signature=signature,
+            market=market,
+        )
+    except Exception as e:
+        print(f"[ws_monitor] market observation write failed {mint[:8]}: {e}")
+
+    try:
         peak_info = db.get_call_peak_info(call_id)
     except Exception:
         peak_info = None
@@ -483,6 +493,11 @@ async def connect_with_retry() -> None:
 
 async def main() -> None:
     print(f"[ws_monitor] starting — {WS_URL[:60]}...")
+
+    try:
+        db.ensure_ws_market_observations_table()
+    except Exception as e:
+        print(f"[ws_monitor] market observation table setup failed: {e}")
 
     # Seed subscriptions from currently open positions on startup
     try:
