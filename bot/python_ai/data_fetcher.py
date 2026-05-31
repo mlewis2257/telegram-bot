@@ -487,40 +487,52 @@ def _fetch_jupiter_simple_price_usd(mint: str) -> Optional[float]:
         return None
 
 
-def _rpc_get_transaction(signature: str, commitment: str = "confirmed") -> Optional[dict]:
+def _rpc_get_transaction(
+    signature: str,
+    commitment: str = "confirmed",
+    *,
+    attempts: int = 3,
+    delay_seconds: float = 0.25,
+) -> Optional[dict]:
     """
     Fetch one transaction from the configured Solana RPC using jsonParsed encoding.
     Returns the transaction result object, or None on failure.
     """
     if not SOLANA_RPC_URL or not signature:
         return None
-    try:
-        resp = requests.post(
-            SOLANA_RPC_URL,
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getTransaction",
-                "params": [
-                    signature,
-                    {
-                        "encoding": "jsonParsed",
-                        "commitment": commitment,
-                        "maxSupportedTransactionVersion": 0,
-                    },
-                ],
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code != 200:
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.post(
+                SOLANA_RPC_URL,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getTransaction",
+                    "params": [
+                        signature,
+                        {
+                            "encoding": "jsonParsed",
+                            "commitment": commitment,
+                            "maxSupportedTransactionVersion": 0,
+                        },
+                    ],
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if data.get("error"):
+                return None
+            result = data.get("result")
+            if result:
+                return result
+            if attempt < attempts:
+                time.sleep(delay_seconds)
+        except Exception as e:
+            log.warning(f"[fetcher] Helius getTransaction failed {signature[:8]}...: {e}")
             return None
-        data = resp.json()
-        if data.get("error"):
-            return None
-        return data.get("result")
-    except Exception as e:
-        log.warning(f"[fetcher] Helius getTransaction failed {signature[:8]}...: {e}")
-        return None
+    return None
 
 
 def _extract_max_abs_token_delta(token_balances: list[dict], mint: str) -> Optional[float]:

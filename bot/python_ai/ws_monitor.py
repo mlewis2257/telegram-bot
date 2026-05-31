@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import time
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -43,12 +44,36 @@ POLL_INTERVAL         = 2     # seconds between new-position polls
 FETCH_COOLDOWN        = 2.0   # min seconds between DexScreener fetches per mint
 RECONNECT_BACKOFF_MAX = 60    # max reconnect delay in seconds
 LOG_COMMITMENT        = os.getenv("WS_LOG_COMMITMENT", "processed")
+TX_MARKET_STATS_INTERVAL = int(os.getenv("WS_TX_MARKET_STATS_INTERVAL", "60"))
+TX_MARKET_DEBUG          = os.getenv("WS_TX_MARKET_DEBUG", "").lower() in ("1", "true", "yes")
 
 # ── Rate-limit state ──────────────────────────────────────────────────────────
 
 _last_fetch: dict[str, float] = {}   # mint → monotonic time of last price fetch
+_market_stats: Counter[str] = Counter()
+_last_market_stats_print = 0.0
 # Strategy A-only realtime peak cache (call_id -> peak mcap since A entry).
 _a_realtime_peak_mcap: dict[int, float] = {}
+
+
+def _maybe_print_market_stats(force: bool = False) -> None:
+    global _last_market_stats_print
+    if TX_MARKET_STATS_INTERVAL <= 0:
+        return
+    now = time.monotonic()
+    if not force and now - _last_market_stats_print < TX_MARKET_STATS_INTERVAL:
+        return
+    _last_market_stats_print = now
+    total = sum(_market_stats.values())
+    if total == 0:
+        return
+    print(
+        "[ws_monitor] market stats "
+        f"tx_success={_market_stats['tx_success']} "
+        f"tx_miss={_market_stats['tx_miss']} "
+        f"fallback_success={_market_stats['fallback_success']} "
+        f"fallback_miss={_market_stats['fallback_miss']}"
+    )
 
 
 # ── Subscription manager ──────────────────────────────────────────────────────
@@ -224,12 +249,16 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
             market = None
 
     if market and market.get("mcap"):
+        _market_stats["tx_success"] += 1
         print(
             f"[ws_monitor] tx market {mint[:8]}..."
             f" sig={signature[:8] if signature else 'none'}"
             f" mcap=${float(market['mcap'])/1000:.1f}k"
         )
     else:
+        _market_stats["tx_miss"] += 1
+        if TX_MARKET_DEBUG and signature:
+            print(f"[ws_monitor] tx market miss {mint[:8]} sig={signature[:8]}")
         try:
             market = data_fetcher.fetch_token_price(mint)
         except Exception as e:
@@ -237,7 +266,14 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
             return
 
     if not market or not market.get("mcap"):
+        _market_stats["fallback_miss"] += 1
+        _maybe_print_market_stats()
         return
+    if market.get("source") != "helius_tx":
+        _market_stats["fallback_success"] += 1
+        if TX_MARKET_DEBUG:
+            print(f"[ws_monitor] fallback market {mint[:8]} source={market.get('source') or 'unknown'}")
+    _maybe_print_market_stats()
 
     current_mcap = float(market["mcap"])
 

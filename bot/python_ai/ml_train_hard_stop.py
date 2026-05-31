@@ -16,6 +16,7 @@ Usage:
     python3 ml_train_hard_stop.py exports/file.csv --epochs 30 --learning-rate 0.03
     python3 ml_train_hard_stop.py exports/file.csv --drop-categorical skip_reason
     python3 ml_train_hard_stop.py exports/file.csv --preset no_leak
+    python3 ml_train_hard_stop.py exports/file.csv --preset no_leak --threshold-sweep
 """
 
 from __future__ import annotations
@@ -263,6 +264,21 @@ def _classification_metrics(labels_and_scores: list[tuple[int, float]], threshol
     }
 
 
+def _print_threshold_sweep(labels_and_scores: list[tuple[int, float]], thresholds: list[float]) -> None:
+    print()
+    print("Threshold sweep on test set")
+    print("-" * 72)
+    print(f"{'thr':>5} {'pred+':>6} {'prec':>7} {'recall':>7} {'f1':>7} {'fp':>5} {'fn':>5}")
+    for threshold in thresholds:
+        metrics = _classification_metrics(labels_and_scores, threshold)
+        pred_pos = metrics["tp"] + metrics["fp"]
+        print(
+            f"{threshold:>5.2f} {pred_pos:>6} "
+            f"{metrics['precision']:>7.3f} {metrics['recall']:>7.3f} "
+            f"{metrics['f1']:>7.3f} {metrics['fp']:>5} {metrics['fn']:>5}"
+        )
+
+
 def _write_predictions(
     path: str,
     test_rows: list[Example],
@@ -284,6 +300,7 @@ def main() -> None:
     parser.add_argument("--test-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--threshold-sweep", action="store_true", help="Print test-set metrics across thresholds")
     parser.add_argument("--top-features", type=int, default=12)
     parser.add_argument("--predictions-out", default=None, help="Optional CSV path for test-set predictions")
     parser.add_argument(
@@ -369,6 +386,12 @@ def main() -> None:
     print("-" * 72)
     for name, weight in top_negative:
         print(f"{name:<40} {weight:>10.4f}")
+
+    if args.threshold_sweep:
+        _print_threshold_sweep(
+            test_scores,
+            thresholds=[0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
+        )
 
     if args.predictions_out:
         _write_predictions(args.predictions_out, test_rows, test_scores)
