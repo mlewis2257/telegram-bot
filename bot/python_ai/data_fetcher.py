@@ -22,6 +22,7 @@ DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
 JUPITER_PRICE_URL      = "https://api.jup.ag/price/v3"
 SOLANA_RPC_URL         = os.getenv("SOLANA_RPC_URL", "")
 JUPITER_API_KEY        = os.getenv("JUPITER_API_KEY", "")
+WSOL_MINT              = "So11111111111111111111111111111111111111112"
 
 REQUEST_TIMEOUT    = 10       # seconds per request
 MAX_RETRIES        = 3
@@ -47,6 +48,7 @@ DEAD_MINTS: set[str] = {
 
 _cache: dict[str, tuple[dict, float]] = {}   # mint → (result, epoch_time)
 _price_cache: dict[str, tuple[dict, float]] = {}   # mint → (result, monotonic_time)
+_sol_price_cache: tuple[float, float] | None = None   # (price_usd, monotonic_time)
 _dex_rate_limited_until = 0.0
 _dex_mint_cooldowns: dict[str, float] = {}   # mint -> monotonic deadline
 _dex_mint_failures: dict[str, int] = {}      # mint -> consecutive Dex failure count
@@ -73,6 +75,18 @@ def _price_cache_get(mint: str, max_age: float = PRICE_CACHE_TTL_SECONDS) -> Opt
 
 def _price_cache_set(mint: str, data: dict) -> None:
     _price_cache[mint] = (data, time.monotonic())
+
+
+def _sol_price_cache_get(max_age: float = PRICE_CACHE_TTL_SECONDS) -> Optional[float]:
+    global _sol_price_cache
+    if _sol_price_cache and (time.monotonic() - _sol_price_cache[1]) < max_age:
+        return _sol_price_cache[0]
+    return None
+
+
+def _sol_price_cache_set(price_usd: float) -> None:
+    global _sol_price_cache
+    _sol_price_cache = (price_usd, time.monotonic())
 
 
 def _set_dex_mint_cooldown(mint: str) -> None:
@@ -435,6 +449,188 @@ def _fetch_token_supply_helius(mint: str) -> tuple:
     except Exception as e:
         log.warning(f"[fetcher] Helius supply fetch failed for {mint[:8]}...: {e}")
         return None, None
+
+
+def _fetch_jupiter_simple_price_usd(mint: str) -> Optional[float]:
+    """
+    Lightweight Jupiter USD price fetch without supply/mcap logic.
+    Used by websocket transaction parsing when we only need a quote asset price.
+    """
+    if not mint:
+        return None
+    if mint == WSOL_MINT:
+        cached = _sol_price_cache_get()
+        if cached:
+            return cached
+    try:
+        headers = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
+        resp = requests.get(
+            JUPITER_PRICE_URL,
+            params={"ids": mint},
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        price_data = data.get(mint)
+        if not price_data:
+            return None
+        price = float(price_data.get("usdPrice") or 0)
+        if price <= 0:
+            return None
+        if mint == WSOL_MINT:
+            _sol_price_cache_set(price)
+        return price
+    except Exception as e:
+        log.warning(f"[fetcher] Jupiter simple price failed for {mint[:8]}...: {e}")
+        return None
+
+
+def _rpc_get_transaction(signature: str, commitment: str = "confirmed") -> Optional[dict]:
+    """
+    Fetch one transaction from the configured Solana RPC using jsonParsed encoding.
+    Returns the transaction result object, or None on failure.
+    """
+    if not SOLANA_RPC_URL or not signature:
+        return None
+    try:
+        resp = requests.post(
+            SOLANA_RPC_URL,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTransaction",
+                "params": [
+                    signature,
+                    {
+                        "encoding": "jsonParsed",
+                        "commitment": commitment,
+                        "maxSupportedTransactionVersion": 0,
+                    },
+                ],
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if data.get("error"):
+            return None
+        return data.get("result")
+    except Exception as e:
+        log.warning(f"[fetcher] Helius getTransaction failed {signature[:8]}...: {e}")
+        return None
+
+
+def _extract_max_abs_token_delta(token_balances: list[dict], mint: str) -> Optional[float]:
+    """
+    For a given mint, compute the largest absolute per-account token balance delta
+    across pre/post token balances in one transaction.
+
+    This heuristic is intentionally simple: for AMM swaps, the biggest changed
+    token account on each side is usually enough to estimate swap price quickly.
+    """
+    if not token_balances or not mint:
+        return None
+
+    amounts_by_index: dict[int, tuple[float, float]] = {}
+    for entry in token_balances:
+        if entry.get("mint") != mint:
+            continue
+        idx = entry.get("accountIndex")
+        if idx is None:
+            continue
+        pre_amt, post_amt = amounts_by_index.get(int(idx), (0.0, 0.0))
+        side = entry.get("_side")
+        ui_amount = ((entry.get("uiTokenAmount") or {}).get("uiAmount"))
+        if ui_amount is None:
+            raw_amount = ((entry.get("uiTokenAmount") or {}).get("amount"))
+            decimals = ((entry.get("uiTokenAmount") or {}).get("decimals") or 0)
+            try:
+                ui_amount = int(raw_amount) / (10 ** int(decimals))
+            except Exception:
+                ui_amount = 0.0
+        try:
+            ui_amount = float(ui_amount)
+        except Exception:
+            ui_amount = 0.0
+        if side == "pre":
+            pre_amt = ui_amount
+        else:
+            post_amt = ui_amount
+        amounts_by_index[int(idx)] = (pre_amt, post_amt)
+
+    max_abs_delta = 0.0
+    for pre_amt, post_amt in amounts_by_index.values():
+        delta = post_amt - pre_amt
+        if abs(delta) > max_abs_delta:
+            max_abs_delta = abs(delta)
+    return max_abs_delta or None
+
+
+def fetch_ws_exit_market_from_transaction(signature: str, mint: str) -> Optional[dict]:
+    """
+    Try to derive a websocket-exit market snapshot from Helius transaction data.
+
+    The first implementation focuses on the common meme-coin swap case where the
+    monitored token is swapped against wrapped SOL. If we can estimate:
+
+        token_price_usd = (wSOL_delta / token_delta) * SOL_USD
+
+    then we can combine it with getTokenSupply to estimate current mcap without
+    touching DexScreener.
+
+    Returns a partial market dict shaped like fetch_token_price() on success:
+        {"price_usd", "mcap", "liquidity_usd", "volume_h1", "source"}
+    """
+    tx = _rpc_get_transaction(signature, commitment="confirmed")
+    if not tx:
+        return None
+
+    meta = tx.get("meta") or {}
+    pre = meta.get("preTokenBalances") or []
+    post = meta.get("postTokenBalances") or []
+    if not pre and not post:
+        return None
+
+    tagged_balances: list[dict] = []
+    for entry in pre:
+        tagged = dict(entry)
+        tagged["_side"] = "pre"
+        tagged_balances.append(tagged)
+    for entry in post:
+        tagged = dict(entry)
+        tagged["_side"] = "post"
+        tagged_balances.append(tagged)
+
+    token_delta = _extract_max_abs_token_delta(tagged_balances, mint)
+    wsol_delta = _extract_max_abs_token_delta(tagged_balances, WSOL_MINT)
+    if not token_delta or not wsol_delta:
+        return None
+
+    sol_price_usd = _fetch_jupiter_simple_price_usd(WSOL_MINT)
+    if not sol_price_usd:
+        return None
+
+    token_price_usd = (wsol_delta / token_delta) * sol_price_usd
+    if token_price_usd <= 0:
+        return None
+
+    mcap = None
+    supply, decimals = _fetch_token_supply_helius(mint)
+    if supply and decimals is not None:
+        mcap = token_price_usd * (supply / (10 ** decimals))
+    if not mcap:
+        return None
+
+    return {
+        "price_usd": token_price_usd,
+        "mcap": mcap,
+        "liquidity_usd": None,
+        "volume_h1": None,
+        "source": "helius_tx",
+    }
 
 
 def _fetch_jupiter_price(mint: str) -> Optional[dict]:

@@ -2,8 +2,9 @@
 ws_monitor.py — Real-time WebSocket exit monitor for open paper trading positions.
 
 Uses Helius logsSubscribe to detect on-chain activity for monitored tokens.
-When a transaction mentions a monitored mint, fetches DexScreener price immediately
-and runs exit checks for both Strategy A and B.
+When a transaction mentions a monitored mint, first tries to derive price/mcap
+from the Helius transaction payload itself and falls back to Dex/Jupiter when
+needed, then runs exit checks for both Strategy A and B.
 
 Runs ALONGSIDE sol-monitor.py (polling fallback). Both check exits safely since
 db.close_paper_position has AND status='open' guard against double-close.
@@ -41,6 +42,7 @@ HEARTBEAT_INTERVAL    = 30    # seconds between pings
 POLL_INTERVAL         = 2     # seconds between new-position polls
 FETCH_COOLDOWN        = 2.0   # min seconds between DexScreener fetches per mint
 RECONNECT_BACKOFF_MAX = 60    # max reconnect delay in seconds
+LOG_COMMITMENT        = os.getenv("WS_LOG_COMMITMENT", "processed")
 
 # ── Rate-limit state ──────────────────────────────────────────────────────────
 
@@ -119,7 +121,7 @@ class SubscriptionManager:
             "method":  "logsSubscribe",
             "params":  [
                 {"mentions": [mint]},
-                {"commitment": "confirmed"},
+                {"commitment": LOG_COMMITMENT},
             ],
         }
         await ws.send(json.dumps(msg))
@@ -200,21 +202,39 @@ async def sync_open_positions(ws) -> None:
 
 # ── Exit handler ──────────────────────────────────────────────────────────────
 
-async def handle_log_notification(ws, mint: str, call_id: int) -> None:
+async def handle_log_notification(ws, mint: str, call_id: int, signature: str | None = None) -> None:
     """
     Called when Helius fires a log mentioning one of our mints.
-    Rate-limited to 1 DexScreener fetch per mint per FETCH_COOLDOWN seconds.
+    Rate-limited to 1 market fetch per mint per FETCH_COOLDOWN seconds.
+
+    First attempts a Helius getTransaction-derived market snapshot using the
+    triggering signature. Falls back to the existing Dex/Jupiter path.
     """
     now = time.monotonic()
     if now - _last_fetch.get(mint, 0) < FETCH_COOLDOWN:
         return
     _last_fetch[mint] = now
 
-    try:
-        market = data_fetcher.fetch_token_price(mint)
-    except Exception as e:
-        print(f"[ws_monitor] price fetch error {mint[:8]}: {e}")
-        return
+    market = None
+    if signature:
+        try:
+            market = data_fetcher.fetch_ws_exit_market_from_transaction(signature, mint)
+        except Exception as e:
+            print(f"[ws_monitor] tx-price parse error {mint[:8]} sig={signature[:8]}: {e}")
+            market = None
+
+    if market and market.get("mcap"):
+        print(
+            f"[ws_monitor] tx market {mint[:8]}..."
+            f" sig={signature[:8] if signature else 'none'}"
+            f" mcap=${float(market['mcap'])/1000:.1f}k"
+        )
+    else:
+        try:
+            market = data_fetcher.fetch_token_price(mint)
+        except Exception as e:
+            print(f"[ws_monitor] price fetch error {mint[:8]}: {e}")
+            return
 
     if not market or not market.get("mcap"):
         return
@@ -333,6 +353,7 @@ async def handle_messages(ws) -> None:
             continue
 
         value = (params.get("result") or {}).get("value") or {}
+        signature = value.get("signature")
 
         # Skip failed transactions
         if value.get("err"):
@@ -346,7 +367,7 @@ async def handle_messages(ws) -> None:
         if not mint:
             continue
 
-        asyncio.create_task(handle_log_notification(ws, mint, call_id))
+        asyncio.create_task(handle_log_notification(ws, mint, call_id, signature))
 
 
 # ── New position poller ───────────────────────────────────────────────────────
