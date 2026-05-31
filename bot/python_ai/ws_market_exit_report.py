@@ -115,6 +115,21 @@ def _load_rows(hours: int) -> list[dict]:
                     ELSE NULL
                 END AS exit_mult,
                 CASE
+                    WHEN tp.exit_time IS NOT NULL THEN
+                        EXTRACT(EPOCH FROM (obs.first_obs_at - tp.exit_time))
+                    ELSE NULL
+                END AS first_obs_vs_exit_sec,
+                CASE
+                    WHEN tp.exit_time IS NOT NULL THEN
+                        EXTRACT(EPOCH FROM (obs.last_obs_at - tp.exit_time))
+                    ELSE NULL
+                END AS last_obs_vs_exit_sec,
+                CASE
+                    WHEN tp.exit_time IS NOT NULL THEN
+                        EXTRACT(EPOCH FROM (obs.min_obs_at - tp.exit_time))
+                    ELSE NULL
+                END AS min_obs_vs_exit_sec,
+                CASE
                     WHEN COALESCE(tp.vip_tier, c.vip_tier, '') IN ('gamble', 'gamble_risk') THEN 0.70
                     ELSE 0.65
                 END AS hard_stop_mult,
@@ -155,6 +170,8 @@ def _print_summary(rows: list[dict]) -> None:
                 "obs": 0,
                 "helius": 0,
                 "fallback": 0,
+                "obs_before_exit": 0,
+                "min_before_exit": 0,
                 "hard_touch": 0,
                 "hard_touch_not_hard_exit": 0,
             },
@@ -164,6 +181,10 @@ def _print_summary(rows: list[dict]) -> None:
         stats["obs"] += int(row["obs_count"] or 0)
         stats["helius"] += int(row["helius_obs"] or 0)
         stats["fallback"] += int(row["fallback_obs"] or 0)
+        if row["first_obs_vs_exit_sec"] is not None and float(row["first_obs_vs_exit_sec"]) <= 0:
+            stats["obs_before_exit"] += 1
+        if row["min_obs_vs_exit_sec"] is not None and float(row["min_obs_vs_exit_sec"]) <= 0:
+            stats["min_before_exit"] += 1
         if row["ws_touched_hard_stop"]:
             stats["hard_touch"] += 1
             if row["exit_reason"] != "hard_stop":
@@ -173,14 +194,16 @@ def _print_summary(rows: list[dict]) -> None:
     print("-" * 100)
     print(
         f"{'strategy':<8} {'positions':>9} {'closed':>7} {'obs':>7} "
-        f"{'helius':>7} {'fallback':>9} {'ws_hard':>8} {'hard_not_exit':>13}"
+        f"{'helius':>7} {'fallback':>9} {'obs_pre':>8} {'min_pre':>8} "
+        f"{'ws_hard':>8} {'hard_not_exit':>13}"
     )
     for strategy in sorted(by_strategy):
         stats = by_strategy[strategy]
         print(
             f"{strategy:<8} {int(stats['positions']):>9} {int(stats['closed']):>7} "
             f"{int(stats['obs']):>7} {int(stats['helius']):>7} "
-            f"{int(stats['fallback']):>9} {int(stats['hard_touch']):>8} "
+            f"{int(stats['fallback']):>9} {int(stats['obs_before_exit']):>8} "
+            f"{int(stats['min_before_exit']):>8} {int(stats['hard_touch']):>8} "
             f"{int(stats['hard_touch_not_hard_exit']):>13}"
         )
 
@@ -191,7 +214,8 @@ def _print_rows(rows: list[dict], limit: int) -> None:
     print(
         f"{'strat':<5} {'call':>7} {'symbol':<14} {'channel':<20} {'score':>6} "
         f"{'obs':>4} {'src':>9} {'min':>9} {'max':>9} {'last':>9} "
-        f"{'minx':>6} {'maxx':>6} {'exitx':>6} {'reason':<13} {'pnl':>9} {'ws_hard':>7}"
+        f"{'minx':>6} {'maxx':>6} {'exitx':>6} {'min_vs_exit':>11} "
+        f"{'last_vs_exit':>12} {'reason':<13} {'pnl':>9} {'ws_hard':>7}"
     )
     for row in rows[:limit]:
         source_mix = f"{int(row['helius_obs'] or 0)}/{int(row['fallback_obs'] or 0)}"
@@ -203,9 +227,34 @@ def _print_rows(rows: list[dict], limit: int) -> None:
             f"{_fmt_mcap(row['min_obs_mcap']):>9} {_fmt_mcap(row['max_obs_mcap']):>9} "
             f"{_fmt_mcap(row['last_obs_mcap']):>9} "
             f"{_fmt_num(row['min_obs_mult']):>6} {_fmt_num(row['max_obs_mult']):>6} "
-            f"{_fmt_num(row['exit_mult']):>6} {(row['exit_reason'] or row['status'] or '?')[:13]:<13} "
+            f"{_fmt_num(row['exit_mult']):>6} "
+            f"{_fmt_num(row['min_obs_vs_exit_sec'], 1):>11} "
+            f"{_fmt_num(row['last_obs_vs_exit_sec'], 1):>12} "
+            f"{(row['exit_reason'] or row['status'] or '?')[:13]:<13} "
             f"{_fmt_sol(row['pnl_sol']):>9} {str(bool(row['ws_touched_hard_stop'])):>7}"
         )
+
+
+def _print_timing_notes(rows: list[dict]) -> None:
+    closed_rows = [row for row in rows if row["exit_time"] is not None]
+    if not closed_rows:
+        return
+    before_exit = [
+        row for row in closed_rows
+        if row["first_obs_vs_exit_sec"] is not None and float(row["first_obs_vs_exit_sec"]) <= 0
+    ]
+    min_before_exit = [
+        row for row in closed_rows
+        if row["min_obs_vs_exit_sec"] is not None and float(row["min_obs_vs_exit_sec"]) <= 0
+    ]
+    print("\nTiming Notes")
+    print("-" * 100)
+    print(
+        f"closed_with_observations={len(closed_rows)}  "
+        f"first_observation_before_or_at_exit={len(before_exit)}  "
+        f"min_observation_before_or_at_exit={len(min_before_exit)}"
+    )
+    print("Negative timing values mean the websocket observation arrived before the stored paper exit.")
 
 
 def main() -> None:
@@ -226,6 +275,7 @@ def main() -> None:
 
     _print_summary(rows)
     _print_rows(rows, args.limit)
+    _print_timing_notes(rows)
 
 
 if __name__ == "__main__":
