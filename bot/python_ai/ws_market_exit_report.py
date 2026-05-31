@@ -17,12 +17,22 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from datetime import datetime
 
 from psycopg2.extras import RealDictCursor
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 import db
+
+
+def _as_float(value, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _fmt_sol(value) -> str:
@@ -61,7 +71,15 @@ def _load_rows(hours: int) -> list[dict]:
                     (ARRAY_AGG(mcap ORDER BY observed_at DESC))[1] AS last_obs_mcap,
                     (ARRAY_AGG(observed_at ORDER BY observed_at ASC))[1] AS first_obs_at,
                     (ARRAY_AGG(observed_at ORDER BY observed_at DESC))[1] AS last_obs_at,
-                    (ARRAY_AGG(observed_at ORDER BY mcap ASC NULLS LAST, observed_at ASC))[1] AS min_obs_at
+                    (ARRAY_AGG(observed_at ORDER BY mcap ASC NULLS LAST, observed_at ASC))[1] AS min_obs_at,
+                    JSONB_AGG(
+                        JSONB_BUILD_OBJECT(
+                            'observed_at', observed_at,
+                            'mcap', mcap,
+                            'source', source
+                        )
+                        ORDER BY observed_at ASC
+                    ) AS observations_json
                 FROM ws_market_observations
                 WHERE observed_at >= NOW() - (%s * INTERVAL '1 hour')
                   AND mcap IS NOT NULL
@@ -80,6 +98,7 @@ def _load_rows(hours: int) -> list[dict]:
                 tp.exit_reason,
                 tp.entry_price,
                 tp.exit_price,
+                tp.sol_in,
                 tp.pnl_sol,
                 tp.pnl_pct,
                 tp.peak_mcap,
@@ -94,6 +113,7 @@ def _load_rows(hours: int) -> list[dict]:
                 obs.first_obs_at,
                 obs.last_obs_at,
                 obs.min_obs_at,
+                obs.observations_json,
                 CASE
                     WHEN tp.entry_price > 0 THEN obs.first_obs_mcap / tp.entry_price
                     ELSE NULL
@@ -155,7 +175,171 @@ def _load_rows(hours: int) -> list[dict]:
             """,
             (hours,),
         )
-        return cur.fetchall()
+        rows = cur.fetchall()
+        for row in rows:
+            row.update(_simulate_shadow_exit(row))
+        return rows
+
+
+def _parse_observed_at(value):
+    if value is None or isinstance(value, datetime):
+        return value
+    try:
+        text = str(value).replace("Z", "+00:00")
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _strategy_a_shadow_reason(
+    *,
+    current_mcap: float,
+    peak_mcap: float,
+    entry_mcap: float,
+    channel_handle: str,
+    vip_tier: str,
+) -> tuple[str | None, float | None]:
+    if entry_mcap <= 0:
+        return None, None
+
+    current_mult = current_mcap / entry_mcap
+    peak_mult = peak_mcap / entry_mcap if peak_mcap > 0 else 0.0
+    is_vip_gamble = vip_tier in ("gamble", "gamble_risk")
+    is_free_solhouse = channel_handle == "solhousesignal"
+
+    if current_mult >= 10.0:
+        return "10x_tp", current_mcap
+    if current_mult >= 5.0:
+        return "5x_tp", current_mcap
+
+    if is_free_solhouse and peak_mcap > 0:
+        if peak_mult >= 10.0 and current_mult <= 4.0:
+            return "profit_floor", entry_mcap * 4.0
+        if peak_mult >= 5.0 and current_mult <= 2.5:
+            return "profit_floor", entry_mcap * 2.5
+        if peak_mult >= 3.0 and current_mult <= 1.75:
+            return "profit_floor", entry_mcap * 1.75
+
+    if peak_mcap > 0:
+        if peak_mult >= 10.0:
+            trail_pct = 0.12
+        elif peak_mult >= 5.0:
+            trail_pct = 0.15
+        elif peak_mult >= 3.0:
+            trail_pct = 0.22
+        elif peak_mult >= 2.0:
+            trail_pct = 0.25
+        else:
+            trail_pct = None
+        if trail_pct is not None and (peak_mcap - current_mcap) / peak_mcap >= trail_pct:
+            return "trail_stop", peak_mcap * (1.0 - trail_pct)
+
+    hard_stop_pct = 0.30 if is_vip_gamble else 0.35
+    if current_mult <= (1.0 - hard_stop_pct):
+        return "hard_stop", current_mcap
+
+    return None, None
+
+
+def _strategy_b_shadow_reason(
+    *,
+    current_mcap: float,
+    peak_mcap: float,
+    entry_mcap: float,
+    vip_tier: str,
+) -> tuple[str | None, float | None]:
+    if entry_mcap <= 0:
+        return None, None
+
+    current_mult = current_mcap / entry_mcap
+    peak_mult = peak_mcap / entry_mcap if peak_mcap > 0 else 0.0
+    is_vip_gamble = vip_tier in ("gamble", "gamble_risk")
+
+    if not is_vip_gamble and current_mult >= 3.0:
+        return "3x_tp", current_mcap
+
+    if peak_mult >= 2.0 and (peak_mcap - current_mcap) / peak_mcap >= 0.25:
+        return "trail_stop", peak_mcap * 0.75
+
+    hard_stop_pct = 0.30 if is_vip_gamble else 0.35
+    if current_mult <= (1.0 - hard_stop_pct):
+        return "hard_stop", current_mcap
+
+    return None, None
+
+
+def _simulate_shadow_exit(row: dict) -> dict:
+    entry_mcap = _as_float(row.get("entry_price"))
+    sol_in = _as_float(row.get("sol_in"))
+    stored_pnl = row.get("pnl_sol")
+    exit_time = row.get("exit_time")
+    strategy = row.get("strategy")
+    observations = row.get("observations_json") or []
+
+    result = {
+        "shadow_exit_reason": None,
+        "shadow_exit_mcap": None,
+        "shadow_exit_at": None,
+        "shadow_exit_mult": None,
+        "shadow_pnl_sol": None,
+        "shadow_delta_pnl_sol": None,
+        "shadow_seconds_before_exit": None,
+    }
+    if entry_mcap <= 0 or sol_in <= 0:
+        return result
+
+    peak_mcap = entry_mcap
+    for obs in observations:
+        observed_at = _parse_observed_at(obs.get("observed_at"))
+        current_mcap = _as_float(obs.get("mcap"))
+        if current_mcap <= 0:
+            continue
+        if exit_time is not None and observed_at is not None and observed_at > exit_time:
+            continue
+
+        peak_mcap = max(peak_mcap, current_mcap)
+        if strategy == "B":
+            reason, exit_mcap = _strategy_b_shadow_reason(
+                current_mcap=current_mcap,
+                peak_mcap=peak_mcap,
+                entry_mcap=entry_mcap,
+                vip_tier=(row.get("vip_tier") or ""),
+            )
+        else:
+            reason, exit_mcap = _strategy_a_shadow_reason(
+                current_mcap=current_mcap,
+                peak_mcap=peak_mcap,
+                entry_mcap=entry_mcap,
+                channel_handle=(row.get("channel_handle") or ""),
+                vip_tier=(row.get("vip_tier") or ""),
+            )
+
+        if not reason:
+            continue
+
+        exit_mcap = exit_mcap or current_mcap
+        shadow_mult = exit_mcap / entry_mcap
+        shadow_pnl = sol_in * (shadow_mult - 1.0)
+        result.update(
+            {
+                "shadow_exit_reason": reason,
+                "shadow_exit_mcap": exit_mcap,
+                "shadow_exit_at": observed_at,
+                "shadow_exit_mult": shadow_mult,
+                "shadow_pnl_sol": shadow_pnl,
+                "shadow_delta_pnl_sol": (
+                    shadow_pnl - float(stored_pnl) if stored_pnl is not None else None
+                ),
+                "shadow_seconds_before_exit": (
+                    (exit_time - observed_at).total_seconds()
+                    if exit_time is not None and observed_at is not None
+                    else None
+                ),
+            }
+        )
+        return result
+
+    return result
 
 
 def _print_summary(rows: list[dict]) -> None:
@@ -174,6 +358,8 @@ def _print_summary(rows: list[dict]) -> None:
                 "min_before_exit": 0,
                 "hard_touch": 0,
                 "hard_touch_not_hard_exit": 0,
+                "shadow_exits": 0,
+                "shadow_delta": 0.0,
             },
         )
         stats["positions"] += 1
@@ -189,13 +375,16 @@ def _print_summary(rows: list[dict]) -> None:
             stats["hard_touch"] += 1
             if row["exit_reason"] != "hard_stop":
                 stats["hard_touch_not_hard_exit"] += 1
+        if row["shadow_exit_reason"]:
+            stats["shadow_exits"] += 1
+            stats["shadow_delta"] += float(row["shadow_delta_pnl_sol"] or 0.0)
 
     print("Summary")
     print("-" * 100)
     print(
         f"{'strategy':<8} {'positions':>9} {'closed':>7} {'obs':>7} "
         f"{'helius':>7} {'fallback':>9} {'obs_pre':>8} {'min_pre':>8} "
-        f"{'ws_hard':>8} {'hard_not_exit':>13}"
+        f"{'ws_hard':>8} {'hard_not_exit':>13} {'shadow':>8} {'sh_delta':>10}"
     )
     for strategy in sorted(by_strategy):
         stats = by_strategy[strategy]
@@ -204,7 +393,8 @@ def _print_summary(rows: list[dict]) -> None:
             f"{int(stats['obs']):>7} {int(stats['helius']):>7} "
             f"{int(stats['fallback']):>9} {int(stats['obs_before_exit']):>8} "
             f"{int(stats['min_before_exit']):>8} {int(stats['hard_touch']):>8} "
-            f"{int(stats['hard_touch_not_hard_exit']):>13}"
+            f"{int(stats['hard_touch_not_hard_exit']):>13} "
+            f"{int(stats['shadow_exits']):>8} {_fmt_sol(stats['shadow_delta']):>10}"
         )
 
 
@@ -215,7 +405,8 @@ def _print_rows(rows: list[dict], limit: int) -> None:
         f"{'strat':<5} {'call':>7} {'symbol':<14} {'channel':<20} {'score':>6} "
         f"{'obs':>4} {'src':>9} {'min':>9} {'max':>9} {'last':>9} "
         f"{'minx':>6} {'maxx':>6} {'exitx':>6} {'min_vs_exit':>11} "
-        f"{'last_vs_exit':>12} {'reason':<13} {'pnl':>9} {'ws_hard':>7}"
+        f"{'last_vs_exit':>12} {'reason':<13} {'pnl':>9} {'shadow':<11} "
+        f"{'sh_pnl':>9} {'delta':>9} {'lead_s':>7} {'ws_hard':>7}"
     )
     for row in rows[:limit]:
         source_mix = f"{int(row['helius_obs'] or 0)}/{int(row['fallback_obs'] or 0)}"
@@ -231,7 +422,12 @@ def _print_rows(rows: list[dict], limit: int) -> None:
             f"{_fmt_num(row['min_obs_vs_exit_sec'], 1):>11} "
             f"{_fmt_num(row['last_obs_vs_exit_sec'], 1):>12} "
             f"{(row['exit_reason'] or row['status'] or '?')[:13]:<13} "
-            f"{_fmt_sol(row['pnl_sol']):>9} {str(bool(row['ws_touched_hard_stop'])):>7}"
+            f"{_fmt_sol(row['pnl_sol']):>9} "
+            f"{(row['shadow_exit_reason'] or '-')[:11]:<11} "
+            f"{_fmt_sol(row['shadow_pnl_sol']):>9} "
+            f"{_fmt_sol(row['shadow_delta_pnl_sol']):>9} "
+            f"{_fmt_num(row['shadow_seconds_before_exit'], 1):>7} "
+            f"{str(bool(row['ws_touched_hard_stop'])):>7}"
         )
 
 
@@ -257,6 +453,31 @@ def _print_timing_notes(rows: list[dict]) -> None:
     print("Negative timing values mean the websocket observation arrived before the stored paper exit.")
 
 
+def _print_shadow_notes(rows: list[dict]) -> None:
+    shadow_rows = [row for row in rows if row["shadow_exit_reason"]]
+    if not shadow_rows:
+        print("\nShadow Exit Notes")
+        print("-" * 100)
+        print("No websocket observations would have triggered the current paper exit rules before stored exit.")
+        return
+
+    print("\nShadow Exit Notes")
+    print("-" * 100)
+    by_reason: dict[str, dict[str, float]] = {}
+    for row in shadow_rows:
+        reason = row["shadow_exit_reason"] or "unknown"
+        stats = by_reason.setdefault(reason, {"count": 0, "delta": 0.0})
+        stats["count"] += 1
+        stats["delta"] += float(row["shadow_delta_pnl_sol"] or 0.0)
+    print(
+        "Shadow exits replay the current paper exit rules over websocket observations only, "
+        "using observations before the stored exit time."
+    )
+    for reason in sorted(by_reason):
+        stats = by_reason[reason]
+        print(f"{reason:<13} count={int(stats['count']):>3}  pnl_delta={_fmt_sol(stats['delta'])}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Join websocket market observations to paper exits")
     parser.add_argument("--hours", type=int, default=24, help="Lookback window")
@@ -276,6 +497,7 @@ def main() -> None:
     _print_summary(rows)
     _print_rows(rows, args.limit)
     _print_timing_notes(rows)
+    _print_shadow_notes(rows)
 
 
 if __name__ == "__main__":
