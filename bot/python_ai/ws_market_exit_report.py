@@ -178,6 +178,7 @@ def _load_rows(hours: int) -> list[dict]:
         rows = cur.fetchall()
         for row in rows:
             row.update(_simulate_shadow_exit(row))
+            row.update(_simulate_pre_exit_opportunity(row))
         return rows
 
 
@@ -342,6 +343,58 @@ def _simulate_shadow_exit(row: dict) -> dict:
     return result
 
 
+def _simulate_pre_exit_opportunity(row: dict) -> dict:
+    entry_mcap = _as_float(row.get("entry_price"))
+    sol_in = _as_float(row.get("sol_in"))
+    stored_pnl = row.get("pnl_sol")
+    exit_time = row.get("exit_time")
+    observations = row.get("observations_json") or []
+    result = {
+        "pre_obs_count": 0,
+        "pre_min_mcap": None,
+        "pre_max_mcap": None,
+        "pre_last_mcap": None,
+        "pre_min_delta_pnl_sol": None,
+        "pre_max_delta_pnl_sol": None,
+        "pre_last_delta_pnl_sol": None,
+    }
+    if entry_mcap <= 0 or sol_in <= 0 or stored_pnl is None:
+        return result
+
+    pre_mcaps: list[float] = []
+    pre_last_mcap = None
+    for obs in observations:
+        observed_at = _parse_observed_at(obs.get("observed_at"))
+        current_mcap = _as_float(obs.get("mcap"))
+        if current_mcap <= 0:
+            continue
+        if exit_time is not None and observed_at is not None and observed_at > exit_time:
+            continue
+        pre_mcaps.append(current_mcap)
+        pre_last_mcap = current_mcap
+
+    if not pre_mcaps:
+        return result
+
+    def delta_for(mcap: float) -> float:
+        return sol_in * ((mcap / entry_mcap) - 1.0) - float(stored_pnl)
+
+    pre_min = min(pre_mcaps)
+    pre_max = max(pre_mcaps)
+    result.update(
+        {
+            "pre_obs_count": len(pre_mcaps),
+            "pre_min_mcap": pre_min,
+            "pre_max_mcap": pre_max,
+            "pre_last_mcap": pre_last_mcap,
+            "pre_min_delta_pnl_sol": delta_for(pre_min),
+            "pre_max_delta_pnl_sol": delta_for(pre_max),
+            "pre_last_delta_pnl_sol": delta_for(pre_last_mcap),
+        }
+    )
+    return result
+
+
 def _print_summary(rows: list[dict]) -> None:
     by_strategy: dict[str, dict[str, float]] = {}
     for row in rows:
@@ -360,6 +413,9 @@ def _print_summary(rows: list[dict]) -> None:
                 "hard_touch_not_hard_exit": 0,
                 "shadow_exits": 0,
                 "shadow_delta": 0.0,
+                "pre_last_delta": 0.0,
+                "pre_min_delta": 0.0,
+                "pre_max_delta": 0.0,
             },
         )
         stats["positions"] += 1
@@ -378,13 +434,17 @@ def _print_summary(rows: list[dict]) -> None:
         if row["shadow_exit_reason"]:
             stats["shadow_exits"] += 1
             stats["shadow_delta"] += float(row["shadow_delta_pnl_sol"] or 0.0)
+        stats["pre_last_delta"] += float(row["pre_last_delta_pnl_sol"] or 0.0)
+        stats["pre_min_delta"] += float(row["pre_min_delta_pnl_sol"] or 0.0)
+        stats["pre_max_delta"] += float(row["pre_max_delta_pnl_sol"] or 0.0)
 
     print("Summary")
     print("-" * 100)
     print(
         f"{'strategy':<8} {'positions':>9} {'closed':>7} {'obs':>7} "
         f"{'helius':>7} {'fallback':>9} {'obs_pre':>8} {'min_pre':>8} "
-        f"{'ws_hard':>8} {'hard_not_exit':>13} {'shadow':>8} {'sh_delta':>10}"
+        f"{'ws_hard':>8} {'hard_not_exit':>13} {'shadow':>8} {'sh_delta':>10} "
+        f"{'last_pre':>10} {'min_preΔ':>10} {'max_preΔ':>10}"
     )
     for strategy in sorted(by_strategy):
         stats = by_strategy[strategy]
@@ -394,7 +454,10 @@ def _print_summary(rows: list[dict]) -> None:
             f"{int(stats['fallback']):>9} {int(stats['obs_before_exit']):>8} "
             f"{int(stats['min_before_exit']):>8} {int(stats['hard_touch']):>8} "
             f"{int(stats['hard_touch_not_hard_exit']):>13} "
-            f"{int(stats['shadow_exits']):>8} {_fmt_sol(stats['shadow_delta']):>10}"
+            f"{int(stats['shadow_exits']):>8} {_fmt_sol(stats['shadow_delta']):>10} "
+            f"{_fmt_sol(stats['pre_last_delta']):>10} "
+            f"{_fmt_sol(stats['pre_min_delta']):>10} "
+            f"{_fmt_sol(stats['pre_max_delta']):>10}"
         )
 
 
@@ -406,7 +469,8 @@ def _print_rows(rows: list[dict], limit: int) -> None:
         f"{'obs':>4} {'src':>9} {'min':>9} {'max':>9} {'last':>9} "
         f"{'minx':>6} {'maxx':>6} {'exitx':>6} {'min_vs_exit':>11} "
         f"{'last_vs_exit':>12} {'reason':<13} {'pnl':>9} {'shadow':<11} "
-        f"{'sh_pnl':>9} {'delta':>9} {'lead_s':>7} {'ws_hard':>7}"
+        f"{'sh_pnl':>9} {'delta':>9} {'lead_s':>7} {'last_pre':>9} "
+        f"{'min_preΔ':>9} {'max_preΔ':>9} {'ws_hard':>7}"
     )
     for row in rows[:limit]:
         source_mix = f"{int(row['helius_obs'] or 0)}/{int(row['fallback_obs'] or 0)}"
@@ -427,6 +491,9 @@ def _print_rows(rows: list[dict], limit: int) -> None:
             f"{_fmt_sol(row['shadow_pnl_sol']):>9} "
             f"{_fmt_sol(row['shadow_delta_pnl_sol']):>9} "
             f"{_fmt_num(row['shadow_seconds_before_exit'], 1):>7} "
+            f"{_fmt_sol(row['pre_last_delta_pnl_sol']):>9} "
+            f"{_fmt_sol(row['pre_min_delta_pnl_sol']):>9} "
+            f"{_fmt_sol(row['pre_max_delta_pnl_sol']):>9} "
             f"{str(bool(row['ws_touched_hard_stop'])):>7}"
         )
 
@@ -478,6 +545,28 @@ def _print_shadow_notes(rows: list[dict]) -> None:
         print(f"{reason:<13} count={int(stats['count']):>3}  pnl_delta={_fmt_sol(stats['delta'])}")
 
 
+def _print_opportunity_notes(rows: list[dict]) -> None:
+    rows_with_pre = [row for row in rows if int(row.get("pre_obs_count") or 0) > 0]
+    if not rows_with_pre:
+        return
+
+    last_delta = sum(float(row["pre_last_delta_pnl_sol"] or 0.0) for row in rows_with_pre)
+    min_delta = sum(float(row["pre_min_delta_pnl_sol"] or 0.0) for row in rows_with_pre)
+    max_delta = sum(float(row["pre_max_delta_pnl_sol"] or 0.0) for row in rows_with_pre)
+    print("\nPre-Exit Opportunity Notes")
+    print("-" * 100)
+    print(
+        "last_pre is the PnL delta if exiting at the last websocket observation before stored exit. "
+        "min/max pre deltas are lower/upper bounds from observed pre-exit prices."
+    )
+    print(
+        f"rows_with_pre_exit_observations={len(rows_with_pre)}  "
+        f"last_pre_delta={_fmt_sol(last_delta)}  "
+        f"min_pre_delta={_fmt_sol(min_delta)}  "
+        f"max_pre_delta={_fmt_sol(max_delta)}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Join websocket market observations to paper exits")
     parser.add_argument("--hours", type=int, default=24, help="Lookback window")
@@ -498,6 +587,7 @@ def main() -> None:
     _print_rows(rows, args.limit)
     _print_timing_notes(rows)
     _print_shadow_notes(rows)
+    _print_opportunity_notes(rows)
 
 
 if __name__ == "__main__":
