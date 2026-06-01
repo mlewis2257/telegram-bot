@@ -200,26 +200,18 @@ def _strategy_a_shadow_reason(
     channel_handle: str,
     vip_tier: str,
 ) -> tuple[str | None, float | None]:
+    """Strategy A: lets runners breathe — no profit floor, tiered trailing stop."""
     if entry_mcap <= 0:
         return None, None
 
     current_mult = current_mcap / entry_mcap
     peak_mult = peak_mcap / entry_mcap if peak_mcap > 0 else 0.0
     is_vip_gamble = vip_tier in ("gamble", "gamble_risk")
-    is_free_solhouse = channel_handle == "solhousesignal"
 
     if current_mult >= 10.0:
         return "10x_tp", current_mcap
     if current_mult >= 5.0:
         return "5x_tp", current_mcap
-
-    if is_free_solhouse and peak_mcap > 0:
-        if peak_mult >= 10.0 and current_mult <= 4.0:
-            return "profit_floor", entry_mcap * 4.0
-        if peak_mult >= 5.0 and current_mult <= 2.5:
-            return "profit_floor", entry_mcap * 2.5
-        if peak_mult >= 3.0 and current_mult <= 1.75:
-            return "profit_floor", entry_mcap * 1.75
 
     if peak_mcap > 0:
         if peak_mult >= 10.0:
@@ -247,17 +239,28 @@ def _strategy_b_shadow_reason(
     current_mcap: float,
     peak_mcap: float,
     entry_mcap: float,
+    channel_handle: str,
     vip_tier: str,
 ) -> tuple[str | None, float | None]:
+    """Strategy B: conservative — 3x TP + profit floor protects gains on retracements."""
     if entry_mcap <= 0:
         return None, None
 
     current_mult = current_mcap / entry_mcap
     peak_mult = peak_mcap / entry_mcap if peak_mcap > 0 else 0.0
     is_vip_gamble = vip_tier in ("gamble", "gamble_risk")
+    is_free_solhouse = channel_handle == "solhousesignal"
 
     if not is_vip_gamble and current_mult >= 3.0:
         return "3x_tp", current_mcap
+
+    if is_free_solhouse and peak_mcap > 0:
+        if peak_mult >= 10.0 and current_mult <= 4.0:
+            return "profit_floor", entry_mcap * 4.0
+        if peak_mult >= 5.0 and current_mult <= 2.5:
+            return "profit_floor", entry_mcap * 2.5
+        if peak_mult >= 3.0 and current_mult <= 1.75:
+            return "profit_floor", entry_mcap * 1.75
 
     if peak_mult >= 2.0 and (peak_mcap - current_mcap) / peak_mcap >= 0.25:
         return "trail_stop", peak_mcap * 0.75
@@ -304,6 +307,7 @@ def _simulate_shadow_exit(row: dict) -> dict:
                 current_mcap=current_mcap,
                 peak_mcap=peak_mcap,
                 entry_mcap=entry_mcap,
+                channel_handle=(row.get("channel_handle") or ""),
                 vip_tier=(row.get("vip_tier") or ""),
             )
         else:

@@ -191,17 +191,38 @@ def apply_exit_config(
 
 # ── Named presets ─────────────────────────────────────────────────────────────
 
-# Paper Strategy A — exact current behaviour
+# Paper Strategy A — lets runners breathe.
+# No profit floor: A holds through retracements and trails out via tiered stop.
+# Tiered trailing tightens as the token runs up to lock in gains on big moves.
 EXIT_A_PAPER = ExitConfig(
     name="exit_a_paper",
     take_profit_levels=(10.0, 5.0),
     skip_fixed_tp_for_vip_gamble=False,
     trail_peak_min=2.0,
     trail_tiers=(
-        (10.0, 0.12),  # 12% drawdown allowed for 10x+ runners
+        (10.0, 0.12),  # 12% allowed for proven 10x+ runners
         (5.0,  0.15),
         (3.0,  0.22),
         (2.0,  0.25),
+    ),
+    hard_stop_pct=0.35,
+    vip_gamble_hard_stop_pct=0.30,
+    profit_floor_tiers=(),               # no floor — A trails freely
+    profit_floor_channels=frozenset(),
+    max_hours=24.0,
+)
+
+# Paper Strategy B — conservative.
+# 3x TP caps most positions early. Profit floor protects accumulated gains on
+# solhousesignal by exiting if price retraces significantly from a peak.
+# VIP gamble skips the 3x TP and relies on trail + hard stop instead.
+EXIT_B_PAPER = ExitConfig(
+    name="exit_b_paper",
+    take_profit_levels=(3.0,),
+    skip_fixed_tp_for_vip_gamble=True,
+    trail_peak_min=2.0,
+    trail_tiers=(
+        (2.0, 0.25),   # flat 25% drawdown from peak
     ),
     hard_stop_pct=0.35,
     vip_gamble_hard_stop_pct=0.30,
@@ -211,22 +232,6 @@ EXIT_A_PAPER = ExitConfig(
         (3.0,  1.75),  # peaked 3x  → exit if back to 1.75x
     ),
     profit_floor_channels=frozenset({"solhousesignal"}),
-    max_hours=24.0,
-)
-
-# Paper Strategy B — exact current behaviour
-EXIT_B_PAPER = ExitConfig(
-    name="exit_b_paper",
-    take_profit_levels=(3.0,),
-    skip_fixed_tp_for_vip_gamble=True,   # VIP gamble skips 3x TP, uses trail
-    trail_peak_min=2.0,
-    trail_tiers=(
-        (2.0, 0.25),   # flat 25% drawdown from peak — no tiers
-    ),
-    hard_stop_pct=0.35,
-    vip_gamble_hard_stop_pct=0.30,
-    profit_floor_tiers=(),
-    profit_floor_channels=frozenset(),
     max_hours=24.0,
 )
 
@@ -249,10 +254,10 @@ EXIT_LIVE_V1 = ExitConfig(
     max_hours=24.0,
 )
 
-# Live v2 — fully aligned with paper Strategy A (recommended default)
+# Live v2 — aligned with paper Strategy A: lets runners breathe, no profit floor
 EXIT_LIVE_V2 = ExitConfig(
     name="exit_live_v2",
-    take_profit_levels=(10.0, 5.0),       # no 3x TP — mirrors paper A
+    take_profit_levels=(10.0, 5.0),
     skip_fixed_tp_for_vip_gamble=False,
     trail_peak_min=2.0,
     trail_tiers=(
@@ -263,26 +268,20 @@ EXIT_LIVE_V2 = ExitConfig(
     ),
     hard_stop_pct=0.35,
     vip_gamble_hard_stop_pct=0.30,
-    profit_floor_tiers=(
-        (10.0, 4.0),
-        (5.0,  2.5),
-        (3.0,  1.75),
-    ),
-    profit_floor_channels=frozenset({"solhousesignal"}),
+    profit_floor_tiers=(),               # no floor — mirrors EXIT_A_PAPER
+    profit_floor_channels=frozenset(),
     max_hours=24.0,
 )
 
-# Live v3 — conservative: 3x TP kept, but trail and profit floor aligned
+# Live v3 — conservative: aligned with paper Strategy B
+# 3x TP + profit floor protects gains on retracements
 EXIT_LIVE_V3 = ExitConfig(
     name="exit_live_v3",
-    take_profit_levels=(10.0, 5.0, 3.0),  # keeps 3x TP as risk management
-    skip_fixed_tp_for_vip_gamble=False,
+    take_profit_levels=(10.0, 5.0, 3.0),
+    skip_fixed_tp_for_vip_gamble=True,
     trail_peak_min=2.0,
     trail_tiers=(
-        (10.0, 0.12),
-        (5.0,  0.15),
-        (3.0,  0.22),
-        (2.0,  0.25),
+        (2.0, 0.25),
     ),
     hard_stop_pct=0.35,
     vip_gamble_hard_stop_pct=0.30,
