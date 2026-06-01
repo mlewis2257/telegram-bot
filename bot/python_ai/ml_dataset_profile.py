@@ -44,6 +44,18 @@ KEY_FEATURES = [
     "snap_t60_volume_h1",
     "snap_t30_volume_over_t0",
     "snap_t60_volume_over_t0",
+    "ws_obs_count",
+    "ws_helius_obs_count",
+    "ws_first_mcap_over_entry",
+    "ws_last_mcap_over_entry",
+    "ws_min_mcap_over_entry",
+    "ws_max_mcap_over_entry",
+    "ws_drawdown_from_max",
+    "ws_last_drawdown_from_max",
+    "ws_last_mcap_1m_over_entry",
+    "ws_last_mcap_5m_over_entry",
+    "ws_last_mcap_15m_over_entry",
+    "feature_has_ws_observations",
 ]
 
 

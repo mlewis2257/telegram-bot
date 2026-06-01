@@ -33,6 +33,39 @@ NUMERIC_FEATURES = [
     "mcap_at_call",
     "local_hour_pst",
     "local_dow_pst",
+    "ws_obs_count",
+    "ws_helius_obs_count",
+    "ws_fallback_obs_count",
+    "ws_observation_span_sec",
+    "ws_first_age_sec",
+    "ws_last_age_sec",
+    "ws_first_mcap_over_entry",
+    "ws_last_mcap_over_entry",
+    "ws_min_mcap_over_entry",
+    "ws_max_mcap_over_entry",
+    "ws_last_over_first",
+    "ws_min_over_first",
+    "ws_max_over_first",
+    "ws_min_over_max",
+    "ws_last_over_max",
+    "ws_drawdown_from_max",
+    "ws_last_drawdown_from_max",
+    "ws_obs_count_1m",
+    "ws_last_mcap_1m_over_entry",
+    "ws_min_mcap_1m_over_entry",
+    "ws_max_mcap_1m_over_entry",
+    "ws_obs_count_5m",
+    "ws_last_mcap_5m_over_entry",
+    "ws_min_mcap_5m_over_entry",
+    "ws_max_mcap_5m_over_entry",
+    "ws_obs_count_15m",
+    "ws_last_mcap_15m_over_entry",
+    "ws_min_mcap_15m_over_entry",
+    "ws_max_mcap_15m_over_entry",
+    "feature_has_ws_observations",
+    "feature_has_ws_1m",
+    "feature_has_ws_5m",
+    "feature_has_ws_15m",
 ]
 
 CATEGORICAL_FEATURES = [
@@ -122,6 +155,25 @@ def _build_features(
             feats["num:dow_cos"] = math.cos(angle)
         else:
             feats["missing:local_dow_pst"] = 1.0
+
+    for name in NUMERIC_FEATURES:
+        if name in {
+            "conviction_score",
+            "mcap_at_call",
+            "local_hour_pst",
+            "local_dow_pst",
+        }:
+            continue
+        if name in drop_numeric:
+            continue
+        value = _safe_float(row.get(name))
+        if value is None:
+            feats[f"missing:{name}"] = 1.0
+            continue
+        if name.endswith("_count") or name.endswith("_sec"):
+            feats[f"num:log_{name}"] = _log1p_or_zero(value)
+        else:
+            feats[f"num:{name}"] = value
 
     for name in CATEGORICAL_FEATURES:
         if name in drop_categorical:

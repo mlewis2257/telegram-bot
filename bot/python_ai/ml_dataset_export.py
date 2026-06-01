@@ -237,7 +237,31 @@ def _load_rows(
                 t60.mcap AS snap_t60_mcap,
                 t60.liquidity_usd AS snap_t60_liquidity_usd,
                 t60.volume_h1 AS snap_t60_volume_h1,
-                t60.price_usd AS snap_t60_price_usd
+                t60.price_usd AS snap_t60_price_usd,
+                ws.obs_count AS ws_obs_count,
+                ws.helius_obs_count AS ws_helius_obs_count,
+                ws.fallback_obs_count AS ws_fallback_obs_count,
+                ws.first_observed_at AS ws_first_observed_at,
+                ws.last_observed_at AS ws_last_observed_at,
+                ws.first_mcap AS ws_first_mcap,
+                ws.last_mcap AS ws_last_mcap,
+                ws.min_mcap AS ws_min_mcap,
+                ws.max_mcap AS ws_max_mcap,
+                ws.observation_span_sec AS ws_observation_span_sec,
+                ws.first_age_sec AS ws_first_age_sec,
+                ws.last_age_sec AS ws_last_age_sec,
+                ws.obs_count_1m AS ws_obs_count_1m,
+                ws.last_mcap_1m AS ws_last_mcap_1m,
+                ws.min_mcap_1m AS ws_min_mcap_1m,
+                ws.max_mcap_1m AS ws_max_mcap_1m,
+                ws.obs_count_5m AS ws_obs_count_5m,
+                ws.last_mcap_5m AS ws_last_mcap_5m,
+                ws.min_mcap_5m AS ws_min_mcap_5m,
+                ws.max_mcap_5m AS ws_max_mcap_5m,
+                ws.obs_count_15m AS ws_obs_count_15m,
+                ws.last_mcap_15m AS ws_last_mcap_15m,
+                ws.min_mcap_15m AS ws_min_mcap_15m,
+                ws.max_mcap_15m AS ws_max_mcap_15m
             FROM calls c
             JOIN tokens t ON t.id = c.token_id
             LEFT JOIN channels ch ON ch.id = c.channel_id
@@ -269,6 +293,68 @@ def _load_rows(
             LEFT JOIN token_volume_snapshots t60
                 ON t60.call_id = c.id
                AND t60.snapshot_label = 't_plus_60m'
+            LEFT JOIN LATERAL (
+                WITH base AS (
+                    SELECT COALESCE(a_tp.entry_time, b_tp.entry_time, c.created_at) AS base_time
+                )
+                SELECT
+                    COUNT(*) AS obs_count,
+                    COUNT(*) FILTER (WHERE w.source = 'helius_tx') AS helius_obs_count,
+                    COUNT(*) FILTER (WHERE w.source IS DISTINCT FROM 'helius_tx') AS fallback_obs_count,
+                    MIN(w.observed_at) AS first_observed_at,
+                    MAX(w.observed_at) AS last_observed_at,
+                    (ARRAY_AGG(w.mcap ORDER BY w.observed_at ASC))[1] AS first_mcap,
+                    (ARRAY_AGG(w.mcap ORDER BY w.observed_at DESC))[1] AS last_mcap,
+                    MIN(w.mcap) AS min_mcap,
+                    MAX(w.mcap) AS max_mcap,
+                    EXTRACT(EPOCH FROM (MAX(w.observed_at) - MIN(w.observed_at))) AS observation_span_sec,
+                    EXTRACT(EPOCH FROM (MIN(w.observed_at) - MIN(base.base_time))) AS first_age_sec,
+                    EXTRACT(EPOCH FROM (MAX(w.observed_at) - MIN(base.base_time))) AS last_age_sec,
+                    COUNT(*) FILTER (
+                        WHERE w.observed_at <= base.base_time + INTERVAL '1 minute'
+                    ) AS obs_count_1m,
+                    (
+                        ARRAY_AGG(w.mcap ORDER BY w.observed_at DESC)
+                        FILTER (WHERE w.observed_at <= base.base_time + INTERVAL '1 minute')
+                    )[1] AS last_mcap_1m,
+                    MIN(w.mcap) FILTER (
+                        WHERE w.observed_at <= base.base_time + INTERVAL '1 minute'
+                    ) AS min_mcap_1m,
+                    MAX(w.mcap) FILTER (
+                        WHERE w.observed_at <= base.base_time + INTERVAL '1 minute'
+                    ) AS max_mcap_1m,
+                    COUNT(*) FILTER (
+                        WHERE w.observed_at <= base.base_time + INTERVAL '5 minutes'
+                    ) AS obs_count_5m,
+                    (
+                        ARRAY_AGG(w.mcap ORDER BY w.observed_at DESC)
+                        FILTER (WHERE w.observed_at <= base.base_time + INTERVAL '5 minutes')
+                    )[1] AS last_mcap_5m,
+                    MIN(w.mcap) FILTER (
+                        WHERE w.observed_at <= base.base_time + INTERVAL '5 minutes'
+                    ) AS min_mcap_5m,
+                    MAX(w.mcap) FILTER (
+                        WHERE w.observed_at <= base.base_time + INTERVAL '5 minutes'
+                    ) AS max_mcap_5m,
+                    COUNT(*) FILTER (
+                        WHERE w.observed_at <= base.base_time + INTERVAL '15 minutes'
+                    ) AS obs_count_15m,
+                    (
+                        ARRAY_AGG(w.mcap ORDER BY w.observed_at DESC)
+                        FILTER (WHERE w.observed_at <= base.base_time + INTERVAL '15 minutes')
+                    )[1] AS last_mcap_15m,
+                    MIN(w.mcap) FILTER (
+                        WHERE w.observed_at <= base.base_time + INTERVAL '15 minutes'
+                    ) AS min_mcap_15m,
+                    MAX(w.mcap) FILTER (
+                        WHERE w.observed_at <= base.base_time + INTERVAL '15 minutes'
+                    ) AS max_mcap_15m
+                FROM ws_market_observations w
+                CROSS JOIN base
+                WHERE w.call_id = c.id
+                  AND w.mcap IS NOT NULL
+                  AND w.observed_at >= base.base_time
+            ) ws ON TRUE
             {where_sql}
             ORDER BY c.created_at ASC, c.id ASC
             """,
@@ -343,6 +429,38 @@ def _augment_row(row: dict) -> dict:
     out["feature_has_t0_snapshot"] = int(row.get("snap_t0_mcap") is not None or row.get("snap_t0_volume_h1") is not None)
     out["feature_has_t30_snapshot"] = int(row.get("snap_t30_mcap") is not None or row.get("snap_t30_volume_h1") is not None)
     out["feature_has_t60_snapshot"] = int(row.get("snap_t60_mcap") is not None or row.get("snap_t60_volume_h1") is not None)
+
+    ws_entry_mcap = (
+        _safe_float(row.get("a_entry_price"))
+        or _safe_float(row.get("b_entry_price"))
+        or _safe_float(row.get("mcap_at_call"))
+    )
+    out["ws_first_mcap_over_entry"] = _ratio(row.get("ws_first_mcap"), ws_entry_mcap)
+    out["ws_last_mcap_over_entry"] = _ratio(row.get("ws_last_mcap"), ws_entry_mcap)
+    out["ws_min_mcap_over_entry"] = _ratio(row.get("ws_min_mcap"), ws_entry_mcap)
+    out["ws_max_mcap_over_entry"] = _ratio(row.get("ws_max_mcap"), ws_entry_mcap)
+    out["ws_last_over_first"] = _ratio(row.get("ws_last_mcap"), row.get("ws_first_mcap"))
+    out["ws_min_over_first"] = _ratio(row.get("ws_min_mcap"), row.get("ws_first_mcap"))
+    out["ws_max_over_first"] = _ratio(row.get("ws_max_mcap"), row.get("ws_first_mcap"))
+    out["ws_min_over_max"] = _ratio(row.get("ws_min_mcap"), row.get("ws_max_mcap"))
+    out["ws_last_over_max"] = _ratio(row.get("ws_last_mcap"), row.get("ws_max_mcap"))
+    ws_min_over_max = _safe_float(out.get("ws_min_over_max"))
+    ws_last_over_max = _safe_float(out.get("ws_last_over_max"))
+    out["ws_drawdown_from_max"] = (1.0 - ws_min_over_max) if ws_min_over_max is not None else None
+    out["ws_last_drawdown_from_max"] = (1.0 - ws_last_over_max) if ws_last_over_max is not None else None
+    out["ws_last_mcap_1m_over_entry"] = _ratio(row.get("ws_last_mcap_1m"), ws_entry_mcap)
+    out["ws_min_mcap_1m_over_entry"] = _ratio(row.get("ws_min_mcap_1m"), ws_entry_mcap)
+    out["ws_max_mcap_1m_over_entry"] = _ratio(row.get("ws_max_mcap_1m"), ws_entry_mcap)
+    out["ws_last_mcap_5m_over_entry"] = _ratio(row.get("ws_last_mcap_5m"), ws_entry_mcap)
+    out["ws_min_mcap_5m_over_entry"] = _ratio(row.get("ws_min_mcap_5m"), ws_entry_mcap)
+    out["ws_max_mcap_5m_over_entry"] = _ratio(row.get("ws_max_mcap_5m"), ws_entry_mcap)
+    out["ws_last_mcap_15m_over_entry"] = _ratio(row.get("ws_last_mcap_15m"), ws_entry_mcap)
+    out["ws_min_mcap_15m_over_entry"] = _ratio(row.get("ws_min_mcap_15m"), ws_entry_mcap)
+    out["ws_max_mcap_15m_over_entry"] = _ratio(row.get("ws_max_mcap_15m"), ws_entry_mcap)
+    out["feature_has_ws_observations"] = int((_safe_float(row.get("ws_obs_count")) or 0) > 0)
+    out["feature_has_ws_1m"] = int((_safe_float(row.get("ws_obs_count_1m")) or 0) > 0)
+    out["feature_has_ws_5m"] = int((_safe_float(row.get("ws_obs_count_5m")) or 0) > 0)
+    out["feature_has_ws_15m"] = int((_safe_float(row.get("ws_obs_count_15m")) or 0) > 0)
 
     return out
 
