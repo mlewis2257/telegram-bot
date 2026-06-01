@@ -17,6 +17,7 @@ Usage:
     python3 ml_train_hard_stop.py exports/file.csv --drop-categorical skip_reason
     python3 ml_train_hard_stop.py exports/file.csv --preset no_leak
     python3 ml_train_hard_stop.py exports/file.csv --preset no_leak --threshold-sweep
+    python3 ml_train_hard_stop.py exports/file.csv --preset no_leak --no-ws-features
 """
 
 from __future__ import annotations
@@ -80,6 +81,7 @@ CATEGORICAL_FEATURES = [
 TARGET_COLUMN = "label_a_hard_stop"
 ROW_ID_COLUMN = "call_id"
 TIME_COLUMN = "created_at"
+WS_NUMERIC_FEATURES = {name for name in NUMERIC_FEATURES if name.startswith("ws_") or name.startswith("feature_has_ws_")}
 PRESET_DROPS = {
     "none": set(),
     "no_skip_reason": {"skip_reason"},
@@ -353,6 +355,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--threshold-sweep", action="store_true", help="Print test-set metrics across thresholds")
+    parser.add_argument("--no-ws-features", action="store_true", help="Drop websocket observation features for comparison")
     parser.add_argument("--top-features", type=int, default=12)
     parser.add_argument("--predictions-out", default=None, help="Optional CSV path for test-set predictions")
     parser.add_argument(
@@ -379,6 +382,8 @@ def main() -> None:
 
     drop_categorical = set(args.drop_categorical) | PRESET_DROPS[args.preset]
     drop_numeric = set(args.drop_numeric)
+    if args.no_ws_features:
+        drop_numeric |= WS_NUMERIC_FEATURES
 
     examples = _load_examples(
         args.path,
@@ -415,7 +420,10 @@ def main() -> None:
     print(f"threshold={args.threshold}")
     print(f"preset={args.preset}")
     print(f"drop_categorical={sorted(drop_categorical) if drop_categorical else []}")
-    print(f"drop_numeric={sorted(drop_numeric) if drop_numeric else []}")
+    if args.no_ws_features:
+        print(f"drop_numeric={len(drop_numeric)} feature(s), including websocket features")
+    else:
+        print(f"drop_numeric={sorted(drop_numeric) if drop_numeric else []}")
     print(f"train_positive_rate={sum(label for label, _ in train_scores) * 100.0 / len(train_scores):.1f}%")
     print(f"test_positive_rate={sum(label for label, _ in test_scores) * 100.0 / len(test_scores):.1f}%")
     print()

@@ -31,6 +31,14 @@ import db
 import data_fetcher
 import paper_trader
 import paper_trader_b
+import live_trader
+from exit_config import EXIT_A_PAPER, EXIT_B_PAPER
+
+# Exit configs must match what monitor.py uses so WS and polling exits
+# are always identical for the same position state.
+_EXIT_A    = EXIT_A_PAPER
+_EXIT_B    = EXIT_B_PAPER
+_EXIT_LIVE = live_trader._LIVE_EXIT_CONFIG
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -198,21 +206,26 @@ _mgr = SubscriptionManager()
 
 async def sync_open_positions(ws) -> None:
     """
-    Sync websocket subscriptions to current open paper positions immediately.
+    Sync websocket subscriptions to all open positions (paper A, paper B, live).
 
     - Subscribe to mints with open positions that are not currently tracked.
     - Unsubscribe mints that no longer have any open position.
     """
-    positions_a = db.get_open_paper_positions(is_strategy_b=False)
-    positions_b = db.get_open_paper_positions(is_strategy_b=True)
-    all_positions = {p["call_id"]: p for p in positions_a}
+    positions_a    = db.get_open_paper_positions(is_strategy_b=False)
+    positions_b    = db.get_open_paper_positions(is_strategy_b=True)
+    positions_live = db.get_open_live_positions()
+
+    all_positions: dict[int, dict] = {p["call_id"]: p for p in positions_a}
     for p in positions_b:
+        if p["call_id"] not in all_positions:
+            all_positions[p["call_id"]] = p
+    for p in positions_live:
         if p["call_id"] not in all_positions:
             all_positions[p["call_id"]] = p
 
     open_mints = set()
     for pos in all_positions.values():
-        mint = pos.get("mint_address") or ""
+        mint    = pos.get("mint_address") or ""
         call_id = pos["call_id"]
         if not mint or mint.startswith(("INFERRED:", "UNKNOWN:")):
             continue
@@ -299,23 +312,23 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
         except Exception:
             pass
 
-    # ── Strategy A check ──────────────────────────────────────────────────────
+    # ── Strategy A paper check ────────────────────────────────────────────────
     a_done = False
     try:
         position_a = db.get_open_paper_position(call_id, is_strategy_b=False)
         if position_a:
-            entry_price    = position_a["entry_price"]
-            peak_mcap_db   = float(position_a.get("peak_mcap") or 0.0)
-            peak_mult_db   = float(position_a.get("peak_multiplier") or 0.0)
-            current_mult   = (current_mcap / entry_price) if entry_price else 0.0
+            entry_price  = position_a["entry_price"]
+            peak_mcap_db = float(position_a.get("peak_mcap") or 0.0)
+            peak_mult_db = float(position_a.get("peak_multiplier") or 0.0)
+            current_mult = (current_mcap / entry_price) if entry_price else 0.0
             if current_mult > peak_mult_db:
                 db.update_paper_position_peak(call_id, current_mcap, current_mult, is_strategy_b=False)
                 peak_mcap_db = current_mcap
 
-            cached_peak_mcap = _a_realtime_peak_mcap.get(call_id, 0.0)
-            peak_mcap = max(peak_mcap_db, cached_peak_mcap)
-            if current_mcap > peak_mcap:
-                peak_mcap = current_mcap
+            cached_peak = _a_realtime_peak_mcap.get(call_id, 0.0)
+            peak_mcap_a = max(peak_mcap_db, cached_peak)
+            if current_mcap > peak_mcap_a:
+                peak_mcap_a = current_mcap
                 _a_realtime_peak_mcap[call_id] = current_mcap
                 print(
                     f"[ws_monitor] {mint[:8]} A realtime peak"
@@ -324,54 +337,89 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
                     f" mult={current_mult:.2f}x"
                 )
 
-            result_a    = paper_trader.check_exits(
-                call_id, current_mcap, peak_mcap, entry_price, mint=mint, is_strategy_b=False
+            result_a = paper_trader.check_exits(
+                call_id, current_mcap, peak_mcap_a, entry_price,
+                mint=mint, is_strategy_b=False, exit_config=_EXIT_A,
             )
             if result_a.should_exit:
                 exit_mcap = result_a.exit_mcap or current_mcap
                 paper_trader.close_position(call_id, exit_mcap, result_a.reason, is_strategy_b=False)
                 _a_realtime_peak_mcap.pop(call_id, None)
-                print(
-                    f"[ws_monitor] {mint[:8]} A closed — {result_a.reason}"
-                    f" @ ${exit_mcap/1000:.1f}k"
-                )
+                print(f"[ws_monitor] {mint[:8]} A closed — {result_a.reason} @ ${exit_mcap/1000:.1f}k")
                 a_done = True
         else:
             _a_realtime_peak_mcap.pop(call_id, None)
-            a_done = True  # no open A position
+            a_done = True
     except Exception as e:
         print(f"[ws_monitor] A exit check error {mint[:8]}: {e}")
 
-    # ── Strategy B check ──────────────────────────────────────────────────────
+    # ── Strategy B paper check ────────────────────────────────────────────────
     b_done = False
     try:
         position_b = db.get_open_paper_position(call_id, is_strategy_b=True)
         if position_b:
-            entry_price      = position_b["entry_price"]
-            peak_mcap_b      = float(position_b.get("peak_mcap") or 0.0)
-            peak_mult_b      = float(position_b.get("peak_multiplier") or 0.0)
-            current_mult_b   = (current_mcap / entry_price) if entry_price else 0.0
-            if current_mult_b > peak_mult_b:
-                db.update_paper_position_peak(call_id, current_mcap, current_mult_b, is_strategy_b=True)
+            entry_price  = position_b["entry_price"]
+            peak_mcap_b  = float(position_b.get("peak_mcap") or 0.0)
+            peak_mult_b  = float(position_b.get("peak_multiplier") or 0.0)
+            current_mult = (current_mcap / entry_price) if entry_price else 0.0
+            if current_mult > peak_mult_b:
+                db.update_paper_position_peak(call_id, current_mcap, current_mult, is_strategy_b=True)
                 peak_mcap_b = current_mcap
-            result_b    = paper_trader_b.check_exits(
-                call_id, current_mcap, peak_mcap_b, entry_price, mint=mint, is_strategy_b=True
+
+            result_b = paper_trader_b.check_exits(
+                call_id, current_mcap, peak_mcap_b, entry_price,
+                mint=mint, is_strategy_b=True, exit_config=_EXIT_B,
             )
             if result_b.should_exit:
                 exit_mcap = result_b.exit_mcap or current_mcap
                 paper_trader_b.close_position(call_id, exit_mcap, result_b.reason, is_strategy_b=True)
-                print(
-                    f"[ws_monitor] {mint[:8]} B closed — {result_b.reason}"
-                    f" @ ${exit_mcap/1000:.1f}k"
-                )
+                print(f"[ws_monitor] {mint[:8]} B closed — {result_b.reason} @ ${exit_mcap/1000:.1f}k")
                 b_done = True
         else:
-            b_done = True  # no open B position
+            b_done = True
     except Exception as e:
         print(f"[ws_monitor] B exit check error {mint[:8]}: {e}")
 
-    # ── Unsubscribe when both positions are closed ────────────────────────────
-    if a_done and b_done:
+    # ── Live position check ───────────────────────────────────────────────────
+    # Peak tracking for live positions piggybacks on paper A's peak_mcap,
+    # matching monitor.py's behaviour exactly. The same token is being tracked
+    # regardless of whether the position is simulated or real.
+    # close_live_position executes a real Jupiter sell; guard with try/except.
+    live_done = False
+    try:
+        position_live = db.get_open_live_position(call_id)
+        if position_live:
+            entry_price = position_live["entry_price"]
+            # Use paper A's already-updated peak as the live peak source.
+            peak_mcap_live = _a_realtime_peak_mcap.get(call_id, 0.0)
+            if position_a:
+                peak_mcap_live = max(
+                    peak_mcap_live,
+                    float(position_a.get("peak_mcap") or 0.0),
+                )
+
+            result_live = live_trader.check_live_exits(
+                call_id, current_mcap, peak_mcap_live, entry_price,
+                exit_config=_EXIT_LIVE,
+            )
+            if result_live.should_exit:
+                exit_mcap = result_live.exit_mcap or current_mcap
+                closed = await live_trader.close_live_position(
+                    call_id, exit_mcap, result_live.reason
+                )
+                if closed:
+                    print(
+                        f"[ws_monitor] {mint[:8]} LIVE closed — {result_live.reason}"
+                        f" @ ${exit_mcap/1000:.1f}k"
+                    )
+                live_done = True
+        else:
+            live_done = True
+    except Exception as e:
+        print(f"[ws_monitor] live exit check error {mint[:8]}: {e}")
+
+    # ── Unsubscribe when all three positions are closed ───────────────────────
+    if a_done and b_done and live_done:
         await _mgr.unsubscribe(ws, mint)
 
 

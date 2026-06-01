@@ -38,6 +38,7 @@ import paper_trader_b
 import live_trader
 import jupiter
 import wallet as _wallet
+from exit_config import EXIT_A_PAPER, EXIT_B_PAPER
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -375,17 +376,21 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
     if not dry_run:
         peak_mcap   = active_peak * mcap_at_call
         exit_result = paper_trader.check_exits(
-            call_id, current_mcap, peak_mcap, mcap_at_call, mint=mint, is_strategy_b=False
+            call_id, current_mcap, peak_mcap, mcap_at_call,
+            mint=mint, is_strategy_b=False, exit_config=EXIT_A_PAPER,
         )
         if exit_result.should_exit:
-            paper_trader.close_position(call_id, current_mcap, exit_result.reason, is_strategy_b=False)
+            exit_mcap = exit_result.exit_mcap or current_mcap
+            paper_trader.close_position(call_id, exit_mcap, exit_result.reason, is_strategy_b=False)
             print(f"  [paper] {symbol} closed — {exit_result.reason}")
 
         exit_result_b = paper_trader_b.check_exits(
-            call_id, current_mcap, peak_mcap, mcap_at_call, mint=mint, is_strategy_b=True
+            call_id, current_mcap, peak_mcap, mcap_at_call,
+            mint=mint, is_strategy_b=True, exit_config=EXIT_B_PAPER,
         )
         if exit_result_b.should_exit:
-            paper_trader_b.close_position(call_id, current_mcap, exit_result_b.reason, is_strategy_b=True)
+            exit_mcap_b = exit_result_b.exit_mcap or current_mcap
+            paper_trader_b.close_position(call_id, exit_mcap_b, exit_result_b.reason, is_strategy_b=True)
             print(f"  [paper_b] {symbol} closed — {exit_result_b.reason}")
 
         # ── Live trade exit check ──────────────────────────────────────────────
@@ -582,7 +587,8 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
 
                 if strategy == "A":
                     exit_result = paper_trader.check_exits(
-                        call_id, current_mcap, peak_mcap, entry_price, mint=mint, is_strategy_b=False
+                        call_id, current_mcap, peak_mcap, entry_price,
+                        mint=mint, is_strategy_b=False, exit_config=EXIT_A_PAPER,
                     )
                     if exit_result.should_exit:
                         exit_mcap = exit_result.exit_mcap or current_mcap
@@ -594,7 +600,8 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
                         closed += 1
                 else:
                     exit_result = paper_trader_b.check_exits(
-                        call_id, current_mcap, peak_mcap, entry_price, mint=mint, is_strategy_b=True
+                        call_id, current_mcap, peak_mcap, entry_price,
+                        mint=mint, is_strategy_b=True, exit_config=EXIT_B_PAPER,
                     )
                     if exit_result.should_exit:
                         exit_mcap = exit_result.exit_mcap or current_mcap

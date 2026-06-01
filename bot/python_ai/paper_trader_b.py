@@ -23,7 +23,7 @@ import asyncio
 import os
 import sys
 import time
-from dataclasses import dataclass
+
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import db
 import data_fetcher
+from exit_config import ExitConfig, ExitResult, apply_exit_config, EXIT_B_PAPER
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -63,14 +64,7 @@ _last_vol_check_b: dict[int, float] = {}
 _position_tiers_b: dict[int, str] = {}
 
 
-# ── Result type ───────────────────────────────────────────────────────────────
-
-@dataclass
-class ExitResult:
-    should_exit: bool
-    reason: str | None = None
-    exit_mcap: float | None = None
-
+# ExitResult imported from exit_config — single definition shared by all traders.
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -288,15 +282,13 @@ def check_exits(
     entry_mcap: float,
     mint: str = None,
     is_strategy_b: bool = True,
+    exit_config: ExitConfig = None,
 ) -> ExitResult:
     """
     Strategy B exit logic.
 
-    Exit conditions checked in priority order:
-      1. 3x take profit (no 5x/10x — trail stop captures runners above 3x)
-      2. Trailing stop  (peak >= 2.0x; flat 25% drawdown — no volume check, no tiers)
-      3. Hard stop      (down 35% from entry — tighter than Strategy A's 50%)
-      4. Time stop      (open > 24 hours)
+    exit_config selects the exit strategy. Defaults to EXIT_B_PAPER which
+    preserves the original Strategy B behaviour exactly.
     """
     position = db.get_open_paper_position(call_id, is_strategy_b=is_strategy_b)
     if not position:
@@ -305,36 +297,20 @@ def check_exits(
     if entry_mcap <= 0:
         return ExitResult(False)
 
-    current_mult      = current_mcap / entry_mcap
+    cfg = exit_config if exit_config is not None else EXIT_B_PAPER
     is_vip_gamble_pos = position.get("vip_tier") in ("gamble_risk", "gamble")
+    channel_handle    = (position.get("channel_handle") or "").lstrip("@")
+    entry_time        = position.get("entry_time")
 
-    # 3x take profit — skipped for VIP gamble tiers
-    if not is_vip_gamble_pos and current_mult >= TAKE_PROFIT_3X:
-        return ExitResult(True, "3x_tp")
-
-    # Trailing stop — flat 25% from peak once peak >= 2.0x. No volume check, no tiers.
-    if peak_mcap > 0:
-        peak_mult = peak_mcap / entry_mcap
-        if peak_mult >= TRAIL_PEAK_MIN:
-            drawdown = (peak_mcap - current_mcap) / peak_mcap
-            if drawdown >= TRAIL_PCT:
-                return ExitResult(True, "trail_stop", exit_mcap=peak_mcap * (1.0 - TRAIL_PCT))
-
-    # Hard stop — tighter for VIP gamble positions (-30%) vs standard (-35%)
-    hard_stop_pct = VIP_GAMBLE_HARD_STOP_PCT if is_vip_gamble_pos else HARD_STOP_PCT
-    if current_mult <= (1.0 - hard_stop_pct):
-        return ExitResult(True, "hard_stop")
-
-    # Time stop — 24 hours
-    entry_time = position["entry_time"]
-    if entry_time:
-        if entry_time.tzinfo is None:
-            entry_time = entry_time.replace(tzinfo=timezone.utc)
-        age_hours = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
-        if age_hours > MAX_HOURS:
-            return ExitResult(True, "time_stop")
-
-    return ExitResult(False)
+    return apply_exit_config(
+        cfg,
+        current_mcap=current_mcap,
+        peak_mcap=peak_mcap,
+        entry_mcap=entry_mcap,
+        is_vip_gamble=is_vip_gamble_pos,
+        channel_handle=channel_handle,
+        entry_time=entry_time,
+    )
 
 
 def close_position(

@@ -58,6 +58,16 @@ KEY_FEATURES = [
     "feature_has_ws_observations",
 ]
 
+BINARY_FEATURES = [
+    "feature_has_t0_snapshot",
+    "feature_has_t30_snapshot",
+    "feature_has_t60_snapshot",
+    "feature_has_ws_observations",
+    "feature_has_ws_1m",
+    "feature_has_ws_5m",
+    "feature_has_ws_15m",
+]
+
 
 def _is_missing(value: str | None) -> bool:
     return value in (None, "")
@@ -95,6 +105,7 @@ def main() -> None:
         vip_counts = Counter()
         skip_counts = Counter()
         target_counts = {name: Counter() for name in TARGET_COLUMNS if name in fieldnames}
+        binary_counts = {name: Counter() for name in BINARY_FEATURES if name in fieldnames}
 
         for row in reader:
             rows += 1
@@ -115,6 +126,15 @@ def main() -> None:
                     target_counts[target][value] += 1
                 else:
                     target_counts[target]["other"] += 1
+
+            for name in binary_counts:
+                value = row.get(name)
+                if _is_missing(value):
+                    binary_counts[name]["missing"] += 1
+                elif value in ("0", "1"):
+                    binary_counts[name][value] += 1
+                else:
+                    binary_counts[name]["other"] += 1
 
     print("=" * 72)
     print("ML Dataset Profile")
@@ -160,6 +180,16 @@ def main() -> None:
         missing = missing_counts.get(name, 0)
         pct = (missing * 100.0 / rows) if rows else 0.0
         print(f"{name:<28} missing={missing:>6} ({pct:>5.1f}%)")
+
+    if binary_counts:
+        print("\nFeature coverage flags")
+        print("-" * 72)
+        for name, counts in binary_counts.items():
+            yes = counts.get("1", 0)
+            no = counts.get("0", 0)
+            missing = counts.get("missing", 0)
+            rate = (yes * 100.0 / (yes + no)) if (yes + no) else 0.0
+            print(f"{name:<28} yes={yes:>6} no={no:>6} missing={missing:>6} yes_rate={rate:>6.1f}%")
 
 
 if __name__ == "__main__":

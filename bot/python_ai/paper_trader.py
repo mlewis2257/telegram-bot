@@ -17,7 +17,7 @@ import asyncio
 import os
 import sys
 import time
-from dataclasses import dataclass
+
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -28,6 +28,7 @@ import data_fetcher
 import alert_bot
 from strategy_config import STRATEGY_A_V2026_05_22
 from strategy_engine import StrategyCallContext, evaluate_strategy_a_entry
+from exit_config import ExitConfig, ExitResult, apply_exit_config, EXIT_A_PAPER
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -36,10 +37,12 @@ SOL_ALERT        = 0.5   # simulated SOL for alert (70–84)
 SOL_SOLHOUSE_70_74 = 0.25  # smaller size for weaker free solhousesignal alerts
 SOL_VIP_GAMBLE   = 0.25  # simulated SOL for experimental VIP gamble/gamble_risk entries
 
-TAKE_PROFIT_5X   = 5.0   # exit at 5x from entry
-TRAIL_PEAK_MIN   = 2.0   # trailing stop only arms once peak >= 2.0x
-HARD_STOP_PCT    = 0.35  # hard stop fires on 35% loss from entry
-MAX_HOURS        = 24    # time stop after 24 hours open
+# Legacy constants — kept so live_trader.py imports still resolve.
+# Exit logic now lives in EXIT_A_PAPER (exit_config.py).
+TAKE_PROFIT_5X   = 5.0
+TRAIL_PEAK_MIN   = 2.0
+HARD_STOP_PCT    = 0.35
+MAX_HOURS        = 24
 LOCAL_TZ         = ZoneInfo("America/Los_Angeles")
 QUIET_HOURS_PST  = set(STRATEGY_A_V2026_05_22.quiet_hours_pst)
 FREE_SOLHOUSE_BLOCKED_HOURS_PST = set(STRATEGY_A_V2026_05_22.free_blocked_hours_pst)
@@ -62,13 +65,7 @@ VIP_GAMBLE_HARD_STOP_PCT = 0.30   # tighter: -30% vs default -35%
 VIP_GAMBLE_MAX_HOURS     = 24.0   # same as default 24h
 
 
-# ── Result type ───────────────────────────────────────────────────────────────
-
-@dataclass
-class ExitResult:
-    should_exit: bool
-    reason: str | None = None
-    exit_mcap: float | None = None
+# ExitResult imported from exit_config — single definition shared by all traders.
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -282,6 +279,7 @@ def check_exits(
     entry_mcap: float,
     mint: str = None,
     is_strategy_b: bool = False,
+    exit_config: ExitConfig = None,
 ) -> ExitResult:
     """
     Check whether the open paper position for call_id should be exited.
@@ -289,13 +287,8 @@ def check_exits(
     Returns ExitResult(should_exit=False) immediately if no open position
     exists — safe to call unconditionally on every monitor pass.
 
-    Exit conditions checked in priority order:
-      1. 10x take profit
-      2. 5x take profit
-      3. Free solhousesignal profit-floor exit
-      4. Trailing stop  (arms at 2.0x+, with tighter tiers as peak grows)
-      5. Hard stop      (down 35% from entry, or 30% for VIP gamble)
-      6. Time stop      (open > 24 hours)
+    exit_config selects the exit strategy. Defaults to EXIT_A_PAPER which
+    preserves the original Strategy A behaviour exactly.
     """
     position = db.get_open_paper_position(call_id, is_strategy_b=is_strategy_b)
     if not position:
@@ -304,62 +297,20 @@ def check_exits(
     if entry_mcap <= 0:
         return ExitResult(False)
 
-    current_mult      = current_mcap / entry_mcap
+    cfg = exit_config if exit_config is not None else EXIT_A_PAPER
     is_vip_gamble_pos = position.get("vip_tier") in ("gamble_risk", "gamble")
     channel_handle    = (position.get("channel_handle") or "").lstrip("@")
-    is_free_solhouse  = channel_handle == "solhousesignal"
+    entry_time        = position.get("entry_time")
 
-    # 10x take profit — checked first so high runners are labelled correctly
-    if current_mult >= 10.0:
-        return ExitResult(True, "10x_tp")
-
-    if current_mult >= TAKE_PROFIT_5X:
-        return ExitResult(True, "5x_tp")
-
-    if is_free_solhouse and peak_mcap > 0:
-        peak_mult = peak_mcap / entry_mcap
-        if peak_mult >= 10.0 and current_mult <= 4.0:
-            return ExitResult(True, "profit_floor", exit_mcap=entry_mcap * 4.0)
-        if peak_mult >= 5.0 and current_mult <= 2.5:
-            return ExitResult(True, "profit_floor", exit_mcap=entry_mcap * 2.5)
-        if peak_mult >= 3.0 and current_mult <= 1.75:
-            return ExitResult(True, "profit_floor", exit_mcap=entry_mcap * 1.75)
-
-    # Trailing stop — tiered by how much the token has run.
-    # Only activates at 2.0x+ to avoid exiting on small early bounces.
-    if peak_mcap > 0:
-        peak_mult = peak_mcap / entry_mcap
-        if peak_mult >= 10.0:
-            trail_pct = 0.12               # capital preservation for proven runners
-        elif peak_mult >= 5.0:
-            trail_pct = 0.15
-        elif peak_mult >= 3.0:
-            trail_pct = 0.22
-        elif peak_mult >= TRAIL_PEAK_MIN:  # >= 2.0x
-            trail_pct = 0.25
-        else:
-            trail_pct = None               # below 2.0x — let hard stop handle
-        if trail_pct is not None:
-            drawdown = (peak_mcap - current_mcap) / peak_mcap
-            if drawdown >= trail_pct:
-                return ExitResult(True, "trail_stop", exit_mcap=peak_mcap * (1.0 - trail_pct))
-
-    # Hard stop — tighter for VIP gamble tiers (-30%) vs default (-35%)
-    hard_stop_pct = VIP_GAMBLE_HARD_STOP_PCT if is_vip_gamble_pos else HARD_STOP_PCT
-    if current_mult <= (1.0 - hard_stop_pct):
-        return ExitResult(True, "hard_stop")
-
-    # Time stop — currently 24h for both standard and VIP gamble positions
-    max_hours = VIP_GAMBLE_MAX_HOURS if is_vip_gamble_pos else MAX_HOURS
-    entry_time = position["entry_time"]
-    if entry_time:
-        if entry_time.tzinfo is None:
-            entry_time = entry_time.replace(tzinfo=timezone.utc)
-        age_hours = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
-        if age_hours > max_hours:
-            return ExitResult(True, "time_stop")
-
-    return ExitResult(False)
+    return apply_exit_config(
+        cfg,
+        current_mcap=current_mcap,
+        peak_mcap=peak_mcap,
+        entry_mcap=entry_mcap,
+        is_vip_gamble=is_vip_gamble_pos,
+        channel_handle=channel_handle,
+        entry_time=entry_time,
+    )
 
 
 def close_position(

@@ -34,12 +34,25 @@ import alert_bot
 import data_fetcher
 import wallet as _wallet
 from paper_trader import (
-    ExitResult,
     TAKE_PROFIT_5X,
     TRAIL_PEAK_MIN,
     HARD_STOP_PCT,
     MAX_HOURS,
 )
+from exit_config import ExitConfig, ExitResult, apply_exit_config, get_exit_config, EXIT_LIVE_V1
+
+# Load exit strategy from env — defaults to v1 (existing behaviour) so live
+# trading is unaffected until EXIT_STRATEGY is explicitly changed.
+_LIVE_EXIT_CONFIG: ExitConfig = EXIT_LIVE_V1
+try:
+    _env_exit = os.getenv("EXIT_STRATEGY", "").strip()
+    if _env_exit:
+        _LIVE_EXIT_CONFIG = get_exit_config(_env_exit)
+        print(f"[live] exit strategy: {_LIVE_EXIT_CONFIG.name}")
+    else:
+        print(f"[live] exit strategy: {_LIVE_EXIT_CONFIG.name} (default)")
+except ValueError as _e:
+    print(f"[live] WARNING: invalid EXIT_STRATEGY env — {_e}. Using {_LIVE_EXIT_CONFIG.name}.")
 
 # ── In-flight mint guard (prevents race-condition duplicate buys) ──────────────
 
@@ -409,11 +422,16 @@ def check_live_exits(
     current_mcap: float,
     peak_mcap: float,
     entry_mcap: float,
+    exit_config: ExitConfig = None,
 ) -> ExitResult:
     """
-    Identical exit logic to paper_trader.check_exits().
-    Uses get_open_live_position() so it only fires for live positions.
+    Check whether the open live position for call_id should be exited.
+
+    Uses get_open_live_position() so it only fires for real positions.
     Synchronous — same pattern as paper_trader.check_exits().
+
+    exit_config defaults to the module-level _LIVE_EXIT_CONFIG which is
+    loaded from the EXIT_STRATEGY env var at startup.
     """
     position = db.get_open_live_position(call_id)
     if not position:
@@ -422,44 +440,20 @@ def check_live_exits(
     if entry_mcap <= 0:
         return ExitResult(False)
 
-    current_mult = current_mcap / entry_mcap
-
-    if current_mult >= 10.0:
-        return ExitResult(True, "10x_tp")
-
-    if current_mult >= TAKE_PROFIT_5X:
-        return ExitResult(True, "5x_tp")
-
-    if current_mult >= 3.0:
-        return ExitResult(True, "3x_tp")
-
-    if peak_mcap > 0:
-        peak_mult = peak_mcap / entry_mcap
-        if peak_mult >= TRAIL_PEAK_MIN:
-            if peak_mult >= 5.0:
-                trail_pct = 0.20
-            elif peak_mult >= 3.0:
-                trail_pct = 0.25
-            else:
-                trail_pct = 0.30
-            if peak_mult >= 2.0:
-                trail_pct -= 0.05
-            drawdown = (peak_mcap - current_mcap) / peak_mcap
-            if drawdown >= trail_pct:
-                return ExitResult(True, "trail_stop")
-
-    if current_mult <= (1.0 - HARD_STOP_PCT):
-        return ExitResult(True, "hard_stop")
-
+    cfg = exit_config if exit_config is not None else _LIVE_EXIT_CONFIG
+    is_vip_gamble = position.get("vip_tier") in ("gamble_risk", "gamble")
+    channel_handle = (position.get("channel_handle") or "").lstrip("@")
     entry_time = position.get("entry_time")
-    if entry_time:
-        if entry_time.tzinfo is None:
-            entry_time = entry_time.replace(tzinfo=timezone.utc)
-        age_hours = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
-        if age_hours > MAX_HOURS:
-            return ExitResult(True, "time_stop")
 
-    return ExitResult(False)
+    return apply_exit_config(
+        cfg,
+        current_mcap=current_mcap,
+        peak_mcap=peak_mcap,
+        entry_mcap=entry_mcap,
+        is_vip_gamble=is_vip_gamble,
+        channel_handle=channel_handle,
+        entry_time=entry_time,
+    )
 
 
 def get_live_pnl_summary() -> dict:
