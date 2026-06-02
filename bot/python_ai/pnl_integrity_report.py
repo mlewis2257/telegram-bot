@@ -163,7 +163,7 @@ def _load_extremes(since: datetime | None, limit: int, direction: str) -> list[d
                 ws.last_mcap AS ws_last_mcap,
                 near_ws.mcap AS nearest_ws_mcap,
                 near_ws.source AS nearest_ws_source,
-                EXTRACT(EPOCH FROM ABS(near_ws.observed_at - tp.exit_time)) AS nearest_ws_abs_sec
+                ABS(EXTRACT(EPOCH FROM (near_ws.observed_at - tp.exit_time))) AS nearest_ws_abs_sec
             FROM trading_positions tp
             JOIN calls c ON c.id = tp.call_id
             LEFT JOIN tokens t ON t.id = c.token_id
