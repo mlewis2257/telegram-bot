@@ -34,7 +34,7 @@ from exit_config import ExitConfig, ExitResult, apply_exit_config, EXIT_A_PAPER
 
 SOL_STRONG_ALERT = 0.5   # simulated SOL for strong_alert (85+)
 SOL_ALERT        = 0.5   # simulated SOL for alert (70–84)
-SOL_SOLHOUSE_70_74 = 0.25  # smaller size for weaker free solhousesignal alerts
+SOL_SOLHOUSE_70_74 = 0.50  # same size as standard trades
 SOL_VIP_GAMBLE   = 0.25  # simulated SOL for experimental VIP gamble/gamble_risk entries
 
 # Legacy constants — kept so live_trader.py imports still resolve.
