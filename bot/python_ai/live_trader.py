@@ -25,6 +25,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -39,11 +40,16 @@ from paper_trader import (
     HARD_STOP_PCT,
     MAX_HOURS,
 )
-from exit_config import ExitConfig, ExitResult, apply_exit_config, get_exit_config, EXIT_LIVE_V1
+from exit_config import ExitConfig, ExitResult, apply_exit_config, get_exit_config, EXIT_LIVE_V2
+from strategy_config import STRATEGY_A_V2026_05_22
+from strategy_engine import StrategyCallContext, evaluate_strategy_a_entry
 
-# Load exit strategy from env — defaults to v1 (existing behaviour) so live
-# trading is unaffected until EXIT_STRATEGY is explicitly changed.
-_LIVE_EXIT_CONFIG: ExitConfig = EXIT_LIVE_V1
+LOCAL_TZ        = ZoneInfo("America/Los_Angeles")
+QUIET_HOURS_PST = set(STRATEGY_A_V2026_05_22.quiet_hours_pst)
+
+# Load exit strategy from env — defaults to EXIT_LIVE_V2 which mirrors paper
+# Strategy A: 10x/5x TP, tiered trailing, no profit floor.
+_LIVE_EXIT_CONFIG: ExitConfig = EXIT_LIVE_V2
 try:
     _env_exit = os.getenv("EXIT_STRATEGY", "").strip()
     if _env_exit:
@@ -83,7 +89,7 @@ MCAP_LIMITS = {
     'solhousesignal_vip': 200_000,
     'solwhaletrending':   100_000,
     'solearlytrending':    75_000,
-    'solhousesignal':      50_000,
+    'solhousesignal':     175_000,  # matches paper A upper bound; strategy engine enforces 20k min
 }
 DEFAULT_MCAP_LIMIT = 75_000  # fallback for unknown channels
 
@@ -225,17 +231,39 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             db.set_call_skip_reason(call_id, "balance")
             return False
 
-        # ── Allowed hours whitelist ────────────────────────────────────────────
+        # ── Channel / score / hour setup ───────────────────────────────────────
+        channel_handle = (
+            token_data.get("channel_tag") or
+            token_data.get("channel_handle") or
+            ""
+        ).lstrip("@")
+        score_val  = float(score_result.get("score") or 0)
+        local_now  = datetime.now(timezone.utc).astimezone(LOCAL_TZ)
+        local_hour = local_now.hour
+
+        # ── Allowed hours whitelist (UTC) ──────────────────────────────────────
         allowed_hours = [int(h) for h in os.getenv("LIVE_ALLOWED_HOURS_UTC", "").split(",") if h.strip()]
-        current_hour  = datetime.now(timezone.utc).hour
-        if allowed_hours and current_hour not in allowed_hours:
-            print(f"[live] {symbol} skipped — hour {current_hour} UTC not in allowed window")
+        if allowed_hours and datetime.now(timezone.utc).hour not in allowed_hours:
+            print(f"[live] {symbol} skipped — hour {datetime.now(timezone.utc).hour} UTC not in allowed window")
             db.set_call_skip_reason(call_id, "allowed_hours")
             return False
 
-        # ── Entry gate ─────────────────────────────────────────────────────────
-        msg_mcap     = float(token_data.get("mcap_at_call") or 0)
-        actual_entry = None
+        # ── Quiet hours (PST) — mirrors paper Strategy A ───────────────────────
+        free_uses_custom_filters = (channel_handle == "solhousesignal")
+        vip_uses_lane_allowlist  = (channel_handle == "solhousesignal_vip")
+        if (
+            local_hour in QUIET_HOURS_PST
+            and not free_uses_custom_filters
+            and not vip_uses_lane_allowlist
+        ):
+            print(f"[live] {symbol} skipped — quiet hour {local_hour:02d}:00 PST")
+            db.set_call_skip_reason(call_id, "quiet_hours")
+            return False
+
+        # ── Price fetch ────────────────────────────────────────────────────────
+        msg_mcap      = float(token_data.get("mcap_at_call") or 0)
+        actual_entry  = None
+        token_onchain: dict = {}
         if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
             try:
                 market = data_fetcher.fetch_token_price(mint)
@@ -243,20 +271,70 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
                     actual_entry = float(market["mcap"])
             except Exception as e:
                 print(f"[live] price fetch failed for {symbol}: {e}")
+            try:
+                token_onchain = db.get_token_onchain_data(mint) or {}
+            except Exception:
+                pass
         if actual_entry is None and mint:
             print(f"[live] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
 
-        security_flag = token_data.get("security_flag")
+        entry_mcap = actual_entry or msg_mcap
+
+        # ── Security flag ──────────────────────────────────────────────────────
+        security_flag = (token_data.get("security_flag") or token_onchain.get("security_flag"))
         if security_flag == "warning":
             print(f"[live] {symbol} skipped — security=warning")
             db.set_call_skip_reason(call_id, "security_warning")
             return False
 
-        channel_handle = (
-            token_data.get("channel_tag") or
-            token_data.get("channel_handle") or
-            ""
-        ).lstrip("@")
+        # ── VIP gamble minimum mcap floor ──────────────────────────────────────
+        vip_tier_val  = (token_data.get("vip_tier") or "")
+        is_vip_gamble = vip_tier_val in ("gamble", "gamble_risk")
+        if is_vip_gamble and actual_entry is not None and actual_entry < 10_000:
+            print(f"[live] {symbol} skipped — mcap ${actual_entry/1000:.1f}k below $10k minimum for vip gamble")
+            db.set_call_skip_reason(call_id, "mcap_too_low")
+            return False
+
+        # ── Strategy A entry gate (solhousesignal / VIP) ───────────────────────
+        if channel_handle in ("solhousesignal", "solhousesignal_vip"):
+            bundle_pct = token_data.get("bundle_pct_remaining")
+            fake_pct   = token_data.get("fake_vol_pct")
+            if bundle_pct is None:
+                bundle_pct = token_onchain.get("bundle_pct_remaining")
+            if fake_pct is None:
+                fake_pct = token_onchain.get("fake_vol_pct")
+
+            decision = evaluate_strategy_a_entry(
+                StrategyCallContext(
+                    call_id=call_id,
+                    strategy_name="A",
+                    channel_handle=channel_handle,
+                    vip_tier=token_data.get("vip_tier"),
+                    score=score_val,
+                    local_hour_pst=local_hour,
+                    entry_mcap=entry_mcap,
+                    bundle_pct=float(bundle_pct) if bundle_pct is not None else None,
+                    fake_pct=float(fake_pct) if fake_pct is not None else None,
+                    security_flag=security_flag,
+                    dev_tokens_made=token_onchain.get("dev_tokens_made"),
+                    symbol=symbol,
+                ),
+                STRATEGY_A_V2026_05_22,
+            )
+            if not decision.should_trade:
+                print(f"[live] {symbol} skipped — {decision.reason}")
+                db.set_call_skip_reason(call_id, decision.reason)
+                return False
+
+        # ── First-call-only dedup for free solhousesignal ─────────────────────
+        if channel_handle == "solhousesignal" and mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
+            first_free = db.get_first_call_id_for_mint_on_channel(mint, "solhousesignal")
+            if first_free and first_free != call_id:
+                print(f"[live] {symbol} skipped — later free solhousesignal repeat (first={first_free})")
+                db.set_call_skip_reason(call_id, "duplicate")
+                return False
+
+        # ── Channel mcap ceiling (outer safety net) ────────────────────────────
         max_mcap = MCAP_LIMITS.get(channel_handle, DEFAULT_MCAP_LIMIT)
         if actual_entry and actual_entry > max_mcap:
             print(f"[live] {symbol} skipped — mcap ${actual_entry/1000:.0f}k too high for {channel_handle or 'unknown'} (max ${max_mcap/1000:.0f}k)")
