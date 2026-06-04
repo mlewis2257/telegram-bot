@@ -315,6 +315,9 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
             pass
 
     # ── Strategy A paper check ────────────────────────────────────────────────
+    # effective_a_peak is shared with the live section below and must survive
+    # the _a_realtime_peak_mcap.pop() that happens when paper A closes.
+    effective_a_peak = 0.0
     a_done = False
     try:
         position_a = db.get_open_paper_position(call_id, is_strategy_b=False)
@@ -338,6 +341,7 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
                     f" mcap=${current_mcap/1000:.1f}k"
                     f" mult={current_mult:.2f}x"
                 )
+            effective_a_peak = peak_mcap_a  # capture before potential pop
 
             result_a = paper_trader.check_exits(
                 call_id, current_mcap, peak_mcap_a, entry_price,
@@ -401,8 +405,7 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
             # proxy for live — ensures a fast DexScreener pump that ws_monitor
             # missed on-chain still arms the live trail.
             cached_peak    = _live_realtime_peak_mcap.get(call_id, 0.0)
-            paper_a_peak   = _a_realtime_peak_mcap.get(call_id, 0.0)
-            peak_mcap_live = max(peak_mcap_db, cached_peak, paper_a_peak, current_mcap)
+            peak_mcap_live = max(peak_mcap_db, cached_peak, effective_a_peak, current_mcap)
             if peak_mcap_live > max(peak_mcap_db, cached_peak):
                 _live_realtime_peak_mcap[call_id] = peak_mcap_live
                 live_peak_mult = (peak_mcap_live / entry_price) if entry_price else 0.0
