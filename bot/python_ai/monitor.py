@@ -394,11 +394,25 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
             print(f"  [paper_b] {symbol} closed — {exit_result_b.reason}")
 
         # ── Live trade exit check ──────────────────────────────────────────────
+        # Uses the live position's own DB-backed peak — independent of paper A's
+        # DexScreener peak so a paper A runner never prematurely arms the live trail.
         try:
-            live_exit = live_trader.check_live_exits(call_id, current_mcap, peak_mcap, mcap_at_call)
-            if live_exit.should_exit:
-                await live_trader.close_live_position(call_id, current_mcap, live_exit.reason)
-                print(f"  [live] {symbol} closed — {live_exit.reason}")
+            pos_live = db.get_open_live_position(call_id)
+            if pos_live:
+                live_entry_price  = pos_live["entry_price"]
+                live_peak_mcap    = pos_live["peak_mcap"]
+                live_current_mult = (current_mcap / live_entry_price) if live_entry_price else 0.0
+                if live_current_mult > pos_live["peak_multiplier"] and live_entry_price > 0:
+                    db.update_live_position_peak(call_id, current_mcap, live_current_mult)
+                    live_peak_mcap = current_mcap
+                live_exit = live_trader.check_live_exits(
+                    call_id, current_mcap, live_peak_mcap, live_entry_price,
+                    exit_config=live_trader._LIVE_EXIT_CONFIG,
+                )
+                if live_exit.should_exit:
+                    exit_mcap_live = live_exit.exit_mcap or current_mcap
+                    await live_trader.close_live_position(call_id, exit_mcap_live, live_exit.reason)
+                    print(f"  [live] {symbol} closed — {live_exit.reason}")
         except Exception as le:
             print(f"  [live] exit check error for {symbol} call_id={call_id}: {le}")
 
