@@ -412,32 +412,36 @@ async def close_live_position(
         print(f"[live] close skipped call_id={call_id} — no mint in position")
         return False
 
-    # ── Verify on-chain balance before selling ─────────────────────────────────
+    # ── Use stored token amount — avoids an extra RPC round-trip before sell ───
+    # tokens_held is the raw integer amount received at buy time.
+    # If it turns out to be 0 or stale, sell_token will fail gracefully and
+    # we fall back to a live balance check before retrying next cycle.
     wallet_addr = _wallet.get_public_key()
-    balance, _decimals = await jupiter.get_token_balance(mint, wallet_addr, _rpc_url())
-    print(f"[live_sell] on-chain balance for {symbol} call_id={call_id}: {balance}")
-
-    if balance == 0:
-        print(
-            f"[live] ⚠️ balance=0 for {symbol} call_id={call_id}"
-            f" — sell skipped, will retry next cycle  mint={mint}"
-        )
-        try:
-            await alert_bot._get_bot().send_message(
-                chat_id=alert_bot._chat_id(),
-                text=f"⚠️ Balance 0 for ${symbol} — sell skipped, retrying",
-                disable_web_page_preview=True,
+    tokens_held = int(pos.get("tokens_held") or 0)
+    if tokens_held == 0:
+        # Rare: DB value missing — verify on-chain before giving up
+        tokens_held, _ = await jupiter.get_token_balance(mint, wallet_addr, _rpc_url())
+        if tokens_held == 0:
+            print(
+                f"[live] ⚠️ tokens_held=0 for {symbol} call_id={call_id}"
+                f" — sell skipped, will retry next cycle  mint={mint}"
             )
-        except Exception as e:
-            print(f"[live] balance=0 alert failed: {e}")
-        return False
+            try:
+                await alert_bot._get_bot().send_message(
+                    chat_id=alert_bot._chat_id(),
+                    text=f"⚠️ Balance 0 for ${symbol} — sell skipped, retrying",
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                print(f"[live] balance=0 alert failed: {e}")
+            return False
 
     # ── Execute sell ───────────────────────────────────────────────────────────
     print(
         f"[live] SELL {symbol}  call_id={call_id}"
-        f"  balance={balance}  reason={exit_reason}"
+        f"  tokens={tokens_held}  reason={exit_reason}"
     )
-    result = await jupiter.sell_token(mint, balance)
+    result = await jupiter.sell_token(mint, tokens_held)
     print(f"[live_sell] sell_token result: {result}")
 
     if not result["success"]:
