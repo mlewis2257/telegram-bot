@@ -60,8 +60,10 @@ TX_MARKET_DEBUG          = os.getenv("WS_TX_MARKET_DEBUG", "").lower() in ("1", 
 _last_fetch: dict[str, float] = {}   # mint → monotonic time of last price fetch
 _market_stats: Counter[str] = Counter()
 _last_market_stats_print = 0.0
-# Strategy A-only realtime peak cache (call_id -> peak mcap since A entry).
-_a_realtime_peak_mcap: dict[int, float] = {}
+# Per-strategy realtime peak caches (call_id -> peak mcap).
+# Live has its own independent cache so closing paper A never corrupts live peak.
+_a_realtime_peak_mcap:    dict[int, float] = {}
+_live_realtime_peak_mcap: dict[int, float] = {}
 
 
 def _maybe_print_market_stats(force: bool = False) -> None:
@@ -381,21 +383,28 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
         print(f"[ws_monitor] B exit check error {mint[:8]}: {e}")
 
     # ── Live position check ───────────────────────────────────────────────────
-    # Peak tracking for live positions piggybacks on paper A's peak_mcap,
-    # matching monitor.py's behaviour exactly. The same token is being tracked
-    # regardless of whether the position is simulated or real.
-    # close_live_position executes a real Jupiter sell; guard with try/except.
+    # Live uses its own independent peak cache (_live_realtime_peak_mcap).
+    # This decouples live peak tracking from paper A — closing paper A no
+    # longer zeroes out the live peak, which was the root cause of live
+    # positions exiting at entry price when paper A closed first.
     live_done = False
     try:
         position_live = db.get_open_live_position(call_id)
         if position_live:
-            entry_price = position_live["entry_price"]
-            # Use paper A's already-updated peak as the live peak source.
-            peak_mcap_live = _a_realtime_peak_mcap.get(call_id, 0.0)
-            if position_a:
-                peak_mcap_live = max(
-                    peak_mcap_live,
-                    float(position_a.get("peak_mcap") or 0.0),
+            entry_price  = position_live["entry_price"]
+            current_mult = (current_mcap / entry_price) if entry_price else 0.0
+
+            # In-memory peak only — get_open_live_position does not store peak.
+            # Cache persists for the ws_monitor process lifetime; resets on restart.
+            peak_mcap_live = _live_realtime_peak_mcap.get(call_id, 0.0)
+            if current_mcap > peak_mcap_live:
+                peak_mcap_live = current_mcap
+                _live_realtime_peak_mcap[call_id] = current_mcap
+                print(
+                    f"[ws_monitor] {mint[:8]} LIVE realtime peak"
+                    f" call_id={call_id}"
+                    f" mcap=${current_mcap/1000:.1f}k"
+                    f" mult={current_mult:.2f}x"
                 )
 
             result_live = live_trader.check_live_exits(
@@ -408,12 +417,14 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
                     call_id, exit_mcap, result_live.reason
                 )
                 if closed:
+                    _live_realtime_peak_mcap.pop(call_id, None)
                     print(
                         f"[ws_monitor] {mint[:8]} LIVE closed — {result_live.reason}"
                         f" @ ${exit_mcap/1000:.1f}k"
                     )
                 live_done = True
         else:
+            _live_realtime_peak_mcap.pop(call_id, None)
             live_done = True
     except Exception as e:
         print(f"[ws_monitor] live exit check error {mint[:8]}: {e}")
