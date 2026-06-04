@@ -53,7 +53,7 @@ def _load_paper(since: datetime | None, is_strategy_b: bool) -> dict:
     params: list = []
     date_sql = ""
     if since:
-        date_sql = "AND tp.exit_time >= %s"
+        date_sql = "AND (tp.exit_time >= %s OR tp.exit_time IS NULL)"
         params.append(since)
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -105,7 +105,7 @@ def _load_live(since: datetime | None) -> dict:
     params: list = []
     date_sql = ""
     if since:
-        date_sql = "AND tp.exit_time >= %s"
+        date_sql = "AND (tp.exit_time >= %s OR tp.exit_time IS NULL)"
         params.append(since)
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
