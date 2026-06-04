@@ -81,6 +81,8 @@ async def get_order(
     output_mint: str,
     amount_lamports: int,
     wallet_address: str,
+    priority_fee_override: int | None = None,
+    slippage_bps_override: int | None = None,
 ) -> dict:
     """
     GET /order — request a swap order from Jupiter.
@@ -94,8 +96,8 @@ async def get_order(
     for inclusion in congested slots. Configurable via LIVE_PRIORITY_FEE
     (default 10000 microlamports/CU). Higher values land faster in congestion.
     """
-    slippage_bps  = int(os.getenv("LIVE_SLIPPAGE_BPS", "500"))
-    priority_fee  = int(os.getenv("LIVE_PRIORITY_FEE", "10000"))
+    slippage_bps  = slippage_bps_override  if slippage_bps_override  is not None else int(os.getenv("LIVE_SLIPPAGE_BPS",  "500"))
+    priority_fee  = priority_fee_override  if priority_fee_override  is not None else int(os.getenv("LIVE_PRIORITY_FEE", "10000"))
 
     params = {
         "inputMint":       input_mint,
@@ -305,24 +307,16 @@ async def sell_token(
     wallet_address = str(keypair.pubkey())
     last_error     = None
 
+    sell_priority_fee = int(os.getenv("LIVE_SELL_PRIORITY_FEE", "500000"))
+    sell_slippage_bps = int(os.getenv("LIVE_SELL_SLIPPAGE_BPS", "1000"))
+
     for attempt in range(1, max_retries + 1):
         try:
-            # Capture SOL balance before sell for delta calculation (direct RPC,
-            # no MIN_SOL_RESERVE check that would raise on low balances)
-            sol_before = None
-            try:
-                async with httpx.AsyncClient(timeout=10) as _bc:
-                    _resp = await _bc.post(_rpc_url(), json={
-                        "jsonrpc": "2.0", "id": 1,
-                        "method": "getBalance",
-                        "params": [wallet_address, {"commitment": "confirmed"}],
-                    })
-                    sol_before = _resp.json()["result"]["value"] / 1_000_000_000
-                    print(f"[jupiter] sell: SOL before = {sol_before:.6f}")
-            except Exception as e:
-                print(f"[jupiter] sell: could not capture SOL before balance: {e}")
-
-            order      = await get_order(mint_address, SOL_MINT, token_amount, wallet_address)
+            order      = await get_order(
+                mint_address, SOL_MINT, token_amount, wallet_address,
+                priority_fee_override=sell_priority_fee,
+                slippage_bps_override=sell_slippage_bps,
+            )
             order_time = time.time()
             signed_tx  = await sign_transaction(order, keypair)
             sign_time  = time.time()

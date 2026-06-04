@@ -49,7 +49,7 @@ WS_URL = _rpc_url.replace("https://", "wss://").replace("http://", "ws://")
 
 HEARTBEAT_INTERVAL    = 30    # seconds between pings
 POLL_INTERVAL         = 2     # seconds between new-position polls
-FETCH_COOLDOWN        = 2.0   # min seconds between DexScreener fetches per mint
+FETCH_COOLDOWN        = float(os.getenv("WS_FETCH_COOLDOWN", "0.5"))  # min seconds between price fetches per mint
 RECONNECT_BACKOFF_MAX = 60    # max reconnect delay in seconds
 LOG_COMMITMENT        = os.getenv("WS_LOG_COMMITMENT", "processed")
 TX_MARKET_STATS_INTERVAL = int(os.getenv("WS_TX_MARKET_STATS_INTERVAL", "60"))
