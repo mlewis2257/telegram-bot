@@ -1432,7 +1432,8 @@ def open_live_position(
 def get_open_live_position(call_id: int) -> dict | None:
     """
     Return the open live position for call_id, or None.
-    Includes mint_address and symbol for use in close_live_position.
+    Includes peak_mcap and peak_multiplier so live exit logic is independent
+    of paper position peaks.
     """
     conn = get_conn()
     safe_rollback()
@@ -1440,7 +1441,8 @@ def get_open_live_position(call_id: int) -> dict | None:
         cur.execute(
             """
             SELECT tp.entry_price, tp.sol_in, tp.entry_time,
-                   tp.tokens_held, t.mint_address, t.symbol
+                   tp.tokens_held, t.mint_address, t.symbol,
+                   tp.peak_mcap, tp.peak_multiplier
             FROM trading_positions tp
             JOIN calls  c ON c.id  = tp.call_id
             JOIN tokens t ON t.id  = c.token_id
@@ -1454,13 +1456,41 @@ def get_open_live_position(call_id: int) -> dict | None:
     if not row:
         return None
     return {
-        "entry_price":  float(row[0]),
-        "sol_in":       float(row[1]),
-        "entry_time":   row[2],
-        "tokens_held":  int(row[3]) if row[3] else 0,
-        "mint_address": row[4],
-        "symbol":       row[5],
+        "entry_price":      float(row[0]),
+        "sol_in":           float(row[1]),
+        "entry_time":       row[2],
+        "tokens_held":      int(row[3]) if row[3] else 0,
+        "mint_address":     row[4],
+        "symbol":           row[5],
+        "peak_mcap":        float(row[6]) if row[6] is not None else 0.0,
+        "peak_multiplier":  float(row[7]) if row[7] is not None else 0.0,
     }
+
+
+def update_live_position_peak(
+    call_id: int,
+    current_mcap: float,
+    current_mult: float,
+) -> None:
+    """Persist the highest observed peak for one open live position."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE trading_positions
+            SET peak_mcap       = %s,
+                peak_multiplier = %s,
+                peak_at         = NOW(),
+                updated_at      = NOW()
+            WHERE call_id       = %s
+              AND is_simulation = FALSE
+              AND status        = 'open'
+              AND (peak_multiplier IS NULL OR peak_multiplier < %s)
+            """,
+            (current_mcap, current_mult, call_id, current_mult),
+        )
+        conn.commit()
 
 
 def has_open_live_position_for_mint(mint_address: str) -> bool:

@@ -391,15 +391,20 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
     try:
         position_live = db.get_open_live_position(call_id)
         if position_live:
-            entry_price  = position_live["entry_price"]
-            current_mult = (current_mcap / entry_price) if entry_price else 0.0
+            entry_price   = position_live["entry_price"]
+            peak_mcap_db  = position_live["peak_mcap"]
+            peak_mult_db  = position_live["peak_multiplier"]
+            current_mult  = (current_mcap / entry_price) if entry_price else 0.0
 
-            # In-memory peak only — get_open_live_position does not store peak.
-            # Cache persists for the ws_monitor process lifetime; resets on restart.
-            peak_mcap_live = _live_realtime_peak_mcap.get(call_id, 0.0)
+            # Merge DB peak with in-memory cache — take the highest seen.
+            # DB-backed so peaks survive process restarts.
+            # In-memory cache avoids a DB write on every notification.
+            cached_peak    = _live_realtime_peak_mcap.get(call_id, 0.0)
+            peak_mcap_live = max(peak_mcap_db, cached_peak)
             if current_mcap > peak_mcap_live:
                 peak_mcap_live = current_mcap
                 _live_realtime_peak_mcap[call_id] = current_mcap
+                db.update_live_position_peak(call_id, current_mcap, current_mult)
                 print(
                     f"[ws_monitor] {mint[:8]} LIVE realtime peak"
                     f" call_id={call_id}"
