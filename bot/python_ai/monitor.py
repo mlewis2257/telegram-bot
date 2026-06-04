@@ -42,7 +42,7 @@ from exit_config import EXIT_A_PAPER, EXIT_B_PAPER
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-PASS_INTERVAL        = 20     # target; actual interval depends on watchlist size
+PASS_INTERVAL        = 10     # target; actual interval depends on watchlist size
 INTER_CALL_SLEEP     = 0.5    # seconds between each DexScreener call
 RATE_LIMIT_SLEEP     = 30     # seconds to back off on 429 responses
 MAX_WATCHLIST_SPREAD = 50     # above this, spread calls evenly across the window
@@ -204,7 +204,7 @@ def _save_alerts_state() -> None:
 
 # ── Per-token processing ──────────────────────────────────────────────────────
 
-async def _process_token(row: dict, dry_run: bool) -> dict:
+async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | None = None) -> dict:
     """
     Fetch current price for one token, update peak if higher, fire any alerts.
     Returns {new_peak: bool, alerts_sent: int, skipped: bool}.
@@ -226,7 +226,16 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
         result["skipped"] = True
         return result
 
-    market = data_fetcher.fetch_token_price(mint)
+    # Use pre-fetched Jupiter price when available; fall back to DexScreener.
+    market = None
+    jup_price = (prefetched_prices or {}).get(mint)
+    if jup_price:
+        mcap = data_fetcher.get_mcap_blended(mint, jup_price)
+        if mcap:
+            market = {"price_usd": jup_price, "mcap": mcap, "source": "jupiter_batch"}
+    if not market:
+        market = data_fetcher.fetch_token_price(mint)
+
     if not market or not market.get("mcap"):
         if not data_only:
             _record_dex_failure(symbol)
@@ -676,6 +685,14 @@ async def run_pass(pass_num: int, dry_run: bool) -> dict:
 
     print(f"[monitor] Pass {pass_num} — watching {count} active call(s)")
 
+    # One Jupiter batch call for all active mints — avoids N DexScreener calls.
+    active_mints = [
+        row["mint_address"] for row in watchlist
+        if row.get("mint_address")
+        and not (row["mint_address"] or "").startswith(("INFERRED:", "UNKNOWN:"))
+    ]
+    prefetched_prices = data_fetcher.fetch_prices_batch_jupiter(active_mints) if active_mints else {}
+
     sleep_per_call = _inter_call_sleep(count) if count > 0 else INTER_CALL_SLEEP
     stats   = {"checked": 0, "new_peaks": 0, "alerts_sent": 0, "errors": 0}
     skipped = 0
@@ -691,7 +708,7 @@ async def run_pass(pass_num: int, dry_run: bool) -> dict:
                     continue
                 _data_only_last_fetch[call_id] = now
 
-            result = await _process_token(row, dry_run)
+            result = await _process_token(row, dry_run, prefetched_prices=prefetched_prices)
             checked_call_ids.add(call_id)
             await asyncio.sleep(sleep_per_call)
 

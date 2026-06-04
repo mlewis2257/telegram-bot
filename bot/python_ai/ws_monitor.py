@@ -275,7 +275,7 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
         if TX_MARKET_DEBUG and signature:
             print(f"[ws_monitor] tx market miss {mint[:8]} sig={signature[:8]}")
         try:
-            market = data_fetcher.fetch_token_price(mint)
+            market = data_fetcher.fetch_token_price_fast(mint)
         except Exception as e:
             print(f"[ws_monitor] price fetch error {mint[:8]}: {e}")
             return

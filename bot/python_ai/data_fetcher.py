@@ -35,6 +35,7 @@ FAILOVER_STALE_GRACE_SECONDS = 30.0
 DEX_RATE_LIMIT_COOLDOWN_SECONDS = 5.0
 DEX_MINT_FAILURE_BASE_COOLDOWN_SECONDS = 10.0
 DEX_MINT_FAILURE_MAX_COOLDOWN_SECONDS = 60.0
+SUPPLY_CACHE_TTL = 300  # 5 minutes — meme coin supply rarely changes
 
 # ── Dead mint blacklist ───────────────────────────────────────────────────────
 # Mints that reliably fail every request (SSL EOF, delisted, etc).
@@ -49,6 +50,7 @@ DEAD_MINTS: set[str] = {
 _cache: dict[str, tuple[dict, float]] = {}   # mint → (result, epoch_time)
 _price_cache: dict[str, tuple[dict, float]] = {}   # mint → (result, monotonic_time)
 _sol_price_cache: tuple[float, float] | None = None   # (price_usd, monotonic_time)
+_supply_cache: dict[str, tuple[int, int, float]] = {}  # mint → (supply, decimals, monotonic_time)
 _dex_rate_limited_until = 0.0
 _dex_mint_cooldowns: dict[str, float] = {}   # mint -> monotonic deadline
 _dex_mint_failures: dict[str, int] = {}      # mint -> consecutive Dex failure count
@@ -422,8 +424,12 @@ def _try_dexscreener_price(mint: str) -> Optional[dict]:
 def _fetch_token_supply_helius(mint: str) -> tuple:
     """
     Fetch token supply and decimals from Helius RPC via getTokenSupply.
+    Results are cached for SUPPLY_CACHE_TTL seconds.
     Returns (amount_raw, decimals) or (None, None) on any failure.
     """
+    cached = _supply_cache.get(mint)
+    if cached and (time.monotonic() - cached[2]) < SUPPLY_CACHE_TTL:
+        return cached[0], cached[1]
     if not SOLANA_RPC_URL:
         return None, None
     try:
@@ -445,6 +451,7 @@ def _fetch_token_supply_helius(mint: str) -> tuple:
         decimals = value.get("decimals")
         if amount is None or decimals is None:
             return None, None
+        _supply_cache[mint] = (int(amount), int(decimals), time.monotonic())
         return int(amount), int(decimals)
     except Exception as e:
         log.warning(f"[fetcher] Helius supply fetch failed for {mint[:8]}...: {e}")
@@ -769,3 +776,79 @@ def fetch_token_price(mint: str) -> Optional[dict]:
     if result and result.get("mcap"):
         _price_cache_set(mint, result)
     return result
+
+
+def fetch_prices_batch_jupiter(mints: list[str]) -> dict[str, float]:
+    """
+    Fetch current USD prices for multiple mints in a single Jupiter API call.
+    Automatically includes WSOL to refresh the SOL price cache.
+    Returns {mint: usd_price} for mints with valid prices only.
+    Handles batches larger than 50 automatically.
+    """
+    if not mints:
+        return {}
+
+    all_mints = list(set(mints) | {WSOL_MINT})
+    results: dict[str, float] = {}
+    headers = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
+
+    for i in range(0, len(all_mints), 50):
+        batch = all_mints[i:i + 50]
+        try:
+            resp = requests.get(
+                JUPITER_PRICE_URL,
+                params={"ids": ",".join(batch)},
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.status_code != 200:
+                log.warning(f"[fetcher] Jupiter batch price HTTP {resp.status_code}")
+                continue
+            data = resp.json()
+            for mint in batch:
+                price_data = data.get(mint)
+                if not price_data:
+                    continue
+                price = float(price_data.get("usdPrice") or 0)
+                if price > 0:
+                    results[mint] = price
+        except Exception as e:
+            log.warning(f"[fetcher] Jupiter batch price failed: {e}")
+
+    sol_price = results.get(WSOL_MINT)
+    if sol_price:
+        _sol_price_cache_set(sol_price)
+
+    return results
+
+
+def get_mcap_blended(mint: str, jup_price_usd: float) -> Optional[float]:
+    """
+    Compute current USD mcap by scaling a cached DexScreener mcap baseline
+    by the Jupiter price ratio. No extra API call needed.
+    Returns None if no DexScreener baseline is cached yet.
+    """
+    stale = _price_cache_get(mint, max_age=300)
+    if stale and stale.get("price_usd") and stale.get("mcap"):
+        try:
+            return float(stale["mcap"]) * (jup_price_usd / float(stale["price_usd"]))
+        except (ZeroDivisionError, TypeError):
+            return None
+    return None
+
+
+def fetch_token_price_fast(mint: str) -> Optional[dict]:
+    """
+    Jupiter-first price fetch for time-sensitive exit checks (ws_monitor fallback).
+    Falls back to the standard DexScreener path if Jupiter fails or has no mcap.
+    """
+    if mint in DEAD_MINTS:
+        return None
+    cached = _price_cache_get(mint)
+    if cached:
+        return cached
+    result = _fetch_jupiter_price(mint)
+    if result and result.get("mcap"):
+        _price_cache_set(mint, result)
+        return result
+    return fetch_token_price(mint)
