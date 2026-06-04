@@ -396,20 +396,22 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
             peak_mult_db  = position_live["peak_multiplier"]
             current_mult  = (current_mcap / entry_price) if entry_price else 0.0
 
-            # Merge DB peak with in-memory cache — take the highest seen.
-            # DB-backed so peaks survive process restarts.
-            # In-memory cache avoids a DB write on every notification.
+            # Merge DB peak, in-memory cache, and paper A's DexScreener peak.
+            # Entry prices are confirmed identical, so paper A's peak is a valid
+            # proxy for live — ensures a fast DexScreener pump that ws_monitor
+            # missed on-chain still arms the live trail.
             cached_peak    = _live_realtime_peak_mcap.get(call_id, 0.0)
-            peak_mcap_live = max(peak_mcap_db, cached_peak)
-            if current_mcap > peak_mcap_live:
-                peak_mcap_live = current_mcap
-                _live_realtime_peak_mcap[call_id] = current_mcap
-                db.update_live_position_peak(call_id, current_mcap, current_mult)
+            paper_a_peak   = _a_realtime_peak_mcap.get(call_id, 0.0)
+            peak_mcap_live = max(peak_mcap_db, cached_peak, paper_a_peak, current_mcap)
+            if peak_mcap_live > max(peak_mcap_db, cached_peak):
+                _live_realtime_peak_mcap[call_id] = peak_mcap_live
+                live_peak_mult = (peak_mcap_live / entry_price) if entry_price else 0.0
+                db.update_live_position_peak(call_id, peak_mcap_live, live_peak_mult)
                 print(
                     f"[ws_monitor] {mint[:8]} LIVE realtime peak"
                     f" call_id={call_id}"
-                    f" mcap=${current_mcap/1000:.1f}k"
-                    f" mult={current_mult:.2f}x"
+                    f" mcap=${peak_mcap_live/1000:.1f}k"
+                    f" mult={live_peak_mult:.2f}x"
                 )
 
             result_live = live_trader.check_live_exits(

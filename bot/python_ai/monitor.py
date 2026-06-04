@@ -400,11 +400,16 @@ async def _process_token(row: dict, dry_run: bool) -> dict:
             pos_live = db.get_open_live_position(call_id)
             if pos_live:
                 live_entry_price  = pos_live["entry_price"]
-                live_peak_mcap    = pos_live["peak_mcap"]
                 live_current_mult = (current_mcap / live_entry_price) if live_entry_price else 0.0
-                if live_current_mult > pos_live["peak_multiplier"] and live_entry_price > 0:
-                    db.update_live_position_peak(call_id, current_mcap, live_current_mult)
-                    live_peak_mcap = current_mcap
+                # Use the higher of: live's own DB peak, paper A's DexScreener peak,
+                # or current price. Entry prices are identical so paper A's peak is valid.
+                live_peak_mcap = max(
+                    float(pos_live["peak_mcap"] or 0),
+                    peak_mcap,
+                    current_mcap,
+                )
+                if live_peak_mcap > float(pos_live["peak_mcap"] or 0) and live_entry_price > 0:
+                    db.update_live_position_peak(call_id, live_peak_mcap, live_peak_mcap / live_entry_price)
                 live_exit = live_trader.check_live_exits(
                     call_id, current_mcap, live_peak_mcap, live_entry_price,
                     exit_config=live_trader._LIVE_EXIT_CONFIG,
