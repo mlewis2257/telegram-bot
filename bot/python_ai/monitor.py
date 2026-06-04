@@ -438,19 +438,23 @@ async def _check_live_stale(dry_run: bool) -> None:
             continue
 
         # ── No price — verify on-chain balance ────────────────────────────────
-        balance_zero = False
+        # RPC errors are treated as UNKNOWN (not zero) so a transient Helius
+        # outage never triggers an auto-close on a valid position.
+        balance_confirmed_zero = False
         try:
             balance, _ = await jupiter.get_token_balance(mint, wallet_addr, rpc_url)
-            balance_zero = (balance == 0)
-        except Exception:
-            balance_zero = True
+            balance_confirmed_zero = (balance == 0)
+        except Exception as rpc_err:
+            print(f"[monitor] {symbol} on-chain balance check failed — skipping stale increment: {rpc_err}")
+            _stale_checks.pop(call_id, None)
+            continue
 
-        if not balance_zero:
+        if not balance_confirmed_zero:
             # Token still held; price feed just temporarily unavailable
             _stale_checks.pop(call_id, None)
             continue
 
-        # ── Both price and balance gone — increment stale counter ─────────────
+        # ── Both price feed and on-chain balance confirmed gone ───────────────
         _stale_checks[call_id] = _stale_checks.get(call_id, 0) + 1
         count = _stale_checks[call_id]
         print(f"[monitor] {symbol} stale check {count}/{STALE_THRESHOLD}")

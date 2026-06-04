@@ -84,14 +84,26 @@ async def get_order(
 ) -> dict:
     """
     GET /order — request a swap order from Jupiter.
-    No optional params passed so all 4 routers compete for best price.
-    Raises ValueError if the response is missing required fields.
+
+    slippageBps caps acceptable price movement during landing.
+    Configurable via LIVE_SLIPPAGE_BPS env var (default 500 = 5%).
+    5% is appropriate for meme coins — tight enough to avoid bad fills,
+    loose enough to survive normal pump/dump volatility during tx landing.
+
+    priorityFeeRate sets compute unit price in microlamports to compete
+    for inclusion in congested slots. Configurable via LIVE_PRIORITY_FEE
+    (default 10000 microlamports/CU). Higher values land faster in congestion.
     """
+    slippage_bps  = int(os.getenv("LIVE_SLIPPAGE_BPS", "500"))
+    priority_fee  = int(os.getenv("LIVE_PRIORITY_FEE", "10000"))
+
     params = {
-        "inputMint":  input_mint,
-        "outputMint": output_mint,
-        "amount":     str(amount_lamports),
-        "taker":      wallet_address,
+        "inputMint":       input_mint,
+        "outputMint":      output_mint,
+        "amount":          str(amount_lamports),
+        "taker":           wallet_address,
+        "slippageBps":     str(slippage_bps),
+        "priorityFeeRate": str(priority_fee),
     }
     resp = await _get_client().get(f"{BASE_URL}/order", params=params)
     resp.raise_for_status()
