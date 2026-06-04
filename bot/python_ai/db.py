@@ -1996,19 +1996,19 @@ def get_live_positions_count() -> int:
 
 def get_today_live_losses() -> float:
     """
-    Sum of absolute losses (SOL) on closed live positions today.
-    Returns a positive number representing total SOL lost.
+    Net loss (SOL) on closed live positions today.
+    Returns a positive number only when the day is net negative.
+    Winners offset losers — the breaker trips on wallet drawdown, not gross losses.
     """
     conn = get_conn()
     safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT COALESCE(SUM(ABS(pnl_sol)), 0)
+            SELECT GREATEST(0, COALESCE(-SUM(pnl_sol), 0))
             FROM trading_positions
             WHERE is_simulation = FALSE
               AND status        = 'closed'
-              AND pnl_sol       < 0
               AND exit_time     >= CURRENT_DATE
             """
         )
