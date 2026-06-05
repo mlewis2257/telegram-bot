@@ -64,6 +64,10 @@ _last_market_stats_print = 0.0
 # Live has its own independent cache so closing paper A never corrupts live peak.
 _a_realtime_peak_mcap:    dict[int, float] = {}
 _live_realtime_peak_mcap: dict[int, float] = {}
+# Tracks when ws_monitor first processed each call_id. Used to skip helius_tx
+# price parsing for brand-new positions where the price cache is not yet seeded.
+_call_first_seen: dict[int, float] = {}
+NEW_POSITION_HELIUS_GRACE = float(os.getenv("WS_NEW_POSITION_HELIUS_GRACE", "30.0"))
 
 
 def _maybe_print_market_stats(force: bool = False) -> None:
@@ -255,8 +259,15 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
         return
     _last_fetch[mint] = now
 
+    # Track first time we process this call_id so we can seed the price cache
+    # before trusting helius_tx delta-derived prices.
+    if call_id not in _call_first_seen:
+        _call_first_seen[call_id] = now
+    position_age = now - _call_first_seen[call_id]
+    in_grace = position_age < NEW_POSITION_HELIUS_GRACE
+
     market = None
-    if signature:
+    if signature and not in_grace:
         try:
             market = data_fetcher.fetch_ws_exit_market_from_transaction(signature, mint)
         except Exception as e:
@@ -441,6 +452,7 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
 
     # ── Unsubscribe when all three positions are closed ───────────────────────
     if a_done and b_done and live_done:
+        _call_first_seen.pop(call_id, None)
         await _mgr.unsubscribe(ws, mint)
 
 
