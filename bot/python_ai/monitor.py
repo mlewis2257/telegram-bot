@@ -226,7 +226,7 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
         result["skipped"] = True
         return result
 
-    # Use pre-fetched Jupiter price when available; fall back to DexScreener.
+    # Use pre-fetched Jupiter price when available; fall back to Jupiter-first fetch.
     market = None
     jup_price = (prefetched_prices or {}).get(mint)
     if jup_price:
@@ -234,7 +234,7 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
         if mcap:
             market = {"price_usd": jup_price, "mcap": mcap, "source": "jupiter_batch"}
     if not market:
-        market = data_fetcher.fetch_token_price(mint)
+        market = data_fetcher.fetch_token_price_fast(mint)
 
     if not market or not market.get("mcap"):
         if not data_only:
@@ -538,6 +538,17 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
     if not call_ids:
         return 0
 
+    # Pre-fetch Jupiter prices for all mints in one batch call.
+    mints_needed = []
+    for cid in call_ids:
+        if cid in skip_call_ids:
+            continue
+        ref_pos = positions_a.get(cid) or positions_b.get(cid)
+        m = (ref_pos or {}).get("mint_address") or ""
+        if m and not m.startswith(("INFERRED:", "UNKNOWN:")):
+            mints_needed.append(m)
+    sweep_prices = data_fetcher.fetch_prices_batch_jupiter(mints_needed) if mints_needed else {}
+
     closed = 0
     for call_id in call_ids:
         if call_id in skip_call_ids:
@@ -552,8 +563,15 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
             continue
 
         try:
-            market = data_fetcher.fetch_token_price(mint)
-            await asyncio.sleep(INTER_CALL_SLEEP)
+            market = None
+            jup_price = sweep_prices.get(mint)
+            if jup_price:
+                blended = data_fetcher.get_mcap_blended(mint, jup_price)
+                if blended:
+                    market = {"price_usd": jup_price, "mcap": blended, "source": "jupiter_batch"}
+            if not market:
+                market = data_fetcher.fetch_token_price_fast(mint)
+                await asyncio.sleep(INTER_CALL_SLEEP)
 
             if not market or not market.get("mcap"):
                 for strategy, pos in (("A", pos_a), ("B", pos_b)):
@@ -597,6 +615,7 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
                 if mcap_at_call_val > 0:
                     db.update_peak_multiplier(call_id, current_mcap / mcap_at_call_val)
 
+            paper_a_peak_mcap = 0.0  # tracked for live peak propagation below
             for strategy, pos in (("A", pos_a), ("B", pos_b)):
                 if not pos:
                     continue
@@ -618,6 +637,7 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
                     pos["peak_multiplier"] = current_mult
 
                 if strategy == "A":
+                    paper_a_peak_mcap = peak_mcap  # propagate to live section
                     exit_result = paper_trader.check_exits(
                         call_id, current_mcap, peak_mcap, entry_price,
                         mint=mint, is_strategy_b=False, exit_config=EXIT_A_PAPER,
@@ -650,13 +670,19 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
             try:
                 pos_live = db.get_open_live_position(call_id)
                 if pos_live:
-                    live_entry_price = pos_live["entry_price"]
-                    live_peak_mcap   = pos_live["peak_mcap"]
+                    live_entry_price  = pos_live["entry_price"]
                     live_current_mult = (current_mcap / live_entry_price) if live_entry_price else 0.0
-                    if live_current_mult > pos_live["peak_multiplier"] and live_entry_price > 0:
-                        db.update_live_position_peak(call_id, current_mcap, live_current_mult)
-                        live_peak_mcap = current_mcap
-                    live_exit = live_trader.check_live_exits(call_id, current_mcap, live_peak_mcap, live_entry_price)
+                    live_peak_mcap = max(
+                        float(pos_live["peak_mcap"] or 0),
+                        paper_a_peak_mcap,
+                        current_mcap,
+                    )
+                    if live_peak_mcap > float(pos_live["peak_mcap"] or 0) and live_entry_price > 0:
+                        db.update_live_position_peak(call_id, live_peak_mcap, live_peak_mcap / live_entry_price)
+                    live_exit = live_trader.check_live_exits(
+                        call_id, current_mcap, live_peak_mcap, live_entry_price,
+                        exit_config=live_trader._LIVE_EXIT_CONFIG,
+                    )
                     if live_exit.should_exit:
                         exit_mcap = live_exit.exit_mcap or current_mcap
                         await live_trader.close_live_position(call_id, exit_mcap, live_exit.reason)
