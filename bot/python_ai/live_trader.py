@@ -241,6 +241,13 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         local_now  = datetime.now(timezone.utc).astimezone(LOCAL_TZ)
         local_hour = local_now.hour
 
+        # ── Blocked channels ───────────────────────────────────────────────────
+        _blocked = {c.strip() for c in os.getenv("LIVE_BLOCKED_CHANNELS", "solwhaletrending").split(",") if c.strip()}
+        if channel_handle in _blocked:
+            print(f"[live] {symbol} skipped — channel {channel_handle} is blocked")
+            db.set_call_skip_reason(call_id, "blocked_channel")
+            return False
+
         # ── Allowed hours whitelist (UTC) ──────────────────────────────────────
         allowed_hours = [int(h) for h in os.getenv("LIVE_ALLOWED_HOURS_UTC", "").split(",") if h.strip()]
         if allowed_hours and datetime.now(timezone.utc).hour not in allowed_hours:
