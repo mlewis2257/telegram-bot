@@ -36,6 +36,7 @@ DEX_RATE_LIMIT_COOLDOWN_SECONDS = 5.0
 DEX_MINT_FAILURE_BASE_COOLDOWN_SECONDS = 10.0
 DEX_MINT_FAILURE_MAX_COOLDOWN_SECONDS = 60.0
 SUPPLY_CACHE_TTL = 300  # 5 minutes — meme coin supply rarely changes
+HELIUS_TX_MAX_PRICE_RATIO = float(os.getenv("HELIUS_TX_MAX_PRICE_RATIO", "3.0"))
 
 # ── Dead mint blacklist ───────────────────────────────────────────────────────
 # Mints that reliably fail every request (SSL EOF, delisted, etc).
@@ -588,6 +589,54 @@ def _extract_max_abs_token_delta(token_balances: list[dict], mint: str) -> Optio
     return max_abs_delta or None
 
 
+def _extract_min_significant_token_delta(
+    token_balances: list[dict], mint: str, min_amount: float = 1e-6
+) -> Optional[float]:
+    """
+    Extract the minimum significant absolute token balance delta for a mint.
+
+    Using min instead of max avoids picking up large unrelated operations in the
+    same transaction (e.g. a 100-SOL WSOL transfer alongside a 0.05-SOL swap).
+    The min_amount filter removes dust/fee changes below the threshold.
+    """
+    if not token_balances or not mint:
+        return None
+
+    amounts_by_index: dict[int, tuple[float, float]] = {}
+    for entry in token_balances:
+        if entry.get("mint") != mint:
+            continue
+        idx = entry.get("accountIndex")
+        if idx is None:
+            continue
+        pre_amt, post_amt = amounts_by_index.get(int(idx), (0.0, 0.0))
+        side = entry.get("_side")
+        ui_amount = (entry.get("uiTokenAmount") or {}).get("uiAmount")
+        if ui_amount is None:
+            raw_amount = (entry.get("uiTokenAmount") or {}).get("amount")
+            decimals = (entry.get("uiTokenAmount") or {}).get("decimals") or 0
+            try:
+                ui_amount = int(raw_amount) / (10 ** int(decimals))
+            except Exception:
+                ui_amount = 0.0
+        try:
+            ui_amount = float(ui_amount)
+        except Exception:
+            ui_amount = 0.0
+        if side == "pre":
+            pre_amt = ui_amount
+        else:
+            post_amt = ui_amount
+        amounts_by_index[int(idx)] = (pre_amt, post_amt)
+
+    significant = [
+        abs(post - pre)
+        for pre, post in amounts_by_index.values()
+        if abs(post - pre) >= min_amount
+    ]
+    return min(significant) if significant else None
+
+
 def fetch_ws_exit_market_from_transaction(signature: str, mint: str) -> Optional[dict]:
     """
     Try to derive a websocket-exit market snapshot from Helius transaction data.
@@ -623,8 +672,12 @@ def fetch_ws_exit_market_from_transaction(signature: str, mint: str) -> Optional
         tagged["_side"] = "post"
         tagged_balances.append(tagged)
 
+    # Min for WSOL: avoids large unrelated WSOL transfers (e.g. 100-SOL transfers
+    # in the same TX) inflating the implied price ratio. The swap amount is almost
+    # always the smallest significant WSOL movement in the transaction.
+    # Max for the token: the pool delta is the largest token change in a swap.
+    wsol_delta  = _extract_min_significant_token_delta(tagged_balances, WSOL_MINT, min_amount=0.0001)
     token_delta = _extract_max_abs_token_delta(tagged_balances, mint)
-    wsol_delta = _extract_max_abs_token_delta(tagged_balances, WSOL_MINT)
     if not token_delta or not wsol_delta:
         return None
 
@@ -642,6 +695,22 @@ def fetch_ws_exit_market_from_transaction(signature: str, mint: str) -> Optional
         mcap = token_price_usd * (supply / (10 ** decimals))
     if not mcap:
         return None
+
+    # Validate computed mcap against cached price. A ratio beyond
+    # HELIUS_TX_MAX_PRICE_RATIO (default 3×) in either direction means the
+    # delta extraction likely picked up a non-swap operation — discard and let
+    # ws_monitor fall back to the DexScreener/Jupiter price path.
+    cached = _price_cache_get(mint, max_age=120)
+    if cached and cached.get("mcap"):
+        cached_mcap = float(cached["mcap"])
+        if cached_mcap > 0:
+            ratio = mcap / cached_mcap
+            if ratio > HELIUS_TX_MAX_PRICE_RATIO or ratio < (1.0 / HELIUS_TX_MAX_PRICE_RATIO):
+                log.warning(
+                    f"[fetcher] helius_tx sanity fail {mint[:8]}..."
+                    f" computed={mcap:.0f} cached={cached_mcap:.0f} ratio={ratio:.2f}x — discarding"
+                )
+                return None
 
     return {
         "price_usd": token_price_usd,
