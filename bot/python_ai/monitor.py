@@ -271,6 +271,22 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
         result["skipped"] = True
         return result
 
+    # Log the REST-sweep price to ws_market_observations. This feed updates
+    # peak_mcap (paper + live) but was previously never persisted, so phantom
+    # peaks originating here were invisible in the observation table. Persisting
+    # it makes every peak source auditable via the db_peak vs observed_peak
+    # cross-check. See memory: phantom_peak_root_cause.
+    if not dry_run:
+        try:
+            db.insert_ws_market_observation(
+                call_id=call_id,
+                mint_address=mint,
+                signature=None,
+                market=market,
+            )
+        except Exception as e:
+            print(f"[monitor] {symbol_pad} observation write failed: {e}")
+
     # ── Peak update ───────────────────────────────────────────────────────────
     is_new_peak = current_mult > stored_peak
     if is_new_peak:

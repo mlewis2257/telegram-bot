@@ -893,16 +893,29 @@ def fetch_prices_batch_jupiter(mints: list[str]) -> dict[str, float]:
 
 def get_mcap_blended(mint: str, jup_price_usd: float) -> Optional[float]:
     """
-    Compute current USD mcap by scaling a cached DexScreener mcap baseline
-    by the Jupiter price ratio. No extra API call needed.
-    Returns None if no DexScreener baseline is cached yet.
+    Compute current USD mcap from the Jupiter price and the token's real
+    circulating supply: mcap = price * (supply / 10**decimals).
+
+    This is the SAME single-source computation _fetch_jupiter_price uses; it
+    just reuses an already-fetched batch price so no extra price call is needed.
+    Supply is served from a 5-minute cache (_fetch_token_supply_helius), so this
+    is usually free.
+
+    IMPORTANT: do NOT scale a cached mcap by a cross-source price ratio. The
+    cached baseline and the Jupiter quote come from different price sources
+    (DexScreener last-trade vs Jupiter quote) and for thin memecoins those
+    routinely differ 1.5-2.2x. That ratio multiplied straight into the mcap,
+    producing phantom peaks ~2x the real value, which armed the trailing stop
+    on moves that never happened and force-exited positions at breakeven.
+    See memory: phantom_peak_root_cause.
+
+    Returns None if supply is unavailable (caller falls back to a full fetch).
     """
-    stale = _price_cache_get(mint, max_age=300)
-    if stale and stale.get("price_usd") and stale.get("mcap"):
-        try:
-            return float(stale["mcap"]) * (jup_price_usd / float(stale["price_usd"]))
-        except (ZeroDivisionError, TypeError):
-            return None
+    if not jup_price_usd or jup_price_usd <= 0:
+        return None
+    supply, decimals = _fetch_token_supply_helius(mint)
+    if supply and decimals is not None:
+        return jup_price_usd * (supply / (10 ** decimals))
     return None
 
 

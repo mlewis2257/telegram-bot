@@ -145,8 +145,10 @@ def apply_exit_config(
             config.profit_floor_tiers, key=lambda t: t[0], reverse=True
         ):
             if peak_mult >= peak_trigger and current_mult <= floor_mult:
+                # Record the real price at exit, not the theoretical floor — the
+                # floor is the trigger condition, current_mcap is what we sell at.
                 return ExitResult(
-                    True, "profit_floor", exit_mcap=entry_mcap * floor_mult
+                    True, "profit_floor", exit_mcap=current_mcap
                 )
 
     # ── 3. Trailing stop ──────────────────────────────────────────────────────
@@ -163,10 +165,16 @@ def apply_exit_config(
             if trail_pct is not None:
                 drawdown = (peak_mcap - current_mcap) / peak_mcap
                 if drawdown >= trail_pct:
+                    # Record the real price at exit, not the trail trigger level.
+                    # peak_mcap * (1 - trail_pct) is the threshold that fires the
+                    # stop; the actual sell happens at current_mcap, which is at
+                    # or below that threshold. Recording the threshold overstated
+                    # every trail exit (paper booked fake wins, live's recorded
+                    # exit_price did not match the real fill).
                     return ExitResult(
                         True,
                         "trail_stop",
-                        exit_mcap=peak_mcap * (1.0 - trail_pct),
+                        exit_mcap=current_mcap,
                     )
 
     # ── 4. Hard stop ──────────────────────────────────────────────────────────

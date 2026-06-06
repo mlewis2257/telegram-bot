@@ -215,6 +215,21 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             db.set_call_skip_reason(call_id, "duplicate")
             return False
 
+        # ── Guard 5b: re-entry cooldown ────────────────────────────────────────
+        # Don't immediately re-buy a mint we just sold — avoids churning fees on
+        # the same name when a fresh call arrives shortly after an exit.
+        # Disabled when LIVE_REENTRY_COOLDOWN_SECS <= 0.
+        cooldown = float(os.getenv("LIVE_REENTRY_COOLDOWN_SECS", "1800"))
+        if cooldown > 0:
+            since_exit = db.seconds_since_last_live_exit_for_mint(mint)
+            if since_exit is not None and since_exit < cooldown:
+                print(
+                    f"[live] {symbol} skipped — re-entry cooldown "
+                    f"({since_exit:.0f}s since last exit < {cooldown:.0f}s) mint={mint[:12]}..."
+                )
+                db.set_call_skip_reason(call_id, "reentry_cooldown")
+                return False
+
         # ── Guard 6: SOL balance ───────────────────────────────────────────────
         size = _position_size(label)
         try:

@@ -1513,6 +1513,36 @@ def has_open_live_position_for_mint(mint_address: str) -> bool:
         return cur.fetchone() is not None
 
 
+def seconds_since_last_live_exit_for_mint(mint_address: str) -> float | None:
+    """
+    Seconds since the most recent CLOSED live position for this mint exited.
+
+    Returns None if the mint has never had a closed live position. Used to
+    enforce a re-entry cooldown so the bot doesn't immediately re-buy a coin
+    it just sold (churning fees on the same name).
+    """
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT EXTRACT(EPOCH FROM (now() - tp.exit_time))
+            FROM trading_positions tp
+            JOIN calls  c ON c.id = tp.call_id
+            JOIN tokens t ON t.id = c.token_id
+            WHERE t.mint_address = %s
+              AND tp.is_simulation = FALSE
+              AND tp.status = 'closed'
+              AND tp.exit_time IS NOT NULL
+            ORDER BY tp.exit_time DESC
+            LIMIT 1
+            """,
+            (mint_address,),
+        )
+        row = cur.fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
+
 def has_open_paper_position_for_mint(mint: str, is_strategy_b: bool = False) -> bool:
     """Check if ANY open paper position exists for this mint address."""
     conn = get_conn()
