@@ -32,6 +32,7 @@ import data_fetcher
 import paper_trader
 import paper_trader_b
 import live_trader
+import peak_guard
 from exit_config import EXIT_A_PAPER, EXIT_B_PAPER
 
 # Exit configs must match what monitor.py uses so WS and polling exits
@@ -335,22 +336,21 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
         if position_a:
             entry_price  = position_a["entry_price"]
             peak_mcap_db = float(position_a.get("peak_mcap") or 0.0)
-            peak_mult_db = float(position_a.get("peak_multiplier") or 0.0)
-            current_mult = (current_mcap / entry_price) if entry_price else 0.0
-            if current_mult > peak_mult_db:
-                db.update_paper_position_peak(call_id, current_mcap, current_mult, is_strategy_b=False)
-                peak_mcap_db = current_mcap
+            cached_peak  = _a_realtime_peak_mcap.get(call_id, 0.0)
 
-            cached_peak = _a_realtime_peak_mcap.get(call_id, 0.0)
-            peak_mcap_a = max(peak_mcap_db, cached_peak)
-            if current_mcap > peak_mcap_a:
-                peak_mcap_a = current_mcap
-                _a_realtime_peak_mcap[call_id] = current_mcap
+            # Corroboration guard: a single spurious spike can't ratchet the peak.
+            prior_peak  = max(peak_mcap_db, cached_peak)
+            peak_mcap_a = peak_guard.guard_peak(f"wsA:{call_id}", current_mcap, prior_peak)
+            if peak_mcap_a > prior_peak:
+                _a_realtime_peak_mcap[call_id] = peak_mcap_a
+                new_mult = (peak_mcap_a / entry_price) if entry_price else 0.0
+                db.update_paper_position_peak(call_id, peak_mcap_a, new_mult, is_strategy_b=False)
+                peak_mcap_db = peak_mcap_a
                 print(
                     f"[ws_monitor] {mint[:8]} A realtime peak"
                     f" call_id={call_id}"
-                    f" mcap=${current_mcap/1000:.1f}k"
-                    f" mult={current_mult:.2f}x"
+                    f" mcap=${peak_mcap_a/1000:.1f}k"
+                    f" mult={new_mult:.2f}x"
                 )
             effective_a_peak = peak_mcap_a  # capture before potential pop
 
@@ -377,11 +377,13 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
         if position_b:
             entry_price  = position_b["entry_price"]
             peak_mcap_b  = float(position_b.get("peak_mcap") or 0.0)
-            peak_mult_b  = float(position_b.get("peak_multiplier") or 0.0)
-            current_mult = (current_mcap / entry_price) if entry_price else 0.0
-            if current_mult > peak_mult_b:
-                db.update_paper_position_peak(call_id, current_mcap, current_mult, is_strategy_b=True)
-                peak_mcap_b = current_mcap
+
+            # Corroboration guard before advancing the peak.
+            guarded_b = peak_guard.guard_peak(f"wsB:{call_id}", current_mcap, peak_mcap_b)
+            if guarded_b > peak_mcap_b:
+                new_mult = (guarded_b / entry_price) if entry_price else 0.0
+                db.update_paper_position_peak(call_id, guarded_b, new_mult, is_strategy_b=True)
+                peak_mcap_b = guarded_b
 
             result_b = paper_trader_b.check_exits(
                 call_id, current_mcap, peak_mcap_b, entry_price,
@@ -416,7 +418,10 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
             # proxy for live — ensures a fast DexScreener pump that ws_monitor
             # missed on-chain still arms the live trail.
             cached_peak    = _live_realtime_peak_mcap.get(call_id, 0.0)
-            peak_mcap_live = max(peak_mcap_db, cached_peak, effective_a_peak, current_mcap)
+            # effective_a_peak is already guard-corroborated (paper A path above),
+            # so fold it in directly; only the raw current_mcap needs the guard.
+            prior_peak     = max(peak_mcap_db, cached_peak, effective_a_peak)
+            peak_mcap_live = peak_guard.guard_peak(f"wsL:{call_id}", current_mcap, prior_peak)
             if peak_mcap_live > max(peak_mcap_db, cached_peak):
                 _live_realtime_peak_mcap[call_id] = peak_mcap_live
                 live_peak_mult = (peak_mcap_live / entry_price) if entry_price else 0.0
@@ -453,6 +458,8 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
     # ── Unsubscribe when all three positions are closed ───────────────────────
     if a_done and b_done and live_done:
         _call_first_seen.pop(call_id, None)
+        for _lane in ("wsA", "wsB", "wsL"):
+            peak_guard.clear(f"{_lane}:{call_id}")
         await _mgr.unsubscribe(ws, mint)
 
 

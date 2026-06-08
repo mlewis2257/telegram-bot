@@ -36,6 +36,7 @@ import alert_bot
 import paper_trader
 import paper_trader_b
 import live_trader
+import peak_guard
 import jupiter
 import wallet as _wallet
 from exit_config import EXIT_A_PAPER, EXIT_B_PAPER
@@ -288,16 +289,22 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
             print(f"[monitor] {symbol_pad} observation write failed: {e}")
 
     # ── Peak update ───────────────────────────────────────────────────────────
-    is_new_peak = current_mult > stored_peak
+    # Corroboration guard: a single spurious high reading from this REST sweep
+    # can't ratchet the peak. Guard works in mcap space, so convert through
+    # mcap_at_call. See peak_guard.py / memory: phantom_peak_root_cause.
+    prior_peak_mcap = stored_peak * mcap_at_call
+    guarded_mcap    = peak_guard.guard_peak(f"mon:{call_id}", current_mcap, prior_peak_mcap)
+    guarded_mult    = (guarded_mcap / mcap_at_call) if mcap_at_call else 0.0
+    is_new_peak = guarded_mult > stored_peak
     if is_new_peak:
         if not dry_run:
-            db.update_peak_multiplier(call_id, current_mult)
-        active_peak = current_mult
+            db.update_peak_multiplier(call_id, guarded_mult)
+        active_peak = guarded_mult
         result["new_peak"] = True
         tag = "[data]" if data_only else "[monitor]"
         print(
             f"{tag} {symbol_pad} call_id={call_id}"
-            f"  NEW PEAK {_fmt_mult(current_mult)} ↑"
+            f"  NEW PEAK {_fmt_mult(guarded_mult)} ↑"
         )
     else:
         active_peak = stored_peak
@@ -399,24 +406,52 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
 
     # ── Paper trade exit check ────────────────────────────────────────────────
     if not dry_run:
-        peak_mcap   = active_peak * mcap_at_call
-        exit_result = paper_trader.check_exits(
-            call_id, current_mcap, peak_mcap, mcap_at_call,
-            mint=mint, is_strategy_b=False, exit_config=EXIT_A_PAPER,
-        )
-        if exit_result.should_exit:
-            exit_mcap = exit_result.exit_mcap or current_mcap
-            paper_trader.close_position(call_id, exit_mcap, exit_result.reason, is_strategy_b=False)
-            print(f"  [paper] {symbol} closed — {exit_result.reason}")
+        # Call-level peak (absolute mcap). Kept ONLY as a supplementary proxy for
+        # the live trail below — NOT as a paper exit baseline. See the per-trade
+        # baselines used in the exit checks that follow.
+        peak_mcap = active_peak * mcap_at_call
 
-        exit_result_b = paper_trader_b.check_exits(
-            call_id, current_mcap, peak_mcap, mcap_at_call,
-            mint=mint, is_strategy_b=True, exit_config=EXIT_B_PAPER,
-        )
-        if exit_result_b.should_exit:
-            exit_mcap_b = exit_result_b.exit_mcap or current_mcap
-            paper_trader_b.close_position(call_id, exit_mcap_b, exit_result_b.reason, is_strategy_b=True)
-            print(f"  [paper_b] {symbol} closed — {exit_result_b.reason}")
+        # ── Paper A exit ───────────────────────────────────────────────────────
+        # CRITICAL: judge the exit from the TRADE's own entry_price and its
+        # trade-tracked peak — never from mcap_at_call. When the bot enters above
+        # the call price (late entry on an already-pumped coin), using mcap_at_call
+        # as the baseline counts the pre-entry pump toward peak_mult and arms/fires
+        # the trail or hard-stop instantly (the 5–60s premature trail_stops). This
+        # mirrors the live block below and ws_monitor's paper path.
+        pos_a = db.get_open_paper_position(call_id, is_strategy_b=False)
+        if pos_a and pos_a.get("entry_price"):
+            a_entry   = float(pos_a["entry_price"])
+            a_db_peak = float(pos_a.get("peak_mcap") or 0)
+            a_peak    = peak_guard.guard_peak(f"monPA:{call_id}", current_mcap, a_db_peak)
+            if a_peak > a_db_peak and a_entry > 0:
+                db.update_paper_position_peak(call_id, a_peak, a_peak / a_entry, is_strategy_b=False)
+            exit_result = paper_trader.check_exits(
+                call_id, current_mcap, a_peak, a_entry,
+                mint=mint, is_strategy_b=False, exit_config=EXIT_A_PAPER,
+            )
+            if exit_result.should_exit:
+                exit_mcap = exit_result.exit_mcap or current_mcap
+                paper_trader.close_position(call_id, exit_mcap, exit_result.reason, is_strategy_b=False)
+                peak_guard.clear(f"monPA:{call_id}")
+                print(f"  [paper] {symbol} closed — {exit_result.reason}")
+
+        # ── Paper B exit ───────────────────────────────────────────────────────
+        pos_b = db.get_open_paper_position(call_id, is_strategy_b=True)
+        if pos_b and pos_b.get("entry_price"):
+            b_entry   = float(pos_b["entry_price"])
+            b_db_peak = float(pos_b.get("peak_mcap") or 0)
+            b_peak    = peak_guard.guard_peak(f"monPB:{call_id}", current_mcap, b_db_peak)
+            if b_peak > b_db_peak and b_entry > 0:
+                db.update_paper_position_peak(call_id, b_peak, b_peak / b_entry, is_strategy_b=True)
+            exit_result_b = paper_trader_b.check_exits(
+                call_id, current_mcap, b_peak, b_entry,
+                mint=mint, is_strategy_b=True, exit_config=EXIT_B_PAPER,
+            )
+            if exit_result_b.should_exit:
+                exit_mcap_b = exit_result_b.exit_mcap or current_mcap
+                paper_trader_b.close_position(call_id, exit_mcap_b, exit_result_b.reason, is_strategy_b=True)
+                peak_guard.clear(f"monPB:{call_id}")
+                print(f"  [paper_b] {symbol} closed — {exit_result_b.reason}")
 
         # ── Live trade exit check ──────────────────────────────────────────────
         # Uses the live position's own DB-backed peak — independent of paper A's
@@ -426,14 +461,14 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
             if pos_live:
                 live_entry_price  = pos_live["entry_price"]
                 live_current_mult = (current_mcap / live_entry_price) if live_entry_price else 0.0
-                # Use the higher of: live's own DB peak, paper A's DexScreener peak,
-                # or current price. Entry prices are identical so paper A's peak is valid.
-                live_peak_mcap = max(
-                    float(pos_live["peak_mcap"] or 0),
-                    peak_mcap,
-                    current_mcap,
-                )
-                if live_peak_mcap > float(pos_live["peak_mcap"] or 0) and live_entry_price > 0:
+                # Use the higher of: live's own DB peak, paper A's (already
+                # guard-corroborated) peak, or the guarded current price. peak_mcap
+                # is corroborated via the paper peak block above; only the raw
+                # current_mcap needs the corroboration guard here.
+                live_db_peak = float(pos_live["peak_mcap"] or 0)
+                prior_live   = max(live_db_peak, peak_mcap)
+                live_peak_mcap = peak_guard.guard_peak(f"monL:{call_id}", current_mcap, prior_live)
+                if live_peak_mcap > live_db_peak and live_entry_price > 0:
                     db.update_live_position_peak(call_id, live_peak_mcap, live_peak_mcap / live_entry_price)
                 live_exit = live_trader.check_live_exits(
                     call_id, current_mcap, live_peak_mcap, live_entry_price,
@@ -442,6 +477,7 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
                 if live_exit.should_exit:
                     exit_mcap_live = live_exit.exit_mcap or current_mcap
                     await live_trader.close_live_position(call_id, exit_mcap_live, live_exit.reason)
+                    peak_guard.clear(f"monL:{call_id}")
                     print(f"  [live] {symbol} closed — {live_exit.reason}")
         except Exception as le:
             print(f"  [live] exit check error for {symbol} call_id={call_id}: {le}")

@@ -26,8 +26,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 import db
 import data_fetcher
 import alert_bot
+from dataclasses import replace as _dc_replace
 from strategy_config import STRATEGY_A_V2026_05_22
 from strategy_engine import StrategyCallContext, evaluate_strategy_a_entry
+
+# Paper Strategy A enters free solhousesignal earlier (10k) than live trading and
+# Strategy B, which keep the shared config's 20k floor. Derived from the shared
+# config so every other gate stays identical.
+STRATEGY_A_PAPER = _dc_replace(STRATEGY_A_V2026_05_22, free_min_entry_mcap=10_000)
 from exit_config import ExitConfig, ExitResult, apply_exit_config, EXIT_A_PAPER
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -231,7 +237,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                         dev_tokens_made=token_onchain.get("dev_tokens_made"),
                         symbol=symbol,
                     ),
-                    STRATEGY_A_V2026_05_22,
+                    STRATEGY_A_PAPER,
                 )
                 if not decision.should_trade:
                     print(f"[paper] {symbol} skipped — {decision.reason}")
