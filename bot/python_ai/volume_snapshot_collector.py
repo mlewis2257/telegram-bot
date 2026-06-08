@@ -22,7 +22,20 @@ import data_fetcher
 import db
 
 
-DEFAULT_SNAPSHOT_MINUTES = (0, 5, 15, 30, 60)
+DEFAULT_SNAPSHOT_MINUTES = (0, 15, 30, 60, 120, 240, 360, 720)
+
+# The offsets the cron is *expected* to collect. If a run's --minutes is missing
+# any of these, we warn loudly — this is what silently killed 5m/15m (they were
+# simply dropped from --minutes and went dark with no signal). Override via env
+# if you intentionally change the schedule so the guard doesn't go stale.
+EXPECTED_SNAPSHOT_MINUTES = tuple(
+    int(x.strip())
+    for x in os.getenv(
+        "VOLUME_SNAPSHOT_EXPECTED_MINUTES",
+        ",".join(str(m) for m in DEFAULT_SNAPSHOT_MINUTES),
+    ).split(",")
+    if x.strip()
+)
 
 
 def _parse_minutes(raw: str | None) -> list[int]:
@@ -188,6 +201,21 @@ def main() -> None:
     print("=" * 72)
     print("Volume Snapshot Collector")
     print("=" * 72)
+
+    warnings: list[str] = []
+
+    # Guard 1: a configured run missing an expected offset = silent data gap.
+    # (This is exactly how 5m/15m went dark — trimmed from --minutes with no signal.)
+    missing_offsets = [m for m in EXPECTED_SNAPSHOT_MINUTES if m not in snapshot_minutes]
+    if missing_offsets:
+        msg = (
+            f"configured --minutes is missing expected offset(s) "
+            f"{missing_offsets} — these will collect NO data this run "
+            f"(check the cron's --minutes or VOLUME_SNAPSHOT_EXPECTED_MINUTES)"
+        )
+        warnings.append(msg)
+        print(f"⚠️  WARNING: {msg}")
+
     total_due = 0
     total_inserted = 0
     total_skipped = 0
@@ -207,8 +235,24 @@ def main() -> None:
         total_inserted += inserted
         total_skipped += skipped
         print(f"t+{minute:02d}m  due={due}  inserted={inserted}  skipped={skipped}")
+
+        # Guard 2: candidates were due but nothing stored = the feed for this
+        # offset is failing (fetch errors / market-context filter / mcap floor).
+        # due==0 is normal (nothing old enough yet, or all already captured), so
+        # only warn when there was work to do and none of it landed.
+        if due > 0 and inserted == 0:
+            msg = f"t+{minute:02d}m had {due} calls due but stored 0 (fetch failures or over-filtering?)"
+            warnings.append(msg)
+            print(f"⚠️  WARNING: {msg}")
+
     print("-" * 72)
     print(f"total_due={total_due}  total_inserted={total_inserted}  total_skipped={total_skipped}")
+
+    if warnings:
+        print("-" * 72)
+        print(f"⚠️  {len(warnings)} warning(s) this run:")
+        for w in warnings:
+            print(f"   - {w}")
 
 
 if __name__ == "__main__":
