@@ -144,7 +144,13 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             token_onchain = {}
             if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
                 try:
-                    market = data_fetcher.fetch_token_price(mint)
+                    # Price the entry on the SAME (Jupiter-first) feed used for
+                    # monitoring/exit. DexScreener prints the marginal/last-trade
+                    # mcap, which on thin coins sits 5-15% above the Jupiter
+                    # executable price — so a DexScreener entry was born underwater
+                    # on the Jupiter ruler that the hard-stop/exit measures against,
+                    # systematically understating PnL and tripping stops early.
+                    market = data_fetcher.fetch_token_price_fast(mint)
                     if market and market.get("mcap"):
                         actual_entry = float(market["mcap"])
                     if market and market.get("volume_h1"):
@@ -153,7 +159,7 @@ async def open_position(score_result: dict, token_data: dict) -> None:
                 except Exception as e:
                     print(f"[paper] price fetch failed for {symbol}: {e}")
             if actual_entry is None and mint:
-                print(f"[paper] {symbol} DexScreener returned no mcap — using msg price ${msg_mcap/1000:.1f}k")
+                print(f"[paper] {symbol} no live mcap — using msg price ${msg_mcap/1000:.1f}k")
 
             # ── Live mcap gate for VIP gamble-sized entries ───────────────────────
             # Checks run against actual_entry (live market price at open time),
