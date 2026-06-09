@@ -215,8 +215,18 @@ EXIT_A_PAPER = ExitConfig(
     ),
     hard_stop_pct=0.35,
     vip_gamble_hard_stop_pct=0.30,
-    profit_floor_tiers=(),               # no floor — A trails freely
-    profit_floor_channels=frozenset(),
+    # Profit floor below the 2x trail-arm. The old mcap_at_call exit bug was
+    # accidentally trailing positions out near their local top (~1.3-1.8x),
+    # which WAS the win rate. Fixing the baseline removed that, so coins now pump
+    # 1.3-1.8x and ride back to the -35% hard stop with no protection. These tiers
+    # lock gains on a pullback FROM a peak — a steady climber never pulls back to
+    # the floor, so true runners still reach the trail; only reversers are caught.
+    profit_floor_tiers=(
+        (2.0,  1.55),   # peaked 2.0x → exit if it falls back to 1.55x (~+55%)
+        (1.6,  1.30),   # peaked 1.6x → exit if it falls back to 1.30x (~+30%)
+        (1.35, 1.15),   # peaked 1.35x → exit if it falls back to 1.15x (~+15%)
+    ),
+    profit_floor_channels=frozenset({"solhousesignal", "solhousesignal_vip"}),
     max_hours=24.0,
 )
 
