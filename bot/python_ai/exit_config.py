@@ -312,6 +312,30 @@ EXIT_LIVE_V3 = ExitConfig(
     max_hours=24.0,
 )
 
+# Ride — experimental "let winners run" profile for the shadow experiment.
+# The thesis under test: the multi-move VIP runners pay for the dumps IF you don't
+# cap them early. So: NO profit floor (the early-take that capped A at +15%), no TP
+# cap until 50x, and a WIDE trail that arms at 2x and gives runners room to breathe.
+# The -35% hard stop still cuts the coins that never run. Compared head-to-head
+# against EXIT_A_PAPER ("early") on the same calls via shadow_monitor.
+EXIT_RIDE = ExitConfig(
+    name="exit_ride",
+    take_profit_levels=(50.0,),          # effectively uncapped — don't bail on a runner
+    skip_fixed_tp_for_vip_gamble=False,
+    trail_peak_min=2.0,
+    trail_tiers=(
+        (10.0, 0.30),   # at 10x+, allow a 30% pullback before exiting
+        (5.0,  0.32),
+        (3.0,  0.35),
+        (2.0,  0.40),   # wide trail near 2x so chop doesn't shake us out
+    ),
+    hard_stop_pct=0.35,
+    vip_gamble_hard_stop_pct=0.35,
+    profit_floor_tiers=(),               # NO early profit-taking — the whole point
+    profit_floor_channels=frozenset(),
+    max_hours=48.0,                      # hold through multi-day second moves
+)
+
 
 # ── Registry ──────────────────────────────────────────────────────────────────
 
@@ -323,6 +347,7 @@ _REGISTRY: dict[str, ExitConfig] = {
         EXIT_LIVE_V1,
         EXIT_LIVE_V2,
         EXIT_LIVE_V3,
+        EXIT_RIDE,
     )
 }
 

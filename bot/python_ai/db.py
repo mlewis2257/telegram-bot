@@ -1298,7 +1298,12 @@ def close_paper_position(
 # construction. Managed solely by shadow_monitor.py.
 
 def ensure_shadow_positions_table() -> None:
-    """Create the shadow_positions table if it doesn't exist. Idempotent."""
+    """
+    Create / migrate the shadow_positions table. Idempotent.
+
+    Holds one row per (call_id, exit_variant) so the SAME call can be shadow-traded
+    under multiple exit profiles (e.g. 'early' vs 'ride') for head-to-head comparison.
+    """
     conn = get_conn()
     safe_rollback()
     with conn.cursor() as cur:
@@ -1307,6 +1312,7 @@ def ensure_shadow_positions_table() -> None:
             CREATE TABLE IF NOT EXISTS shadow_positions (
                 id              bigserial PRIMARY KEY,
                 call_id         integer NOT NULL,
+                exit_variant    text NOT NULL DEFAULT 'early',
                 token_id        integer NOT NULL,
                 vip_tier        text,
                 status          text NOT NULL DEFAULT 'open',
@@ -1325,9 +1331,23 @@ def ensure_shadow_positions_table() -> None:
                     CASE WHEN sol_in > 0 THEN round((sol_out - sol_in) / sol_in * 100, 2)
                          ELSE NULL END) STORED,
                 created_at      timestamptz NOT NULL DEFAULT now(),
-                updated_at      timestamptz NOT NULL DEFAULT now(),
-                UNIQUE (call_id)
+                updated_at      timestamptz NOT NULL DEFAULT now()
             )
+            """
+        )
+        # Migrate older tables (call_id-only unique → composite) idempotently.
+        cur.execute("ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS exit_variant text NOT NULL DEFAULT 'early'")
+        cur.execute("ALTER TABLE shadow_positions DROP CONSTRAINT IF EXISTS shadow_positions_call_id_key")
+        cur.execute(
+            """
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'shadow_positions_call_variant_key'
+                ) THEN
+                    ALTER TABLE shadow_positions
+                        ADD CONSTRAINT shadow_positions_call_variant_key UNIQUE (call_id, exit_variant);
+                END IF;
+            END $$;
             """
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_status ON shadow_positions (status)")
@@ -1339,22 +1359,24 @@ def open_shadow_position(
     entry_price: float,
     sol_in: float,
     vip_tier: str | None,
+    exit_variant: str = "early",
     entry_time: datetime | None = None,
 ) -> bool:
-    """Open a shadow position for a normally-skipped call. No-ops if one exists."""
+    """Open a shadow position for a normally-skipped call under one exit variant.
+    No-ops if a position for this (call_id, exit_variant) already exists."""
     conn = get_conn()
     safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO shadow_positions
-                (call_id, token_id, vip_tier, entry_price, sol_in, entry_time, status)
-            SELECT %s, c.token_id, %s, %s, %s, %s, 'open'
+                (call_id, exit_variant, token_id, vip_tier, entry_price, sol_in, entry_time, status)
+            SELECT %s, %s, c.token_id, %s, %s, %s, %s, 'open'
             FROM calls c
             WHERE c.id = %s
-            ON CONFLICT (call_id) DO NOTHING
+            ON CONFLICT (call_id, exit_variant) DO NOTHING
             """,
-            (call_id, vip_tier, entry_price, sol_in,
+            (call_id, exit_variant, vip_tier, entry_price, sol_in,
              entry_time or datetime.now(timezone.utc), call_id),
         )
         affected = cur.rowcount
@@ -1370,7 +1392,7 @@ def get_open_shadow_positions() -> list[dict]:
         cur.execute(
             """
             SELECT
-                sp.call_id, t.symbol, t.mint_address,
+                sp.call_id, sp.exit_variant, t.symbol, t.mint_address,
                 sp.entry_price, sp.sol_in, sp.entry_time,
                 sp.vip_tier, sp.peak_mcap, sp.peak_multiplier,
                 ch.handle AS channel_handle,
@@ -1387,7 +1409,7 @@ def get_open_shadow_positions() -> list[dict]:
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
-def update_shadow_position_peak(call_id: int, current_mcap: float, current_mult: float) -> bool:
+def update_shadow_position_peak(call_id: int, exit_variant: str, current_mcap: float, current_mult: float) -> bool:
     conn = get_conn()
     safe_rollback()
     with conn.cursor() as cur:
@@ -1395,16 +1417,16 @@ def update_shadow_position_peak(call_id: int, current_mcap: float, current_mult:
             """
             UPDATE shadow_positions
             SET peak_mcap = %s, peak_multiplier = %s, peak_at = NOW(), updated_at = NOW()
-            WHERE call_id = %s AND status = 'open'
+            WHERE call_id = %s AND exit_variant = %s AND status = 'open'
               AND (peak_multiplier IS NULL OR peak_multiplier < %s)
             """,
-            (current_mcap, current_mult, call_id, current_mult),
+            (current_mcap, current_mult, call_id, exit_variant, current_mult),
         )
         conn.commit()
         return cur.rowcount > 0
 
 
-def close_shadow_position(call_id: int, exit_price: float, sol_out: float, exit_reason: str) -> None:
+def close_shadow_position(call_id: int, exit_variant: str, exit_price: float, sol_out: float, exit_reason: str) -> None:
     conn = get_conn()
     safe_rollback()
     with conn.cursor() as cur:
@@ -1413,9 +1435,9 @@ def close_shadow_position(call_id: int, exit_price: float, sol_out: float, exit_
             UPDATE shadow_positions SET
                 exit_price = %s, sol_out = %s, exit_time = NOW(),
                 exit_reason = %s, status = 'closed', updated_at = NOW()
-            WHERE call_id = %s AND status = 'open'
+            WHERE call_id = %s AND exit_variant = %s AND status = 'open'
             """,
-            (exit_price, sol_out, exit_reason, call_id),
+            (exit_price, sol_out, exit_reason, call_id, exit_variant),
         )
         conn.commit()
 

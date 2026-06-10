@@ -27,10 +27,17 @@ sys.path.insert(0, os.path.dirname(__file__))
 import db
 import data_fetcher
 import peak_guard
-from exit_config import EXIT_A_PAPER, apply_exit_config
+from exit_config import EXIT_A_PAPER, EXIT_RIDE, apply_exit_config
 
 PASS_INTERVAL = float(os.getenv("SHADOW_PASS_INTERVAL", "15"))
 MAX_HOURS = float(os.getenv("SHADOW_MAX_HOURS", "24"))
+
+# Each shadow exit_variant -> the exit config it's managed by. 'early' = the current
+# take-profit-early A logic; 'ride' = let winners run. Compared head-to-head.
+_VARIANT_CONFIGS = {
+    "early": EXIT_A_PAPER,
+    "ride": EXIT_RIDE,
+}
 
 
 def _aware(ts):
@@ -50,40 +57,52 @@ async def run_pass() -> int:
     ]
     prices = data_fetcher.fetch_prices_batch_jupiter(mints) if mints else {}
 
+    # Cache mcap per mint within a pass so the two variants of the same coin agree.
+    mcap_cache: dict[str, float | None] = {}
+
+    def _mcap(mint: str):
+        if mint in mcap_cache:
+            return mcap_cache[mint]
+        val = None
+        jp = prices.get(mint)
+        if jp:
+            val = data_fetcher.get_mcap_blended(mint, jp)
+        if not val:
+            m = data_fetcher.fetch_token_price_fast(mint)
+            val = float(m["mcap"]) if m and m.get("mcap") else None
+        mcap_cache[mint] = val
+        return val
+
     closed = 0
     for pos in positions:
         call_id = pos["call_id"]
+        variant = pos.get("exit_variant") or "early"
         mint = pos.get("mint_address")
         entry = float(pos.get("entry_price") or 0)
         if entry <= 0 or not mint:
             continue
+        cfg = _VARIANT_CONFIGS.get(variant, EXIT_A_PAPER)
+        gkey = f"shadow:{variant}:{call_id}"
         try:
-            # Current mcap on the same feed as entry (Jupiter-first).
-            mcap = None
-            jp = prices.get(mint)
-            if jp:
-                mcap = data_fetcher.get_mcap_blended(mint, jp)
-            if not mcap:
-                m = data_fetcher.fetch_token_price_fast(mint)
-                mcap = float(m["mcap"]) if m and m.get("mcap") else None
+            mcap = _mcap(mint)
 
             if not mcap or mcap <= 0:
                 # No data — force-close as delisted after MAX_HOURS (mirrors paper sweep).
                 et = _aware(pos.get("entry_time"))
                 if et and (datetime.now(timezone.utc) - et).total_seconds() / 3600 > MAX_HOURS:
-                    db.close_shadow_position(call_id, 0, 0, "hard_stop")
-                    peak_guard.clear(f"shadow:{call_id}")
+                    db.close_shadow_position(call_id, variant, 0, 0, "hard_stop")
+                    peak_guard.clear(gkey)
                     closed += 1
-                    print(f"[shadow] {pos.get('symbol','?')} delisted — force closed (-100%)")
+                    print(f"[shadow] {pos.get('symbol','?')} [{variant}] delisted — force closed (-100%)")
                 continue
 
             db_peak = float(pos.get("peak_mcap") or 0)
-            peak = peak_guard.guard_peak(f"shadow:{call_id}", mcap, db_peak)
+            peak = peak_guard.guard_peak(gkey, mcap, db_peak)
             if peak > db_peak and entry > 0:
-                db.update_shadow_position_peak(call_id, peak, peak / entry)
+                db.update_shadow_position_peak(call_id, variant, peak, peak / entry)
 
             res = apply_exit_config(
-                EXIT_A_PAPER,
+                cfg,
                 current_mcap=mcap,
                 peak_mcap=max(peak, db_peak),
                 entry_mcap=entry,
@@ -94,16 +113,16 @@ async def run_pass() -> int:
             if res.should_exit:
                 exit_mcap = res.exit_mcap or mcap
                 sol_out = float(pos["sol_in"]) * (exit_mcap / entry)
-                db.close_shadow_position(call_id, exit_mcap, sol_out, res.reason)
-                peak_guard.clear(f"shadow:{call_id}")
+                db.close_shadow_position(call_id, variant, exit_mcap, sol_out, res.reason)
+                peak_guard.clear(gkey)
                 closed += 1
                 print(
-                    f"[shadow] closed {pos.get('symbol','?')} call_id={call_id}"
+                    f"[shadow] closed {pos.get('symbol','?')} [{variant}] call_id={call_id}"
                     f" tier={pos.get('vip_tier')} {res.reason} @ {exit_mcap/entry:.2f}x"
                 )
         except Exception as e:
             db.safe_rollback()
-            print(f"[shadow] exit error call_id={call_id}: {e}")
+            print(f"[shadow] exit error call_id={call_id} [{variant}]: {e}")
 
     return closed
 

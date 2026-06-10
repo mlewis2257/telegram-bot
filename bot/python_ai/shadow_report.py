@@ -22,6 +22,7 @@ import db
 
 QUERY = """
 SELECT
+  sp.exit_variant                                            AS variant,
   COALESCE(sp.vip_tier, 'none')                              AS vip_tier,
   COALESCE(c.skip_reason, 'none')                            AS skip_reason,
   count(*) FILTER (WHERE sp.status='closed')                 AS closed,
@@ -36,8 +37,8 @@ SELECT
 FROM shadow_positions sp
 JOIN calls c ON c.id = sp.call_id
 WHERE ( %s = 0 OR sp.entry_time >= now() - (%s || ' days')::interval )
-GROUP BY 1, 2
-ORDER BY total_sol DESC NULLS LAST
+GROUP BY 1, 2, 3
+ORDER BY vip_tier, skip_reason, variant
 """
 
 
@@ -60,19 +61,21 @@ def main() -> None:
         print("  restart the listener, and run shadow_monitor.py.\n")
         return
 
-    hdr = (f"{'tier':<12} {'skip_reason':<16} {'closed':>6} {'open':>5} {'win%':>6} "
+    hdr = (f"{'tier':<11} {'skip_reason':<15} {'var':<6} {'closed':>6} {'open':>5} {'win%':>6} "
            f"{'avg%':>7} {'total_sol':>10} {'avg_pk':>7} {'2x':>4}")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
-        print(f"{(r['vip_tier'] or '')[:12]:<12} {(r['skip_reason'] or '')[:16]:<16} "
+        print(f"{(r['vip_tier'] or '')[:11]:<11} {(r['skip_reason'] or '')[:15]:<15} "
+              f"{(r['variant'] or '')[:6]:<6} "
               f"{r['closed']:>6} {r['still_open']:>5} "
               f"{(r['win_rate'] if r['win_rate'] is not None else 0):>6} "
               f"{(r['avg_pnl_pct'] if r['avg_pnl_pct'] is not None else 0):>7} "
               f"{(r['total_sol'] if r['total_sol'] is not None else 0):>10} "
               f"{(r['avg_peak'] if r['avg_peak'] is not None else 0):>7} "
               f"{r['hit_2x']:>4}")
-    print()
+    print("\n  Compare 'early' vs 'ride' within each lane: ride should show bigger avg_peak")
+    print("  and (if your thesis holds) higher total_sol despite a lower win rate.\n")
 
 
 if __name__ == "__main__":

@@ -25,6 +25,9 @@ import data_fetcher
 
 SHADOW_LANES = {l.strip() for l in os.getenv("SHADOW_LANES", "").split(",") if l.strip()}
 SHADOW_SOL_IN = float(os.getenv("SHADOW_SOL_IN", "0.5"))
+# Which exit profiles to shadow-trade per call, head-to-head on the same coins.
+# Each must map to an exit_config in shadow_monitor._VARIANT_CONFIGS.
+SHADOW_VARIANTS = [v.strip() for v in os.getenv("SHADOW_VARIANTS", "early,ride").split(",") if v.strip()]
 
 _table_ready = False
 
@@ -73,7 +76,12 @@ async def maybe_open_shadow(score_result: dict, token_data: dict) -> None:
         if entry <= 0:
             return
 
-        if db.open_shadow_position(call_id, entry, SHADOW_SOL_IN, vip_tier):
-            print(f"[shadow] opened {symbol} call_id={call_id} tier={vip_tier} @ ${entry/1000:.1f}k")
+        opened = []
+        for variant in SHADOW_VARIANTS:
+            if db.open_shadow_position(call_id, entry, SHADOW_SOL_IN, vip_tier, exit_variant=variant):
+                opened.append(variant)
+        if opened:
+            print(f"[shadow] opened {symbol} call_id={call_id} tier={vip_tier} "
+                  f"variants={','.join(opened)} @ ${entry/1000:.1f}k")
     except Exception as e:
         print(f"[shadow] maybe_open_shadow error: {e}")
