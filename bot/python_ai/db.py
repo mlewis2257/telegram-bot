@@ -1291,6 +1291,135 @@ def close_paper_position(
         conn.commit()
 
 
+# ── Shadow paper positions (gated-lane experiment) ─────────────────────────────
+# Shadow positions measure the TRUE tradeable PnL of lanes the MAIN strategy skips,
+# without touching the A/B numbers. They live in their OWN table (shadow_positions),
+# so NO existing query over trading_positions can ever see them — isolation by
+# construction. Managed solely by shadow_monitor.py.
+
+def ensure_shadow_positions_table() -> None:
+    """Create the shadow_positions table if it doesn't exist. Idempotent."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shadow_positions (
+                id              bigserial PRIMARY KEY,
+                call_id         integer NOT NULL,
+                token_id        integer NOT NULL,
+                vip_tier        text,
+                status          text NOT NULL DEFAULT 'open',
+                entry_price     numeric NOT NULL,
+                sol_in          numeric NOT NULL,
+                entry_time      timestamptz NOT NULL DEFAULT now(),
+                peak_mcap       numeric,
+                peak_multiplier numeric,
+                peak_at         timestamptz,
+                exit_price      numeric,
+                sol_out         numeric,
+                exit_time       timestamptz,
+                exit_reason     text,
+                pnl_sol numeric GENERATED ALWAYS AS (sol_out - sol_in) STORED,
+                pnl_pct numeric(8,2) GENERATED ALWAYS AS (
+                    CASE WHEN sol_in > 0 THEN round((sol_out - sol_in) / sol_in * 100, 2)
+                         ELSE NULL END) STORED,
+                created_at      timestamptz NOT NULL DEFAULT now(),
+                updated_at      timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (call_id)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_status ON shadow_positions (status)")
+        conn.commit()
+
+
+def open_shadow_position(
+    call_id: int,
+    entry_price: float,
+    sol_in: float,
+    vip_tier: str | None,
+    entry_time: datetime | None = None,
+) -> bool:
+    """Open a shadow position for a normally-skipped call. No-ops if one exists."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO shadow_positions
+                (call_id, token_id, vip_tier, entry_price, sol_in, entry_time, status)
+            SELECT %s, c.token_id, %s, %s, %s, %s, 'open'
+            FROM calls c
+            WHERE c.id = %s
+            ON CONFLICT (call_id) DO NOTHING
+            """,
+            (call_id, vip_tier, entry_price, sol_in,
+             entry_time or datetime.now(timezone.utc), call_id),
+        )
+        affected = cur.rowcount
+        conn.commit()
+        return affected > 0
+
+
+def get_open_shadow_positions() -> list[dict]:
+    """All open shadow positions with the context shadow_monitor needs to manage them."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                sp.call_id, t.symbol, t.mint_address,
+                sp.entry_price, sp.sol_in, sp.entry_time,
+                sp.vip_tier, sp.peak_mcap, sp.peak_multiplier,
+                ch.handle AS channel_handle,
+                c.skip_reason
+            FROM shadow_positions sp
+            JOIN calls    c  ON c.id = sp.call_id
+            JOIN tokens   t  ON t.id = sp.token_id
+            LEFT JOIN channels ch ON ch.id = c.channel_id
+            WHERE sp.status = 'open'
+            ORDER BY sp.entry_time DESC
+            """,
+        )
+        cols = [d.name for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def update_shadow_position_peak(call_id: int, current_mcap: float, current_mult: float) -> bool:
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE shadow_positions
+            SET peak_mcap = %s, peak_multiplier = %s, peak_at = NOW(), updated_at = NOW()
+            WHERE call_id = %s AND status = 'open'
+              AND (peak_multiplier IS NULL OR peak_multiplier < %s)
+            """,
+            (current_mcap, current_mult, call_id, current_mult),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def close_shadow_position(call_id: int, exit_price: float, sol_out: float, exit_reason: str) -> None:
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE shadow_positions SET
+                exit_price = %s, sol_out = %s, exit_time = NOW(),
+                exit_reason = %s, status = 'closed', updated_at = NOW()
+            WHERE call_id = %s AND status = 'open'
+            """,
+            (exit_price, sol_out, exit_reason, call_id),
+        )
+        conn.commit()
+
+
 def get_paper_pnl_summary(is_strategy_b: bool = False) -> dict:
     """
     Return aggregate P&L stats for all closed simulation positions,

@@ -33,6 +33,7 @@ import scorer
 import alert_bot
 import paper_trader
 import paper_trader_b
+import shadow_trader
 import monitor as _monitor
 from parsers import type_a, type_b, type_a_vip
 
@@ -1105,6 +1106,14 @@ def run_listener() -> None:
                 mcap_at_call = float(extra.get("mcap_at_call") or 0)
                 print(f"[vip_debug] tier={vip_tier} mcap={mcap_at_call} score={score} symbol={extra.get('symbol')}")
                 if "solhousesignal_vip" in channel_tag:
+                    # Shadow-trade configured gated lanes for measurement (no-op unless
+                    # SHADOW_LANES is set). Fully independent of the skip logic below and
+                    # of the main exit path — managed only by shadow_monitor.py.
+                    if shadow_trader.enabled():
+                        _track_task(
+                            asyncio.create_task(shadow_trader.maybe_open_shadow(score_result, extra)),
+                            f"shadow call_id={score_result.get('call_id')}",
+                        )
                     call_id = score_result.get("call_id")
                     if vip_tier is None:
                         # No tier data — can't validate, skip explicitly for analysis.
