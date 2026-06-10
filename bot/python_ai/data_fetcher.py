@@ -415,6 +415,7 @@ def _try_dexscreener_price(mint: str) -> Optional[dict]:
             "mcap":          best.get("marketCap"),
             "liquidity_usd": (best.get("liquidity") or {}).get("usd"),
             "volume_h1":     (best.get("volume") or {}).get("h1"),
+            "volume_m5":     (best.get("volume") or {}).get("m5"),   # 5-min — responsive
         }
         _clear_dex_mint_cooldown(mint)
         return result

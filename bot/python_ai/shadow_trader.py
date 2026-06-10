@@ -26,8 +26,10 @@ import data_fetcher
 SHADOW_LANES = {l.strip() for l in os.getenv("SHADOW_LANES", "").split(",") if l.strip()}
 SHADOW_SOL_IN = float(os.getenv("SHADOW_SOL_IN", "0.5"))
 # Which exit profiles to shadow-trade per call, head-to-head on the same coins.
-# Each must map to an exit_config in shadow_monitor._VARIANT_CONFIGS.
-SHADOW_VARIANTS = [v.strip() for v in os.getenv("SHADOW_VARIANTS", "early,ride").split(",") if v.strip()]
+#   early    = take-profit-early (EXIT_A_PAPER)
+#   ride     = let winners run (EXIT_RIDE)
+#   ride_vol = ride while volume confirms, bank early when volume dies
+SHADOW_VARIANTS = [v.strip() for v in os.getenv("SHADOW_VARIANTS", "early,ride,ride_vol").split(",") if v.strip()]
 
 _table_ready = False
 
@@ -65,10 +67,13 @@ async def maybe_open_shadow(score_result: dict, token_data: dict) -> None:
 
         # Real entry on the SAME feed used for monitoring/exit (consistent ruler).
         entry = None
+        entry_vol = None
         try:
             market = data_fetcher.fetch_token_price_fast(mint)
             if market and market.get("mcap"):
                 entry = float(market["mcap"])
+            if market and market.get("volume_h1"):
+                entry_vol = float(market["volume_h1"])
         except Exception as e:
             print(f"[shadow] entry price fetch failed for {symbol}: {e}")
         if not entry or entry <= 0:
@@ -76,9 +81,13 @@ async def maybe_open_shadow(score_result: dict, token_data: dict) -> None:
         if entry <= 0:
             return
 
+        # ride_vol judges momentum from the live 5-min/1h volume ratio at exit time,
+        # so it needs no entry baseline. entry_vol is stored only as a reference when
+        # the entry fetch happened to include it.
         opened = []
         for variant in SHADOW_VARIANTS:
-            if db.open_shadow_position(call_id, entry, SHADOW_SOL_IN, vip_tier, exit_variant=variant):
+            if db.open_shadow_position(call_id, entry, SHADOW_SOL_IN, vip_tier,
+                                       exit_variant=variant, entry_volume=entry_vol):
                 opened.append(variant)
         if opened:
             print(f"[shadow] opened {symbol} call_id={call_id} tier={vip_tier} "

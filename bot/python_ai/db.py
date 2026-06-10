@@ -1337,6 +1337,7 @@ def ensure_shadow_positions_table() -> None:
         )
         # Migrate older tables (call_id-only unique → composite) idempotently.
         cur.execute("ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS exit_variant text NOT NULL DEFAULT 'early'")
+        cur.execute("ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS entry_volume numeric")
         cur.execute("ALTER TABLE shadow_positions DROP CONSTRAINT IF EXISTS shadow_positions_call_id_key")
         cur.execute(
             """
@@ -1360,6 +1361,7 @@ def open_shadow_position(
     sol_in: float,
     vip_tier: str | None,
     exit_variant: str = "early",
+    entry_volume: float | None = None,
     entry_time: datetime | None = None,
 ) -> bool:
     """Open a shadow position for a normally-skipped call under one exit variant.
@@ -1370,13 +1372,13 @@ def open_shadow_position(
         cur.execute(
             """
             INSERT INTO shadow_positions
-                (call_id, exit_variant, token_id, vip_tier, entry_price, sol_in, entry_time, status)
-            SELECT %s, %s, c.token_id, %s, %s, %s, %s, 'open'
+                (call_id, exit_variant, token_id, vip_tier, entry_price, sol_in, entry_volume, entry_time, status)
+            SELECT %s, %s, c.token_id, %s, %s, %s, %s, %s, 'open'
             FROM calls c
             WHERE c.id = %s
             ON CONFLICT (call_id, exit_variant) DO NOTHING
             """,
-            (call_id, exit_variant, vip_tier, entry_price, sol_in,
+            (call_id, exit_variant, vip_tier, entry_price, sol_in, entry_volume,
              entry_time or datetime.now(timezone.utc), call_id),
         )
         affected = cur.rowcount
@@ -1393,7 +1395,7 @@ def get_open_shadow_positions() -> list[dict]:
             """
             SELECT
                 sp.call_id, sp.exit_variant, t.symbol, t.mint_address,
-                sp.entry_price, sp.sol_in, sp.entry_time,
+                sp.entry_price, sp.sol_in, sp.entry_time, sp.entry_volume,
                 sp.vip_tier, sp.peak_mcap, sp.peak_multiplier,
                 ch.handle AS channel_handle,
                 c.skip_reason

@@ -31,9 +31,13 @@ from exit_config import EXIT_A_PAPER, EXIT_RIDE, apply_exit_config
 
 PASS_INTERVAL = float(os.getenv("SHADOW_PASS_INTERVAL", "15"))
 MAX_HOURS = float(os.getenv("SHADOW_MAX_HOURS", "24"))
+# ride_vol momentum gate. RVOL = (last-5-min volume) / (hourly-average 5-min pace)
+#   = volume_m5 / (volume_h1 / 12). >1 = accelerating, <1 = decelerating.
+# Keep RIDING while RVOL >= RVOL_HOLD (move still alive on a 5-min view); once the
+# 5-min pace fades below it, switch to EARLY exits and bank. Checked every pass.
+RVOL_HOLD = float(os.getenv("SHADOW_RVOL_HOLD", "0.8"))
 
-# Each shadow exit_variant -> the exit config it's managed by. 'early' = the current
-# take-profit-early A logic; 'ride' = let winners run. Compared head-to-head.
+# Static variant -> exit config. 'ride_vol' is dynamic (see _pick_config).
 _VARIANT_CONFIGS = {
     "early": EXIT_A_PAPER,
     "ride": EXIT_RIDE,
@@ -57,8 +61,9 @@ async def run_pass() -> int:
     ]
     prices = data_fetcher.fetch_prices_batch_jupiter(mints) if mints else {}
 
-    # Cache mcap per mint within a pass so the two variants of the same coin agree.
+    # Cache mcap per mint within a pass so all variants of the same coin agree.
     mcap_cache: dict[str, float | None] = {}
+    vol_cache: dict[str, float | None] = {}
 
     def _mcap(mint: str):
         if mint in mcap_cache:
@@ -73,6 +78,33 @@ async def run_pass() -> int:
         mcap_cache[mint] = val
         return val
 
+    def _rvol(mint: str):
+        # Relative volume = 5-min volume / hourly-average 5-min pace. From DexScreener
+        # (Jupiter lacks volume). Cached per pass. None if no usable reading.
+        if mint in vol_cache:
+            return vol_cache[mint]
+        val = None
+        try:
+            m = data_fetcher.fetch_token_price(mint)
+            if m:
+                m5 = m.get("volume_m5")
+                h1 = m.get("volume_h1")
+                if m5 is not None and h1 and float(h1) > 0:
+                    val = float(m5) / (float(h1) / 12.0)
+        except Exception:
+            val = None
+        vol_cache[mint] = val
+        return val
+
+    def _pick_config(variant: str, mint: str):
+        """ride_vol: RIDE while 5-min volume is accelerating, else EARLY. Others: static."""
+        if variant != "ride_vol":
+            return _VARIANT_CONFIGS.get(variant, EXIT_A_PAPER)
+        rv = _rvol(mint)
+        if rv is None:
+            return EXIT_RIDE          # no reading → keep riding
+        return EXIT_RIDE if rv >= RVOL_HOLD else EXIT_A_PAPER
+
     closed = 0
     for pos in positions:
         call_id = pos["call_id"]
@@ -81,7 +113,7 @@ async def run_pass() -> int:
         entry = float(pos.get("entry_price") or 0)
         if entry <= 0 or not mint:
             continue
-        cfg = _VARIANT_CONFIGS.get(variant, EXIT_A_PAPER)
+        cfg = _pick_config(variant, mint)
         gkey = f"shadow:{variant}:{call_id}"
         try:
             mcap = _mcap(mint)
