@@ -13,6 +13,8 @@ from typing import Optional
 
 import requests
 
+import order_flow
+
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -705,6 +707,13 @@ def fetch_ws_exit_market_from_transaction(signature: str, mint: str) -> Optional
     if not tx:
         return None
 
+    # Live order flow — extract buy/sell/size/wallet from the SAME tx (no extra fetch)
+    # and feed the rolling per-mint state. Side-effect only; never blocks price calc.
+    try:
+        order_flow.ingest(mint, order_flow.parse_swap(tx, mint))
+    except Exception:
+        pass
+
     meta = tx.get("meta") or {}
     pre = meta.get("preTokenBalances") or []
     post = meta.get("postTokenBalances") or []
@@ -767,6 +776,8 @@ def fetch_ws_exit_market_from_transaction(signature: str, mint: str) -> Optional
         "liquidity_usd": None,
         "volume_h1": None,
         "source": "helius_tx",
+        # live order flow, persisted with the observation (market_json) for analysis
+        "order_flow": order_flow.metrics(mint),
     }
 
 

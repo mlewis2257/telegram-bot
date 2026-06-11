@@ -48,6 +48,11 @@ FEATURES = [
     ("dev_best_mcap",        "dev_best_mc",    None,  None),    # dev's prior best — track record
     ("dev_pct_held",         "dev_held_pct",   None,  None),
     ("dev_tokens_made",      "dev_tokens",     None,  None),
+    # --- live order flow near entry (NULL until order_flow capture accumulates) ---
+    ("net_pressure",         "net_pressure",   None,  None),   # +1 all buys .. -1 all sells
+    ("of_buy_vol",           "of_buy_vol",     None,  None),
+    ("of_uniq_buyers",       "of_uniq_buy",    None,  None),
+    ("of_n_buys",            "of_n_buys",      None,  None),
     # --- structural / risk ---
     ("bundle_pct_remaining", "bundle_pct",     None,  -1),
     ("fake_vol_pct",         "fake_vol_pct",   None,  -1),
@@ -73,10 +78,25 @@ SELECT
   tok.dev_best_mcap, tok.dev_pct_held, tok.dev_tokens_made,
   tok.bundle_pct_remaining, tok.fake_vol_pct, tok.sniper_pct_remaining,
   tok.bundle_count, tok.sniper_count,
-  tok.token_age_minutes
+  tok.token_age_minutes,
+  (ofq.of->>'net_pressure')::numeric   AS net_pressure,
+  (ofq.of->>'buy_vol_sol')::numeric     AS of_buy_vol,
+  (ofq.of->>'unique_buyers')::numeric   AS of_uniq_buyers,
+  (ofq.of->>'n_buys')::numeric          AS of_n_buys
 FROM trading_positions tp
 JOIN calls  c   ON c.id  = tp.call_id
 JOIN tokens tok ON tok.id = tp.token_id
+-- earliest order-flow snapshot within 2 min of entry (NULL if none captured)
+LEFT JOIN LATERAL (
+  SELECT o.market_json->'order_flow' AS of
+  FROM ws_market_observations o
+  WHERE o.mint_address = tok.mint_address
+    AND o.observed_at BETWEEN tp.entry_time AND tp.entry_time + interval '2 minutes'
+    AND o.market_json ? 'order_flow'
+    AND o.market_json->'order_flow' <> 'null'::jsonb
+  ORDER BY o.observed_at
+  LIMIT 1
+) ofq ON true
 WHERE tp.is_simulation = TRUE AND NOT tp.is_strategy_b AND tp.status = 'closed'
   AND tp.peak_multiplier IS NOT NULL
   AND ( %s = 0 OR tp.entry_time >= now() - (%s || ' days')::interval )
