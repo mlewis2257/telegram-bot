@@ -1098,6 +1098,16 @@ def run_listener() -> None:
                 _write_last_message_id(handle, msg.id)
                 return
 
+            # Shadow-trade configured channels/lanes for measurement (no-op unless
+            # SHADOW_LANES is set). Fires for EVERY scored call regardless of channel;
+            # shadow_trader decides which to open. Fully independent of the routing
+            # below and of the main exit path — managed only by shadow_monitor.py.
+            if score_result and extra and shadow_trader.enabled():
+                _track_task(
+                    asyncio.create_task(shadow_trader.maybe_open_shadow(score_result, extra)),
+                    f"shadow call_id={score_result.get('call_id')}",
+                )
+
             # VIP tier-specific position routing
             if cfg["channel_type"] == "vip" and score_result and extra:
                 score       = score_result.get("score", 0)
@@ -1106,14 +1116,6 @@ def run_listener() -> None:
                 mcap_at_call = float(extra.get("mcap_at_call") or 0)
                 print(f"[vip_debug] tier={vip_tier} mcap={mcap_at_call} score={score} symbol={extra.get('symbol')}")
                 if "solhousesignal_vip" in channel_tag:
-                    # Shadow-trade configured gated lanes for measurement (no-op unless
-                    # SHADOW_LANES is set). Fully independent of the skip logic below and
-                    # of the main exit path — managed only by shadow_monitor.py.
-                    if shadow_trader.enabled():
-                        _track_task(
-                            asyncio.create_task(shadow_trader.maybe_open_shadow(score_result, extra)),
-                            f"shadow call_id={score_result.get('call_id')}",
-                        )
                     call_id = score_result.get("call_id")
                     if vip_tier is None:
                         # No tier data — can't validate, skip explicitly for analysis.

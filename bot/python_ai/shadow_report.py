@@ -22,9 +22,10 @@ import db
 
 QUERY = """
 SELECT
-  sp.exit_variant                                            AS variant,
+  COALESCE(ch.handle, '?')                                   AS channel,
   COALESCE(sp.vip_tier, 'none')                              AS vip_tier,
   COALESCE(c.skip_reason, 'none')                            AS skip_reason,
+  sp.exit_variant                                            AS variant,
   count(*) FILTER (WHERE sp.status='closed')                 AS closed,
   count(*) FILTER (WHERE sp.status='open')                   AS still_open,
   count(*) FILTER (WHERE sp.pnl_sol > 0)                     AS wins,
@@ -36,9 +37,10 @@ SELECT
   count(*) FILTER (WHERE sp.peak_multiplier >= 2)            AS hit_2x
 FROM shadow_positions sp
 JOIN calls c ON c.id = sp.call_id
+LEFT JOIN channels ch ON ch.id = c.channel_id
 WHERE ( %s = 0 OR sp.entry_time >= now() - (%s || ' days')::interval )
-GROUP BY 1, 2, 3
-ORDER BY vip_tier, skip_reason, variant
+GROUP BY 1, 2, 3, 4
+ORDER BY channel, vip_tier, skip_reason, variant
 """
 
 
@@ -61,13 +63,14 @@ def main() -> None:
         print("  restart the listener, and run shadow_monitor.py.\n")
         return
 
-    hdr = (f"{'tier':<11} {'skip_reason':<15} {'var':<6} {'closed':>6} {'open':>5} {'win%':>6} "
+    hdr = (f"{'channel':<14} {'tier':<7} {'skip_reason':<14} {'var':<8} {'closed':>6} {'open':>5} {'win%':>6} "
            f"{'avg%':>7} {'total_sol':>10} {'avg_pk':>7} {'2x':>4}")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
-        print(f"{(r['vip_tier'] or '')[:11]:<11} {(r['skip_reason'] or '')[:15]:<15} "
-              f"{(r['variant'] or '')[:6]:<6} "
+        print(f"{(r['channel'] or '')[:14]:<14} {(r['vip_tier'] or '')[:7]:<7} "
+              f"{(r['skip_reason'] or '')[:14]:<14} "
+              f"{(r['variant'] or '')[:8]:<8} "
               f"{r['closed']:>6} {r['still_open']:>5} "
               f"{(r['win_rate'] if r['win_rate'] is not None else 0):>6} "
               f"{(r['avg_pnl_pct'] if r['avg_pnl_pct'] is not None else 0):>7} "

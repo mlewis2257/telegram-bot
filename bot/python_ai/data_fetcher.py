@@ -460,6 +460,54 @@ def _fetch_token_supply_helius(mint: str) -> tuple:
         return None, None
 
 
+def fetch_top_holders_helius(mint: str, top_n: int = 20) -> list[dict]:
+    """
+    Return the current top holders of a mint as [{wallet, ui_amount, rank}].
+
+    Two RPC calls: getTokenLargestAccounts (top token ACCOUNTS) then
+    getMultipleAccounts (jsonParsed) to resolve each token account's OWNER wallet.
+    Needs a real RPC (Helius) — the public endpoint 429s getTokenLargestAccounts.
+    Returns [] on any failure. rank 0 is the largest holder (often the LP/bonding
+    curve — filter program addresses at analysis time, not here).
+    """
+    if not SOLANA_RPC_URL:
+        return []
+    try:
+        r = requests.post(
+            SOLANA_RPC_URL,
+            json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [mint]},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code != 200:
+            return []
+        val = ((r.json().get("result") or {}).get("value")) or []
+        if not val:
+            return []
+        val = val[:top_n]
+        accts = [v["address"] for v in val]
+        amts = [v.get("uiAmount") for v in val]
+
+        r2 = requests.post(
+            SOLANA_RPC_URL,
+            json={"jsonrpc": "2.0", "id": 1, "method": "getMultipleAccounts",
+                  "params": [accts, {"encoding": "jsonParsed"}]},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if r2.status_code != 200:
+            return []
+        infos = ((r2.json().get("result") or {}).get("value")) or []
+
+        out: list[dict] = []
+        for rank, (info, amt) in enumerate(zip(infos, amts)):
+            owner = (((info or {}).get("data") or {}).get("parsed") or {}).get("info", {}).get("owner")
+            if owner:
+                out.append({"wallet": owner, "ui_amount": amt, "rank": rank})
+        return out
+    except Exception as e:
+        log.warning(f"[fetcher] holders fetch failed for {mint[:8]}...: {e}")
+        return []
+
+
 def _fetch_jupiter_simple_price_usd(mint: str) -> Optional[float]:
     """
     Lightweight Jupiter USD price fetch without supply/mcap logic.

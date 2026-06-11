@@ -1863,6 +1863,89 @@ def ensure_token_volume_snapshots_table() -> None:
         conn.commit()
 
 
+# ── Coin holders capture (smart-money bootstrap) ──────────────────────────────
+# Snapshot each coin's top holders shortly after the call. Combined with our
+# existing coin outcomes (peak_multiplier), this lets us RETROACTIVELY score which
+# wallets keep holding winners — bootstrapping a smart-money signal from our own
+# data instead of a paid third party. Needs a real (Helius) RPC.
+
+def ensure_coin_holders_table() -> None:
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS coin_holders (
+                id            bigserial PRIMARY KEY,
+                call_id       integer,
+                mint_address  text NOT NULL,
+                wallet        text NOT NULL,
+                ui_amount     numeric,
+                holder_rank   int,
+                captured_at   timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (call_id, wallet)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_coin_holders_wallet ON coin_holders (wallet)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_coin_holders_mint ON coin_holders (mint_address)")
+        conn.commit()
+
+
+def insert_coin_holders(call_id: int, mint_address: str, holders: list[dict]) -> int:
+    """holders = [{wallet, ui_amount, rank}]. Returns rows inserted."""
+    if not holders:
+        return 0
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO coin_holders (call_id, mint_address, wallet, ui_amount, holder_rank)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (call_id, wallet) DO NOTHING
+            """,
+            [(call_id, mint_address, h["wallet"], h.get("ui_amount"), h.get("rank")) for h in holders],
+        )
+        n = cur.rowcount
+        conn.commit()
+        return n
+
+
+def get_calls_needing_holders(
+    since_hours: int = 48, limit: int = 50, selection: str = "traded"
+) -> list[dict]:
+    """Recent calls with no coin_holders snapshot yet."""
+    conn = get_conn()
+    safe_rollback()
+    selection_sql = {
+        "traded": """
+            AND EXISTS (SELECT 1 FROM trading_positions tp
+                        WHERE tp.call_id = c.id AND tp.is_simulation = TRUE)
+        """,
+        "not_skipped": " AND COALESCE(c.skip_reason,'') IN ('', 'none') ",
+        "all": "",
+    }.get(selection, "")
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT c.id AS call_id, t.mint_address, t.symbol, c.created_at
+            FROM calls c
+            JOIN tokens t ON t.id = c.token_id
+            WHERE c.created_at >= NOW() - (%s * INTERVAL '1 hour')
+              AND t.mint_address IS NOT NULL
+              AND t.mint_address NOT LIKE 'UNKNOWN:%%'
+              AND t.mint_address NOT LIKE 'INFERRED:%%'
+              {selection_sql}
+              AND NOT EXISTS (SELECT 1 FROM coin_holders ch WHERE ch.call_id = c.id)
+            ORDER BY c.created_at DESC
+            LIMIT %s
+            """,
+            (since_hours, limit),
+        )
+        return cur.fetchall()
+
+
 def get_due_volume_snapshot_calls(
     snapshot_minutes: int,
     *,

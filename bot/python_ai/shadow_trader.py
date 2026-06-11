@@ -25,6 +25,13 @@ import data_fetcher
 
 SHADOW_LANES = {l.strip() for l in os.getenv("SHADOW_LANES", "").split(",") if l.strip()}
 SHADOW_SOL_IN = float(os.getenv("SHADOW_SOL_IN", "0.5"))
+# Channels to shadow. For solhousesignal_vip we further restrict to SHADOW_LANES
+# tiers; non-VIP channels (free solhousesignal, solwhaletrending) shadow all calls.
+SHADOW_CHANNELS = {
+    c.strip() for c in
+    os.getenv("SHADOW_CHANNELS", "solhousesignal_vip,solhousesignal,solwhaletrending").split(",")
+    if c.strip()
+}
 # Which exit profiles to shadow-trade per call, head-to-head on the same coins.
 #   early    = take-profit-early (EXIT_A_PAPER)
 #   ride     = let winners run (EXIT_RIDE)
@@ -57,10 +64,15 @@ async def maybe_open_shadow(score_result: dict, token_data: dict) -> None:
         vip_tier = (token_data or {}).get("vip_tier")
         mint = (token_data or {}).get("mint_address")
         symbol = (token_data or {}).get("symbol", "?")
+        channel = ((token_data or {}).get("channel_tag")
+                   or (token_data or {}).get("channel_handle") or "").lstrip("@")
 
-        if not call_id or not vip_tier or vip_tier not in SHADOW_LANES:
+        if not call_id or not mint or mint.startswith(("INFERRED:", "UNKNOWN:")):
             return
-        if not mint or mint.startswith(("INFERRED:", "UNKNOWN:")):
+        if channel not in SHADOW_CHANNELS:
+            return
+        # VIP: restrict to the configured tiers. Non-VIP channels: shadow every call.
+        if channel == "solhousesignal_vip" and (not vip_tier or vip_tier not in SHADOW_LANES):
             return
 
         _ensure_table_once()
