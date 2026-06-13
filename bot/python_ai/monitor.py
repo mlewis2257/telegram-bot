@@ -50,6 +50,11 @@ MAX_WATCHLIST_SPREAD = 50     # above this, spread calls evenly across the windo
 MIN_SCORE            = 45     # minimum conviction_score to include (vip_safe floor)
 MAX_AGE_HOURS        = 24     # only monitor calls from the last N hours
 PAPER_EXIT_SWEEP_EVERY_PASSES = 3  # websocket monitor owns primary protection; poll sweep is fallback
+# A paper position we can NEVER price (delisted/rugged, or a call whose mint never
+# resolved past an INFERRED:/UNKNOWN: placeholder) must not sit open forever. After
+# this many hours with no obtainable price, force it closed at 0 (-100%). Without
+# this, unresolved-mint positions were skipped by the sweep and lingered indefinitely.
+FORCE_CLOSE_UNPRICEABLE_HOURS = 4.0
 
 MILESTONE_THRESHOLDS    = [2.0, 5.0, 10.0]  # send alert on first crossing of each
 SUPPRESS_HISTORICAL_HOURS = 2  # don't fire milestones/drawdowns for stored peaks on old tokens
@@ -611,7 +616,40 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
         symbol = (ref or {}).get("symbol") or "?"
         mint   = (ref or {}).get("mint_address")
 
+        def _force_close_unpriceable(reason_word: str) -> int:
+            """Close any open A/B leg that's past the grace period when no price
+            can be obtained — delisted/rugged, OR a mint that never resolved past
+            an INFERRED:/UNKNOWN: placeholder. Closes at 0 (-100%). Returns count.
+
+            This is the backstop that stops unpriceable positions lingering open
+            forever; both the unresolved-mint and the delisted paths funnel here so
+            they share one threshold (FORCE_CLOSE_UNPRICEABLE_HOURS)."""
+            n = 0
+            now = datetime.now(timezone.utc)
+            for strategy, pos in (("A", pos_a), ("B", pos_b)):
+                if not pos:
+                    continue
+                et = pos.get("entry_time")
+                if not et:
+                    continue
+                if et.tzinfo is None:
+                    et = et.replace(tzinfo=timezone.utc)
+                hours_open = (now - et).total_seconds() / 3600
+                if hours_open <= FORCE_CLOSE_UNPRICEABLE_HOURS:
+                    continue
+                tag = "[paper]" if strategy == "A" else "[paper_b]"
+                print(f"{tag} {symbol} {reason_word} — force closed after {hours_open:.1f}h")
+                if strategy == "A":
+                    paper_trader.close_position(call_id, 0, "hard_stop", is_strategy_b=False)
+                else:
+                    paper_trader_b.close_position(call_id, 0, "hard_stop", is_strategy_b=True)
+                n += 1
+            return n
+
         if not mint or mint.startswith(("INFERRED:", "UNKNOWN:")):
+            # Mint never resolved to a real address — every price fetch is impossible,
+            # so don't just skip (that left these open indefinitely). Cut once aged out.
+            closed += _force_close_unpriceable("unresolved mint")
             continue
 
         try:
@@ -626,22 +664,7 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
                 await asyncio.sleep(INTER_CALL_SLEEP)
 
             if not market or not market.get("mcap"):
-                for strategy, pos in (("A", pos_a), ("B", pos_b)):
-                    if not pos:
-                        continue
-                    entry_time = pos["entry_time"]
-                    if entry_time:
-                        if entry_time.tzinfo is None:
-                            entry_time = entry_time.replace(tzinfo=timezone.utc)
-                        hours_open = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
-                        if hours_open > 4:
-                            tag = "[paper]" if strategy == "A" else "[paper_b]"
-                            print(f"{tag} {symbol} delisted — force closed after {hours_open:.1f}h")
-                            if strategy == "A":
-                                paper_trader.close_position(call_id, 0, "hard_stop", is_strategy_b=False)
-                            else:
-                                paper_trader_b.close_position(call_id, 0, "hard_stop", is_strategy_b=True)
-                            closed += 1
+                closed += _force_close_unpriceable("delisted")
                 continue
 
             current_mcap = float(market["mcap"])
