@@ -14,6 +14,7 @@ from typing import Optional
 import requests
 
 import order_flow
+import rpc_pool
 
 log = logging.getLogger(__name__)
 
@@ -425,6 +426,22 @@ def _try_dexscreener_price(mint: str) -> Optional[dict]:
     return None
 
 
+def _rpc_post(payload: dict, *, timeout: float = REQUEST_TIMEOUT):
+    """POST a JSON-RPC payload to a pooled RPC endpoint.
+
+    Rotates across the configured keys (rpc_pool) and, if the chosen endpoint
+    429s / reports quota exhaustion (-32429), cools it down so the next call lands
+    on a different key. Returns the requests.Response, or None if nothing is
+    configured. Network exceptions propagate to the caller's existing try/except."""
+    url = rpc_pool.http_url() or SOLANA_RPC_URL
+    if not url:
+        return None
+    resp = requests.post(url, json=payload, timeout=timeout)
+    if rpc_pool.is_quota_error(resp.status_code, resp.text[:300] if resp.content else None):
+        rpc_pool.penalize(url)
+    return resp
+
+
 def _fetch_token_supply_helius(mint: str) -> tuple:
     """
     Fetch token supply and decimals from Helius RPC via getTokenSupply.
@@ -434,20 +451,16 @@ def _fetch_token_supply_helius(mint: str) -> tuple:
     cached = _supply_cache.get(mint)
     if cached and (time.monotonic() - cached[2]) < SUPPLY_CACHE_TTL:
         return cached[0], cached[1]
-    if not SOLANA_RPC_URL:
+    if not rpc_pool.count() and not SOLANA_RPC_URL:
         return None, None
     try:
-        resp = requests.post(
-            SOLANA_RPC_URL,
-            json={
-                "jsonrpc": "2.0",
-                "id":      1,
-                "method":  "getTokenSupply",
-                "params":  [mint],
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code != 200:
+        resp = _rpc_post({
+            "jsonrpc": "2.0",
+            "id":      1,
+            "method":  "getTokenSupply",
+            "params":  [mint],
+        })
+        if not resp or resp.status_code != 200:
             return None, None
         data  = resp.json()
         value = (data.get("result") or {}).get("value") or {}
@@ -472,15 +485,11 @@ def fetch_top_holders_helius(mint: str, top_n: int = 20) -> list[dict]:
     Returns [] on any failure. rank 0 is the largest holder (often the LP/bonding
     curve — filter program addresses at analysis time, not here).
     """
-    if not SOLANA_RPC_URL:
+    if not rpc_pool.count() and not SOLANA_RPC_URL:
         return []
     try:
-        r = requests.post(
-            SOLANA_RPC_URL,
-            json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [mint]},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if r.status_code != 200:
+        r = _rpc_post({"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [mint]})
+        if not r or r.status_code != 200:
             return []
         val = ((r.json().get("result") or {}).get("value")) or []
         if not val:
@@ -489,13 +498,9 @@ def fetch_top_holders_helius(mint: str, top_n: int = 20) -> list[dict]:
         accts = [v["address"] for v in val]
         amts = [v.get("uiAmount") for v in val]
 
-        r2 = requests.post(
-            SOLANA_RPC_URL,
-            json={"jsonrpc": "2.0", "id": 1, "method": "getMultipleAccounts",
-                  "params": [accts, {"encoding": "jsonParsed"}]},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if r2.status_code != 200:
+        r2 = _rpc_post({"jsonrpc": "2.0", "id": 1, "method": "getMultipleAccounts",
+                        "params": [accts, {"encoding": "jsonParsed"}]})
+        if not r2 or r2.status_code != 200:
             return []
         infos = ((r2.json().get("result") or {}).get("value")) or []
 
@@ -557,28 +562,24 @@ def _rpc_get_transaction(
     Fetch one transaction from the configured Solana RPC using jsonParsed encoding.
     Returns the transaction result object, or None on failure.
     """
-    if not SOLANA_RPC_URL or not signature:
+    if (not rpc_pool.count() and not SOLANA_RPC_URL) or not signature:
         return None
     for attempt in range(1, attempts + 1):
         try:
-            resp = requests.post(
-                SOLANA_RPC_URL,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "getTransaction",
-                    "params": [
-                        signature,
-                        {
-                            "encoding": "jsonParsed",
-                            "commitment": commitment,
-                            "maxSupportedTransactionVersion": 0,
-                        },
-                    ],
-                },
-                timeout=REQUEST_TIMEOUT,
-            )
-            if resp.status_code != 200:
+            resp = _rpc_post({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTransaction",
+                "params": [
+                    signature,
+                    {
+                        "encoding": "jsonParsed",
+                        "commitment": commitment,
+                        "maxSupportedTransactionVersion": 0,
+                    },
+                ],
+            })
+            if not resp or resp.status_code != 200:
                 return None
             data = resp.json()
             if data.get("error"):

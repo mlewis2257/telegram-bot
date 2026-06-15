@@ -29,6 +29,7 @@ load_dotenv()
 import websockets
 import db
 import data_fetcher
+import rpc_pool
 import paper_trader
 import paper_trader_b
 import live_trader
@@ -43,10 +44,11 @@ _EXIT_LIVE = live_trader._LIVE_EXIT_CONFIG
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-_rpc_url = os.getenv("SOLANA_RPC_URL", "")
-if not _rpc_url:
-    raise RuntimeError("SOLANA_RPC_URL not set in .env")
-WS_URL = _rpc_url.replace("https://", "wss://").replace("http://", "ws://")
+if not rpc_pool.count():
+    raise RuntimeError("No RPC endpoints configured (set SOLANA_RPC_URL / SOLANA_RPC_URLS in .env)")
+# Static default for logging; the live connection picks a fresh (rotated) endpoint
+# per reconnect via rpc_pool.ws_url(), so a throttled key fails over to the next.
+WS_URL = rpc_pool.ws_url()
 
 HEARTBEAT_INTERVAL    = 30    # seconds between pings
 POLL_INTERVAL         = 2     # seconds between new-position polls
@@ -546,16 +548,17 @@ async def connect_with_retry() -> None:
     poll_task = asyncio.create_task(poll_new_positions(ws_ref))
     try:
         while True:
+            ws_url = rpc_pool.ws_url() or WS_URL
             try:
                 async with websockets.connect(
-                    WS_URL,
+                    ws_url,
                     ping_interval=None,   # manual heartbeat
                     open_timeout=20,
                     close_timeout=10,
                 ) as ws:
                     ws_ref[0] = ws
                     backoff   = 1
-                    print(f"[ws_monitor] connected — {WS_URL[:50]}...")
+                    print(f"[ws_monitor] connected — {ws_url[:50]}...")
 
                     await _mgr.resubscribe_all(ws)
                     await sync_open_positions(ws)
@@ -570,6 +573,11 @@ async def connect_with_retry() -> None:
 
             except Exception as e:
                 ws_ref[0] = None
+                # If this endpoint 429'd / hit quota, cool it down so the next
+                # reconnect rotates to a different key instead of hammering the
+                # exhausted one.
+                if rpc_pool.is_quota_error(getattr(e, "status_code", None), repr(e)):
+                    rpc_pool.penalize(ws_url)
                 print(f"[ws_monitor] disconnected: {e!r} — retrying in {backoff}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX)
