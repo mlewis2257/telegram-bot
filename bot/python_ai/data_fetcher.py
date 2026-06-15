@@ -708,43 +708,51 @@ def fetch_ws_exit_market_from_transaction(signature: str, mint: str) -> Optional
     if not tx:
         return None
 
-    # Live order flow — extract buy/sell/size/wallet from the SAME tx (no extra fetch)
-    # and feed the rolling per-mint state. Side-effect only; never blocks price calc.
+    # Parse the swap ONCE — it feeds both live order flow and the price estimate.
+    swap = order_flow.parse_swap(tx, mint)
     try:
-        order_flow.ingest(mint, order_flow.parse_swap(tx, mint))
+        order_flow.ingest(mint, swap)            # side-effect only; never blocks price
     except Exception:
         pass
-
-    meta = tx.get("meta") or {}
-    pre = meta.get("preTokenBalances") or []
-    post = meta.get("postTokenBalances") or []
-    if not pre and not post:
-        return None
-
-    tagged_balances: list[dict] = []
-    for entry in pre:
-        tagged = dict(entry)
-        tagged["_side"] = "pre"
-        tagged_balances.append(tagged)
-    for entry in post:
-        tagged = dict(entry)
-        tagged["_side"] = "post"
-        tagged_balances.append(tagged)
-
-    # Min for WSOL: avoids large unrelated WSOL transfers (e.g. 100-SOL transfers
-    # in the same TX) inflating the implied price ratio. The swap amount is almost
-    # always the smallest significant WSOL movement in the transaction.
-    # Max for the token: the pool delta is the largest token change in a swap.
-    wsol_delta  = _extract_min_significant_token_delta(tagged_balances, WSOL_MINT, min_amount=0.0001)
-    token_delta = _extract_max_abs_token_delta(tagged_balances, mint)
-    if not token_delta or not wsol_delta:
-        return None
 
     sol_price_usd = _fetch_jupiter_simple_price_usd(WSOL_MINT)
     if not sol_price_usd:
         return None
 
-    token_price_usd = (wsol_delta / token_delta) * sol_price_usd
+    # Primary: price from the trader's TRUE size (parse_swap's fee-payer net SOL vs
+    # token delta — already validated on real swaps). The old min/max delta heuristic
+    # below grabbed tiny fee/tip WSOL movements (≥0.0001 SOL) instead of the swap
+    # amount, computing mcaps ~100x too low (the "sanity fail ratio=0.00x" floods).
+    token_price_usd = None
+    if swap:
+        sz = swap.get("sol_size")
+        ta = swap.get("token_amount")
+        if sz and ta:
+            token_price_usd = (float(sz) / float(ta)) * sol_price_usd
+
+    # Fallback heuristic only when parse_swap couldn't size the tx (e.g. the swapper
+    # isn't the fee payer). The sanity guard below still vets whatever this produces.
+    if not token_price_usd or token_price_usd <= 0:
+        meta = tx.get("meta") or {}
+        pre = meta.get("preTokenBalances") or []
+        post = meta.get("postTokenBalances") or []
+        if not pre and not post:
+            return None
+        tagged_balances: list[dict] = []
+        for entry in pre:
+            tagged = dict(entry)
+            tagged["_side"] = "pre"
+            tagged_balances.append(tagged)
+        for entry in post:
+            tagged = dict(entry)
+            tagged["_side"] = "post"
+            tagged_balances.append(tagged)
+        wsol_delta  = _extract_min_significant_token_delta(tagged_balances, WSOL_MINT, min_amount=0.0001)
+        token_delta = _extract_max_abs_token_delta(tagged_balances, mint)
+        if not token_delta or not wsol_delta:
+            return None
+        token_price_usd = (wsol_delta / token_delta) * sol_price_usd
+
     if token_price_usd <= 0:
         return None
 
