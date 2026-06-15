@@ -29,6 +29,7 @@ load_dotenv()
 import websockets
 import db
 import data_fetcher
+import order_flow
 import rpc_pool
 import paper_trader
 import paper_trader_b
@@ -305,6 +306,16 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
     _maybe_print_market_stats()
 
     current_mcap = float(market["mcap"])
+
+    # Attach live order flow to EVERY observation, not just helius_tx-success ones.
+    # order_flow.ingest already ran during the tx-parse attempt above, so the rolling
+    # state is fresh even when we fell back to a non-helius price (which carries no
+    # order_flow). Without this, ~82% of swaps compute order_flow then discard it
+    # along with the sanity-failed price, capping order_flow coverage at tx_success.
+    if market.get("order_flow") is None:
+        of = order_flow.metrics(mint)
+        if of is not None:
+            market = {**market, "order_flow": of}
 
     try:
         db.insert_ws_market_observation(
