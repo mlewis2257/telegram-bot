@@ -430,12 +430,16 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
             a_peak    = peak_guard.guard_peak(f"monPA:{call_id}", current_mcap, a_db_peak)
             if a_peak > a_db_peak and a_entry > 0:
                 db.update_paper_position_peak(call_id, a_peak, a_peak / a_entry, is_strategy_b=False)
+            # Cap an un-corroborated up-spike for the exit trigger: a_peak holds at
+            # the real level on a phantom, so min() blocks a phantom take-profit while
+            # passing genuine climbs and pullbacks.
+            a_eff = min(current_mcap, a_peak) if a_peak > 0 else current_mcap
             exit_result = paper_trader.check_exits(
-                call_id, current_mcap, a_peak, a_entry,
+                call_id, a_eff, a_peak, a_entry,
                 mint=mint, is_strategy_b=False, exit_config=EXIT_A_PAPER,
             )
             if exit_result.should_exit:
-                exit_mcap = exit_result.exit_mcap or current_mcap
+                exit_mcap = exit_result.exit_mcap or a_eff
                 paper_trader.close_position(call_id, exit_mcap, exit_result.reason, is_strategy_b=False)
                 peak_guard.clear(f"monPA:{call_id}")
                 print(f"  [paper] {symbol} closed — {exit_result.reason}")
@@ -448,12 +452,13 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
             b_peak    = peak_guard.guard_peak(f"monPB:{call_id}", current_mcap, b_db_peak)
             if b_peak > b_db_peak and b_entry > 0:
                 db.update_paper_position_peak(call_id, b_peak, b_peak / b_entry, is_strategy_b=True)
+            b_eff = min(current_mcap, b_peak) if b_peak > 0 else current_mcap
             exit_result_b = paper_trader_b.check_exits(
-                call_id, current_mcap, b_peak, b_entry,
+                call_id, b_eff, b_peak, b_entry,
                 mint=mint, is_strategy_b=True, exit_config=EXIT_B_PAPER,
             )
             if exit_result_b.should_exit:
-                exit_mcap_b = exit_result_b.exit_mcap or current_mcap
+                exit_mcap_b = exit_result_b.exit_mcap or b_eff
                 paper_trader_b.close_position(call_id, exit_mcap_b, exit_result_b.reason, is_strategy_b=True)
                 peak_guard.clear(f"monPB:{call_id}")
                 print(f"  [paper_b] {symbol} closed — {exit_result_b.reason}")
@@ -475,12 +480,13 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
                 live_peak_mcap = peak_guard.guard_peak(f"monL:{call_id}", current_mcap, prior_live)
                 if live_peak_mcap > live_db_peak and live_entry_price > 0:
                     db.update_live_position_peak(call_id, live_peak_mcap, live_peak_mcap / live_entry_price)
+                live_eff = min(current_mcap, live_peak_mcap) if live_peak_mcap > 0 else current_mcap
                 live_exit = live_trader.check_live_exits(
-                    call_id, current_mcap, live_peak_mcap, live_entry_price,
+                    call_id, live_eff, live_peak_mcap, live_entry_price,
                     exit_config=live_trader._LIVE_EXIT_CONFIG,
                 )
                 if live_exit.should_exit:
-                    exit_mcap_live = live_exit.exit_mcap or current_mcap
+                    exit_mcap_live = live_exit.exit_mcap or live_eff
                     await live_trader.close_live_position(call_id, exit_mcap_live, live_exit.reason)
                     peak_guard.clear(f"monL:{call_id}")
                     print(f"  [live] {symbol} closed — {live_exit.reason}")

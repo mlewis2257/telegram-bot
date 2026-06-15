@@ -133,9 +133,18 @@ async def run_pass() -> int:
             if peak > db_peak and entry > 0:
                 db.update_shadow_position_peak(call_id, variant, peak, peak / entry)
 
+            # Guard the EXIT trigger against un-corroborated up-spikes, the same way
+            # peak_guard guards the peak. A single phantom-high reading must not fire
+            # a take-profit (this is what recorded PABLO's 50x_tp at a real 4.9x peak
+            # with +640000% pnl). On a spike, guard_peak holds `peak` at the real
+            # corroborated level, so min(mcap, peak) caps the phantom while still
+            # passing genuine climbs (peak advances with them) and any pullback
+            # (mcap < peak) straight through — so hard/trail stops are unaffected.
+            eff_mcap = min(mcap, peak) if peak > 0 else mcap
+
             res = apply_exit_config(
                 cfg,
-                current_mcap=mcap,
+                current_mcap=eff_mcap,
                 peak_mcap=max(peak, db_peak),
                 entry_mcap=entry,
                 is_vip_gamble=(pos.get("vip_tier") in ("gamble", "gamble_risk")),
@@ -143,7 +152,7 @@ async def run_pass() -> int:
                 entry_time=_aware(pos.get("entry_time")),
             )
             if res.should_exit:
-                exit_mcap = res.exit_mcap or mcap
+                exit_mcap = res.exit_mcap or eff_mcap
                 sol_out = float(pos["sol_in"]) * (exit_mcap / entry)
                 db.close_shadow_position(call_id, variant, exit_mcap, sol_out, res.reason)
                 peak_guard.clear(gkey)

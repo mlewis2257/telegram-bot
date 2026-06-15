@@ -367,12 +367,17 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
                 )
             effective_a_peak = peak_mcap_a  # capture before potential pop
 
+            # Guard the exit trigger against un-corroborated up-spikes: on a phantom
+            # high, peak_mcap_a holds at the real corroborated level, so this caps the
+            # spike while passing genuine climbs and pullbacks. Without it a single bad
+            # reading fires a phantom take-profit (closing at a price that never was).
+            eff_mcap_a = min(current_mcap, peak_mcap_a) if peak_mcap_a > 0 else current_mcap
             result_a = paper_trader.check_exits(
-                call_id, current_mcap, peak_mcap_a, entry_price,
+                call_id, eff_mcap_a, peak_mcap_a, entry_price,
                 mint=mint, is_strategy_b=False, exit_config=_EXIT_A,
             )
             if result_a.should_exit:
-                exit_mcap = result_a.exit_mcap or current_mcap
+                exit_mcap = result_a.exit_mcap or eff_mcap_a
                 paper_trader.close_position(call_id, exit_mcap, result_a.reason, is_strategy_b=False)
                 _a_realtime_peak_mcap.pop(call_id, None)
                 print(f"[ws_monitor] {mint[:8]} A closed — {result_a.reason} @ ${exit_mcap/1000:.1f}k")
@@ -398,12 +403,13 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
                 db.update_paper_position_peak(call_id, guarded_b, new_mult, is_strategy_b=True)
                 peak_mcap_b = guarded_b
 
+            eff_mcap_b = min(current_mcap, peak_mcap_b) if peak_mcap_b > 0 else current_mcap
             result_b = paper_trader_b.check_exits(
-                call_id, current_mcap, peak_mcap_b, entry_price,
+                call_id, eff_mcap_b, peak_mcap_b, entry_price,
                 mint=mint, is_strategy_b=True, exit_config=_EXIT_B,
             )
             if result_b.should_exit:
-                exit_mcap = result_b.exit_mcap or current_mcap
+                exit_mcap = result_b.exit_mcap or eff_mcap_b
                 paper_trader_b.close_position(call_id, exit_mcap, result_b.reason, is_strategy_b=True)
                 print(f"[ws_monitor] {mint[:8]} B closed — {result_b.reason} @ ${exit_mcap/1000:.1f}k")
                 b_done = True
@@ -446,12 +452,15 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
                     f" mult={live_peak_mult:.2f}x"
                 )
 
+            # Same spike guard on the LIVE trigger — a phantom take-profit here would
+            # close a real position at a price that never existed.
+            eff_mcap_live = min(current_mcap, peak_mcap_live) if peak_mcap_live > 0 else current_mcap
             result_live = live_trader.check_live_exits(
-                call_id, current_mcap, peak_mcap_live, entry_price,
+                call_id, eff_mcap_live, peak_mcap_live, entry_price,
                 exit_config=_EXIT_LIVE,
             )
             if result_live.should_exit:
-                exit_mcap = result_live.exit_mcap or current_mcap
+                exit_mcap = result_live.exit_mcap or eff_mcap_live
                 closed = await live_trader.close_live_position(
                     call_id, exit_mcap, result_live.reason
                 )
