@@ -26,10 +26,12 @@ import data_fetcher
 SHADOW_LANES = {l.strip() for l in os.getenv("SHADOW_LANES", "").split(",") if l.strip()}
 SHADOW_SOL_IN = float(os.getenv("SHADOW_SOL_IN", "0.5"))
 # Channels to shadow. For solhousesignal_vip we further restrict to SHADOW_LANES
-# tiers; non-VIP channels (free solhousesignal, solwhaletrending) shadow all calls.
+# tiers; non-VIP channels (free solhousesignal, solwhaletrending, solearlytrending)
+# shadow all calls.
 SHADOW_CHANNELS = {
     c.strip() for c in
-    os.getenv("SHADOW_CHANNELS", "solhousesignal_vip,solhousesignal,solwhaletrending").split(",")
+    os.getenv("SHADOW_CHANNELS",
+              "solhousesignal_vip,solhousesignal,solwhaletrending,solearlytrending").split(",")
     if c.strip()
 }
 # Which exit profiles to shadow-trade per call, head-to-head on the same coins.
