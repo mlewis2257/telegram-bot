@@ -971,9 +971,19 @@ def normalize_chat_id(chat_id: int) -> int:
     return abs(chat_id)
 
 
+# Channels re-listed for SHADOW measurement ONLY — kept out of all paper/live entry
+# by the guard in the message handler below. solearlytrending was cut from trading
+# 2026-03-30 ("losing way too much money"); this lets us re-measure it risk-free.
+SHADOW_ONLY_CHANNELS = {
+    c.strip() for c in os.getenv("SHADOW_ONLY_CHANNELS", "solearlytrending").split(",") if c.strip()
+}
+
+
 def run_listener() -> None:
     channels = db.get_active_channels()
-    channels = [c for c in channels if c["handle"] != "solearlytrending"]
+    # solearlytrending is intentionally re-listed for shadow-only tracking (guarded
+    # against trading downstream). If it doesn't show in shadow_report, confirm it's
+    # active in the channels table.
     if not channels:
         print("[listener] No active channels found in database. Exiting.")
         return
@@ -1107,6 +1117,17 @@ def run_listener() -> None:
                     asyncio.create_task(shadow_trader.maybe_open_shadow(score_result, extra)),
                     f"shadow call_id={score_result.get('call_id')}",
                 )
+
+            # SHADOW-ONLY guard: shadow fired above (score_result captured by value),
+            # so nulling it here blocks every downstream paper/live/alert entry while
+            # keeping the call measured in shadow_report. This is what keeps a re-listed
+            # but money-losing channel (solearlytrending) out of real trading.
+            if score_result and cfg.get("handle") in SHADOW_ONLY_CHANNELS:
+                _soc_cid = score_result.get("call_id")
+                if _soc_cid:
+                    db.set_call_skip_reason(_soc_cid, "shadow_only")
+                print(f"[shadow_only] {cfg.get('handle')} call logged + shadowed — not traded")
+                score_result = None
 
             # VIP tier-specific position routing
             if cfg["channel_type"] == "vip" and score_result and extra:
