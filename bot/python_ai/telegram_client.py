@@ -929,13 +929,22 @@ def _catchup(client, entity, channel_cfg: dict, caller_id: int) -> int:
         if not is_candidate(message.text):
             continue
 
-        if c_type == "lagging":
-            status, *_ = handle_lagging(message, caller_id, c_id)
-        elif c_type == "realtime":
-            status, *_ = handle_realtime(message, caller_id, c_id)
-        elif c_type == "vip":
-            status, *_ = handle_vip(message, caller_id, c_id)
-        else:
+        # One malformed/out-of-range message must NOT crash the whole listener.
+        # Skip it (and roll back the aborted transaction so the next message's
+        # queries don't fail with "current transaction is aborted"). highest_id is
+        # already advanced above, so catchup moves past the bad message permanently.
+        try:
+            if c_type == "lagging":
+                status, *_ = handle_lagging(message, caller_id, c_id)
+            elif c_type == "realtime":
+                status, *_ = handle_realtime(message, caller_id, c_id)
+            elif c_type == "vip":
+                status, *_ = handle_vip(message, caller_id, c_id)
+            else:
+                continue
+        except Exception as e:
+            db.safe_rollback()
+            print(f"  [catchup] skipped msg {getattr(message, 'id', '?')} on {handle}: {e}")
             continue
 
         _bump(handle, status)
@@ -1357,6 +1366,10 @@ def run_listener() -> None:
             _write_last_message_id(handle, msg.id)
 
         except Exception as e:
+            # Roll back the aborted transaction so a single bad message (e.g. a numeric
+            # overflow) doesn't poison every subsequent message with "current
+            # transaction is aborted".
+            db.safe_rollback()
             print(f"[listener] handler error ({handle} msg={msg.id}): {e}")
             _bump(handle, "error")
 
