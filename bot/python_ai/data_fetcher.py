@@ -304,32 +304,31 @@ def fetch_token_data(mint: str) -> Optional[dict]:
     if cached:
         return cached
 
-    # Jupiter-FIRST. The only callers are the listener's scoring path, which already
-    # gets liquidity/holders/bundles/snipers from the parsed Telegram message — it
-    # needs only price/mcap here. Pricing from KEYED Jupiter (high limit) instead of
-    # DexScreener (free ~300/min) keeps the high-volume scoring path off the tight
-    # rate limit that was 429-storming. DexScreener is now only a fallback for coins
-    # Jupiter can't price yet. (mcap from Jupiter = price * on-chain supply, the same
-    # single-source value the rest of the system uses — no cross-source phantoms.)
-    jp = _fetch_jupiter_price(mint)
-    if jp and jp.get("mcap"):
-        result = {
-            "mint":          mint,
-            "price_usd":     jp.get("price_usd"),
-            "mcap":          jp.get("mcap"),
-            "liquidity_usd": jp.get("liquidity_usd"),
-            "name":          None,
-            "symbol":        None,
-            "dex_url":       None,
-            "price_source":  "jupiter",
-            "fetched_at":    datetime.now(timezone.utc),
-        }
-        _cache_set(mint, result)
-        return result
-
+    # DexScreener-FIRST for the listener's entry pricing. This is deliberate: fresh
+    # trending coins (the bulk of entries) are on DexScreener but NOT yet indexed on
+    # Jupiter, so Jupiter-first would just waste a call then fall to DexScreener
+    # anyway AND drop entries for coins Jupiter can't price. DexScreener is budget-
+    # capped (DEX_MAX_PER_MIN); the monitor was moved to Jupiter-only so this budget
+    # is reserved for entries. Jupiter is the FALLBACK for coins DexScreener throttled
+    # on or doesn't have.
     dex = _fetch_dexscreener(mint)
     if not dex:
-        log.info(f"[fetcher] no Jupiter or DexScreener data: {mint[:8]}...")
+        jp = _fetch_jupiter_price(mint)
+        if jp and jp.get("mcap"):
+            result = {
+                "mint":          mint,
+                "price_usd":     jp.get("price_usd"),
+                "mcap":          jp.get("mcap"),
+                "liquidity_usd": None,
+                "name":          None,
+                "symbol":        None,
+                "dex_url":       None,
+                "price_source":  "jupiter_fallback",
+                "fetched_at":    datetime.now(timezone.utc),
+            }
+            _cache_set(mint, result)
+            return result
+        log.info(f"[fetcher] no DexScreener or Jupiter data: {mint[:8]}...")
         return None
 
     result = {
