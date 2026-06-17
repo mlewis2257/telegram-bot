@@ -595,8 +595,10 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
     same monitor pass.
     """
     if _dex_circuit_open:
-        print("[monitor] Circuit breaker open — skipping paper exit sweep")
-        return 0
+        # The sweep prices off the Jupiter batch first, so a DexScreener outage must
+        # NOT stop exits (it used to — that's how a DexScreener flood silently halted
+        # closing). Note it and continue on Jupiter.
+        print("[monitor] DexScreener breaker open — exit sweep running on Jupiter")
 
     skip_call_ids = skip_call_ids or set()
 
@@ -788,8 +790,10 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
 async def run_pass(pass_num: int, dry_run: bool) -> dict:
     """Run one full monitoring pass across the active watchlist."""
     if _dex_circuit_open:
-        print(f"[monitor] Pass {pass_num} — circuit breaker open, skipping pass")
-        return {"checked": 0, "new_peaks": 0, "alerts_sent": 0, "errors": 0}
+        # The pass prices off the prefetched Jupiter batch, so DON'T skip it when the
+        # DexScreener breaker is open — skipping used to stop monitoring + exits every
+        # time the trending flood tripped the breaker. Just note it and run on Jupiter.
+        print(f"[monitor] Pass {pass_num} — DexScreener breaker open, running on Jupiter")
 
     _failures_this_pass.clear()
     watchlist = db.get_active_watchlist(min_score=MIN_SCORE, max_age_hours=MAX_AGE_HOURS)
