@@ -245,7 +245,7 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
         if mcap:
             market = {"price_usd": jup_price, "mcap": mcap, "source": "jupiter_batch"}
     if not market:
-        market = data_fetcher.fetch_token_price_fast(mint)
+        market = data_fetcher.fetch_token_price_jupiter_only(mint)
 
     if not market or not market.get("mcap"):
         if not data_only:
@@ -673,7 +673,7 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
                 if blended:
                     market = {"price_usd": jup_price, "mcap": blended, "source": "jupiter_batch"}
             if not market:
-                market = data_fetcher.fetch_token_price_fast(mint)
+                market = data_fetcher.fetch_token_price_jupiter_only(mint)
                 await asyncio.sleep(INTER_CALL_SLEEP)
 
             if not market or not market.get("mcap"):

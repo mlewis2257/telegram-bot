@@ -1118,3 +1118,25 @@ def fetch_token_price_fast(mint: str) -> Optional[dict]:
         _price_cache_set(mint, result)
         return result
     return fetch_token_price(mint)
+
+
+def fetch_token_price_jupiter_only(mint: str) -> Optional[dict]:
+    """
+    Jupiter-only price/mcap — NO DexScreener fallback.
+
+    For the polling monitor (a backstop; ws_monitor + the 4h force-close cover the
+    gaps). Brand-new trending coins aren't on Jupiter yet and DO exist on DexScreener,
+    so a DexScreener fallback here meant the monitor chased DexScreener for every new
+    coin → the 429 floods. Jupiter-only: a coin Jupiter can't price is just skipped
+    this pass (caught once indexed, or force-closed if it's a rug).
+    """
+    if mint in DEAD_MINTS:
+        return None
+    cached = _price_cache_get(mint)
+    if cached:
+        return cached
+    result = _fetch_jupiter_price(mint)
+    if result and result.get("mcap"):
+        _price_cache_set(mint, result)
+        return result
+    return None
