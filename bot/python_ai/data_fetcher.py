@@ -126,6 +126,14 @@ def _get(url: str, params: dict = None) -> Optional[dict]:
                 log.debug(f"[fetcher] 404 — {url}")
                 return None
 
+            # 429 = rate limited. Retrying within seconds only deepens the limit and
+            # was the amplifier behind the 429 storms (3x the requests against an
+            # endpoint already throttling us). Bail immediately so the caller falls
+            # back (Jupiter) and DexScreener can recover. 5xx still retries (transient).
+            if resp.status_code == 429:
+                log.warning(f"[fetcher] 429 rate-limited (no retry, falling back): {url}")
+                return None
+
             if resp.status_code in RETRY_STATUS_CODES:
                 log.warning(
                     f"[fetcher] {resp.status_code} on attempt {attempt}/{MAX_RETRIES} "
