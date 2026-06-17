@@ -33,7 +33,14 @@ MAX_RETRIES        = 3
 BACKOFF_BASE       = 1.0      # seconds; doubles each retry
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 CACHE_TTL_SECONDS  = 60
-PRICE_CACHE_TTL_SECONDS = 2.0
+# Short-lived price cache. Bumped from 2s → 6s so the paper-entry and shadow-entry
+# fetches of the SAME call (fired ~1s apart, both via fetch_token_price_fast) share
+# ONE live fetch instead of each hammering DexScreener for the same fresh coin. 6s
+# is still well inside "live at entry" (your accuracy comes from fetching at entry
+# time vs the stale message price — a 6s window doesn't change that), and it expires
+# long before any deferred entry (e.g. VIP-confirm minutes later) so those re-fetch
+# fresh. Env-tunable.
+PRICE_CACHE_TTL_SECONDS = float(os.getenv("PRICE_CACHE_TTL_SECONDS", "6.0"))
 STALE_PRICE_GRACE_SECONDS = 8.0
 FAILOVER_STALE_GRACE_SECONDS = 30.0
 DEX_RATE_LIMIT_COOLDOWN_SECONDS = 5.0
