@@ -55,6 +55,11 @@ PAPER_EXIT_SWEEP_EVERY_PASSES = 3  # websocket monitor owns primary protection; 
 # this many hours with no obtainable price, force it closed at 0 (-100%). Without
 # this, unresolved-mint positions were skipped by the sweep and lingered indefinitely.
 FORCE_CLOSE_UNPRICEABLE_HOURS = 4.0
+# Watchlist tiering: calls with an open position are HOT (polled every pass — exits
+# need fresh prices); everything else is COLD (milestone-tracking only, bloated by
+# the trending firehose) and polled once every N passes. Keeps exits fast while
+# cutting per-pass fetch volume ~Nx — the cold tier is what floods the price APIs.
+MONITOR_COLD_EVERY_PASSES = int(os.getenv("MONITOR_COLD_EVERY_PASSES", "6"))
 
 MILESTONE_THRESHOLDS    = [2.0, 5.0, 10.0]  # send alert on first crossing of each
 SUPPRESS_HISTORICAL_HOURS = 2  # don't fire milestones/drawdowns for stored peaks on old tokens
@@ -788,9 +793,31 @@ async def run_pass(pass_num: int, dry_run: bool) -> dict:
 
     _failures_this_pass.clear()
     watchlist = db.get_active_watchlist(min_score=MIN_SCORE, max_age_hours=MAX_AGE_HOURS)
+    total = len(watchlist)
+
+    # ── Tier the watchlist ────────────────────────────────────────────────────
+    # HOT = calls with an open position (poll every pass; exits need fresh prices).
+    # COLD = milestone-tracking only — poll once every MONITOR_COLD_EVERY_PASSES.
+    # This is the core of the rate-limit fix: the trending firehose bloats COLD,
+    # so polling it every pass was flooding both DexScreener and Jupiter.
+    hot_ids: set[int] = set()
+    if not dry_run:
+        try:
+            for p in db.get_open_paper_positions(is_strategy_b=False):
+                hot_ids.add(p["call_id"])
+            for p in db.get_open_paper_positions(is_strategy_b=True):
+                hot_ids.add(p["call_id"])
+            for p in db.get_open_live_positions():
+                hot_ids.add(p["call_id"])
+        except Exception as e:
+            print(f"[monitor] hot-set build failed — treating all as hot: {e}")
+            hot_ids = {r["call_id"] for r in watchlist}
+    cold_due = dry_run or (pass_num % MONITOR_COLD_EVERY_PASSES == 0)
+    watchlist = [r for r in watchlist if (r["call_id"] in hot_ids or cold_due)]
     count = len(watchlist)
 
-    print(f"[monitor] Pass {pass_num} — watching {count} active call(s)")
+    print(f"[monitor] Pass {pass_num} — watching {count}/{total} active call(s) "
+          f"({len(hot_ids)} hot{', +cold' if cold_due else ''})")
 
     # One Jupiter batch call for all active mints — avoids N DexScreener calls.
     active_mints = [

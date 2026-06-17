@@ -146,6 +146,33 @@ def _dex_trip_cooldown() -> None:
     _dex_rate_limited_until = time.monotonic() + DEX_RATE_LIMIT_COOLDOWN_SECONDS
 
 
+# ── Jupiter proactive rate limit (mirrors the DexScreener bucket) ────────────
+# Even keyed Jupiter has a ceiling, and BOTH the monitor's batch poll and the
+# listener's price fallback hit it. Same token bucket so neither floods it.
+JUP_MAX_PER_MIN = int(os.getenv("JUP_MAX_PER_MIN", "300"))
+_jup_rate_limited_until = 0.0
+_jup_call_times: deque = deque()
+
+
+def _jup_available() -> bool:
+    now = time.monotonic()
+    if now < _jup_rate_limited_until:
+        return False
+    cut = now - 60.0
+    while _jup_call_times and _jup_call_times[0] < cut:
+        _jup_call_times.popleft()
+    return len(_jup_call_times) < JUP_MAX_PER_MIN
+
+
+def _jup_note_call() -> None:
+    _jup_call_times.append(time.monotonic())
+
+
+def _jup_trip_cooldown() -> None:
+    global _jup_rate_limited_until
+    _jup_rate_limited_until = time.monotonic() + 5.0
+
+
 # ── HTTP helper ───────────────────────────────────────────────────────────────
 
 def _get(url: str, params: dict = None) -> Optional[dict]:
@@ -867,6 +894,8 @@ def _fetch_jupiter_price(mint: str) -> Optional[dict]:
     Fallback price fetch from Jupiter Price API when DexScreener is unavailable.
     Attempts to compute mcap via Helius RPC getTokenSupply.
     """
+    if not _jup_available():
+        return None  # over budget / cooling down — don't add to a Jupiter storm
     try:
         headers = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
         resp = requests.get(
@@ -875,6 +904,10 @@ def _fetch_jupiter_price(mint: str) -> Optional[dict]:
             headers=headers,
             timeout=REQUEST_TIMEOUT,
         )
+        _jup_note_call()
+        if resp.status_code == 429:
+            _jup_trip_cooldown()
+            return None
         if resp.status_code != 200:
             return None
         data       = resp.json()
@@ -1004,6 +1037,8 @@ def fetch_prices_batch_jupiter(mints: list[str]) -> dict[str, float]:
 
     for i in range(0, len(all_mints), 50):
         batch = all_mints[i:i + 50]
+        if not _jup_available():
+            break  # over budget / cooling down — return what we have so far
         try:
             resp = requests.get(
                 JUPITER_PRICE_URL,
@@ -1011,6 +1046,11 @@ def fetch_prices_batch_jupiter(mints: list[str]) -> dict[str, float]:
                 headers=headers,
                 timeout=REQUEST_TIMEOUT,
             )
+            _jup_note_call()
+            if resp.status_code == 429:
+                _jup_trip_cooldown()
+                log.warning("[fetcher] Jupiter batch 429 — cooling down")
+                break
             if resp.status_code != 200:
                 log.warning(f"[fetcher] Jupiter batch price HTTP {resp.status_code}")
                 continue
