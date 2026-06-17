@@ -47,9 +47,16 @@ _EXIT_LIVE = live_trader._LIVE_EXIT_CONFIG
 
 if not rpc_pool.count():
     raise RuntimeError("No RPC endpoints configured (set SOLANA_RPC_URL / SOLANA_RPC_URLS in .env)")
-# Static default for logging; the live connection picks a fresh (rotated) endpoint
-# per reconnect via rpc_pool.ws_url(), so a throttled key fails over to the next.
-WS_URL = rpc_pool.ws_url()
+# PIN the websocket to ONE endpoint — do NOT rotate it per reconnect. Helius wss
+# support is plan/key-specific, so rotating the long-lived socket onto a key whose
+# plan handles wss differently caused instant ConnectionClosedError crash-loops.
+# The HTTP path (getTransaction etc.) still rotates via rpc_pool — that's where the
+# quota actually matters. Override with WS_RPC_URL if a specific key should serve wss.
+_ws_http = (os.getenv("WS_RPC_URL") or os.getenv("SOLANA_RPC_URL")
+            or (rpc_pool.endpoints()[0] if rpc_pool.count() else ""))
+if not _ws_http:
+    raise RuntimeError("No RPC endpoint for ws_monitor (set SOLANA_RPC_URL or WS_RPC_URL)")
+WS_URL = _ws_http.replace("https://", "wss://").replace("http://", "ws://")
 
 HEARTBEAT_INTERVAL    = 30    # seconds between pings
 POLL_INTERVAL         = 2     # seconds between new-position polls
@@ -568,7 +575,7 @@ async def connect_with_retry() -> None:
     poll_task = asyncio.create_task(poll_new_positions(ws_ref))
     try:
         while True:
-            ws_url = rpc_pool.ws_url() or WS_URL
+            ws_url = WS_URL   # pinned; HTTP rotation handled separately by rpc_pool
             try:
                 async with websockets.connect(
                     ws_url,
@@ -577,7 +584,7 @@ async def connect_with_retry() -> None:
                     close_timeout=10,
                 ) as ws:
                     ws_ref[0] = ws
-                    backoff   = 1
+                    connected_at = time.monotonic()
                     print(f"[ws_monitor] connected — {ws_url[:50]}...")
 
                     await _mgr.resubscribe_all(ws)
@@ -590,6 +597,12 @@ async def connect_with_retry() -> None:
                     finally:
                         hb_task.cancel()
                         ws_ref[0] = None
+
+                    # Reset backoff ONLY after a stable connection. A connect that drops
+                    # within seconds keeps the backoff growing, so a flapping endpoint
+                    # isn't hammered with 1s reconnects (which makes Helius drop it more).
+                    if time.monotonic() - connected_at >= 30:
+                        backoff = 1
 
             except Exception as e:
                 ws_ref[0] = None
