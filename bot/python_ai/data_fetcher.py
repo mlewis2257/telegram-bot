@@ -8,6 +8,7 @@ from DexScreener. Results are cached for 60 seconds.
 import logging
 import os
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -110,6 +111,41 @@ def _clear_dex_mint_cooldown(mint: str) -> None:
     _dex_mint_cooldowns.pop(mint, None)
 
 
+# ── DexScreener proactive rate limit (token bucket) ──────────────────────────
+# DexScreener's public limit is ~300 req/min. Stay safely under it so we almost
+# never get 429'd in the first place: when this minute's budget is spent (or we're
+# in a post-429 cooldown), skip DexScreener and let the caller fall back to Jupiter
+# instead of firing a request that would just 429. Pure timestamp bookkeeping —
+# non-blocking, no event-loop sleeps, fits the single-threaded listener.
+# NOTE: per-process. sol-listener and sol-monitor each get their own budget, so the
+# sum should stay under the real ceiling; the reactive cooldown covers any overlap.
+DEX_MAX_PER_MIN = int(os.getenv("DEX_MAX_PER_MIN", "200"))
+_dex_call_times: deque = deque()
+
+
+def _dex_available() -> bool:
+    """True if we may call DexScreener now: not in a post-429 cooldown AND under the
+    rolling per-minute budget. When False, callers fall back to Jupiter."""
+    now = time.monotonic()
+    if now < _dex_rate_limited_until:
+        return False
+    cut = now - 60.0
+    while _dex_call_times and _dex_call_times[0] < cut:
+        _dex_call_times.popleft()
+    return len(_dex_call_times) < DEX_MAX_PER_MIN
+
+
+def _dex_note_call() -> None:
+    """Record a DexScreener request against the per-minute budget."""
+    _dex_call_times.append(time.monotonic())
+
+
+def _dex_trip_cooldown() -> None:
+    """Enter a short global cooldown after an actual 429 (reactive backstop)."""
+    global _dex_rate_limited_until
+    _dex_rate_limited_until = time.monotonic() + DEX_RATE_LIMIT_COOLDOWN_SECONDS
+
+
 # ── HTTP helper ───────────────────────────────────────────────────────────────
 
 def _get(url: str, params: dict = None) -> Optional[dict]:
@@ -131,6 +167,10 @@ def _get(url: str, params: dict = None) -> Optional[dict]:
             # endpoint already throttling us). Bail immediately so the caller falls
             # back (Jupiter) and DexScreener can recover. 5xx still retries (transient).
             if resp.status_code == 429:
+                # Don't retry a rate-limited endpoint. For DexScreener, also enter the
+                # shared cooldown so every path (scoring + price) backs off together.
+                if "dexscreener" in url:
+                    _dex_trip_cooldown()
                 log.warning(f"[fetcher] 429 rate-limited (no retry, falling back): {url}")
                 return None
 
@@ -174,6 +214,11 @@ def _fetch_dexscreener(mint: str) -> Optional[dict]:
     Picks the Solana pair with the highest USD liquidity.
     Returns a partial result dict or None.
     """
+    if not _dex_available():
+        # Over the per-minute budget or in a 429 cooldown — skip so the caller can
+        # fall back to Jupiter instead of adding to a rate-limit storm.
+        return None
+    _dex_note_call()
     data = _get(f"{DEXSCREENER_URL}/{mint}")
     if not data:
         log.debug(f"[fetcher] DexScreener HTTP failed for {mint[:8]}...")
@@ -234,7 +279,27 @@ def fetch_token_data(mint: str) -> Optional[dict]:
 
     dex = _fetch_dexscreener(mint)
     if not dex:
-        log.info(f"[fetcher] token not yet on DexScreener: {mint[:8]}...")
+        # DexScreener unavailable — not listed yet, over the per-minute budget, or in
+        # a 429 cooldown. Fall back to a Jupiter price so scoring + shadow can still
+        # proceed with a DEGRADED record (price/mcap only, no liquidity) rather than
+        # dropping the call entirely (which is what left shadow lanes empty during
+        # 429 storms). price_source flags it so the gap is visible in analysis.
+        jp = _fetch_jupiter_price(mint)
+        if jp and jp.get("mcap"):
+            result = {
+                "mint":          mint,
+                "price_usd":     jp.get("price_usd"),
+                "mcap":          jp.get("mcap"),
+                "liquidity_usd": None,
+                "name":          None,
+                "symbol":        None,
+                "dex_url":       None,
+                "price_source":  "jupiter_fallback",
+                "fetched_at":    datetime.now(timezone.utc),
+            }
+            _cache_set(mint, result)
+            return result
+        log.info(f"[fetcher] no DexScreener or Jupiter data: {mint[:8]}...")
         return None
 
     result = {
@@ -369,14 +434,13 @@ def _try_dexscreener_price(mint: str) -> Optional[dict]:
     Lightweight DexScreener price fetch. Bypasses cache.
     Returns result dict or None on any failure.
     """
-    global _dex_rate_limited_until
-
-    if time.monotonic() < _dex_rate_limited_until:
+    if not _dex_available():
         return None
     if time.monotonic() < _dex_mint_cooldowns.get(mint, 0.0):
         return None
 
     url = f"{DEXSCREENER_URL}/{mint}"
+    _dex_note_call()
 
     for attempt in range(1, MAX_RETRIES + 2):   # +1 extra slot for the 429 retry
         try:
@@ -387,7 +451,7 @@ def _try_dexscreener_price(mint: str) -> Optional[dict]:
                 return None
 
             if resp.status_code == 429:
-                _dex_rate_limited_until = time.monotonic() + DEX_RATE_LIMIT_COOLDOWN_SECONDS
+                _dex_trip_cooldown()
                 _set_dex_mint_cooldown(mint)
                 log.warning(
                     f"[fetcher] 429 rate-limited on {mint[:8]}... "
