@@ -330,10 +330,12 @@ def fetch_token_data(mint: str) -> Optional[dict]:
                 "name":          None,
                 "symbol":        None,
                 "dex_url":       None,
+                "volume_h1":     None,
                 "price_source":  "jupiter_fallback",
                 "fetched_at":    datetime.now(timezone.utc),
             }
             _cache_set(mint, result)
+            _price_cache_set(mint, result)   # share this fetch with paper/shadow entry
             return result
         log.info(f"[fetcher] no DexScreener or Jupiter data: {mint[:8]}...")
         return None
@@ -346,11 +348,17 @@ def fetch_token_data(mint: str) -> Optional[dict]:
         "name":          dex.get("name"),
         "symbol":        dex.get("symbol"),
         "dex_url":       dex.get("dex_url"),
+        "volume_h1":     dex.get("volume_h1"),
         "price_source":  "dexscreener",
         "fetched_at":    datetime.now(timezone.utc),
     }
 
     _cache_set(mint, result)
+    # Share this fetch with the paper/shadow entry fetches (fetch_token_price_fast
+    # reads the same _price_cache), so the entry path reuses handle_realtime's price
+    # instead of making its own (Jupiter-first) call ~1s later for the same coin.
+    # This is the consolidation to ONE fetch per call that frees up Jupiter.
+    _price_cache_set(mint, result)
     log.debug(
         f"[fetcher] {mint[:8]}... price={result['price_usd']} (dexscreener) "
         f"mcap={result['mcap']} liq={result['liquidity_usd']}"
