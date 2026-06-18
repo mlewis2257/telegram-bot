@@ -89,10 +89,17 @@ _failures_this_pass: set[str] = set()   # deduplicate failures per mint per pass
 DEX_FAILURE_WINDOW    = 60   # seconds
 DEX_FAILURE_THRESHOLD = 8    # failures within window before circuit opens
 _dex_circuit_open     = False
+# Only PHONE-ALERT on a SUSTAINED outage, not the transient 429 flaps that happen
+# constantly now (rate-limiting is handled — exits/monitoring run on Jupiter, so a
+# flapping breaker is NOT a real outage). A genuine DexScreener outage lasts minutes;
+# 429 flaps recover in seconds. Alert only if the breaker stays open this long.
+DEX_OUTAGE_ALERT_AFTER = float(os.getenv("DEX_OUTAGE_ALERT_AFTER", "180"))  # seconds
+_dex_open_since      = 0.0
+_dex_outage_alerted  = False
 
 
 def _record_dex_failure(symbol: str = "") -> None:
-    global _dex_circuit_open
+    global _dex_circuit_open, _dex_open_since, _dex_outage_alerted
     # One mint can only contribute one failure per pass — prevents double-counting
     # when both the price check and volume check fail for the same token.
     if symbol and symbol in _failures_this_pass:
@@ -104,25 +111,35 @@ def _record_dex_failure(symbol: str = "") -> None:
     recent = [t for t in _dex_failures if now - t < DEX_FAILURE_WINDOW]
     _dex_failures[:] = recent
 
-    if len(recent) >= DEX_FAILURE_THRESHOLD and not _dex_circuit_open:
-        _dex_circuit_open = True
-        print("[monitor] DexScreener outage — circuit breaker OPEN")
-        asyncio.create_task(alert_bot.send_system_alert(
-            "DexScreener outage detected!\n"
-            "All buys and exits PAUSED until connection restored."
-        ))
+    if len(recent) >= DEX_FAILURE_THRESHOLD:
+        if not _dex_circuit_open:
+            _dex_circuit_open = True
+            _dex_open_since = now
+            print("[monitor] DexScreener degraded — circuit breaker OPEN (running on Jupiter)")
+        # Defer the phone alert until the outage is SUSTAINED — kills the 429-flap spam.
+        if not _dex_outage_alerted and (now - _dex_open_since) >= DEX_OUTAGE_ALERT_AFTER:
+            _dex_outage_alerted = True
+            mins = int(DEX_OUTAGE_ALERT_AFTER // 60)
+            asyncio.create_task(alert_bot.send_system_alert(
+                f"DexScreener degraded for {mins}+ min.\n"
+                "Monitoring & exits continue on Jupiter; fresh-coin entries may be delayed."
+            ))
 
 
 def _record_dex_success() -> None:
-    global _dex_circuit_open
+    global _dex_circuit_open, _dex_open_since, _dex_outage_alerted
     if _dex_circuit_open:
         _dex_circuit_open = False
         _dex_failures.clear()
+        _dex_open_since = 0.0
         print("[monitor] DexScreener recovered — circuit breaker CLOSED")
-        asyncio.create_task(alert_bot.send_system_alert(
-            "DexScreener connection restored.\n"
-            "Bot resuming normal operation."
-        ))
+        # Only send a 'recovered' alert if we actually alerted about the outage —
+        # transient flaps never alerted, so they stay silent here too.
+        if _dex_outage_alerted:
+            _dex_outage_alerted = False
+            asyncio.create_task(alert_bot.send_system_alert(
+                "DexScreener recovered — back to normal."
+            ))
 
 # ── Alert dedup state — persisted across restarts ─────────────────────────────
 # Tracks which alert keys have already been sent per call_id.
