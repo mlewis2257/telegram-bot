@@ -7,6 +7,7 @@ shadow-trading — the honest answer to "which VIP lanes are worth trading."
     python3 shadow_report.py            # all time
     python3 shadow_report.py --days 7
     python3 shadow_report.py --raw      # don't drop phantom-price rows
+    python3 shadow_report.py --by-day --days 7   # per-day total_sol per lane×variant
 
 PHANTOM GUARD: cross-source / stale-supply pricing still leaks the occasional
 impossible exit into the shadow set (e.g. a +6716% avg on a lane whose avg peak
@@ -87,11 +88,76 @@ ORDER BY sp.peak_multiplier DESC NULLS LAST, sp.pnl_pct DESC
 """
 
 
+# Per-day pivot: total_sol per (lane, variant) per UTC entry-day. Same phantom guard.
+BY_DAY_QUERY = """
+SELECT
+  COALESCE(ch.handle, '?')                       AS channel,
+  COALESCE(sp.vip_tier, 'none')                  AS vip_tier,
+  COALESCE(c.skip_reason, 'none')                AS skip_reason,
+  sp.exit_variant                                AS variant,
+  (sp.entry_time AT TIME ZONE 'UTC')::date        AS day,
+  round(sum(sp.pnl_sol), 2)                       AS day_sol,
+  count(*)                                        AS n
+FROM shadow_positions sp
+JOIN calls c ON c.id = sp.call_id
+LEFT JOIN channels ch ON ch.id = c.channel_id
+WHERE sp.status = 'closed'
+  {phantom_clause}
+  AND ( %(days)s = 0 OR sp.entry_time >= now() - (%(days)s || ' days')::interval )
+GROUP BY 1, 2, 3, 4, 5
+"""
+
+
+def _run_by_day(conn, params: dict, phantom_clause: str, args) -> None:
+    """Pivot closed-trade PnL into one row per (lane, variant) with a column per day,
+    so you can see whether a lane is consistently positive vs one lucky day."""
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(BY_DAY_QUERY.format(phantom_clause=phantom_clause), params)
+        rows = cur.fetchall()
+
+    label = f"last {args.days}d" if args.days else "all time"
+    print(f"\nShadow PnL by day — {label}  (total_sol per UTC entry-day, phantom-excluded,"
+          f" lanes with >= {args.min_trades} trades)\n")
+    if not rows:
+        print("  No closed shadow positions in window.\n")
+        return
+
+    days = sorted({r["day"] for r in rows})
+    lanes: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["channel"], r["vip_tier"], r["skip_reason"], r["variant"])
+        e = lanes.setdefault(key, {"days": {}, "n": 0, "total": 0.0})
+        sol = float(r["day_sol"] or 0)
+        e["days"][r["day"]] = sol
+        e["n"] += int(r["n"])
+        e["total"] += sol
+
+    items = [(k, v) for k, v in lanes.items() if v["n"] >= args.min_trades]
+    items.sort(key=lambda kv: kv[1]["total"], reverse=True)
+    if not items:
+        print(f"  No lanes with >= {args.min_trades} trades. Lower --min-trades.\n")
+        return
+
+    daycols = "".join(f"{d.strftime('%m/%d'):>8}" for d in days)
+    hdr = f"{'lane':<32}{'var':<9}{daycols}{'TOTAL':>9}{'n':>6}"
+    print(hdr)
+    print("-" * len(hdr))
+    for (ch, tier, skip, var), v in items:
+        lane = f"{(ch or '')[:11]:<11} {(tier or '')[:4]:<4} {(skip or '')[:13]:<13}"
+        cells = "".join(f"{v['days'].get(d, 0.0):>8.2f}" for d in days)
+        print(f"{lane:<32}{(var or '')[:8]:<9}{cells}{v['total']:>9.2f}{v['n']:>6}")
+    print("\n  Read each row L→R: a real edge is positive across MOST days, not one spike.\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=0, help="0 = all time")
     ap.add_argument("--raw", action="store_true",
                     help="include phantom-price rows (peak>50x or pnl outside [-100%%,+5000%%])")
+    ap.add_argument("--by-day", action="store_true",
+                    help="per-day total_sol per lane×variant (spot consistency vs one lucky day)")
+    ap.add_argument("--min-trades", type=int, default=10,
+                    help="--by-day: hide lanes with fewer than this many closed trades")
     args = ap.parse_args()
 
     params = {
@@ -109,6 +175,11 @@ def main() -> None:
     db.ensure_shadow_positions_table()
     conn = db.get_conn()
     db.safe_rollback()
+
+    if args.by_day:
+        _run_by_day(conn, params, phantom_clause, args)
+        return
+
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(QUERY.format(phantom_clause=phantom_clause), params)
         rows = cur.fetchall()
