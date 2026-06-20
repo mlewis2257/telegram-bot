@@ -62,15 +62,19 @@ DEFAULT: dict = {"trade": False}
 # (which is corrupted by the pre-fix phantom period). Per-lane exit matters: `ride`
 # is leverage — great where the edge is real, ruinous where it isn't.
 LANE_POLICY: dict[tuple[str, str, str], dict] = {
-    # ── TRADE: confirmed winners ──
+    # ── TRADE: ride/ride_vol lanes (genuine big runners — let them run) ──
     # low_score (free): ride_vol best (+9.06 / 3d), ride +7.49, early +3.68 — strongest lane.
     ("solhousesignal",     "none", "low_score"):     {"trade": True, "size": 0.5,  "exit": EXIT_RIDE_VOL},
     # safe/vip_low_score: ride best (+8.22 / 3d, 139 trades), early +1.17 — strong.
     ("solhousesignal_vip", "safe", "vip_low_score"): {"trade": True, "size": 0.5,  "exit": EXIT_RIDE_S},
-    # solwhaletrending low_score: ride LOSES here (-1.65); early +3.17 / ride_vol +2.84 (95 trades).
-    ("solwhaletrending",   "none", "low_score"):     {"trade": True, "size": 0.25, "exit": EXIT_RIDE_VOL},
-    # solwhaletrending none: ride_vol/early ~+3.9 (small n=18) — trade small, watch.
-    ("solwhaletrending",   "none", "none"):          {"trade": True, "size": 0.25, "exit": EXIT_RIDE_VOL},
+
+    # ── TRADE: EARLY lanes (modest, high-win-rate; ride amplifies give-back into a loss) ──
+    # solwhaletrending low_score: early +3.17 best (3d); ride LOSES -1.65 (95 trades).
+    ("solwhaletrending",   "none", "low_score"):     {"trade": True, "size": 0.25, "exit": EXIT_EARLY},
+    # solwhaletrending none: early +3.93 ~= ride_vol (n=18) — early is lower-variance.
+    ("solwhaletrending",   "none", "none"):          {"trade": True, "size": 0.25, "exit": EXIT_EARLY},
+    # vip_mcap_gate: early +1.66 is the ONLY positive variant; ride -3.69 / ride_vol -4.0 (64 trades).
+    ("solhousesignal_vip", "gamble", "vip_mcap_gate"): {"trade": True, "size": 0.25, "exit": EXIT_EARLY},
 
     # ── SKIP: confirmed losers (explicit so intent is auditable) ──
     ("solhousesignal_vip", "gamble_risk", "vip_paused"):               {"trade": False},  # ride -97
