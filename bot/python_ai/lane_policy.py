@@ -57,20 +57,29 @@ LANE_POLICY_ENABLED = os.getenv("LANE_POLICY_ENABLED", "false").lower() == "true
 # clean 7-day window before sizing up. This is a STARTING table — edit it freely.
 DEFAULT: dict = {"trade": False}
 
+# Keys CONFIRMED against the DB (2026-06-20). Trade/exit/size from the recent
+# PHANTOM-EXCLUDED windows (shadow_report --days 2/3), NOT the raw all-time PnL
+# (which is corrupted by the pre-fix phantom period). Per-lane exit matters: `ride`
+# is leverage — great where the edge is real, ruinous where it isn't.
 LANE_POLICY: dict[tuple[str, str, str], dict] = {
-    # ── confirmed winners → trade with ride (ride leverages a real edge) ──
-    ("solhousesignal",     "none", "low_score"):     {"trade": True, "size": 0.5,  "exit": EXIT_RIDE_S},   # ride +7.78
-    ("solhousesignal_vip", "safe", "vip_low_score"): {"trade": True, "size": 0.5,  "exit": EXIT_RIDE_S},   # ride +9.15
+    # ── TRADE: confirmed winners ──
+    # low_score (free): ride_vol best (+9.06 / 3d), ride +7.49, early +3.68 — strongest lane.
+    ("solhousesignal",     "none", "low_score"):     {"trade": True, "size": 0.5,  "exit": EXIT_RIDE_VOL},
+    # safe/vip_low_score: ride best (+8.22 / 3d, 139 trades), early +1.17 — strong.
+    ("solhousesignal_vip", "safe", "vip_low_score"): {"trade": True, "size": 0.5,  "exit": EXIT_RIDE_S},
+    # solwhaletrending low_score: ride LOSES here (-1.65); early +3.17 / ride_vol +2.84 (95 trades).
+    ("solwhaletrending",   "none", "low_score"):     {"trade": True, "size": 0.25, "exit": EXIT_RIDE_VOL},
+    # solwhaletrending none: ride_vol/early ~+3.9 (small n=18) — trade small, watch.
+    ("solwhaletrending",   "none", "none"):          {"trade": True, "size": 0.25, "exit": EXIT_RIDE_VOL},
 
-    # ── marginal / watch → trade small, early or vol-gated ──
-    ("solwhaletrending",   "none", "none"):          {"trade": True, "size": 0.25, "exit": EXIT_EARLY},    # early +2.39
-    ("solhousesignal_vip", "gamble", "vip_mcap_gate"): {"trade": True, "size": 0.25, "exit": EXIT_RIDE_VOL}, # ride +1.43 (small n)
-
-    # ── confirmed losers → SKIP (listed explicitly so intent is auditable) ──
-    ("solhousesignal_vip", "gamble",      "mcap_too_low"): {"trade": False},   # -27
-    ("solhousesignal_vip", "gamble_risk", "vip_paused"):   {"trade": False},   # -54
-    ("solhousesignal_vip", "gamble",      "vip_gamble_allowed_hours"): {"trade": False},  # -13
-    ("solhousesignal",     "none",        "none"):         {"trade": False},   # -7 (free traded lane, negative)
+    # ── SKIP: confirmed losers (explicit so intent is auditable) ──
+    ("solhousesignal_vip", "gamble_risk", "vip_paused"):               {"trade": False},  # ride -97
+    ("solhousesignal_vip", "gamble",      "mcap_too_low"):             {"trade": False},  # ride -32
+    ("solhousesignal_vip", "gamble",      "vip_gamble_allowed_hours"): {"trade": False},  # -15
+    ("solhousesignal_vip", "gamble",      "vip_low_score"):            {"trade": False},  # -6.8 (gamble loses; SAFE wins)
+    ("solhousesignal_vip", "safe",        "vip_safe_allowed_hours"):   {"trade": False},  # -12 (all variants)
+    ("solhousesignal_vip", "gamble",      "none"):                     {"trade": False},  # -3
+    ("solhousesignal",     "none",        "none"):                     {"trade": False},  # -11 (free traded lane)
 }
 
 
