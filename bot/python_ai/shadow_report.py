@@ -149,6 +149,74 @@ def _run_by_day(conn, params: dict, phantom_clause: str, args) -> None:
     print("\n  Read each row L→R: a real edge is positive across MOST days, not one spike.\n")
 
 
+# Per-day-of-week pivot: which lanes earn on which weekdays + overall volume by day.
+BY_DOW_QUERY = """
+SELECT
+  COALESCE(ch.handle, '?')                       AS channel,
+  COALESCE(sp.vip_tier, 'none')                  AS vip_tier,
+  COALESCE(c.skip_reason, 'none')                AS skip_reason,
+  sp.exit_variant                                AS variant,
+  EXTRACT(ISODOW FROM (sp.entry_time AT TIME ZONE 'UTC'))::int AS dow,
+  round(sum(sp.pnl_sol), 2)                       AS dow_sol,
+  count(*)                                        AS n
+FROM shadow_positions sp
+JOIN calls c ON c.id = sp.call_id
+LEFT JOIN channels ch ON ch.id = c.channel_id
+WHERE sp.status = 'closed'
+  {phantom_clause}
+  AND ( %(days)s = 0 OR sp.entry_time >= now() - (%(days)s || ' days')::interval )
+GROUP BY 1, 2, 3, 4, 5
+"""
+
+_DOW_NAMES = {1: "Mon", 2: "Tue", 3: "Wed", 4: "Thu", 5: "Fri", 6: "Sat", 7: "Sun"}
+
+
+def _run_by_dow(conn, params: dict, phantom_clause: str, args) -> None:
+    """Pivot PnL by day-of-WEEK (Mon..Sun) + show overall trade volume per weekday,
+    so you can see which days are busiest and which lanes earn on which days."""
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(BY_DOW_QUERY.format(phantom_clause=phantom_clause), params)
+        rows = cur.fetchall()
+
+    label = f"last {args.days}d" if args.days else "all time"
+    print(f"\nShadow PnL by day-of-week — {label}  (phantom-excluded, lanes >= {args.min_trades} trades)\n")
+    if not rows:
+        print("  No closed shadow positions in window.\n")
+        return
+
+    dows = list(range(1, 8))
+    vol = {d: 0 for d in dows}
+    lanes: dict[tuple, dict] = {}
+    for r in rows:
+        d = int(r["dow"])
+        vol[d] += int(r["n"])
+        key = (r["channel"], r["vip_tier"], r["skip_reason"], r["variant"])
+        e = lanes.setdefault(key, {"dows": {}, "n": 0, "total": 0.0})
+        sol = float(r["dow_sol"] or 0)
+        e["dows"][d] = e["dows"].get(d, 0.0) + sol
+        e["n"] += int(r["n"])
+        e["total"] += sol
+
+    print("  Volume (trades) by weekday:  " + "   ".join(f"{_DOW_NAMES[d]} {vol[d]}" for d in dows) + "\n")
+
+    items = [(k, v) for k, v in lanes.items() if v["n"] >= args.min_trades]
+    items.sort(key=lambda kv: kv[1]["total"], reverse=True)
+    if not items:
+        print(f"  No lanes with >= {args.min_trades} trades. Lower --min-trades.\n")
+        return
+
+    daycols = "".join(f"{_DOW_NAMES[d]:>8}" for d in dows)
+    hdr = f"{'lane':<32}{'var':<9}{daycols}{'TOTAL':>9}{'n':>6}"
+    print(hdr)
+    print("-" * len(hdr))
+    for (ch, tier, skip, var), v in items:
+        lane = f"{(ch or '')[:11]:<11} {(tier or '')[:4]:<4} {(skip or '')[:13]:<13}"
+        cells = "".join(f"{v['dows'].get(d, 0.0):>8.2f}" for d in dows)
+        print(f"{lane:<32}{(var or '')[:8]:<9}{cells}{v['total']:>9.2f}{v['n']:>6}")
+    print("\n  NEEDS SEVERAL WEEKS to trust — each weekday column is only ~(days/7) samples,")
+    print("  so a single Saturday can dominate 'Sat' until you have many of them.\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=0, help="0 = all time")
@@ -156,8 +224,10 @@ def main() -> None:
                     help="include phantom-price rows (peak>50x or pnl outside [-100%%,+5000%%])")
     ap.add_argument("--by-day", action="store_true",
                     help="per-day total_sol per lane×variant (spot consistency vs one lucky day)")
+    ap.add_argument("--by-dow", action="store_true",
+                    help="per-day-of-week pivot + volume by weekday (needs weeks of data)")
     ap.add_argument("--min-trades", type=int, default=10,
-                    help="--by-day: hide lanes with fewer than this many closed trades")
+                    help="--by-day/--by-dow: hide lanes with fewer than this many closed trades")
     args = ap.parse_args()
 
     params = {
@@ -178,6 +248,9 @@ def main() -> None:
 
     if args.by_day:
         _run_by_day(conn, params, phantom_clause, args)
+        return
+    if args.by_dow:
+        _run_by_dow(conn, params, phantom_clause, args)
         return
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
