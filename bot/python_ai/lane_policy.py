@@ -81,11 +81,22 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     ("solhousesignal",     "none",        "none"):                     {"trade": False},  # -20 / 5d
 
     # ── CUT: flipped NET-NEGATIVE 3d->5d (the trap). Kept here so we don't re-add blindly. ──
-    # vip_low_score (safe) ride: +8.22 (3d) -> -8.69 (5d). BUT loss is Tue/Wed (recovery period)
-    # + Sat/Sun; Thu +5.17 / Fri +7.38. PRIME day-gate candidate — watch by-dow over weeks.
     ("solhousesignal_vip", "safe",   "vip_low_score"): {"trade": False},
-    # vip_mcap_gate early: +1.66 (3d) -> -3.59 (5d).
     ("solhousesignal_vip", "gamble", "vip_mcap_gate"): {"trade": False},
+
+    # ── DAY-GATE WATCH LIST (NOT traded — single-sample so far) ─────────────────
+    # These lanes are net-NEGATIVE overall but strongly positive on SPECIFIC weekdays
+    # in the 7d --by-dow. 7 days = ONE of each weekday, so each is n=1 — a candidate,
+    # not an edge. PROMOTE a row to a gated lane only after its weekday repeats ~3-4x.
+    # When ready, the entry becomes e.g.:
+    #   ("solhousesignal_vip","safe","vip_low_score"):
+    #       {"trade": True, "size": 0.25, "exit": "ride", "days": {"Thu","Fri"}}
+    # Candidates (lane -> strong day(s), best variant, 1-sample PnL):
+    #   solhousesignal_vip/safe/vip_low_score          -> Thu+Fri  ride      (+12.55)
+    #   solhousesignal_vip/gamble/vip_gamble_allowed_h -> Sat       early     (+8.32)
+    #   solhousesignal_vip/gamble/none                 -> Mon,Sun   early     (+5.5)
+    #   solhousesignal_vip/gamble/vip_low_score        -> Mon       ride_vol  (+3.6)
+    #   solhousesignal_vip/gamble/mcap_too_low         -> Fri       early     (+7.53, risky lane)
 }
 
 
