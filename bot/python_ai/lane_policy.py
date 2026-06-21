@@ -57,33 +57,35 @@ LANE_POLICY_ENABLED = os.getenv("LANE_POLICY_ENABLED", "false").lower() == "true
 # clean 7-day window before sizing up. This is a STARTING table — edit it freely.
 DEFAULT: dict = {"trade": False}
 
-# Keys CONFIRMED against the DB (2026-06-20). Trade/exit/size from the recent
-# PHANTOM-EXCLUDED windows (shadow_report --days 2/3), NOT the raw all-time PnL
-# (which is corrupted by the pre-fix phantom period). Per-lane exit matters: `ride`
-# is leverage — great where the edge is real, ruinous where it isn't.
+# Keys CONFIRMED against the DB. Trade/exit kept only for lanes NET-POSITIVE over the
+# reliable 5-day phantom-excluded window (shadow_report --by-dow --days 5); lanes that
+# flipped negative going 3d->5d were cut (the mcap_too_low trap — a 3d spike isn't an
+# edge). Per-lane exit matters: `ride` is leverage — great where the edge is real,
+# ruinous where it isn't.
 LANE_POLICY: dict[tuple[str, str, str], dict] = {
-    # ── TRADE: ride/ride_vol lanes (genuine big runners — let them run) ──
-    # low_score (free): ride_vol best (+9.06 / 3d), ride +7.49, early +3.68 — strongest lane.
-    ("solhousesignal",     "none", "low_score"):     {"trade": True, "size": 0.5,  "exit": EXIT_RIDE_VOL},
-    # safe/vip_low_score: ride best (+8.22 / 3d, 139 trades), early +1.17 — strong.
-    ("solhousesignal_vip", "safe", "vip_low_score"): {"trade": True, "size": 0.5,  "exit": EXIT_RIDE_S},
-
-    # ── TRADE: EARLY lanes (modest, high-win-rate; ride amplifies give-back into a loss) ──
-    # solwhaletrending low_score: early +3.17 best (3d); ride LOSES -1.65 (95 trades).
-    ("solwhaletrending",   "none", "low_score"):     {"trade": True, "size": 0.25, "exit": EXIT_EARLY},
-    # solwhaletrending none: early +3.93 ~= ride_vol (n=18) — early is lower-variance.
-    ("solwhaletrending",   "none", "none"):          {"trade": True, "size": 0.25, "exit": EXIT_EARLY},
-    # vip_mcap_gate: early +1.66 is the ONLY positive variant; ride -3.69 / ride_vol -4.0 (64 trades).
-    ("solhousesignal_vip", "gamble", "vip_mcap_gate"): {"trade": True, "size": 0.25, "exit": EXIT_EARLY},
+    # ── TRADE: net-positive over 5d ──
+    # low_score (free): ALL variants + over 5d (ride_vol +8.15, early +5.28, ride +4.03) — robust.
+    ("solhousesignal",   "none", "low_score"): {"trade": True, "size": 0.5,  "exit": EXIT_RIDE_VOL},
+    # solwhaletrending low_score: early +6.63 / 5d (ride_vol +2.97; ride -3.64 loses) — steadiest lane.
+    ("solwhaletrending", "none", "low_score"): {"trade": True, "size": 0.25, "exit": EXIT_EARLY},
+    # solwhaletrending none: ALL variants + over 5d (early +4.43, ride_vol +4.30, ride +2.27).
+    ("solwhaletrending", "none", "none"):      {"trade": True, "size": 0.25, "exit": EXIT_EARLY},
 
     # ── SKIP: confirmed losers (explicit so intent is auditable) ──
-    ("solhousesignal_vip", "gamble_risk", "vip_paused"):               {"trade": False},  # ride -97
-    ("solhousesignal_vip", "gamble",      "mcap_too_low"):             {"trade": False},  # ride -32
-    ("solhousesignal_vip", "gamble",      "vip_gamble_allowed_hours"): {"trade": False},  # -15
-    ("solhousesignal_vip", "gamble",      "vip_low_score"):            {"trade": False},  # -6.8 (gamble loses; SAFE wins)
+    ("solhousesignal_vip", "gamble_risk", "vip_paused"):               {"trade": False},  # ride -166 / 5d
+    ("solhousesignal_vip", "gamble",      "mcap_too_low"):             {"trade": False},  # ride -71 / 5d
+    ("solhousesignal_vip", "gamble",      "vip_gamble_allowed_hours"): {"trade": False},  # -16
+    ("solhousesignal_vip", "gamble",      "vip_low_score"):            {"trade": False},  # -6.8 (gamble; SAFE different)
     ("solhousesignal_vip", "safe",        "vip_safe_allowed_hours"):   {"trade": False},  # -12 (all variants)
     ("solhousesignal_vip", "gamble",      "none"):                     {"trade": False},  # -3
-    ("solhousesignal",     "none",        "none"):                     {"trade": False},  # -11 (free traded lane)
+    ("solhousesignal",     "none",        "none"):                     {"trade": False},  # -20 / 5d
+
+    # ── CUT: flipped NET-NEGATIVE 3d->5d (the trap). Kept here so we don't re-add blindly. ──
+    # vip_low_score (safe) ride: +8.22 (3d) -> -8.69 (5d). BUT loss is Tue/Wed (recovery period)
+    # + Sat/Sun; Thu +5.17 / Fri +7.38. PRIME day-gate candidate — watch by-dow over weeks.
+    ("solhousesignal_vip", "safe",   "vip_low_score"): {"trade": False},
+    # vip_mcap_gate early: +1.66 (3d) -> -3.59 (5d).
+    ("solhousesignal_vip", "gamble", "vip_mcap_gate"): {"trade": False},
 }
 
 
