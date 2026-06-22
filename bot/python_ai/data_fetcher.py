@@ -631,6 +631,51 @@ def fetch_top_holders_helius(mint: str, top_n: int = 20) -> list[dict]:
         return []
 
 
+_mint_authority_cache: dict[str, dict] = {}   # mint -> authorities (immutable-ish, cache forever)
+
+
+def fetch_mint_authorities(mint: str) -> Optional[dict]:
+    """
+    Read a mint's on-chain authorities via getAccountInfo(jsonParsed). Returns:
+        {freeze_authority, mint_authority, decimals, program, is_token2022}
+    or None on failure.
+
+    freeze_authority SET = the deployer can freeze your token account = the classic
+    Solana honeypot/"can't sell" vector. mint_authority SET = can dilute. is_token2022
+    flags the newer program (transfer hooks/fees can also block selling). This is the
+    on-chain truth shadow can't see — shadow tracks price, not whether you can exit.
+    Cached forever (authorities only ever get renounced, which is strictly safer).
+    """
+    cached = _mint_authority_cache.get(mint)
+    if cached is not None:
+        return cached
+    if not rpc_pool.count() and not SOLANA_RPC_URL:
+        return None
+    try:
+        resp = _rpc_post({
+            "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
+            "params": [mint, {"encoding": "jsonParsed"}],
+        })
+        if not resp or resp.status_code != 200:
+            return None
+        value = ((resp.json().get("result") or {}).get("value")) or {}
+        owner = value.get("owner") or ""
+        info = (((value.get("data") or {}).get("parsed") or {}).get("info")) or {}
+        result = {
+            "freeze_authority": info.get("freezeAuthority"),   # str or None
+            "mint_authority":   info.get("mintAuthority"),     # str or None
+            "decimals":         info.get("decimals"),
+            "program":          owner,
+            # Token-2022 program id; its mints can carry transfer hooks/fees that block sells
+            "is_token2022":     owner == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        }
+        _mint_authority_cache[mint] = result
+        return result
+    except Exception as e:
+        log.warning(f"[fetcher] mint authorities fetch failed for {mint[:8]}...: {e}")
+        return None
+
+
 def _fetch_jupiter_simple_price_usd(mint: str) -> Optional[float]:
     """
     Lightweight Jupiter USD price fetch without supply/mcap logic.
