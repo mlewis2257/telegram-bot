@@ -241,22 +241,7 @@ GROUP BY 1, 2
 def _run_by_hour(conn, params: dict, phantom_clause: str, args) -> None:
     """Grid of total_sol by weekday (cols) × hour-of-day (rows, UTC) — the intra-day
     shape of PnL, to see whether a bad day is bad all day or just a tight window."""
-    lane_filter = ""
-    scope_parts = []
-    if args.channel:
-        lane_filter += " AND ch.handle ILIKE %(channel)s"
-        params["channel"] = f"%{args.channel}%"
-        scope_parts.append(f"channel~{args.channel}")
-    if args.vip_tier:
-        lane_filter += " AND COALESCE(sp.vip_tier, 'none') = %(tier)s"
-        params["tier"] = args.vip_tier
-        scope_parts.append(f"tier={args.vip_tier}")
-    if args.skip_reason:
-        lane_filter += " AND COALESCE(c.skip_reason, 'none') = %(skip)s"
-        params["skip"] = args.skip_reason
-        scope_parts.append(f"skip_reason={args.skip_reason}")
-    scope = ", ".join(scope_parts) if scope_parts else "all lanes"
-
+    lane_filter, scope = _lane_filter(args, params)
     q = BY_HOUR_QUERY.format(phantom_clause=phantom_clause, lane_filter=lane_filter)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(q, params)
@@ -299,6 +284,86 @@ def _run_by_hour(conn, params: dict, phantom_clause: str, args) -> None:
     print("  One cell = one hour of one day = tiny sample. UTC hours; PDT = UTC-7.\n")
 
 
+def _lane_filter(args, params: dict):
+    """Build the optional channel/vip_tier/skip_reason WHERE fragment + a scope label,
+    shared by the lane-filtered breakdowns. Mutates `params` with the bind values."""
+    frag, parts = "", []
+    if args.channel:
+        frag += " AND ch.handle ILIKE %(channel)s"
+        params["channel"] = f"%{args.channel}%"
+        parts.append(f"channel~{args.channel}")
+    if args.vip_tier:
+        frag += " AND COALESCE(sp.vip_tier, 'none') = %(tier)s"
+        params["tier"] = args.vip_tier
+        parts.append(f"tier={args.vip_tier}")
+    if args.skip_reason:
+        frag += " AND COALESCE(c.skip_reason, 'none') = %(skip)s"
+        params["skip"] = args.skip_reason
+        parts.append(f"skip_reason={args.skip_reason}")
+    return frag, (", ".join(parts) if parts else "all lanes")
+
+
+# Weekday × WEEK pivot: the same weekday split across calendar weeks, so you can see
+# whether a lane's "good day" REPEATS (a real day-of-week edge) or was one lucky week.
+# This is the persistence test for the day patterns --by-dow only hints at. Needs
+# several weeks of history to say anything (use a wide --days, e.g. 28+).
+DOW_WEEKS_QUERY = """
+SELECT
+  EXTRACT(ISODOW FROM (sp.entry_time AT TIME ZONE 'UTC'))::int AS dow,
+  date_trunc('week', (sp.entry_time AT TIME ZONE 'UTC'))::date AS wk,
+  round(sum(sp.pnl_sol), 2)                                    AS sol,
+  count(*)                                                     AS n
+FROM shadow_positions sp
+JOIN calls c ON c.id = sp.call_id
+LEFT JOIN channels ch ON ch.id = c.channel_id
+WHERE sp.status = 'closed'
+  {phantom_clause}
+  AND ( %(days)s = 0 OR sp.entry_time >= now() - (%(days)s || ' days')::interval )
+  {lane_filter}
+GROUP BY 1, 2
+"""
+
+
+def _run_dow_weeks(conn, params: dict, phantom_clause: str, args) -> None:
+    """For a (filtered) lane, show each weekday's PnL split BY WEEK + a '+wk' consistency
+    count — turning '<lane> had one good Monday' into 'is Monday RELIABLY good?'."""
+    lane_filter, scope = _lane_filter(args, params)
+    q = DOW_WEEKS_QUERY.format(phantom_clause=phantom_clause, lane_filter=lane_filter)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(q, params)
+        rows = cur.fetchall()
+
+    label = f"last {args.days}d" if args.days else "all time"
+    print(f"\nWeekday PnL across weeks — {label}  (UTC, phantom-excluded, {scope})\n")
+    if not rows:
+        print("  No closed shadow positions in window.\n")
+        return
+
+    weeks = sorted({r["wk"] for r in rows})
+    sol = {(int(r["dow"]), r["wk"]): float(r["sol"] or 0) for r in rows}
+    have = {(int(r["dow"]), r["wk"]) for r in rows if int(r["n"]) > 0}
+
+    wkcols = "".join(f"{w.strftime('%m/%d'):>9}" for w in weeks)
+    hdr = f"{'wkday':<6}{wkcols}{'mean':>9}{'+wk':>8}"
+    print(hdr)
+    print("-" * len(hdr))
+    for d in range(1, 8):
+        cells, vals, pos = "", [], 0
+        for w in weeks:
+            if (d, w) in have:
+                v = sol.get((d, w), 0.0)
+                cells += f"{v:>9.2f}"
+                vals.append(v)
+                pos += 1 if v > 0 else 0
+            else:
+                cells += f"{'·':>9}"
+        mean = sum(vals) / len(vals) if vals else 0.0
+        print(f"{_DOW_NAMES[d]:<6}{cells}{mean:>9.2f}{(f'{pos}/{len(vals)}'):>8}")
+    print("\n  Each column is one ISO week (Mon-start). '+wk' = weeks that weekday was")
+    print("  POSITIVE / weeks it traded. A real day-of-week edge is a HIGH, repeating +wk")
+    print("  ratio — NOT one green week. '·' = lane didn't trade that weekday that week.\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=0, help="0 = all time")
@@ -310,6 +375,8 @@ def main() -> None:
                     help="per-day-of-week pivot + volume by weekday (needs weeks of data)")
     ap.add_argument("--by-hour", action="store_true",
                     help="weekday × hour-of-day grid of total_sol (intra-day shape; UTC)")
+    ap.add_argument("--dow-weeks", action="store_true",
+                    help="a lane's weekday PnL split BY WEEK + consistency count (use --days 28+)")
     ap.add_argument("--channel", default=None,
                     help="--by-hour: filter to channels whose handle matches (ILIKE)")
     ap.add_argument("--vip-tier", default=None,
@@ -344,6 +411,9 @@ def main() -> None:
         return
     if args.by_hour:
         _run_by_hour(conn, params, phantom_clause, args)
+        return
+    if args.dow_weeks:
+        _run_dow_weeks(conn, params, phantom_clause, args)
         return
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
