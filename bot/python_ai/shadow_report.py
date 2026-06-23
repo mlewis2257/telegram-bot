@@ -242,15 +242,20 @@ def _run_by_hour(conn, params: dict, phantom_clause: str, args) -> None:
     """Grid of total_sol by weekday (cols) × hour-of-day (rows, UTC) — the intra-day
     shape of PnL, to see whether a bad day is bad all day or just a tight window."""
     lane_filter = ""
-    scope = "all lanes"
-    if args.skip_reason:
-        lane_filter += " AND COALESCE(c.skip_reason, 'none') = %(skip)s"
-        params["skip"] = args.skip_reason
-        scope = f"skip_reason={args.skip_reason}"
+    scope_parts = []
     if args.channel:
         lane_filter += " AND ch.handle ILIKE %(channel)s"
         params["channel"] = f"%{args.channel}%"
-        scope = (scope + f", channel~{args.channel}") if args.skip_reason else f"channel~{args.channel}"
+        scope_parts.append(f"channel~{args.channel}")
+    if args.vip_tier:
+        lane_filter += " AND COALESCE(sp.vip_tier, 'none') = %(tier)s"
+        params["tier"] = args.vip_tier
+        scope_parts.append(f"tier={args.vip_tier}")
+    if args.skip_reason:
+        lane_filter += " AND COALESCE(c.skip_reason, 'none') = %(skip)s"
+        params["skip"] = args.skip_reason
+        scope_parts.append(f"skip_reason={args.skip_reason}")
+    scope = ", ".join(scope_parts) if scope_parts else "all lanes"
 
     q = BY_HOUR_QUERY.format(phantom_clause=phantom_clause, lane_filter=lane_filter)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -307,6 +312,8 @@ def main() -> None:
                     help="weekday × hour-of-day grid of total_sol (intra-day shape; UTC)")
     ap.add_argument("--channel", default=None,
                     help="--by-hour: filter to channels whose handle matches (ILIKE)")
+    ap.add_argument("--vip-tier", default=None,
+                    help="--by-hour: filter to one vip tier (none|safe|gamble|gamble_risk)")
     ap.add_argument("--skip-reason", default=None,
                     help="--by-hour: filter to one lane category (e.g. low_score)")
     ap.add_argument("--min-trades", type=int, default=10,

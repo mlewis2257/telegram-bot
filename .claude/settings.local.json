@@ -8,7 +8,9 @@
       "Bash(ls /Users/sw33tlew5th/Documents/telegram-bot/bot/python_ai/*.py)",
       "Bash(python3 -m py_compile paper_trader.py)",
       "Bash(python3 -c ' *)",
-      "Bash(python3 -c \"import ast; ast.parse\\(open\\('ws_monitor.py'\\).read\\(\\)\\); print\\('ws_monitor.py OK'\\)\")"
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('ws_monitor.py'\\).read\\(\\)\\); print\\('ws_monitor.py OK'\\)\")",
+      "Bash(python3 -c 'import ast; ast.parse\\(open\\('\\\\''__TRACKED_VAR__'\\\\''\\).read\\(\\)\\); print\\('\\\\''__TRACKED_VAR__ OK'\\\\''\\)')",
+      "Bash(grep -oE \"[\\\\\"'][a-z_]+[\\\\\"']$\")"
     ]
   }
 }
