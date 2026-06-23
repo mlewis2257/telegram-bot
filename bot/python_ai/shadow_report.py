@@ -217,6 +217,83 @@ def _run_by_dow(conn, params: dict, phantom_clause: str, args) -> None:
     print("  so a single Saturday can dominate 'Sat' until you have many of them.\n")
 
 
+# Hour-of-week pivot: total_sol per (weekday, hour-of-day) so you can see the intra-day
+# SHAPE of a day's PnL — whether a bad weekday is bad all day or just a few hours. Hours
+# are UTC (matches --by-dow). Optional channel/skip_reason filters isolate one lane
+# (e.g. an anchor), since summing every lane lets the big losers swamp the cells.
+BY_HOUR_QUERY = """
+SELECT
+  EXTRACT(ISODOW FROM (sp.entry_time AT TIME ZONE 'UTC'))::int AS dow,
+  EXTRACT(HOUR   FROM (sp.entry_time AT TIME ZONE 'UTC'))::int AS hour,
+  round(sum(sp.pnl_sol), 3)                                    AS sol,
+  count(*)                                                     AS n
+FROM shadow_positions sp
+JOIN calls c ON c.id = sp.call_id
+LEFT JOIN channels ch ON ch.id = c.channel_id
+WHERE sp.status = 'closed'
+  {phantom_clause}
+  AND ( %(days)s = 0 OR sp.entry_time >= now() - (%(days)s || ' days')::interval )
+  {lane_filter}
+GROUP BY 1, 2
+"""
+
+
+def _run_by_hour(conn, params: dict, phantom_clause: str, args) -> None:
+    """Grid of total_sol by weekday (cols) × hour-of-day (rows, UTC) — the intra-day
+    shape of PnL, to see whether a bad day is bad all day or just a tight window."""
+    lane_filter = ""
+    scope = "all lanes"
+    if args.skip_reason:
+        lane_filter += " AND COALESCE(c.skip_reason, 'none') = %(skip)s"
+        params["skip"] = args.skip_reason
+        scope = f"skip_reason={args.skip_reason}"
+    if args.channel:
+        lane_filter += " AND ch.handle ILIKE %(channel)s"
+        params["channel"] = f"%{args.channel}%"
+        scope = (scope + f", channel~{args.channel}") if args.skip_reason else f"channel~{args.channel}"
+
+    q = BY_HOUR_QUERY.format(phantom_clause=phantom_clause, lane_filter=lane_filter)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(q, params)
+        rows = cur.fetchall()
+
+    label = f"last {args.days}d" if args.days else "all time"
+    print(f"\nShadow PnL by hour-of-week — {label}  (UTC hours, phantom-excluded, {scope})\n")
+    if not rows:
+        print("  No closed shadow positions in window.\n")
+        return
+
+    dows = list(range(1, 8))
+    grid = {(d, h): 0.0 for d in dows for h in range(24)}
+    voln = {(d, h): 0 for d in dows for h in range(24)}
+    for r in rows:
+        d, h = int(r["dow"]), int(r["hour"])
+        grid[(d, h)] += float(r["sol"] or 0)
+        voln[(d, h)] += int(r["n"])
+
+    daycols = "".join(f"{_DOW_NAMES[d]:>8}" for d in dows)
+    hdr = f"{'UTC':>3}  {daycols}{'TOTAL':>9}"
+    print(hdr)
+    print("-" * len(hdr))
+    dow_tot = {d: 0.0 for d in dows}
+    for h in range(24):
+        cells, rowtot = "", 0.0
+        for d in dows:
+            v = grid[(d, h)]
+            dow_tot[d] += v
+            rowtot += v
+            cells += f"{v:>8.2f}"
+        print(f"{h:>3}  {cells}{rowtot:>9.2f}")
+    print("-" * len(hdr))
+    tot_cells = "".join(f"{dow_tot[d]:>8.2f}" for d in dows)
+    print(f"{'TOT':>3}  {tot_cells}{sum(dow_tot.values()):>9.2f}")
+    vol_cells = "".join(f"{sum(voln[(d, h)] for h in range(24)):>8d}" for d in dows)
+    print(f"{'n':>3}  {vol_cells}")
+    print("\n  Read DOWN a column for a day's intra-day shape; a real time-of-day effect")
+    print("  is a band of same-hour cells with the same sign across MULTIPLE day columns.")
+    print("  One cell = one hour of one day = tiny sample. UTC hours; PDT = UTC-7.\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=0, help="0 = all time")
@@ -226,6 +303,12 @@ def main() -> None:
                     help="per-day total_sol per lane×variant (spot consistency vs one lucky day)")
     ap.add_argument("--by-dow", action="store_true",
                     help="per-day-of-week pivot + volume by weekday (needs weeks of data)")
+    ap.add_argument("--by-hour", action="store_true",
+                    help="weekday × hour-of-day grid of total_sol (intra-day shape; UTC)")
+    ap.add_argument("--channel", default=None,
+                    help="--by-hour: filter to channels whose handle matches (ILIKE)")
+    ap.add_argument("--skip-reason", default=None,
+                    help="--by-hour: filter to one lane category (e.g. low_score)")
     ap.add_argument("--min-trades", type=int, default=10,
                     help="--by-day/--by-dow: hide lanes with fewer than this many closed trades")
     args = ap.parse_args()
@@ -251,6 +334,9 @@ def main() -> None:
         return
     if args.by_dow:
         _run_by_dow(conn, params, phantom_clause, args)
+        return
+    if args.by_hour:
+        _run_by_hour(conn, params, phantom_clause, args)
         return
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:

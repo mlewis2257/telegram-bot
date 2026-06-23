@@ -25,7 +25,14 @@ listener. It does NOT execute trades — it just answers "what should this lane 
 from __future__ import annotations
 
 import os
+import sys
+from datetime import datetime, timezone
 from typing import Optional
+
+try:
+    from zoneinfo import ZoneInfo  # py3.9+ (needs system tzdata or the `tzdata` pkg)
+except ImportError:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
 
 from exit_config import EXIT_A_PAPER, EXIT_RIDE
 
@@ -42,6 +49,65 @@ RVOL_HOLD = float(os.getenv("LANE_RVOL_HOLD", "0.8"))
 
 # Master switch — keep the router OFF until you deliberately route a strategy to it.
 LANE_POLICY_ENABLED = os.getenv("LANE_POLICY_ENABLED", "false").lower() == "true"
+
+
+# ── Global day-gate (defensive weekday skip) ──────────────────────────────────
+# Some weekdays are structurally bad to trade (Sunday — historically weak unless a
+# special occasion). This skips them OUTRIGHT, across every lane. It's a *defensive*
+# gate (a skip), which is low-regret: worst case you miss the rare good Sunday. That's
+# the opposite of a day-*add*, which would need many samples before it's safe to trust.
+#
+# The weekday is evaluated in LANE_GATE_TZ. Default UTC — which is how the DB stores
+# entry_time AND how shadow_report buckets the data, so "skip Sun" skips exactly the
+# UTC-Sunday bucket the report measured (one coordinate system end to end). Set
+# LANE_GATE_TZ="America/Los_Angeles" to gate on your local calendar day instead; note a
+# local day is offset ~7-8h from the UTC buckets, so it straddles two of them.
+LANE_GATE_TZ = os.getenv("LANE_GATE_TZ", "UTC")
+
+# Weekdays to skip, as 3-letter abbrevs. Default: Sunday. Override WITHOUT a redeploy
+# for a "special occasion" Sunday: LANE_SKIP_WEEKDAYS="" trades every day,
+# LANE_SKIP_WEEKDAYS="Sat,Sun" skips both.
+_WD_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+SKIP_WEEKDAYS = {
+    d.strip().title()
+    for d in os.getenv("LANE_SKIP_WEEKDAYS", "Sun").split(",")
+    if d.strip()
+}
+
+# Resolve the gate tz once at import. UTC needs no tzdata; a named zone does — if it
+# can't load we degrade to UTC weekdays and warn loudly rather than silently dropping
+# the gate.
+_GATE_TZ = timezone.utc
+if LANE_GATE_TZ.upper() not in ("UTC", "ETC/UTC"):
+    loaded = None
+    if ZoneInfo is not None:
+        try:
+            loaded = ZoneInfo(LANE_GATE_TZ)
+        except Exception:  # ZoneInfoNotFoundError, etc.
+            loaded = None
+    if loaded is not None:
+        _GATE_TZ = loaded
+    elif SKIP_WEEKDAYS:
+        print(f"[lane_policy] WARNING: could not load tz '{LANE_GATE_TZ}' "
+              f"(install the `tzdata` package) — day-gate will fall back to UTC weekdays.",
+              file=sys.stderr)
+
+
+def gate_weekday(now: Optional[datetime] = None) -> str:
+    """
+    3-letter weekday ('Mon'..'Sun') for `now` in LANE_GATE_TZ. `now` defaults to the
+    current time; a naive datetime is assumed UTC (DB timestamps are UTC).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return _WD_NAMES[now.astimezone(_GATE_TZ).weekday()]
+
+
+def is_skipped_day(now: Optional[datetime] = None) -> bool:
+    """True if `now` (see gate_weekday) lands on a skipped weekday in LANE_GATE_TZ."""
+    return bool(SKIP_WEEKDAYS) and gate_weekday(now) in SKIP_WEEKDAYS
 
 
 # ── The lane policy table ─────────────────────────────────────────────────────
@@ -100,11 +166,18 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
 }
 
 
-def resolve(channel: Optional[str], vip_tier: Optional[str], category: Optional[str]) -> dict:
+def resolve(channel: Optional[str], vip_tier: Optional[str], category: Optional[str],
+            now: Optional[datetime] = None) -> dict:
     """
     Return the policy for a lane: at minimum {"trade": bool}; traded lanes also
     carry "size" (SOL) and "exit" (strategy name). Unlisted lanes -> DEFAULT (skip).
+
+    `now` drives the global weekday day-gate: on a skipped weekday (SKIP_WEEKDAYS,
+    evaluated in LANE_GATE_TZ) NO lane trades and the result carries reason="skip_day".
+    Pass the call/entry timestamp (naive -> treated as UTC); defaults to the current time.
     """
+    if is_skipped_day(now):
+        return {"trade": False, "reason": "skip_day", "weekday": gate_weekday(now)}
     ch   = (channel or "").lstrip("@").strip()
     tier = (vip_tier or "none").strip()
     cat  = (category or "none").strip()
