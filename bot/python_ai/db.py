@@ -1203,7 +1203,8 @@ def get_open_paper_position(call_id: int, is_strategy_b: bool = False) -> dict |
         cur.execute(
             """
             SELECT tp.entry_price, tp.sol_in, tp.entry_time, tp.vip_tier,
-                   ch.handle, tp.peak_mcap, tp.peak_multiplier, tp.peak_at
+                   ch.handle, tp.peak_mcap, tp.peak_multiplier, tp.peak_at,
+                   c.skip_reason
             FROM trading_positions tp
             JOIN calls c ON c.id = tp.call_id
             LEFT JOIN channels ch ON ch.id = c.channel_id
@@ -1226,6 +1227,7 @@ def get_open_paper_position(call_id: int, is_strategy_b: bool = False) -> dict |
             "peak_mcap": float(row[5]) if row[5] is not None else None,
             "peak_multiplier": float(row[6]) if row[6] is not None else None,
             "peak_at": row[7],
+            "skip_reason": row[8],   # the lane label, for the lane-testbed exit resolver
         }
 
 

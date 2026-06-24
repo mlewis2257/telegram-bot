@@ -31,7 +31,13 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import db
 import data_fetcher
+import lane_policy
 from exit_config import ExitConfig, ExitResult, apply_exit_config, EXIT_B_PAPER
+
+# Lane testbed: when on, Strategy B trades lane_policy ANCHORS + day-gated WATCH POCKETS
+# (via open_lane_position) and exits each position on its lane's research-best rule.
+# Default off — importing this module changes nothing until the flag is set.
+LANE_TESTBED_ENABLED = os.getenv("LANE_TESTBED_ENABLED", "false").lower() == "true"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -275,6 +281,47 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             _pending_mints_b.discard(mint)
 
 
+async def open_lane_position(score_result: dict, token_data: dict, policy: dict) -> None:
+    """
+    Lane-testbed entry (Strategy B = anchors + watch pockets). lane_policy has ALREADY
+    decided trade/size/exit/day-gate; this just prices and opens. No legacy entry
+    gates — lane_policy IS the gate. Never raises.
+    """
+    position_entry_time = datetime.now(timezone.utc)
+    symbol  = token_data.get("symbol", "?")
+    mint    = token_data.get("mint_address")
+    call_id = score_result.get("call_id") if score_result else None
+    size    = float(policy.get("size") or 0)
+    if not call_id or not mint or mint.startswith(("INFERRED:", "UNKNOWN:")) or size <= 0:
+        return
+
+    async with _pending_lock_b:
+        if mint in _pending_mints_b:
+            return
+        _pending_mints_b.add(mint)
+    try:
+        if db.has_open_paper_position_for_mint(mint, is_strategy_b=True):
+            return
+        market = data_fetcher.fetch_token_price_fast(mint)
+        entry_price = float(market["mcap"]) if market and market.get("mcap") else float(token_data.get("mcap_at_call") or 0)
+        if entry_price <= 0:
+            return
+        entry_volume = float(market["volume_h1"]) if market and market.get("volume_h1") else None
+        db.open_paper_position(call_id, entry_price, size,
+                               entry_time=position_entry_time,
+                               entry_volume=entry_volume,
+                               is_strategy_b=True,
+                               vip_tier=token_data.get("vip_tier"))
+        _position_mints_b[call_id] = mint
+        print(f"[lane_B] opened {symbol} call_id={call_id} {size} SOL @ {entry_price:.0f} exit={policy.get('exit')}")
+    except Exception as e:
+        db.safe_rollback()
+        print(f"[lane_B] open_lane_position failed: {e}")
+    finally:
+        async with _pending_lock_b:
+            _pending_mints_b.discard(mint)
+
+
 def check_exits(
     call_id: int,
     current_mcap: float,
@@ -288,7 +335,8 @@ def check_exits(
     Strategy B exit logic.
 
     exit_config selects the exit strategy. Defaults to EXIT_B_PAPER which
-    preserves the original Strategy B behaviour exactly.
+    preserves the original Strategy B behaviour exactly. In lane-testbed mode the
+    position's lane (its research-best exit) overrides the passed config.
     """
     position = db.get_open_paper_position(call_id, is_strategy_b=is_strategy_b)
     if not position:
@@ -297,10 +345,17 @@ def check_exits(
     if entry_mcap <= 0:
         return ExitResult(False)
 
-    cfg = exit_config if exit_config is not None else EXIT_B_PAPER
     is_vip_gamble_pos = position.get("vip_tier") in ("gamble_risk", "gamble")
     channel_handle    = (position.get("channel_handle") or "").lstrip("@")
     entry_time        = position.get("entry_time")
+
+    cfg = exit_config if exit_config is not None else EXIT_B_PAPER
+    # Lane testbed: exit each position on ITS lane's rule, overriding the monitor's
+    # default. rvol is None here (no live volume in the exit check) so ride_vol -> ride.
+    if LANE_TESTBED_ENABLED:
+        _exit = lane_policy.lane_exit(channel_handle, position.get("vip_tier"), position.get("skip_reason"))
+        if _exit:
+            cfg = lane_policy.exit_config_for(_exit)
 
     return apply_exit_config(
         cfg,

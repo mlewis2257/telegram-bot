@@ -26,9 +26,15 @@ sys.path.insert(0, os.path.dirname(__file__))
 import db
 import data_fetcher
 import alert_bot
+import lane_policy
 from dataclasses import replace as _dc_replace
 from strategy_config import STRATEGY_A_V2026_05_22
 from strategy_engine import StrategyCallContext, evaluate_strategy_a_entry
+
+# Lane testbed: when on, Strategy A trades the lane_policy ANCHOR lanes (via
+# open_lane_position) and exits each position on its lane's research-best rule.
+# Default off — importing this module changes nothing until the flag is set.
+LANE_TESTBED_ENABLED = os.getenv("LANE_TESTBED_ENABLED", "false").lower() == "true"
 
 # Paper Strategy A enters free solhousesignal at 15k vs live trading and Strategy B,
 # which keep the shared config's 20k floor. Derived from the shared config so every
@@ -285,6 +291,46 @@ async def open_position(score_result: dict, token_data: dict) -> None:
             _pending_mints.discard(mint)
 
 
+async def open_lane_position(score_result: dict, token_data: dict, policy: dict) -> None:
+    """
+    Lane-testbed entry (Strategy A = anchors). lane_policy has ALREADY decided
+    trade/size/exit/day-gate; this just prices the entry and opens the position.
+    No legacy entry gates — lane_policy IS the gate. Never raises.
+    """
+    position_entry_time = datetime.now(timezone.utc)
+    symbol  = token_data.get("symbol", "?")
+    mint    = token_data.get("mint_address")
+    call_id = score_result.get("call_id") if score_result else None
+    size    = float(policy.get("size") or 0)
+    if not call_id or not mint or mint.startswith(("INFERRED:", "UNKNOWN:")) or size <= 0:
+        return
+
+    async with _pending_lock:
+        if mint in _pending_mints:
+            return
+        _pending_mints.add(mint)
+    try:
+        if db.has_open_paper_position_for_mint(mint, is_strategy_b=False):
+            return
+        market = data_fetcher.fetch_token_price_fast(mint)
+        entry_price = float(market["mcap"]) if market and market.get("mcap") else float(token_data.get("mcap_at_call") or 0)
+        if entry_price <= 0:
+            return
+        entry_volume = float(market["volume_h1"]) if market and market.get("volume_h1") else None
+        db.open_paper_position(call_id, entry_price, size,
+                               entry_time=position_entry_time,
+                               entry_volume=entry_volume,
+                               vip_tier=token_data.get("vip_tier"))
+        _position_mints[call_id] = mint
+        print(f"[lane_A] opened {symbol} call_id={call_id} {size} SOL @ {entry_price:.0f} exit={policy.get('exit')}")
+    except Exception as e:
+        db.safe_rollback()
+        print(f"[lane_A] open_lane_position failed: {e}")
+    finally:
+        async with _pending_lock:
+            _pending_mints.discard(mint)
+
+
 def check_exits(
     call_id: int,
     current_mcap: float,
@@ -301,7 +347,8 @@ def check_exits(
     exists — safe to call unconditionally on every monitor pass.
 
     exit_config selects the exit strategy. Defaults to EXIT_A_PAPER which
-    preserves the original Strategy A behaviour exactly.
+    preserves the original Strategy A behaviour exactly. In lane-testbed mode the
+    position's lane (its research-best exit) overrides the passed config.
     """
     position = db.get_open_paper_position(call_id, is_strategy_b=is_strategy_b)
     if not position:
@@ -310,10 +357,17 @@ def check_exits(
     if entry_mcap <= 0:
         return ExitResult(False)
 
-    cfg = exit_config if exit_config is not None else EXIT_A_PAPER
     is_vip_gamble_pos = position.get("vip_tier") in ("gamble_risk", "gamble")
     channel_handle    = (position.get("channel_handle") or "").lstrip("@")
     entry_time        = position.get("entry_time")
+
+    cfg = exit_config if exit_config is not None else EXIT_A_PAPER
+    # Lane testbed: exit each position on ITS lane's rule, overriding the monitor's
+    # default. rvol is None here (no live volume in the exit check) so ride_vol -> ride.
+    if LANE_TESTBED_ENABLED:
+        _exit = lane_policy.lane_exit(channel_handle, position.get("vip_tier"), position.get("skip_reason"))
+        if _exit:
+            cfg = lane_policy.exit_config_for(_exit)
 
     return apply_exit_config(
         cfg,

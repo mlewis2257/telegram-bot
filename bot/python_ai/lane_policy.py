@@ -123,65 +123,84 @@ def is_skipped_day(now: Optional[datetime] = None) -> bool:
 # clean 7-day window before sizing up. This is a STARTING table — edit it freely.
 DEFAULT: dict = {"trade": False}
 
-# Keys CONFIRMED against the DB. Trade/exit kept only for lanes NET-POSITIVE over the
-# reliable 5-day phantom-excluded window (shadow_report --by-dow --days 5); lanes that
-# flipped negative going 3d->5d were cut (the mcap_too_low trap — a 3d spike isn't an
-# edge). Per-lane exit matters: `ride` is leverage — great where the edge is real,
-# ruinous where it isn't.
+# TESTBED POLICY (2026-06-24). Drives the paper lane-testbed (LANE_TESTBED_ENABLED):
+#   strategy "A" trades ANCHORS only; strategy "B" trades ANCHORS + WATCH POCKETS.
+# Both honor each lane's research-best exit (the value's "exit"). Optional per-lane keys:
+#   "watch": True  -> B-only (an unconfirmed day-pocket inside a net-negative lane)
+#   "days": {...}  -> only trade on these LANE_GATE_TZ weekdays (3-letter abbrevs)
+# The global Sunday skip (SKIP_WEEKDAYS) still applies on top of everything.
+DEFAULT: dict = {"trade": False}
+
 LANE_POLICY: dict[tuple[str, str, str], dict] = {
-    # ── TRADE: net-positive over 5d ──
-    # low_score (free): ALL variants + over 5d (ride_vol +8.15, early +5.28, ride +4.03) — robust.
-    ("solhousesignal",   "none", "low_score"): {"trade": True, "size": 0.5,  "exit": EXIT_RIDE_VOL},
-    # solwhaletrending low_score: early +6.63 / 5d (ride_vol +2.97; ride -3.64 loses) — steadiest lane.
-    ("solwhaletrending", "none", "low_score"): {"trade": True, "size": 0.25, "exit": EXIT_EARLY},
-    # solwhaletrending none: ALL variants + over 5d (early +4.43, ride_vol +4.30, ride +2.27).
+    # ── ANCHORS — net-positive over 14d; A & B BOTH trade these ──
+    # low_score (free): the king. EARLY best over 14d (+20.4; ride_vol +16.8; ride +8.1).
+    # (ride_vol led the shorter 5d window — early wins on the larger, more robust sample.)
+    ("solhousesignal",   "none", "low_score"): {"trade": True, "size": 0.5,  "exit": EXIT_EARLY},
+    # solwhaletrending none: +13.5/14d, all variants green but THIN (~45/wk) & lumpy. early.
     ("solwhaletrending", "none", "none"):      {"trade": True, "size": 0.25, "exit": EXIT_EARLY},
 
-    # ── SKIP: confirmed losers (explicit so intent is auditable) ──
-    ("solhousesignal_vip", "gamble_risk", "vip_paused"):               {"trade": False},  # ride -166 / 5d
-    ("solhousesignal_vip", "gamble",      "mcap_too_low"):             {"trade": False},  # ride -71 / 5d
-    ("solhousesignal_vip", "gamble",      "vip_gamble_allowed_hours"): {"trade": False},  # -16
-    ("solhousesignal_vip", "gamble",      "vip_low_score"):            {"trade": False},  # -6.8 (gamble; SAFE different)
-    ("solhousesignal_vip", "safe",        "vip_safe_allowed_hours"):   {"trade": False},  # -12 (all variants)
-    ("solhousesignal_vip", "gamble",      "none"):                     {"trade": False},  # -3
-    ("solhousesignal",     "none",        "none"):                     {"trade": False},  # -20 / 5d
+    # ── WATCH POCKETS — B ONLY, day-gated. Net-NEGATIVE lanes with a repeating green
+    #    weekday in --dow-weeks. UNCONFIRMED (2/2 so far) → small size; exit is a tunable
+    #    judgement call (thin per-variant data), not a proven number. ──
+    # vip_low_score gamble: Monday 2/2 (+6.7 mean), held & grew — best long-shot. ride_vol (per by-dow).
+    ("solhousesignal_vip", "gamble", "vip_low_score"): {"trade": True, "size": 0.1, "exit": EXIT_RIDE_VOL, "watch": True, "days": {"Mon"}},
+    # free/none: Tuesday 2/2 (+3.15) inside the -61 free/none loser. early (cut fast in a loser lane).
+    ("solhousesignal",     "none",  "none"):           {"trade": True, "size": 0.1, "exit": EXIT_EARLY,    "watch": True, "days": {"Tue"}},
+    # free/quiet_hours: Saturday 2/2 (+6.75) inside the -15 quiet_hours loser. early.
+    ("solhousesignal",     "none",  "quiet_hours"):    {"trade": True, "size": 0.1, "exit": EXIT_EARLY,    "watch": True, "days": {"Sat"}},
 
-    # ── CUT: flipped NET-NEGATIVE 3d->5d (the trap). Kept here so we don't re-add blindly. ──
-    ("solhousesignal_vip", "safe",   "vip_low_score"): {"trade": False},
-    ("solhousesignal_vip", "gamble", "vip_mcap_gate"): {"trade": False},
-
-    # ── DAY-GATE WATCH LIST (NOT traded — single-sample so far) ─────────────────
-    # These lanes are net-NEGATIVE overall but strongly positive on SPECIFIC weekdays
-    # in the 7d --by-dow. 7 days = ONE of each weekday, so each is n=1 — a candidate,
-    # not an edge. PROMOTE a row to a gated lane only after its weekday repeats ~3-4x.
-    # When ready, the entry becomes e.g.:
-    #   ("solhousesignal_vip","safe","vip_low_score"):
-    #       {"trade": True, "size": 0.25, "exit": "ride", "days": {"Thu","Fri"}}
-    # Candidates (lane -> strong day(s), best variant, 1-sample PnL):
-    #   solhousesignal_vip/safe/vip_low_score          -> Thu+Fri  ride      (+12.55)
-    #   solhousesignal_vip/gamble/vip_gamble_allowed_h -> Sat       early     (+8.32)
-    #   solhousesignal_vip/gamble/none                 -> Mon,Sun   early     (+5.5)
-    #   solhousesignal_vip/gamble/vip_low_score        -> Mon       ride_vol  (+3.6)
-    #   solhousesignal_vip/gamble/mcap_too_low         -> Fri       early     (+7.53, risky lane)
+    # ── SKIP / CUT — confirmed losers, explicit so intent is auditable (NEVER traded) ──
+    ("solwhaletrending",   "none",        "low_score"):                {"trade": False},  # DEMOTED: net-neg clean window, n>216
+    ("solhousesignal_vip", "gamble_risk", "vip_paused"):               {"trade": False},  # -471, worst lane
+    ("solhousesignal_vip", "gamble",      "mcap_too_low"):             {"trade": False},  # -256
+    ("solhousesignal_vip", "safe",        "vip_low_score"):            {"trade": False},  # -104
+    ("solhousesignal_vip", "safe",        "vip_safe_allowed_hours"):   {"trade": False},  # -75
+    ("solhousesignal_vip", "gamble",      "vip_gamble_allowed_hours"): {"trade": False},  # -63
+    ("solhousesignal_vip", "gamble",      "vip_mcap_gate"):            {"trade": False},  # mirage — all 1/2 coin-flips
+    ("solhousesignal_vip", "gamble",      "none"):                     {"trade": False},  # -27
 }
 
 
 def resolve(channel: Optional[str], vip_tier: Optional[str], category: Optional[str],
-            now: Optional[datetime] = None) -> dict:
+            now: Optional[datetime] = None, strategy: str = "A") -> dict:
     """
     Return the policy for a lane: at minimum {"trade": bool}; traded lanes also
     carry "size" (SOL) and "exit" (strategy name). Unlisted lanes -> DEFAULT (skip).
 
-    `now` drives the global weekday day-gate: on a skipped weekday (SKIP_WEEKDAYS,
-    evaluated in LANE_GATE_TZ) NO lane trades and the result carries reason="skip_day".
-    Pass the call/entry timestamp (naive -> treated as UTC); defaults to the current time.
+    `strategy` is the testbed lane "A" (anchors only) or "B" (anchors + watch pockets).
+    `now` drives the weekday gates (evaluated in LANE_GATE_TZ). Layered skips, each with
+    a `reason`: global skipped weekday -> "skip_day"; a B-only watch pocket seen by A ->
+    "watch_excluded"; a day-gated lane off its weekday -> "off_day". Pass the call/entry
+    timestamp (naive -> treated as UTC); defaults to the current time.
     """
     if is_skipped_day(now):
         return {"trade": False, "reason": "skip_day", "weekday": gate_weekday(now)}
     ch   = (channel or "").lstrip("@").strip()
     tier = (vip_tier or "none").strip()
     cat  = (category or "none").strip()
-    return LANE_POLICY.get((ch, tier, cat), DEFAULT)
+    policy = LANE_POLICY.get((ch, tier, cat), DEFAULT)
+    if not policy.get("trade"):
+        return policy
+    # B-only watch pockets: an unconfirmed day-pocket inside a net-negative lane.
+    if policy.get("watch") and str(strategy).upper() != "B":
+        return {"trade": False, "reason": "watch_excluded"}
+    # Per-lane weekday restriction (the day-gate): only trade on the lane's good day(s).
+    days = policy.get("days")
+    if days and gate_weekday(now) not in days:
+        return {"trade": False, "reason": "off_day", "weekday": gate_weekday(now)}
+    return policy
+
+
+def lane_exit(channel: Optional[str], vip_tier: Optional[str], category: Optional[str]) -> Optional[str]:
+    """
+    The lane's assigned exit-strategy name, IGNORING trade/day/watch gating. Used at
+    exit-check time: the entry decision is already made, so a position must keep
+    exiting on its lane's rule even on an off-day or in a watch lane A wouldn't enter.
+    """
+    ch   = (channel or "").lstrip("@").strip()
+    tier = (vip_tier or "none").strip()
+    cat  = (category or "none").strip()
+    return LANE_POLICY.get((ch, tier, cat), {}).get("exit")
 
 
 def exit_config_for(strategy: Optional[str], rvol: Optional[float] = None):

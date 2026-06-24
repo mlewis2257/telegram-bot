@@ -34,6 +34,12 @@ import alert_bot
 import paper_trader
 import paper_trader_b
 import shadow_trader
+import lane_policy
+
+# Lane testbed master switch (mirrors paper_trader.LANE_TESTBED_ENABLED). When on, A/B
+# trade lane_policy lanes via open_lane_position and the legacy paper dispatch is
+# suppressed. Default off — no behaviour change until set.
+LANE_TESTBED_ENABLED = os.getenv("LANE_TESTBED_ENABLED", "false").lower() == "true"
 import monitor as _monitor
 from parsers import type_a, type_b, type_a_vip
 
@@ -280,6 +286,8 @@ async def _dispatch_paper_open(
     is_strategy_b: bool,
     fallback_reason: str | None = None,
 ) -> None:
+    if LANE_TESTBED_ENABLED:
+        return  # legacy A/B paper dispatch is replaced by the lane testbed
     trader = paper_trader_b if is_strategy_b else paper_trader
     call_id = score_result.get("call_id") if score_result else None
 
@@ -297,6 +305,36 @@ async def _dispatch_paper_open(
             f"[paper_dispatch] call_id={call_id} symbol={extra.get('symbol')} "
             f"fell through dispatch without trade/skip — stamped {fallback_reason}"
         )
+
+
+async def _dispatch_lane_testbed(score_result: dict, extra: dict) -> None:
+    """
+    Lane testbed dispatch. Fires AFTER routing (so the call's skip_reason — the lane
+    label — is final), resolving lane_policy independently for Strategy A (anchors) and
+    Strategy B (anchors + day-gated watch pockets) and opening paper positions for each.
+    Never raises — a testbed failure must not affect the listener.
+    """
+    call_id = score_result.get("call_id") if score_result else None
+    if not call_id or not extra:
+        return
+    try:
+        channel  = (extra.get("channel_tag") or extra.get("channel_handle") or "").lstrip("@")
+        vip_tier = extra.get("vip_tier")
+        category = db.get_call_skip_reason(call_id)  # the lane label; None -> "none"
+        pa = lane_policy.resolve(channel, vip_tier, category, strategy="A")
+        if pa.get("trade"):
+            _track_task(
+                asyncio.create_task(paper_trader.open_lane_position(score_result, extra, pa)),
+                f"laneA call_id={call_id}",
+            )
+        pb = lane_policy.resolve(channel, vip_tier, category, strategy="B")
+        if pb.get("trade"):
+            _track_task(
+                asyncio.create_task(paper_trader_b.open_lane_position(score_result, extra, pb)),
+                f"laneB call_id={call_id}",
+            )
+    except Exception as e:
+        print(f"[lane_testbed] dispatch failed call_id={call_id}: {e}")
 
 
 # ── Per-channel-type handlers ─────────────────────────────────────────────────
@@ -1127,6 +1165,10 @@ def run_listener() -> None:
                     f"shadow call_id={score_result.get('call_id')}",
                 )
 
+            # Lane testbed: capture the scorer result by value BEFORE routing nulls it,
+            # so we can dispatch off the FINAL skip_reason once routing has labeled the lane.
+            _lane_sr = score_result if (LANE_TESTBED_ENABLED and score_result and extra) else None
+
             # SHADOW-ONLY guard: shadow fired above (score_result captured by value),
             # so nulling it here blocks every downstream paper/live/alert entry while
             # keeping the call measured in shadow_report. This is what keeps a re-listed
@@ -1358,6 +1400,11 @@ def run_listener() -> None:
                 ):
                     db.set_call_skip_reason(call_id, "low_score")
                     print(f"[paper] {extra.get('symbol')} skipped — score {score:.1f} < 63")
+
+            # Lane testbed: routing is done, so skip_reason (the lane label) is final.
+            # Resolve lane_policy for A (anchors) + B (anchors+pockets) and open paper trades.
+            if LANE_TESTBED_ENABLED and _lane_sr and extra:
+                await _dispatch_lane_testbed(_lane_sr, extra)
 
             if status == "milestone" and extra:
                 await alert_bot.send_milestone(**extra)
