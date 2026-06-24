@@ -44,13 +44,23 @@ PHANTOM_PRED = """(
 )"""
 
 
-def _q(query: str, normalize: bool, **fmt) -> str:
-    """Format a report query, then (if --normalize) rewrite the PnL sum to a per-1-SOL
-    return — pnl_sol / sol_in — so totals are invariant to SHADOW_SOL_IN and stay
-    comparable across a size change. Targets only `sum(sp.pnl_sol)`, not win counts."""
+def _project(args) -> float | None:
+    """SOL size to project each trade to, or None for raw pnl_sol. `--size X` projects
+    to X SOL/trade; `--normalize` is shorthand for `--size 1` (per-1-SOL, scale-invariant)."""
+    if getattr(args, "size", None) is not None:
+        return float(args.size)
+    return 1.0 if args.normalize else None
+
+
+def _q(query: str, project: float | None, **fmt) -> str:
+    """Format a report query, then (if projecting) rewrite the PnL sum to a per-SOL
+    return scaled to `project` SOL/trade — pnl_sol / sol_in * project. This is invariant
+    to SHADOW_SOL_IN, so totals stay comparable across a size change AND show the PnL you'd
+    have at any size. Targets only `sum(sp.pnl_sol)`, not win counts."""
     q = query.format(**fmt)
-    if normalize:
-        q = q.replace("sum(sp.pnl_sol)", "sum(sp.pnl_sol / NULLIF(sp.sol_in, 0))")
+    if project is not None:
+        q = q.replace("sum(sp.pnl_sol)",
+                      f"sum(sp.pnl_sol / NULLIF(sp.sol_in, 0) * {float(project)})")
     return q
 
 
@@ -123,7 +133,7 @@ def _run_by_day(conn, params: dict, phantom_clause: str, args) -> None:
     """Pivot closed-trade PnL into one row per (lane, variant) with a column per day,
     so you can see whether a lane is consistently positive vs one lucky day."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(_q(BY_DAY_QUERY, args.normalize, phantom_clause=phantom_clause), params)
+        cur.execute(_q(BY_DAY_QUERY, _project(args), phantom_clause=phantom_clause), params)
         rows = cur.fetchall()
 
     label = f"last {args.days}d" if args.days else "all time"
@@ -186,7 +196,7 @@ def _run_by_dow(conn, params: dict, phantom_clause: str, args) -> None:
     """Pivot PnL by day-of-WEEK (Mon..Sun) + show overall trade volume per weekday,
     so you can see which days are busiest and which lanes earn on which days."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(_q(BY_DOW_QUERY, args.normalize, phantom_clause=phantom_clause), params)
+        cur.execute(_q(BY_DOW_QUERY, _project(args), phantom_clause=phantom_clause), params)
         rows = cur.fetchall()
 
     label = f"last {args.days}d" if args.days else "all time"
@@ -253,7 +263,7 @@ def _run_by_hour(conn, params: dict, phantom_clause: str, args) -> None:
     """Grid of total_sol by weekday (cols) × hour-of-day (rows, UTC) — the intra-day
     shape of PnL, to see whether a bad day is bad all day or just a tight window."""
     lane_filter, scope = _lane_filter(args, params)
-    q = _q(BY_HOUR_QUERY, args.normalize, phantom_clause=phantom_clause, lane_filter=lane_filter)
+    q = _q(BY_HOUR_QUERY, _project(args), phantom_clause=phantom_clause, lane_filter=lane_filter)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(q, params)
         rows = cur.fetchall()
@@ -339,7 +349,7 @@ def _run_dow_weeks(conn, params: dict, phantom_clause: str, args) -> None:
     """For a (filtered) lane, show each weekday's PnL split BY WEEK + a '+wk' consistency
     count — turning '<lane> had one good Monday' into 'is Monday RELIABLY good?'."""
     lane_filter, scope = _lane_filter(args, params)
-    q = _q(DOW_WEEKS_QUERY, args.normalize, phantom_clause=phantom_clause, lane_filter=lane_filter)
+    q = _q(DOW_WEEKS_QUERY, _project(args), phantom_clause=phantom_clause, lane_filter=lane_filter)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(q, params)
         rows = cur.fetchall()
@@ -398,11 +408,18 @@ def main() -> None:
                     help="--by-day/--by-dow: hide lanes with fewer than this many closed trades")
     ap.add_argument("--normalize", action="store_true",
                     help="report PnL per 1 SOL deployed (pnl_sol/sol_in) — comparable across SHADOW_SOL_IN changes")
+    ap.add_argument("--size", type=float, default=None,
+                    help="project PnL to this SOL/trade (e.g. --size 2). Implies --normalize at that size.")
     args = ap.parse_args()
 
-    if args.normalize:
-        print("\n[NORMALIZED] values are PnL per 1 SOL deployed (pnl_sol / sol_in) — "
-              "scale-invariant; multiply by your intended size to project.")
+    _proj = _project(args)
+    if _proj is not None:
+        if _proj == 1.0:
+            print("\n[NORMALIZED] values are PnL per 1 SOL deployed (pnl_sol / sol_in) — "
+                  "scale-invariant; multiply by your intended size to project.")
+        else:
+            print(f"\n[PROJECTED → {_proj:g} SOL/trade] values are PnL as if every position "
+                  f"were {_proj:g} SOL (size-invariant projection from pnl_sol / sol_in).")
 
     params = {
         "days": args.days,
@@ -434,7 +451,7 @@ def main() -> None:
         return
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(_q(QUERY, args.normalize, phantom_clause=phantom_clause), params)
+        cur.execute(_q(QUERY, _project(args), phantom_clause=phantom_clause), params)
         rows = cur.fetchall()
         excluded = []
         if not args.raw:
