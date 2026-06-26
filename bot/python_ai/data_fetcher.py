@@ -48,6 +48,11 @@ DEX_MINT_FAILURE_BASE_COOLDOWN_SECONDS = 10.0
 DEX_MINT_FAILURE_MAX_COOLDOWN_SECONDS = 60.0
 SUPPLY_CACHE_TTL = 300  # 5 minutes — meme coin supply rarely changes
 HELIUS_TX_MAX_PRICE_RATIO = float(os.getenv("HELIUS_TX_MAX_PRICE_RATIO", "3.0"))
+# Sticky last-known-good mcap TTL. The helius_tx sanity check normally validates a
+# computed mcap against the fresh price cache, but that cache goes cold during a
+# Jupiter/DexScreener rate-limit storm — exactly when phantom helius_tx prints are
+# most likely. This sticky baseline survives the storm so the check still fires.
+HELIUS_TX_LAST_GOOD_TTL = float(os.getenv("HELIUS_TX_LAST_GOOD_TTL", "1800"))  # 30 min
 
 # ── Dead mint blacklist ───────────────────────────────────────────────────────
 # Mints that reliably fail every request (SSL EOF, delisted, etc).
@@ -61,6 +66,9 @@ DEAD_MINTS: set[str] = {
 
 _cache: dict[str, tuple[dict, float]] = {}   # mint → (result, epoch_time)
 _price_cache: dict[str, tuple[dict, float]] = {}   # mint → (result, monotonic_time)
+# Sticky last-good mcap from TRUSTED sources only (pool/Jupiter via _price_cache_set;
+# never the raw helius_tx delta). Used as the storm-proof sanity baseline.
+_last_good_mcap: dict[str, tuple[float, float]] = {}  # mint → (mcap, monotonic_time)
 _sol_price_cache: tuple[float, float] | None = None   # (price_usd, monotonic_time)
 _supply_cache: dict[str, tuple[int, int, float]] = {}  # mint → (supply, decimals, monotonic_time)
 _dex_rate_limited_until = 0.0
@@ -89,6 +97,17 @@ def _price_cache_get(mint: str, max_age: float = PRICE_CACHE_TTL_SECONDS) -> Opt
 
 def _price_cache_set(mint: str, data: dict) -> None:
     _price_cache[mint] = (data, time.monotonic())
+    # Every trusted price write also refreshes the sticky last-good baseline.
+    m = data.get("mcap")
+    if m and float(m) > 0:
+        _last_good_mcap[mint] = (float(m), time.monotonic())
+
+
+def _last_good_mcap_get(mint: str, max_age: float = HELIUS_TX_LAST_GOOD_TTL) -> Optional[float]:
+    entry = _last_good_mcap.get(mint)
+    if entry and (time.monotonic() - entry[1]) < max_age:
+        return entry[0]
+    return None
 
 
 def _sol_price_cache_get(max_age: float = PRICE_CACHE_TTL_SECONDS) -> Optional[float]:
@@ -924,21 +943,30 @@ def fetch_ws_exit_market_from_transaction(signature: str, mint: str) -> Optional
     if not mcap:
         return None
 
-    # Validate computed mcap against cached price. A ratio beyond
+    # Validate computed mcap against a trusted reference. A ratio beyond
     # HELIUS_TX_MAX_PRICE_RATIO (default 3×) in either direction means the
     # delta extraction likely picked up a non-swap operation — discard and let
     # ws_monitor fall back to the DexScreener/Jupiter price path.
+    #
+    # Prefer the fresh price cache; but during a rate-limit storm that cache goes
+    # cold and the check would be SKIPPED entirely — which is exactly how a phantom
+    # crater (e.g. a 2,663 mcap derived from a mis-sized fee/transfer leg) slipped
+    # through and force-closed positions at −99%. Fall back to the sticky last-good
+    # mcap so the guard still fires when the storm makes phantoms most likely.
+    ref_mcap = None
     cached = _price_cache_get(mint, max_age=120)
-    if cached and cached.get("mcap"):
-        cached_mcap = float(cached["mcap"])
-        if cached_mcap > 0:
-            ratio = mcap / cached_mcap
-            if ratio > HELIUS_TX_MAX_PRICE_RATIO or ratio < (1.0 / HELIUS_TX_MAX_PRICE_RATIO):
-                log.warning(
-                    f"[fetcher] helius_tx sanity fail {mint[:8]}..."
-                    f" computed={mcap:.0f} cached={cached_mcap:.0f} ratio={ratio:.2f}x — discarding"
-                )
-                return None
+    if cached and cached.get("mcap") and float(cached["mcap"]) > 0:
+        ref_mcap = float(cached["mcap"])
+    if ref_mcap is None:
+        ref_mcap = _last_good_mcap_get(mint)
+    if ref_mcap and ref_mcap > 0:
+        ratio = mcap / ref_mcap
+        if ratio > HELIUS_TX_MAX_PRICE_RATIO or ratio < (1.0 / HELIUS_TX_MAX_PRICE_RATIO):
+            log.warning(
+                f"[fetcher] helius_tx sanity fail {mint[:8]}..."
+                f" computed={mcap:.0f} ref={ref_mcap:.0f} ratio={ratio:.2f}x — discarding"
+            )
+            return None
 
     return {
         "price_usd": token_price_usd,
