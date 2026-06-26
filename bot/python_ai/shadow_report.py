@@ -124,7 +124,15 @@ JOIN calls c ON c.id = sp.call_id
 LEFT JOIN channels ch ON ch.id = c.channel_id
 WHERE sp.status = 'closed'
   {phantom_clause}
-  AND ( %(days)s = 0 OR sp.entry_time >= now() - (%(days)s || ' days')::interval )
+  -- Calendar-aligned window: include N full UTC days ending today, filtered on the
+  -- SAME UTC-date expression the `day` column buckets on. The old rolling
+  -- now()-N days window made the oldest column a partial slice, so a given date read
+  -- differently across --days values (06/25 was a half-day in --days 1 but a full day
+  -- in --days 4). Now every column is a complete UTC day and is stable across runs;
+  -- today's column still grows as positions close — inherent to a live day.
+  AND ( %(days)s = 0
+        OR (sp.entry_time AT TIME ZONE 'UTC')::date
+            >= (now() AT TIME ZONE 'UTC')::date - (%(days)s - 1) )
 GROUP BY 1, 2, 3, 4, 5
 """
 
