@@ -148,9 +148,12 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     ("solhousesignal",     "none",  "none"):           {"trade": True, "size": 0.1, "exit": EXIT_EARLY,    "watch": True, "days": {"Tue"}},
     # free/quiet_hours: Saturday 2/2 (+6.75) inside the -15 quiet_hours loser. early.
     ("solhousesignal",     "none",  "quiet_hours"):    {"trade": True, "size": 0.1, "exit": EXIT_EARLY,    "watch": True, "days": {"Sat"}},
+    # solwhaletrending low_score: RE-ADDED 2026-06-28 (un-demoted). Tue 2/2 (+8.42) + Fri 2/3
+    # (+3.88) over 28d, AND the top lane over the last 7d. The original demotion read the
+    # AGGREGATE net-neg (n>216) and missed the clean day edges — day-gate Tue+Fri, don't cut.
+    ("solwhaletrending",   "none",  "low_score"):      {"trade": True, "size": 0.1, "exit": EXIT_RIDE_VOL, "watch": True, "days": {"Tue", "Fri"}},
 
     # ── SKIP / CUT — confirmed losers, explicit so intent is auditable (NEVER traded) ──
-    ("solwhaletrending",   "none",        "low_score"):                {"trade": False},  # DEMOTED: net-neg clean window, n>216
     ("solhousesignal_vip", "gamble_risk", "vip_paused"):               {"trade": False},  # -471, worst lane
     ("solhousesignal_vip", "gamble",      "mcap_too_low"):             {"trade": False},  # -256
     ("solhousesignal_vip", "safe",        "vip_low_score"):            {"trade": False},  # -104
