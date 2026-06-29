@@ -136,8 +136,14 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # low_score (free): the king. EARLY best over 14d (+20.4; ride_vol +16.8; ride +8.1).
     # (ride_vol led the shorter 5d window — early wins on the larger, more robust sample.)
     ("solhousesignal",   "none", "low_score"): {"trade": True, "size": 0.5,  "exit": EXIT_EARLY},
-    # solwhaletrending none: +13.5/14d, all variants green but THIN (~45/wk) & lumpy. early.
-    ("solwhaletrending", "none", "none"):      {"trade": True, "size": 0.25, "exit": EXIT_EARLY},
+    # solwhaletrending/none DEMOTED from anchor 2026-06-29: marginal on the clean windows
+    # (early +0.28/14d, -2.91/7d). solwhale's real edge lives in the low_score sub-lane
+    # (Tue/Fri), not none/traded. Re-homed below as a thin Wed-only watch pocket.
+    # solwhaletrending/low_score: a DAY-GATED anchor (A & B both trade, but only Tue+Fri,
+    # where the edge lives: Tue +7.31, Fri +4.51 / 14d early; Mon -6.47). Aggregate is net-neg
+    # so the gate is load-bearing — ungated it would trade Mon/Wed/Thu losers. Promoted to A
+    # 2026-06-29 (was a B-only watch pocket). Size 0.1 for now — experimental.
+    ("solwhaletrending", "none", "low_score"): {"trade": True, "size": 0.1, "exit": EXIT_RIDE_VOL, "days": {"Tue", "Fri"}},
 
     # ── WATCH POCKETS — B ONLY, day-gated. Net-NEGATIVE lanes with a repeating green
     #    weekday in --dow-weeks. UNCONFIRMED (2/2 so far) → small size; exit is a tunable
@@ -148,10 +154,15 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     ("solhousesignal",     "none",  "none"):           {"trade": True, "size": 0.1, "exit": EXIT_EARLY,    "watch": True, "days": {"Tue"}},
     # free/quiet_hours: Saturday 2/2 (+6.75) inside the -15 quiet_hours loser. early.
     ("solhousesignal",     "none",  "quiet_hours"):    {"trade": True, "size": 0.1, "exit": EXIT_EARLY,    "watch": True, "days": {"Sat"}},
-    # solwhaletrending low_score: RE-ADDED 2026-06-28 (un-demoted). Tue 2/2 (+8.42) + Fri 2/3
-    # (+3.88) over 28d, AND the top lane over the last 7d. The original demotion read the
-    # AGGREGATE net-neg (n>216) and missed the clean day edges — day-gate Tue+Fri, don't cut.
-    ("solwhaletrending",   "none",  "low_score"):      {"trade": True, "size": 0.1, "exit": EXIT_RIDE_VOL, "watch": True, "days": {"Tue", "Fri"}},
+    # vip_mcap_gate gamble: PROMOTED from skip 2026-06-29. NOT a mirage — the EARLY variant
+    # is green in BOTH 7d (+3.94) and 14d (+2.49), with a *repeating* weekday split: green
+    # Mon/Tue/Sat, red Wed/Thu/Fri in both windows. (ride/ride_vol totals flip between
+    # windows — a few fat cells — so do NOT use them; early only.) Day-gate Mon/Tue/Sat.
+    ("solhousesignal_vip", "gamble", "vip_mcap_gate"):  {"trade": True, "size": 0.1, "exit": EXIT_EARLY,    "watch": True, "days": {"Mon", "Tue", "Sat"}},
+    # solwhaletrending/none: re-homed from anchor. Only consistent green day is Wed, and it's
+    # the RIDE variant that carries it (Wed ride +5.26/14d, +5.18/7d; early ~+2). THIN (one
+    # day, ~12 trades) — probationary, smallest size, yank if Wed doesn't repeat.
+    ("solwhaletrending",   "none",  "none"):            {"trade": True, "size": 0.1, "exit": EXIT_RIDE_S,   "watch": True, "days": {"Wed"}},
 
     # ── SKIP / CUT — confirmed losers, explicit so intent is auditable (NEVER traded) ──
     ("solhousesignal_vip", "gamble_risk", "vip_paused"):               {"trade": False},  # -471, worst lane
@@ -159,7 +170,6 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     ("solhousesignal_vip", "safe",        "vip_low_score"):            {"trade": False},  # -104
     ("solhousesignal_vip", "safe",        "vip_safe_allowed_hours"):   {"trade": False},  # -75
     ("solhousesignal_vip", "gamble",      "vip_gamble_allowed_hours"): {"trade": False},  # -63
-    ("solhousesignal_vip", "gamble",      "vip_mcap_gate"):            {"trade": False},  # mirage — all 1/2 coin-flips
     ("solhousesignal_vip", "gamble",      "none"):                     {"trade": False},  # -27
 }
 
