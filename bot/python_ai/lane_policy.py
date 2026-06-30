@@ -47,6 +47,16 @@ VALID_EXITS   = {EXIT_EARLY, EXIT_RIDE_S, EXIT_RIDE_VOL}
 # is at/above the hourly average — the move is still alive, so keep riding.
 RVOL_HOLD = float(os.getenv("LANE_RVOL_HOLD", "0.8"))
 
+# Flow-aware ride_vol (the live, direction-aware upgrade to RVOL). order_flow.metrics()
+# gives net_pressure in [-1, +1] (+1 = all buying, -1 = all selling) off the live swap
+# stream. ride_vol RIDES while net_pressure >= FLOW_HOLD and BANKS (early) once selling
+# takes over — protecting a runner's round-trip WITHOUT the fixed profit cap `early` imposes.
+# FLOW_MIN_EVENTS stops a single dust swap from flipping the call; FLOW_WINDOW is the
+# look-back (seconds) handed to order_flow.metrics().
+FLOW_HOLD       = float(os.getenv("LANE_FLOW_HOLD", "-0.15"))
+FLOW_MIN_EVENTS = int(os.getenv("LANE_FLOW_MIN_EVENTS", "3"))
+FLOW_WINDOW     = float(os.getenv("LANE_FLOW_WINDOW", "60"))
+
 # Master switch — keep the router OFF until you deliberately route a strategy to it.
 LANE_POLICY_ENABLED = os.getenv("LANE_POLICY_ENABLED", "false").lower() == "true"
 
@@ -143,13 +153,20 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # where the edge lives: Tue +7.31, Fri +4.51 / 14d early; Mon -6.47). Aggregate is net-neg
     # so the gate is load-bearing — ungated it would trade Mon/Wed/Thu losers. Promoted to A
     # 2026-06-29 (was a B-only watch pocket). Size 0.1 for now — experimental.
-    ("solwhaletrending", "none", "low_score"): {"trade": True, "size": 0.1, "exit": EXIT_RIDE_VOL, "days": {"Tue", "Fri"}},
+    # EXIT EARLY (changed from ride_vol 2026-06-30): EARLY was already the best shadow variant
+    # (early +5.64 > ride_vol +2.70 > ride -6.22 /14d) AND live ride_vol silently degrades to
+    # plain RIDE (exit ticks carry no live volume → rvol=None → EXIT_RIDE), which rode a real
+    # +78% runner all the way back to a -36% hard_stop on 06/30. early banks the spike.
+    ("solwhaletrending", "none", "low_score"): {"trade": True, "size": 0.1, "exit": EXIT_EARLY, "days": {"Tue", "Fri"}},
 
     # ── WATCH POCKETS — B ONLY, day-gated. Net-NEGATIVE lanes with a repeating green
     #    weekday in --dow-weeks. UNCONFIRMED (2/2 so far) → small size; exit is a tunable
     #    judgement call (thin per-variant data), not a proven number. ──
-    # vip_low_score gamble: Monday 2/2 (+6.7 mean), held & grew — best long-shot. ride_vol (per by-dow).
-    ("solhousesignal_vip", "gamble", "vip_low_score"): {"trade": True, "size": 0.1, "exit": EXIT_RIDE_VOL, "watch": True, "days": {"Mon"}},
+    # vip_low_score gamble: Monday 2/2 (+6.7 mean), held & grew — best long-shot.
+    # EXIT EARLY (changed from ride_vol 2026-06-30): same live-degradation risk as solwhale/low_score
+    # — live ride_vol has no volume feed so it becomes plain RIDE (gives back runs). Until volume is
+    # in the live exit path, ride_vol shadow numbers are NOT achievable live, so use early.
+    ("solhousesignal_vip", "gamble", "vip_low_score"): {"trade": True, "size": 0.1, "exit": EXIT_EARLY, "watch": True, "days": {"Mon"}},
     # free/none: Tuesday 2/2 (+3.15) inside the -61 free/none loser. early (cut fast in a loser lane).
     ("solhousesignal",     "none",  "none"):           {"trade": True, "size": 0.1, "exit": EXIT_EARLY,    "watch": True, "days": {"Tue"}},
     # free/quiet_hours: Saturday 2/2 (+6.75) inside the -15 quiet_hours loser. early.
@@ -216,18 +233,30 @@ def lane_exit(channel: Optional[str], vip_tier: Optional[str], category: Optiona
     return LANE_POLICY.get((ch, tier, cat), {}).get("exit")
 
 
-def exit_config_for(strategy: Optional[str], rvol: Optional[float] = None):
+def exit_config_for(strategy: Optional[str], rvol: Optional[float] = None,
+                    flow: Optional[dict] = None):
     """
     Map an exit-strategy name to a concrete ExitConfig the exit checks already accept.
-    `ride_vol` is dynamic — pass the current rvol (see compute_rvol); None -> ride.
+
+    `ride_vol` is dynamic, resolved from the best available signal in priority order:
+      1. `flow` — order_flow.metrics() dict (live + direction-AWARE). RIDE while
+         net_pressure >= FLOW_HOLD, BANK (early) once selling takes over. Ignored
+         unless >= FLOW_MIN_EVENTS swaps back it (one dust swap must not flip the exit).
+      2. `rvol` — legacy volume ratio (direction-BLIND): RIDE while >= RVOL_HOLD.
+      3. neither -> RIDE (historical fallback; e.g. monitor.py has no live swap state).
     Falls back to `early` (EXIT_A_PAPER) for anything unrecognized — the safe default.
     """
     if strategy == EXIT_RIDE_S:
         return EXIT_RIDE
     if strategy == EXIT_RIDE_VOL:
-        if rvol is None:
-            return EXIT_RIDE
-        return EXIT_RIDE if rvol >= RVOL_HOLD else EXIT_A_PAPER
+        if flow is not None:
+            n_events = int(flow.get("n_buys", 0)) + int(flow.get("n_sells", 0))
+            if n_events >= FLOW_MIN_EVENTS:
+                net_pressure = float(flow.get("net_pressure", 0.0))
+                return EXIT_RIDE if net_pressure >= FLOW_HOLD else EXIT_A_PAPER
+        if rvol is not None:
+            return EXIT_RIDE if rvol >= RVOL_HOLD else EXIT_A_PAPER
+        return EXIT_RIDE
     return EXIT_A_PAPER  # early / default
 
 

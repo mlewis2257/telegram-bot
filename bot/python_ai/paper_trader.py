@@ -27,6 +27,7 @@ import db
 import data_fetcher
 import alert_bot
 import lane_policy
+import order_flow
 from dataclasses import replace as _dc_replace
 from strategy_config import STRATEGY_A_V2026_05_22
 from strategy_engine import StrategyCallContext, evaluate_strategy_a_entry
@@ -363,11 +364,19 @@ def check_exits(
 
     cfg = exit_config if exit_config is not None else EXIT_A_PAPER
     # Lane testbed: exit each position on ITS lane's rule, overriding the monitor's
-    # default. rvol is None here (no live volume in the exit check) so ride_vol -> ride.
+    # default. For ride_vol we read live, direction-aware order flow from order_flow
+    # (same process as ws_monitor, so its rolling swap state is populated here). Outside
+    # ws_monitor (e.g. monitor.py) metrics() returns None -> ride_vol falls back to ride.
     if LANE_TESTBED_ENABLED:
         _exit = lane_policy.lane_exit(channel_handle, position.get("vip_tier"), position.get("skip_reason"))
         if _exit:
-            cfg = lane_policy.exit_config_for(_exit)
+            flow = order_flow.metrics(mint, window=lane_policy.FLOW_WINDOW) if mint else None
+            cfg = lane_policy.exit_config_for(_exit, flow=flow)
+            if _exit == lane_policy.EXIT_RIDE_VOL and flow:
+                _np = flow.get("net_pressure", 0.0)
+                print(f"[lane_flow A] call_id={call_id} net_pressure={_np} "
+                      f"n={flow.get('n_buys',0)+flow.get('n_sells',0)} "
+                      f"-> {'ride' if _np >= lane_policy.FLOW_HOLD else 'BANK'}")
 
     return apply_exit_config(
         cfg,
