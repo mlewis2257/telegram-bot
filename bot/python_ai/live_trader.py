@@ -33,6 +33,7 @@ import db
 import jupiter
 import alert_bot
 import data_fetcher
+import peak_guard
 import wallet as _wallet
 from paper_trader import (
     TAKE_PROFIT_5X,
@@ -542,6 +543,21 @@ def check_live_exits(
         return ExitResult(False)
 
     if entry_mcap <= 0:
+        return ExitResult(False)
+
+    # Never act on a 0/null current_mcap (dead/unavailable feed). On LIVE this would fire
+    # an UNNECESSARY real sell of a possibly-healthy position — the swap executes at the
+    # real market price, so a feed glitch dumps a winner (opportunity cost + fees), not a
+    # fake -100%. A genuine decline still produces a real reading and exits normally. Mirrors
+    # the paper_trader guard; see PASSION 2026-06-30 (was +36% at last tick, 0-marked).
+    if current_mcap <= 0:
+        return ExitResult(False)
+
+    # Low-side corroboration: hold a single uncorroborated crater for one reading so one
+    # phantom low tick can't trigger a real stop-sell (mirror of guard_peak on the high
+    # side; the high side is already guarded in ws_monitor).
+    current_mcap = peak_guard.guard_trough(f"tL:{call_id}", current_mcap)
+    if current_mcap <= 0:
         return ExitResult(False)
 
     cfg = exit_config if exit_config is not None else _LIVE_EXIT_CONFIG

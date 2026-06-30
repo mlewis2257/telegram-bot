@@ -33,6 +33,7 @@ import db
 import data_fetcher
 import lane_policy
 import order_flow
+import peak_guard
 from exit_config import ExitConfig, ExitResult, apply_exit_config, EXIT_B_PAPER
 
 # Lane testbed: when on, Strategy B trades lane_policy ANCHORS + day-gated WATCH POCKETS
@@ -351,6 +352,12 @@ def check_exits(
     # manufactures a -100% hard_stop on a live position — PASSION (2026-06-30) was
     # +36% at its last real tick, then closed at 0 by a lone null poll. Skip the cycle;
     # a genuine decline still produces a real reading and exits normally.
+    if current_mcap <= 0:
+        return ExitResult(False)
+
+    # Low-side corroboration: hold a single uncorroborated crater for one reading so a
+    # phantom low tick can't fire a hard_stop (mirror of guard_peak on the high side).
+    current_mcap = peak_guard.guard_trough(f"t{'B' if is_strategy_b else 'A'}:{call_id}", current_mcap)
     if current_mcap <= 0:
         return ExitResult(False)
 

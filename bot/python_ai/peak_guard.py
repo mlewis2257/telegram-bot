@@ -38,15 +38,28 @@ import time
 # corroboration. Jumps beyond it must be confirmed by a second reading.
 MAX_UNCONFIRMED_JUMP_PCT = float(os.getenv("PEAK_MAX_UNCONFIRMED_JUMP_PCT", "0.50"))
 
+# Symmetric threshold for the DOWN direction (guard_trough): a single reading may DROP by
+# up to this fraction below the last accepted level without corroboration. Sudden craters
+# beyond it (phantom lows / null-derived prices) must be confirmed by a second reading
+# before the exit acts on them, so one bad tick can't fire a hard_stop.
+MAX_UNCONFIRMED_DROP_PCT = float(os.getenv("PEAK_MAX_UNCONFIRMED_DROP_PCT", "0.50"))
+
 # A pending (unconfirmed) candidate is forgotten after this many seconds with no
 # corroborating reading.
 PENDING_TTL_SECS = float(os.getenv("PEAK_PENDING_TTL_SECS", "30.0"))
+
+# The trough baseline (last accepted mcap per position) is evicted after this long with no
+# readings — i.e. the position has closed. Bounds memory without dropping active positions.
+TROUGH_REF_TTL_SECS = float(os.getenv("PEAK_TROUGH_REF_TTL_SECS", "1800.0"))
 
 # The corroborating reading must be at least (candidate * (1 - this)) to confirm.
 CONFIRM_TOLERANCE = float(os.getenv("PEAK_CONFIRM_TOLERANCE", "0.15"))
 
 # key -> (candidate_mcap, monotonic_time) for jumps awaiting corroboration.
 _pending: dict[str, tuple[float, float]] = {}
+# Down-direction counterparts for guard_trough.
+_pending_low: dict[str, tuple[float, float]] = {}   # craters awaiting corroboration
+_trough_ref:  dict[str, tuple[float, float]] = {}   # last accepted mcap (the drop baseline)
 
 
 def guard_peak(key: str, current_mcap: float, prior_peak: float) -> float:
@@ -101,15 +114,68 @@ def guard_peak(key: str, current_mcap: float, prior_peak: float) -> float:
     return prior_peak
 
 
+def guard_trough(key: str, current_mcap: float) -> float:
+    """
+    Mirror image of guard_peak for the DOWN direction. Returns the mcap the exit check
+    should ACT ON, holding back a single uncorroborated crater so one bad-low tick (a
+    phantom / null-derived price) cannot fire a hard_stop. A real, sustained drop is
+    confirmed by the very next reading and exits one tick (~2-3s) later — the same safe
+    "act one tick late, never on a phantom" trade-off guard_peak makes on the high side.
+
+    Tracks the last accepted mcap per `key` internally as the drop baseline, so callers
+    just pass each new reading. Gradual pullbacks (<= MAX_UNCONFIRMED_DROP_PCT per tick)
+    pass straight through, so normal trailing stops are unaffected.
+    """
+    now = time.monotonic()
+    if current_mcap is None or current_mcap <= 0:
+        # No usable price this tick — hand back the trusted baseline so the exit doesn't
+        # act on a null (callers also hard-guard <=0; this is belt-and-suspenders).
+        ref = _trough_ref.get(key)
+        return ref[0] if ref else 0.0
+
+    ref_entry = _trough_ref.get(key)
+    ref = ref_entry[0] if ref_entry else 0.0
+
+    if ref <= 0 or current_mcap >= ref or (1.0 - current_mcap / ref) <= MAX_UNCONFIRMED_DROP_PCT:
+        # No baseline yet, not a drop, or a plausible incremental pullback — accept the
+        # reading and advance the baseline.
+        _pending_low.pop(key, None)
+        _trough_ref[key] = (current_mcap, now)
+        return current_mcap
+
+    # Large sudden crater — require a 2nd consecutive low reading to confirm it's real.
+    pend = _pending_low.get(key)
+    if (
+        pend is not None
+        and (now - pend[1]) <= PENDING_TTL_SECS
+        and current_mcap <= pend[0] * (1.0 + CONFIRM_TOLERANCE)
+    ):
+        _pending_low.pop(key, None)
+        _trough_ref[key] = (current_mcap, now)
+        return current_mcap
+
+    # First sighting of the crater — HOLD at the trusted baseline, don't act on it yet.
+    _pending_low[key] = (current_mcap, now)
+    _maybe_sweep(now)
+    return ref
+
+
 def clear(key: str) -> None:
-    """Drop any pending state for a position (call on close)."""
+    """Drop any pending/baseline state for a position (call on close)."""
     _pending.pop(key, None)
+    _pending_low.pop(key, None)
+    _trough_ref.pop(key, None)
 
 
 def _maybe_sweep(now: float) -> None:
-    """Opportunistically evict expired pending entries to bound memory."""
-    if len(_pending) < 256:
+    """Opportunistically evict expired entries to bound memory."""
+    if len(_pending) < 256 and len(_pending_low) < 256 and len(_trough_ref) < 1024:
         return
-    expired = [k for k, (_, t) in _pending.items() if (now - t) > PENDING_TTL_SECS]
-    for k in expired:
-        _pending.pop(k, None)
+    for store, ttl in (
+        (_pending, PENDING_TTL_SECS),
+        (_pending_low, PENDING_TTL_SECS),
+        (_trough_ref, TROUGH_REF_TTL_SECS),
+    ):
+        expired = [k for k, (_, t) in store.items() if (now - t) > ttl]
+        for k in expired:
+            store.pop(k, None)
