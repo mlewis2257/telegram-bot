@@ -346,6 +346,14 @@ def check_exits(
     if entry_mcap <= 0:
         return ExitResult(False)
 
+    # A 0/null current_mcap means "no price this cycle" (e.g. monitor.py polled a
+    # momentarily-unavailable/dead-feed token), NOT "price is zero". Acting on it
+    # manufactures a -100% hard_stop on a live position — PASSION (2026-06-30) was
+    # +36% at its last real tick, then closed at 0 by a lone null poll. Skip the cycle;
+    # a genuine decline still produces a real reading and exits normally.
+    if current_mcap <= 0:
+        return ExitResult(False)
+
     is_vip_gamble_pos = position.get("vip_tier") in ("gamble_risk", "gamble")
     channel_handle    = (position.get("channel_handle") or "").lstrip("@")
     entry_time        = position.get("entry_time")
