@@ -153,11 +153,16 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # where the edge lives: Tue +7.31, Fri +4.51 / 14d early; Mon -6.47). Aggregate is net-neg
     # so the gate is load-bearing — ungated it would trade Mon/Wed/Thu losers. Promoted to A
     # 2026-06-29 (was a B-only watch pocket). Size 0.1 for now — experimental.
-    # EXIT EARLY (changed from ride_vol 2026-06-30): EARLY was already the best shadow variant
-    # (early +5.64 > ride_vol +2.70 > ride -6.22 /14d) AND live ride_vol silently degrades to
-    # plain RIDE (exit ticks carry no live volume → rvol=None → EXIT_RIDE), which rode a real
-    # +78% runner all the way back to a -36% hard_stop on 06/30. early banks the spike.
-    ("solwhaletrending", "none", "low_score"): {"trade": True, "size": 0.1, "exit": EXIT_EARLY, "days": {"Tue", "Fri"}},
+    # EXIT: ride_vol (flow-aware). Back to ride_vol 2026-06-30 PM to LIVE-TEST the new
+    # order_flow net_pressure exit (rides while net-buying, banks on the dump) — shadow says
+    # ride_vol is the best variant here (+10.51/15d > early +8.41 > ride -1.98; 06/30 ride_vol
+    # +7.96 vs early +2.79). Was briefly EARLY after we found live ride_vol degraded to plain
+    # RIDE (no volume feed) and gave back a +78% runner; the flow fix now feeds live net_pressure,
+    # so this is its first live trial. First gated day = Fri. WATCH: on thin nano-caps with
+    # <FLOW_MIN_EVENTS swaps it still falls back to ride — if the [lane_flow] logs show it mostly
+    # degrading / it underperforms shadow, revert to EXIT_EARLY. Size held at 0.1 (test the exit,
+    # not a size bump too); size up only after Friday validates.
+    ("solwhaletrending", "none", "low_score"): {"trade": True, "size": 0.1, "exit": EXIT_RIDE_VOL, "days": {"Tue", "Fri"}},
 
     # ── WATCH POCKETS — B ONLY, day-gated. Net-NEGATIVE lanes with a repeating green
     #    weekday in --dow-weeks. UNCONFIRMED (2/2 so far) → small size; exit is a tunable
