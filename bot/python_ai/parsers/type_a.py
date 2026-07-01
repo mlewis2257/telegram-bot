@@ -84,6 +84,15 @@ def classify(text: str) -> str:
       'boost_alert'      — team purchased Lightning Boost visibility boosts
       'noise'            — VIP promos, join links, unrecognised
     """
+    # An INITIAL gem alert is uniquely identified by a labeled contract address AND the
+    # "➔ … ACHIEVED" signature — no promo, whale, or milestone message carries a contract
+    # address. Check it FIRST so nothing below can steal it. solhousesignal added a
+    # "SolHouse AI Scanner" footer (+ "(VIP Call)") to their gem alerts ~2026-06-29, which
+    # tripped IS_VIP_PROMO_RE and silently dropped every real initial call as noise — killing
+    # the free low_score signal that Strategy A's anchor runs on.
+    if LABEL_MINT_RE.search(text) and IS_GEM_ALERT_RE.search(text):
+        return 'gem_alert'
+
     # Whale checked first — whale messages also contain VIP links
     if IS_WHALE_ALERT_RE.search(text):
         return 'whale_alert'
