@@ -48,7 +48,7 @@ INTER_CALL_SLEEP     = 0.5    # seconds between each DexScreener call
 RATE_LIMIT_SLEEP     = 30     # seconds to back off on 429 responses
 MAX_WATCHLIST_SPREAD = 50     # above this, spread calls evenly across the window
 MIN_SCORE            = 45     # minimum conviction_score to include (vip_safe floor)
-MAX_AGE_HOURS        = 24     # only monitor calls from the last N hours
+MAX_AGE_HOURS        = int(os.getenv("MONITOR_MAX_AGE_HOURS", "12"))  # only monitor calls from the last N hours (was hardcoded 24; halved + env-tunable to shrink the cold-tier firehose that floods Jupiter)
 PAPER_EXIT_SWEEP_EVERY_PASSES = 3  # websocket monitor owns primary protection; poll sweep is fallback
 # A paper position we can NEVER price (delisted/rugged, or a call whose mint never
 # resolved past an INFERRED:/UNKNOWN: placeholder) must not sit open forever. After
