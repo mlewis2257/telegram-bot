@@ -199,6 +199,44 @@ def _jup_trip_cooldown() -> None:
     _jup_rate_limited_until = time.monotonic() + 5.0
 
 
+# ── Shared cross-process budget (Postgres-backed) ────────────────────────────
+# The per-process buckets above let all 3 processes (monitor / ws-monitor / listener)
+# each spend the full quota -> ~3x the real ceiling -> the 429 storms. Route the acquire
+# through ONE shared Postgres counter (db.rate_budget_try_acquire) so JUP_MAX_PER_MIN
+# becomes a TRUE global budget. On ANY DB error, fall back to the per-process bucket —
+# never worse than before, never blocks an exit-critical fetch.
+_rate_budget_ready = False
+
+
+def _shared_try_acquire(bucket: str, limit: int) -> Optional[bool]:
+    """One reservation against the shared budget. True/False if it answered, or None on
+    any DB error so the caller can fall back to the in-memory bucket."""
+    global _rate_budget_ready
+    try:
+        import db
+        if not _rate_budget_ready:
+            db.ensure_api_rate_budget_table()
+            _rate_budget_ready = True
+        return db.rate_budget_try_acquire(bucket, limit)
+    except Exception:
+        return None
+
+
+def _jup_try_acquire() -> bool:
+    """Reserve a Jupiter request: shared global budget first, per-process bucket as the
+    fallback. Honors this process's post-429 cooldown either way. Replaces the old
+    two-step _jup_available()+_jup_note_call() (reserve-then-fire is race-free)."""
+    if time.monotonic() < _jup_rate_limited_until:
+        return False
+    shared = _shared_try_acquire("jupiter", JUP_MAX_PER_MIN)
+    if shared is not None:
+        return shared
+    if _jup_available():
+        _jup_note_call()
+        return True
+    return False
+
+
 # ── HTTP helper ───────────────────────────────────────────────────────────────
 
 def _get(url: str, params: dict = None) -> Optional[dict]:
@@ -984,7 +1022,7 @@ def _fetch_jupiter_price(mint: str) -> Optional[dict]:
     Fallback price fetch from Jupiter Price API when DexScreener is unavailable.
     Attempts to compute mcap via Helius RPC getTokenSupply.
     """
-    if not _jup_available():
+    if not _jup_try_acquire():
         return None  # over budget / cooling down — don't add to a Jupiter storm
     try:
         headers = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
@@ -994,7 +1032,6 @@ def _fetch_jupiter_price(mint: str) -> Optional[dict]:
             headers=headers,
             timeout=REQUEST_TIMEOUT,
         )
-        _jup_note_call()
         if resp.status_code == 429:
             _jup_trip_cooldown()
             return None
@@ -1127,7 +1164,7 @@ def fetch_prices_batch_jupiter(mints: list[str]) -> dict[str, float]:
 
     for i in range(0, len(all_mints), 50):
         batch = all_mints[i:i + 50]
-        if not _jup_available():
+        if not _jup_try_acquire():
             break  # over budget / cooling down — return what we have so far
         try:
             resp = requests.get(
@@ -1136,7 +1173,6 @@ def fetch_prices_batch_jupiter(mints: list[str]) -> dict[str, float]:
                 headers=headers,
                 timeout=REQUEST_TIMEOUT,
             )
-            _jup_note_call()
             if resp.status_code == 429:
                 _jup_trip_cooldown()
                 log.warning("[fetcher] Jupiter batch 429 — cooling down")

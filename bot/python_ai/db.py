@@ -1,4 +1,5 @@
 import os
+import time
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from datetime import datetime, timezone
@@ -2104,6 +2105,65 @@ def get_recent_volume_snapshot_counts(days: int = 3) -> list[dict]:
             (days,),
         )
         return cur.fetchall()
+
+
+# ── Shared cross-process API rate budget ─────────────────────────────────────
+
+def ensure_api_rate_budget_table() -> None:
+    """
+    Per-minute request counter shared by ALL processes (sol-monitor, sol-ws-monitor,
+    sol-listener) so they draw from ONE budget per API key. Without this each process
+    kept a private in-memory bucket, so 3 processes each spent the full quota -> ~3x the
+    real ceiling -> the recurring Jupiter 429 storms. One row per (bucket, unix-minute).
+    """
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS api_rate_budget (
+                bucket     TEXT   NOT NULL,
+                window_min BIGINT NOT NULL,
+                count      INT    NOT NULL DEFAULT 0,
+                PRIMARY KEY (bucket, window_min)
+            )
+            """
+        )
+    conn.commit()
+
+
+def rate_budget_try_acquire(bucket: str, limit: int, window_min: int | None = None) -> bool:
+    """
+    Atomically reserve one request against the shared per-minute budget for `bucket`.
+    Returns True if we were under `limit` (reserved -> may fire the request), False if
+    at/over it (caller should skip / fall back). Atomic across processes: the conditional
+    ON CONFLICT increment only bumps the count while it is below the limit, and RETURNING
+    yields a row only when the insert-or-increment actually happened. Raises on DB error so
+    the caller can fall back to its per-process in-memory bucket (never blocks trading).
+    """
+    if window_min is None:
+        window_min = int(time.time() // 60)
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO api_rate_budget (bucket, window_min, count)
+            VALUES (%s, %s, 1)
+            ON CONFLICT (bucket, window_min)
+            DO UPDATE SET count = api_rate_budget.count + 1
+            WHERE api_rate_budget.count < %s
+            RETURNING count
+            """,
+            (bucket, window_min, limit),
+        )
+        row = cur.fetchone()
+        # First reservation of a new minute (count == 1) -> prune stale windows. Runs ~once
+        # per minute per bucket, so the table stays tiny with no per-call overhead.
+        if row is not None and row[0] == 1:
+            cur.execute("DELETE FROM api_rate_budget WHERE window_min < %s", (window_min - 5,))
+    conn.commit()
+    return row is not None
 
 
 # ── Websocket market observations ────────────────────────────────────────────
