@@ -115,11 +115,16 @@ def _classify(series: list) -> tuple:
     ratio = pos / n_weeks
     mean = sum(sols) / n_weeks
     recent = sols[-2:]
-    if ratio >= KEEP_RATIO and mean > 0:
+    # `mean` is the MONEY signal (what compounds); `ratio` is the RELIABILITY signal.
+    # A cell that loses on average is a real cut candidate; a cell that MAKES money but
+    # only in a minority of weeks is merely noisy (+EV, hold) — never cut a +EV cell.
+    if mean <= 0:
+        return ("DEMOTE", ratio, mean, n_weeks, total_n, recent)
+    if ratio >= KEEP_RATIO:
         if len(recent) == 2 and all(s < 0 for s in recent):
             return ("SLIDING", ratio, mean, n_weeks, total_n, recent)
         return ("KEEP", ratio, mean, n_weeks, total_n, recent)
-    return ("DEMOTE", ratio, mean, n_weeks, total_n, recent)
+    return ("MARGINAL", ratio, mean, n_weeks, total_n, recent)
 
 
 def _fmt_cell(ch, tier, skip, variant, dow) -> str:
@@ -161,7 +166,7 @@ def main() -> None:
     print("═" * 78)
     print("  CURRENTLY TRADED — is each lane/day still earning on ITS exit variant?")
     print("═" * 78)
-    buckets = {"DEMOTE": [], "SLIDING": [], "THIN": [], "KEEP": []}
+    buckets = {"DEMOTE": [], "SLIDING": [], "MARGINAL": [], "THIN": [], "KEEP": []}
     for cell, meta in sorted(traded.items()):
         series = _series(data.get(cell, {}))
         status, ratio, mean, n_weeks, total_n, recent = _classify(series)
@@ -173,11 +178,13 @@ def main() -> None:
             detail = f"+wk {pos}/{n_weeks}  mean {mean:+.2f}  {_wkstr(series)}"
             if status == "SLIDING":
                 detail += "  ← last 2 wks red, WATCH"
+            elif status == "MARGINAL":
+                detail += "  ← +EV but streaky, HOLD & watch"
             elif status == "DEMOTE":
-                detail += "  ← below bar, CONSIDER CUT"
-        buckets[status].append(f"  [{status:<7}] {_fmt_cell(*cell)}  ({who})   {detail}")
+                detail += "  ← losing on avg, CUT candidate"
+        buckets[status].append(f"  [{status:<8}] {_fmt_cell(*cell)}  ({who})   {detail}")
 
-    for status in ("DEMOTE", "SLIDING", "THIN", "KEEP"):
+    for status in ("DEMOTE", "SLIDING", "MARGINAL", "THIN", "KEEP"):
         for line in buckets[status]:
             print(line)
     if not any(buckets.values()):
