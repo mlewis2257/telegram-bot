@@ -601,7 +601,8 @@ async def _check_live_stale(dry_run: bool) -> None:
 
 # ── Paper position exit sweep ─────────────────────────────────────────────────
 
-async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
+async def _check_paper_exits(skip_call_ids: set[int] | None = None,
+                             include_live: bool = True) -> int:
     """
     Exit sweep for all open paper positions, independent of watchlist age.
 
@@ -610,6 +611,12 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
     Returns the number of positions closed this sweep.
     `skip_call_ids` avoids re-fetching positions already checked earlier in the
     same monitor pass.
+
+    `include_live` gates the live-position exit check. The dedicated exit_monitor
+    process calls this with include_live=False so that live on-chain SELLS remain
+    owned solely by sol-monitor (this process) + ws_monitor — two processes must
+    never race to submit the same real sell. Paper closes are idempotent (close
+    only WHERE status='open'), so paper is safe to sweep from multiple processes.
     """
     if _dex_circuit_open:
         # The sweep prices off the Jupiter batch first, so a DexScreener outage must
@@ -773,7 +780,7 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
             # Reads peak from the live position's own DB record — independent of
             # paper A so closing paper A never zeroes out the live peak.
             try:
-                pos_live = db.get_open_live_position(call_id)
+                pos_live = db.get_open_live_position(call_id) if include_live else None
                 if pos_live:
                     live_entry_price  = pos_live["entry_price"]
                     live_current_mult = (current_mcap / live_entry_price) if live_entry_price else 0.0
@@ -800,6 +807,18 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None) -> int:
             print(f"[paper] exit check error for {symbol} call_id={call_id}: {e}")
 
     return closed
+
+
+async def run_exit_sweep(skip_call_ids: set[int] | None = None,
+                         include_live: bool = True) -> int:
+    """
+    Public entry point for the dedicated exit_monitor process.
+
+    Delegates to the shared open-position exit sweep so the exit logic (peak
+    ratchet, zero-mark guard, guard_trough, lane exit + order_flow, force-close)
+    has a SINGLE source of truth used by both sol-monitor and sol-exit-monitor.
+    """
+    return await _check_paper_exits(skip_call_ids=skip_call_ids, include_live=include_live)
 
 
 # ── Full pass ─────────────────────────────────────────────────────────────────
