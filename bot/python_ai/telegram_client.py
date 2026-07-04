@@ -40,6 +40,19 @@ import lane_policy
 # trade lane_policy lanes via open_lane_position and the legacy paper dispatch is
 # suppressed. Default off — no behaviour change until set.
 LANE_TESTBED_ENABLED = os.getenv("LANE_TESTBED_ENABLED", "false").lower() == "true"
+
+# Entry-side rug gate (trending channels only). A high holder count AT DETECTION is a
+# rug/dud signal on the early/realtime channels — shadow backtest on solwhale/low_score:
+# runners cluster low (~450 holders), rugs high (~765); skipping hodl_count > threshold
+# lifted 28d PnL in BOTH validation halves without killing the (low-holder) monster
+# runners. Reclassifies to a 'high_holders' skip lane so LIVE stops trading it while the
+# SHADOW keeps measuring (self-validates on forward data — watch it in lane_policy_review).
+# Deliberately NOT applied to solhousesignal: a LAGGING channel where coins are already
+# mature (~1300 holders regardless of outcome), so the signal is saturated. Default
+# threshold 700 = monster-safe (runners cluster well below it). Flip HOLDER_SKIP_ENABLED
+# to disable instantly if the high_holders shadow lane turns out net-positive.
+HOLDER_SKIP_ENABLED   = os.getenv("HOLDER_SKIP_ENABLED", "true").lower() == "true"
+HOLDER_SKIP_THRESHOLD = int(os.getenv("HOLDER_SKIP_THRESHOLD", "700"))
 import monitor as _monitor
 from parsers import type_a, type_b, type_a_vip
 
@@ -1398,8 +1411,22 @@ def run_listener() -> None:
                     )
                     and "vip" not in channel_tag
                 ):
-                    db.set_call_skip_reason(call_id, "low_score")
-                    print(f"[paper] {extra.get('symbol')} skipped — score {score:.1f} < 63")
+                    # Entry-side rug gate: high holders at detection = rug/dud on the
+                    # realtime trending channel (solwhale). Reclassify to a skip lane so
+                    # live stops trading it; the shadow still measures it. solhousesignal is
+                    # exempt (lagging → holders saturated, no signal). Missing hodl_count ->
+                    # NOT gated (never skip on absent data).
+                    _hodl = extra.get("hodl_count")
+                    if (HOLDER_SKIP_ENABLED
+                            and "solwhaletrending" in channel_tag
+                            and _hodl is not None
+                            and int(_hodl) > HOLDER_SKIP_THRESHOLD):
+                        db.set_call_skip_reason(call_id, "high_holders")
+                        print(f"[paper] {extra.get('symbol')} → high_holders "
+                              f"(hodl={_hodl} > {HOLDER_SKIP_THRESHOLD}, score {score:.1f})")
+                    else:
+                        db.set_call_skip_reason(call_id, "low_score")
+                        print(f"[paper] {extra.get('symbol')} skipped — score {score:.1f} < 63")
 
             # Lane testbed: routing is done, so skip_reason (the lane label) is final.
             # Resolve lane_policy for A (anchors) + B (anchors+pockets) and open paper trades.

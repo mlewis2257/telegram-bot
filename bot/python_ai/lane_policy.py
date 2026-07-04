@@ -193,6 +193,12 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     ("solhousesignal_vip", "safe",        "vip_safe_allowed_hours"):   {"trade": False},  # -75
     ("solhousesignal_vip", "gamble",      "vip_gamble_allowed_hours"): {"trade": False},  # -63
     ("solhousesignal_vip", "gamble",      "none"):                     {"trade": False},  # -27
+    # Entry-side rug gate output (telegram_client HOLDER_SKIP): solwhale low_score coins with
+    # hodl_count > HOLDER_SKIP_THRESHOLD (default 700) are reclassified here instead of
+    # low_score. NOT traded live; the shadow still tracks it so we can confirm the skip was
+    # right — this lane should read net-NEGATIVE in lane_policy_review. If it goes green, the
+    # gate is cutting winners: raise the threshold or set HOLDER_SKIP_ENABLED=false.
+    ("solwhaletrending",   "none",        "high_holders"):             {"trade": False},
 }
 
 
