@@ -186,7 +186,11 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # confirmed multi-week record (KEEP on Mon/Tue/Sat in lane_policy_review; +16-25 SOL over
     # 7-28d, the top lane in every window). Was 0.1 as an unconfirmed watch pocket; it's earned
     # full size — now matches SHADOW_SOL_IN so realized PnL tracks what the shadow measures.
-    ("solhousesignal_vip", "gamble", "vip_mcap_gate"):  {"trade": True, "size": 0.5, "exit": EXIT_EARLY,    "watch": True, "days": {"Mon", "Tue", "Sat"}},
+    # PER-DAY EXIT 2026-07-06: added Fri via day_exits{Fri:ride}. EARLY is red on Fri, but RIDE
+    # on Fri is a clean repeating edge — dow-weeks Fri/ride: 3/4 weeks green, mean +3.21, AND
+    # +3.20 with 2-of-3 green even after DROPPING the one +9.64 week (verified not an outlier
+    # fluke). early stays the exit Mon/Tue/Sat; Fri overrides to ride. Entry-day keyed (lane_exit).
+    ("solhousesignal_vip", "gamble", "vip_mcap_gate"):  {"trade": True, "size": 0.5, "exit": EXIT_EARLY, "watch": True, "days": {"Mon", "Tue", "Fri", "Sat"}, "day_exits": {"Fri": EXIT_RIDE_S}},
     # solwhaletrending/none: re-homed from anchor. Only consistent green day is Wed, and it's
     # the RIDE variant that carries it (Wed ride +5.26/14d, +5.18/7d; early ~+2). THIN (one
     # day, ~12 trades) — probationary, smallest size, yank if Wed doesn't repeat.
@@ -238,16 +242,31 @@ def resolve(channel: Optional[str], vip_tier: Optional[str], category: Optional[
     return policy
 
 
-def lane_exit(channel: Optional[str], vip_tier: Optional[str], category: Optional[str]) -> Optional[str]:
+def lane_exit(channel: Optional[str], vip_tier: Optional[str], category: Optional[str],
+              entry_time: Optional[datetime] = None) -> Optional[str]:
     """
     The lane's assigned exit-strategy name, IGNORING trade/day/watch gating. Used at
     exit-check time: the entry decision is already made, so a position must keep
     exiting on its lane's rule even on an off-day or in a watch lane A wouldn't enter.
+
+    PER-DAY EXITS: a lane may carry "day_exits" = {weekday: variant} to override its
+    default "exit" on specific weekdays (e.g. vip_mcap_gate runs `early` Mon/Tue/Sat but
+    `ride` on Fri, where the dow-weeks data says ride — not early — is the edge). The
+    override is keyed by the position's ENTRY weekday via `entry_time`, so a position keeps
+    its entry-day exit for its whole life even if checked on a later calendar day. Weekday
+    is evaluated in LANE_GATE_TZ (naive entry_time treated as UTC), same as the day-gate.
+    If entry_time is omitted, falls back to the lane's default "exit".
     """
     ch   = (channel or "").lstrip("@").strip()
     tier = (vip_tier or "none").strip()
     cat  = (category or "none").strip()
-    return LANE_POLICY.get((ch, tier, cat), {}).get("exit")
+    policy = LANE_POLICY.get((ch, tier, cat), {})
+    day_exits = policy.get("day_exits")
+    if day_exits and entry_time is not None:
+        wd = gate_weekday(entry_time)
+        if wd in day_exits:
+            return day_exits[wd]
+    return policy.get("exit")
 
 
 def exit_config_for(strategy: Optional[str], rvol: Optional[float] = None,

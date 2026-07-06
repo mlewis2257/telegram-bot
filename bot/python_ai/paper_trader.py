@@ -383,7 +383,8 @@ def check_exits(
     # (same process as ws_monitor, so its rolling swap state is populated here). Outside
     # ws_monitor (e.g. monitor.py) metrics() returns None -> ride_vol falls back to ride.
     if LANE_TESTBED_ENABLED:
-        _exit = lane_policy.lane_exit(channel_handle, position.get("vip_tier"), position.get("skip_reason"))
+        _exit = lane_policy.lane_exit(channel_handle, position.get("vip_tier"),
+                                      position.get("skip_reason"), position.get("entry_time"))
         if _exit:
             flow = order_flow.metrics(mint, window=lane_policy.FLOW_WINDOW) if mint else None
             cfg = lane_policy.exit_config_for(_exit, flow=flow)
