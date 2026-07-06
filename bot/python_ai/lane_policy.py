@@ -167,11 +167,13 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # ── WATCH POCKETS — B ONLY, day-gated. Net-NEGATIVE lanes with a repeating green
     #    weekday in --dow-weeks. UNCONFIRMED (2/2 so far) → small size; exit is a tunable
     #    judgement call (thin per-variant data), not a proven number. ──
-    # vip_low_score gamble: Monday 2/2 (+6.7 mean), held & grew — best long-shot.
-    # EXIT EARLY (changed from ride_vol 2026-06-30): same live-degradation risk as solwhale/low_score
-    # — live ride_vol has no volume feed so it becomes plain RIDE (gives back runs). Until volume is
-    # in the live exit path, ride_vol shadow numbers are NOT achievable live, so use early.
-    ("solhousesignal_vip", "gamble", "vip_low_score"): {"trade": True, "size": 0.1, "exit": EXIT_EARLY, "watch": True, "days": {"Mon"}},
+    # vip_low_score gamble: REMOVED 2026-07-06 — the `vip_low_score` skip label stopped being
+    # emitted by the VIP router on 2026-06-24 (verified in DB: 71 coins/day -> 0 for 12+ days,
+    # alongside vip_safe_allowed_hours / mcap_too_low / vip_gamble_allowed_hours also dropping to 0).
+    # Those coins now pass UNLABELED (skip_reason NULL), shadowed as solhousesignal_vip/gamble/none
+    # (deeply negative) and NOT traded. So this pocket had been inert ~2 weeks. Root cause = a
+    # separate VIP-routing investigation (why the labels died ~testbed commit fdea57a); pulled here
+    # so the board reflects reality. Was: gamble/vip_low_score EARLY 0.1 Mon (hist. Mon 2/2 +6.7).
     # free/none: Tuesday 2/2 (+3.15) inside the -61 free/none loser. early (cut fast in a loser lane).
     ("solhousesignal",     "none",  "none"):           {"trade": True, "size": 0.1, "exit": EXIT_EARLY,    "watch": True, "days": {"Tue"}},
     # free/quiet_hours: Saturday 2/2 (+6.75) inside the -15 quiet_hours loser. early.
@@ -180,7 +182,11 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # is green in BOTH 7d (+3.94) and 14d (+2.49), with a *repeating* weekday split: green
     # Mon/Tue/Sat, red Wed/Thu/Fri in both windows. (ride/ride_vol totals flip between
     # windows — a few fat cells — so do NOT use them; early only.) Day-gate Mon/Tue/Sat.
-    ("solhousesignal_vip", "gamble", "vip_mcap_gate"):  {"trade": True, "size": 0.1, "exit": EXIT_EARLY,    "watch": True, "days": {"Mon", "Tue", "Sat"}},
+    # SIZE UP 2026-07-06: 0.1 -> 0.5 (full shadow/anchor size). Best-performing traded lane on a
+    # confirmed multi-week record (KEEP on Mon/Tue/Sat in lane_policy_review; +16-25 SOL over
+    # 7-28d, the top lane in every window). Was 0.1 as an unconfirmed watch pocket; it's earned
+    # full size — now matches SHADOW_SOL_IN so realized PnL tracks what the shadow measures.
+    ("solhousesignal_vip", "gamble", "vip_mcap_gate"):  {"trade": True, "size": 0.5, "exit": EXIT_EARLY,    "watch": True, "days": {"Mon", "Tue", "Sat"}},
     # solwhaletrending/none: re-homed from anchor. Only consistent green day is Wed, and it's
     # the RIDE variant that carries it (Wed ride +5.26/14d, +5.18/7d; early ~+2). THIN (one
     # day, ~12 trades) — probationary, smallest size, yank if Wed doesn't repeat.
