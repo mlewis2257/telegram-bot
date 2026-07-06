@@ -91,10 +91,14 @@ def _traded_cells() -> dict:
     for (ch, tier, skip), pol in lane_policy.LANE_POLICY.items():
         if not pol.get("trade"):
             continue
-        variant = pol.get("exit")
+        default_variant = pol.get("exit")
+        day_exits = pol.get("day_exits") or {}   # {weekday: variant} per-day exit overrides
         days = pol.get("days")
-        dows = [_WD_TO_DOW[d] for d in days] if days else all_days
-        for dow in dows:
+        # (dow_int, weekday_str) pairs for the lane's traded days.
+        dows = ([(_WD_TO_DOW[d], d) for d in days] if days
+                else [(dow, _DOW_TO_WD[dow]) for dow in all_days])
+        for dow, wd in dows:
+            variant = day_exits.get(wd, default_variant)  # Fri->ride, others->default
             cells[(ch, tier, skip, variant, dow)] = {"watch": bool(pol.get("watch"))}
     return cells
 
