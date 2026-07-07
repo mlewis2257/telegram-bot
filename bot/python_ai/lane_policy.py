@@ -60,6 +60,15 @@ FLOW_WINDOW     = float(os.getenv("LANE_FLOW_WINDOW", "60"))
 # Master switch — keep the router OFF until you deliberately route a strategy to it.
 LANE_POLICY_ENABLED = os.getenv("LANE_POLICY_ENABLED", "false").lower() == "true"
 
+# Uniform paper-testbed size override. When > 0, EVERY traded lane opens at THIS size instead
+# of its per-lane "size" — turning the paper testbed into a clean measurement instrument where
+# all lanes are comparable and read directly against the shadow (SHADOW_SOL_IN, default 0.5).
+# Set LANE_UNIFORM_SIZE=0.5 in .env to activate. Leave at 0 (default) to use the risk-
+# differentiated per-lane sizes in the table below. NOTE: this is a MEASUREMENT choice, not a
+# live-risk one — for live trading you'd want smaller sizes on unconfirmed/high-variance lanes,
+# so the per-lane sizes are kept intact and simply overridden while this is on.
+LANE_UNIFORM_SIZE = float(os.getenv("LANE_UNIFORM_SIZE", "0") or "0")
+
 
 # ── Global day-gate (defensive weekday skip) ──────────────────────────────────
 # Some weekdays are structurally bad to trade (Sunday — historically weak unless a
@@ -242,6 +251,10 @@ def resolve(channel: Optional[str], vip_tier: Optional[str], category: Optional[
     days = policy.get("days")
     if days and gate_weekday(now) not in days:
         return {"trade": False, "reason": "off_day", "weekday": gate_weekday(now)}
+    # Uniform-size override (paper measurement mode): every traded lane at LANE_UNIFORM_SIZE.
+    # Return a COPY so the LANE_POLICY table itself is never mutated.
+    if LANE_UNIFORM_SIZE > 0 and policy.get("size") is not None:
+        return {**policy, "size": LANE_UNIFORM_SIZE}
     return policy
 
 
