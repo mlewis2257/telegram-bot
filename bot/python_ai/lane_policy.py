@@ -174,8 +174,11 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # (deeply negative) and NOT traded. So this pocket had been inert ~2 weeks. Root cause = a
     # separate VIP-routing investigation (why the labels died ~testbed commit fdea57a); pulled here
     # so the board reflects reality. Was: gamble/vip_low_score EARLY 0.1 Mon (hist. Mon 2/2 +6.7).
-    # free/none: Tuesday 2/2 (+3.15) inside the -61 free/none loser. early (cut fast in a loser lane).
-    ("solhousesignal",     "none",  "none"):           {"trade": True, "size": 0.1, "exit": EXIT_EARLY,    "watch": True, "days": {"Tue"}},
+    # free/none (solhousesignal/none/none) Tue pocket: REMOVED 2026-07-07. Added on a thin 2/2
+    # Tuesday sample inside the deeply-negative free/none lane; more data proved it a loser
+    # (lane_policy_review flagged Tue 1/3, mean -1.20 -> DEMOTE) and it bled ~-0.9 SOL on 07/07
+    # alone. The none/none bucket is a bad lane and the Tuesday exception didn't hold — cut per
+    # our own rule (demote when mean<=0). Unlisted now -> DEFAULT skip; shadow still measures it.
     # free/quiet_hours: Saturday 2/2 (+6.75) inside the -15 quiet_hours loser. early.
     ("solhousesignal",     "none",  "quiet_hours"):    {"trade": True, "size": 0.1, "exit": EXIT_EARLY,    "watch": True, "days": {"Sat"}},
     # vip_mcap_gate gamble: PROMOTED from skip 2026-06-29. NOT a mirage — the EARLY variant
