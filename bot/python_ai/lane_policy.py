@@ -206,7 +206,12 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # solwhaletrending/none: re-homed from anchor. Only consistent green day is Wed, and it's
     # the RIDE variant that carries it (Wed ride +5.26/14d, +5.18/7d; early ~+2). THIN (one
     # day, ~12 trades) — probationary, smallest size, yank if Wed doesn't repeat.
-    ("solwhaletrending",   "none",  "none"):            {"trade": True, "size": 0.1, "exit": EXIT_RIDE_S,   "watch": True, "days": {"Wed"}},
+    # Sat added 2026-07-07 (ride_vol) from lane_policy_review --weeks 5: Sat/ride_vol +wk 3/4,
+    # mean +1.85, and it SURVIVES dropping its best week (+0.69/3, 2/3 green) — same robustness
+    # test that justified vip_mcap_gate Fri->ride. New DAY-cell on an existing lane, not a variant
+    # dup. Probationary like Wed: watch B-only, day-keyed exit (Wed->ride, Sat->ride_vol). If next
+    # Sat is red (breaks the 3/4) or the review demotes it, yank. Default exit stays ride (Wed).
+    ("solwhaletrending",   "none",  "none"):            {"trade": True, "size": 0.1, "exit": EXIT_RIDE_S,   "watch": True, "days": {"Wed", "Sat"}, "day_exits": {"Sat": EXIT_RIDE_VOL}},
 
     # ── SKIP / CUT — confirmed losers, explicit so intent is auditable (NEVER traded) ──
     ("solhousesignal_vip", "gamble_risk", "vip_paused"):               {"trade": False},  # -471, worst lane
