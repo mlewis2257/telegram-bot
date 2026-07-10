@@ -154,7 +154,11 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # ── ANCHORS — net-positive over 14d; A & B BOTH trade these ──
     # low_score (free): the king. EARLY best over 14d (+20.4; ride_vol +16.8; ride +8.1).
     # (ride_vol led the shorter 5d window — early wins on the larger, more robust sample.)
-    ("solhousesignal",   "none", "low_score"): {"trade": True, "size": 0.5,  "exit": EXIT_EARLY},
+    # FRIDAY CUT 2026-07-10: lane_policy_review flagged Fri DEMOTE (2/5, mean -0.03, a real
+    # 2-wk slide — 3 of last 4 Fridays red). Day-gated to Mon-Thu+Sat (KEEP on all of those:
+    # Mon +1.49, Tue +1.43, Wed +1.54, Thu +1.76, Sat +1.48). Sun already global-skipped.
+    # Re-add Fri if the review flips it back to KEEP.
+    ("solhousesignal",   "none", "low_score"): {"trade": True, "size": 0.5,  "exit": EXIT_EARLY, "days": {"Mon", "Tue", "Wed", "Thu", "Sat"}},
     # solwhaletrending/none DEMOTED from anchor 2026-06-29: marginal on the clean windows
     # (early +0.28/14d, -2.91/7d). solwhale's real edge lives in the low_score sub-lane
     # (Tue/Fri), not none/traded. Re-homed below as a thin Wed-only watch pocket.
@@ -171,7 +175,10 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # <FLOW_MIN_EVENTS swaps it still falls back to ride — if the [lane_flow] logs show it mostly
     # degrading / it underperforms shadow, revert to EXIT_EARLY. Size held at 0.1 (test the exit,
     # not a size bump too); size up only after Friday validates.
-    ("solwhaletrending", "none", "low_score"): {"trade": True, "size": 0.1, "exit": EXIT_RIDE_VOL, "days": {"Tue", "Fri"}},
+    # FRIDAY CUT 2026-07-10: Tue+Fri -> Tue ONLY. review flagged Fri DEMOTE (2/5, mean -0.24,
+    # last 2 Fridays big red: -4.12, -2.66). Tuesday is the star (KEEP 4/4, mean +4.50) and
+    # carries the lane's whole edge; Friday was dragging. Re-add Fri if review flips it to KEEP.
+    ("solwhaletrending", "none", "low_score"): {"trade": True, "size": 0.1, "exit": EXIT_RIDE_VOL, "days": {"Tue"}},
 
     # ── WATCH POCKETS — B ONLY, day-gated. Net-NEGATIVE lanes with a repeating green
     #    weekday in --dow-weeks. UNCONFIRMED (2/2 so far) → small size; exit is a tunable
