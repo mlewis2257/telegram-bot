@@ -42,6 +42,7 @@ import argparse
 import asyncio
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -58,9 +59,14 @@ async def main_loop() -> None:
           f"(dedicated open-position exit driver)")
     while True:
         try:
+            t0 = time.monotonic()
             n = await monitor.run_exit_sweep(include_live=False)
-            if n:
-                print(f"[exit_monitor] closed {n} this pass")
+            dur = time.monotonic() - t0
+            # Sweep duration is the whole point of the fix: if this creeps toward/past
+            # INTERVAL on busy days, the effective exit cadence is stretching and paper
+            # falls behind shadow on fast coins. Flag the slow passes loudly.
+            tag = "  SLOW ⚠" if dur > INTERVAL else ""
+            print(f"[exit_monitor] pass {dur:.1f}s closed={n}{tag}")
         except Exception as e:
             db.safe_rollback()
             print(f"[exit_monitor] pass error: {e}")

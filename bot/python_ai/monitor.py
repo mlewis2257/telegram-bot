@@ -45,6 +45,14 @@ from exit_config import EXIT_A_PAPER, EXIT_B_PAPER
 
 PASS_INTERVAL        = 10     # target; actual interval depends on watchlist size
 INTER_CALL_SLEEP     = 0.5    # seconds between each DexScreener call
+# Per-batch-miss throttle in the PAPER EXIT sweep. Was hardcoded to INTER_CALL_SLEEP
+# (0.5s), which stretched the exit sweep to 20-30s on busy days (batch-misses = fast
+# nano-caps), sampling the volatile coins COARSER than shadow_monitor and firing stale
+# exits — the paper-vs-shadow gap. shadow_monitor has no such throttle and keeps up fine,
+# because every Jupiter fetch already routes through the SHARED api_rate_budget
+# (_jup_try_acquire), so 429s are prevented at the acquire layer regardless. Default 0 =
+# match shadow. Bump EXIT_FALLBACK_SLEEP only if the shared budget proves insufficient.
+EXIT_FALLBACK_SLEEP  = float(os.getenv("EXIT_FALLBACK_SLEEP", "0"))
 RATE_LIMIT_SLEEP     = 30     # seconds to back off on 429 responses
 MAX_WATCHLIST_SPREAD = 50     # above this, spread calls evenly across the window
 MIN_SCORE            = 45     # minimum conviction_score to include (vip_safe floor)
@@ -698,7 +706,8 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None,
                     market = {"price_usd": jup_price, "mcap": blended, "source": "jupiter_batch"}
             if not market:
                 market = data_fetcher.fetch_token_price_jupiter_only(mint)
-                await asyncio.sleep(INTER_CALL_SLEEP)
+                if EXIT_FALLBACK_SLEEP > 0:
+                    await asyncio.sleep(EXIT_FALLBACK_SLEEP)
 
             if not market or not market.get("mcap"):
                 closed += _force_close_unpriceable("delisted")
