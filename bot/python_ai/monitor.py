@@ -705,7 +705,16 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None,
                 if blended:
                     market = {"price_usd": jup_price, "mcap": blended, "source": "jupiter_batch"}
             if not market:
-                market = data_fetcher.fetch_token_price_jupiter_only(mint)
+                # DexScreener-capable fallback, matching shadow_monitor's _mcap chain.
+                # Jupiter DROPS thin pump.fun nano-caps mid-life (migration / low liquidity).
+                # With a Jupiter-only fallback, an open position that ran 2x then went
+                # Jupiter-unpriceable was held blind for FORCE_CLOSE_UNPRICEABLE_HOURS and
+                # force-closed at -100% — e.g. KITWIFMIT peaked 2.13x, Jamey 2.61x, both booked
+                # -100% while shadow (DexScreener) trail-stopped them at +57%/+45%. That single
+                # bug drove most of the paper-vs-shadow gap. Safe here — unlike the cold-tier
+                # watchlist firehose that forced jupiter_only, the EXIT sweep only prices OPEN
+                # positions (bounded), and DexScreener stays under DEX_MAX_PER_MIN.
+                market = data_fetcher.fetch_token_price_fast(mint)
                 if EXIT_FALLBACK_SLEEP > 0:
                     await asyncio.sleep(EXIT_FALLBACK_SLEEP)
 
