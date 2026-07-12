@@ -3,7 +3,9 @@ lane_policy_review.py — weekly adaptability check for lane_policy.
 
 Reads the SAME shadow_positions data the reports read and, for every lane/day
 lane_policy CURRENTLY trades, tells you whether it still earns — KEEP, SLIDING,
-or DEMOTE? — then surfaces EMERGING cells that now qualify but aren't traded yet.
+or DEMOTE? — re-checks any RECENTLY CUT days (lane_policy.CUT_WATCH) at the KEEP
+bar to catch a recovery, then surfaces EMERGING cells that now qualify but aren't
+traded yet.
 
 It changes NOTHING. It prints a recommendation; you decide and hand-edit
 lane_policy. Run it weekly (or whenever you're second-guessing a lane) so decay
@@ -103,6 +105,22 @@ def _traded_cells() -> dict:
     return cells
 
 
+def _cut_watch_cells() -> dict:
+    """lane_policy.CUT_WATCH -> {(channel, tier, skip, variant, dow): {'note': str}}.
+    These are day-cells we deliberately removed from a lane's `days`; we keep evaluating
+    them at the KEEP bar (not the stricter ADD bar) so a recovering cut day doesn't fall
+    into a visibility blind spot between the TRADED and EMERGING sections."""
+    cells: dict = {}
+    for entry in getattr(lane_policy, "CUT_WATCH", []):
+        ch, tier, skip, wd, variant = entry[:5]
+        note = entry[5] if len(entry) > 5 else ""
+        dow = _WD_TO_DOW.get(wd)
+        if dow is None:
+            continue
+        cells[(ch, tier, skip, variant, dow)] = {"note": note}
+    return cells
+
+
 def _series(cell_weeks: dict) -> list:
     """cell_weeks {wk_date: (sol, n)} -> list of (sol, n) oldest→newest."""
     return [cell_weeks[w] for w in sorted(cell_weeks)]
@@ -194,14 +212,39 @@ def main() -> None:
     if not any(buckets.values()):
         print("  (no traded cells found — is LANE_POLICY populated?)")
 
-    # ── SECTION 2: emerging cells not currently traded ──
+    # ── SECTION 2: recently-cut day-cells, recovery watch (KEEP bar, not ADD bar) ──
+    cut = _cut_watch_cells()
+    if cut:
+        print("\n" + "═" * 78)
+        print("  RECENTLY CUT — days we removed; re-checked at the KEEP bar for recovery")
+        print("═" * 78)
+        for cell, meta in sorted(cut.items()):
+            series = _series(data.get(cell, {}))
+            status, ratio, mean, n_weeks, total_n, recent = _classify(series)
+            note = f"  — {meta['note']}" if meta.get("note") else ""
+            if status == "THIN":
+                tag, detail = "THIN", f"n_wk={n_weeks} n={total_n} — insufficient, still cut"
+            else:
+                pos = int(round(ratio * n_weeks))
+                base = f"+wk {pos}/{n_weeks}  mean {mean:+.2f}  {_wkstr(series)}"
+                if status == "KEEP":
+                    tag, detail = "RECOVERED", base + "  ← clears KEEP bar, CONSIDER RE-ADDING"
+                elif status == "MARGINAL":
+                    tag, detail = "WARMING", base + "  ← +EV but streaky, keep watching"
+                elif status == "SLIDING":
+                    tag, detail = "STILL CUT", base + "  ← good ratio but last 2 red, stay cut"
+                else:  # DEMOTE
+                    tag, detail = "STILL CUT", base + "  ← losing on avg, stay cut"
+            print(f"  [{tag:<9}] {_fmt_cell(*cell)}   {detail}{note}")
+
+    # ── SECTION 3: emerging cells not currently traded ──
     print("\n" + "═" * 78)
     print(f"  EMERGING — cells that clear the ADD bar ({PROMOTE_RATIO:.0%} +wk, "
           f"mean>{PROMOTE_MIN_MEAN}) but aren't traded")
     print("═" * 78)
     candidates = []
     for cell, cell_weeks in data.items():
-        if cell in traded:
+        if cell in traded or cell in cut:
             continue
         series = _series(cell_weeks)
         n_weeks = len(series)

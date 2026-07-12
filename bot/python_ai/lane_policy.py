@@ -236,6 +236,27 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
 }
 
 
+# ── CUT_WATCH — day-cells we deliberately REMOVED, kept under observation ──────
+# When we day-gate a weekday OUT of a lane (drop it from "days"), that cell leaves
+# lane_policy_review's TRADED section — and it only re-surfaces in EMERGING if it
+# clears the STRICTER add bar (PROMOTE_RATIO / PROMOTE_MIN_MEAN). A cell that's merely
+# RECOVERING (back above the KEEP bar but not yet the add bar) falls into a blind spot:
+# gone from TRADED, not yet in EMERGING. This registry lists those cuts so
+# lane_policy_review re-evaluates them at the KEEP bar and tells us when to reconsider —
+# turning a cut into an explicit, tracked, reversible decision instead of a silent gap.
+#
+# Each entry = (channel, vip_tier, skip_reason, weekday, variant, note). `variant` is the
+# exit the day WOULD run if re-added (so the review reads the RIGHT series); `weekday` is a
+# 3-letter LANE_GATE_TZ abbrev. Remove an entry once you either re-add the day (it's back
+# in TRADED) or decide the cut is permanent.
+CUT_WATCH: list[tuple] = [
+    # Friday cut 2026-07-10 (commit e49b1d4): both anchors' Fridays DEMOTEd by the review
+    # (a real 2-week slide, 3 of last 4 Fridays red). Watching for recovery at the KEEP bar.
+    ("solhousesignal",   "none", "low_score", "Fri", EXIT_EARLY,    "cut 07-10, was Mon-Thu+Sat anchor"),
+    ("solwhaletrending", "none", "low_score", "Fri", EXIT_RIDE_VOL, "cut 07-10, Tue+Fri -> Tue only"),
+]
+
+
 def resolve(channel: Optional[str], vip_tier: Optional[str], category: Optional[str],
             now: Optional[datetime] = None, strategy: str = "A") -> dict:
     """
