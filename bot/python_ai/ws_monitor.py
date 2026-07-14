@@ -35,6 +35,7 @@ import paper_trader
 import paper_trader_b
 import live_trader
 import peak_guard
+import lane_policy
 from exit_config import EXIT_A_PAPER, EXIT_B_PAPER
 
 # Exit configs must match what monitor.py uses so WS and polling exits
@@ -42,6 +43,38 @@ from exit_config import EXIT_A_PAPER, EXIT_B_PAPER
 _EXIT_A    = EXIT_A_PAPER
 _EXIT_B    = EXIT_B_PAPER
 _EXIT_LIVE = live_trader._LIVE_EXIT_CONFIG
+
+# ── Coarse-exit routing (forward experiment: is shadow's coarse edge capturable?) ──
+# Lanes whose exit variant is listed here are NOT exited by ws_monitor's dense per-swap
+# (helius_tx) feed. ws still RATCHETS their peak every tick (harmless, monotonic), but the
+# EXIT decision is delegated to the coarse Jupiter sweep (exit_monitor / sol-monitor), which
+# prices on Jupiter's liquidity-aggregated mcap — so it rides THROUGH single-swap wicks the
+# way shadow does, instead of trail-stopping paper out on a transient down-tick (e.g. CATTEARS
+# 2.04x -> booked -1% on a one-tick -44% wick, while shadow rode it to 6.74x).
+#
+# Default empty = ws_monitor owns every paper exit (unchanged legacy behavior). Set
+# WS_COARSE_EXIT_VARIANTS="early" to route the low_score anchor (and any other `early` lane)
+# to the coarse sweep — the forward test of whether shadow's coarse-anchor edge is realizable
+# on real paper positions. Paper-only (live is never gated here). Reversible instantly by
+# clearing the env var + restarting ws_monitor. Do NOT add `ride`/`ride_vol` — the coarse-exit
+# backtest showed coarsening those lanes RIDES the rugs down (net loss). Anchor/early only.
+WS_COARSE_EXIT_VARIANTS = frozenset(
+    v.strip() for v in os.getenv("WS_COARSE_EXIT_VARIANTS", "").split(",") if v.strip()
+)
+
+
+def _coarse_routed(position: dict | None) -> bool:
+    """True if this lane's exit is delegated to the coarse Jupiter sweep (see
+    WS_COARSE_EXIT_VARIANTS). ws_monitor keeps ratcheting the peak but must NOT fire the
+    exit on its dense per-swap feed. Resolves the lane's variant exactly like the exit
+    resolver everything else uses (lane_policy.lane_exit, honoring per-day overrides)."""
+    if not WS_COARSE_EXIT_VARIANTS or not position:
+        return False
+    variant = lane_policy.lane_exit(
+        position.get("channel_handle"), position.get("vip_tier"),
+        position.get("skip_reason"), position.get("entry_time"),
+    )
+    return variant in WS_COARSE_EXIT_VARIANTS
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -374,21 +407,24 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
                 )
             effective_a_peak = peak_mcap_a  # capture before potential pop
 
-            # Guard the exit trigger against un-corroborated up-spikes: on a phantom
-            # high, peak_mcap_a holds at the real corroborated level, so this caps the
-            # spike while passing genuine climbs and pullbacks. Without it a single bad
-            # reading fires a phantom take-profit (closing at a price that never was).
-            eff_mcap_a = min(current_mcap, peak_mcap_a) if peak_mcap_a > 0 else current_mcap
-            result_a = paper_trader.check_exits(
-                call_id, eff_mcap_a, peak_mcap_a, entry_price,
-                mint=mint, is_strategy_b=False, exit_config=_EXIT_A,
-            )
-            if result_a.should_exit:
-                exit_mcap = result_a.exit_mcap or eff_mcap_a
-                paper_trader.close_position(call_id, exit_mcap, result_a.reason, is_strategy_b=False)
-                _a_realtime_peak_mcap.pop(call_id, None)
-                print(f"[ws_monitor] {mint[:8]} A closed — {result_a.reason} @ ${exit_mcap/1000:.1f}k")
-                a_done = True
+            # Coarse-routed lanes (WS_COARSE_EXIT_VARIANTS): peak is ratcheted above, but the
+            # EXIT is left to the coarse Jupiter sweep so a single-swap wick can't fire it here.
+            if not _coarse_routed(position_a):
+                # Guard the exit trigger against un-corroborated up-spikes: on a phantom
+                # high, peak_mcap_a holds at the real corroborated level, so this caps the
+                # spike while passing genuine climbs and pullbacks. Without it a single bad
+                # reading fires a phantom take-profit (closing at a price that never was).
+                eff_mcap_a = min(current_mcap, peak_mcap_a) if peak_mcap_a > 0 else current_mcap
+                result_a = paper_trader.check_exits(
+                    call_id, eff_mcap_a, peak_mcap_a, entry_price,
+                    mint=mint, is_strategy_b=False, exit_config=_EXIT_A,
+                )
+                if result_a.should_exit:
+                    exit_mcap = result_a.exit_mcap or eff_mcap_a
+                    paper_trader.close_position(call_id, exit_mcap, result_a.reason, is_strategy_b=False)
+                    _a_realtime_peak_mcap.pop(call_id, None)
+                    print(f"[ws_monitor] {mint[:8]} A closed — {result_a.reason} @ ${exit_mcap/1000:.1f}k")
+                    a_done = True
         else:
             _a_realtime_peak_mcap.pop(call_id, None)
             a_done = True
@@ -410,16 +446,18 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
                 db.update_paper_position_peak(call_id, guarded_b, new_mult, is_strategy_b=True)
                 peak_mcap_b = guarded_b
 
-            eff_mcap_b = min(current_mcap, peak_mcap_b) if peak_mcap_b > 0 else current_mcap
-            result_b = paper_trader_b.check_exits(
-                call_id, eff_mcap_b, peak_mcap_b, entry_price,
-                mint=mint, is_strategy_b=True, exit_config=_EXIT_B,
-            )
-            if result_b.should_exit:
-                exit_mcap = result_b.exit_mcap or eff_mcap_b
-                paper_trader_b.close_position(call_id, exit_mcap, result_b.reason, is_strategy_b=True)
-                print(f"[ws_monitor] {mint[:8]} B closed — {result_b.reason} @ ${exit_mcap/1000:.1f}k")
-                b_done = True
+            # Coarse-routed lanes: peak ratcheted above; exit left to the coarse Jupiter sweep.
+            if not _coarse_routed(position_b):
+                eff_mcap_b = min(current_mcap, peak_mcap_b) if peak_mcap_b > 0 else current_mcap
+                result_b = paper_trader_b.check_exits(
+                    call_id, eff_mcap_b, peak_mcap_b, entry_price,
+                    mint=mint, is_strategy_b=True, exit_config=_EXIT_B,
+                )
+                if result_b.should_exit:
+                    exit_mcap = result_b.exit_mcap or eff_mcap_b
+                    paper_trader_b.close_position(call_id, exit_mcap, result_b.reason, is_strategy_b=True)
+                    print(f"[ws_monitor] {mint[:8]} B closed — {result_b.reason} @ ${exit_mcap/1000:.1f}k")
+                    b_done = True
         else:
             b_done = True
     except Exception as e:
@@ -622,6 +660,9 @@ async def connect_with_retry() -> None:
 
 async def main() -> None:
     print(f"[ws_monitor] starting — {WS_URL[:60]}...")
+    if WS_COARSE_EXIT_VARIANTS:
+        print(f"[ws_monitor] COARSE-EXIT routing ON for variants {sorted(WS_COARSE_EXIT_VARIANTS)} "
+              f"— those lanes' paper exits are delegated to the Jupiter sweep (peak still tracked here)")
 
     try:
         db.ensure_ws_market_observations_table()
