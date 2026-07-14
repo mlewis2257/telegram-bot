@@ -70,6 +70,11 @@ def _coarse_routed(position: dict | None) -> bool:
     resolver everything else uses (lane_policy.lane_exit, honoring per-day overrides)."""
     if not WS_COARSE_EXIT_VARIANTS or not position:
         return False
+    # NEVER coarse-route gamble lanes even if they run `early` (vip_mcap_gate does): the
+    # coarse-exit backtest showed coarsening gamble/volatile lanes rides their rugs down.
+    # Coarse routing is only ever safe on the non-gamble `early` anchors (low_score et al.).
+    if position.get("vip_tier") in ("gamble", "gamble_risk"):
+        return False
     variant = lane_policy.lane_exit(
         position.get("channel_handle"), position.get("vip_tier"),
         position.get("skip_reason"), position.get("entry_time"),
