@@ -36,6 +36,7 @@ import alert_bot
 import paper_trader
 import paper_trader_b
 import live_trader
+import lane_policy
 import peak_guard
 import jupiter
 import wallet as _wallet
@@ -45,6 +46,14 @@ from exit_config import EXIT_A_PAPER, EXIT_B_PAPER
 
 PASS_INTERVAL        = 10     # target; actual interval depends on watchlist size
 INTER_CALL_SLEEP     = 0.5    # seconds between each DexScreener call
+
+# Coarse-routed lanes (WS_COARSE_EXIT_VARIANTS) exit on a deliberately slower cadence so a
+# transient sub-15s dip can't trip profit_floor/trail before it recovers — matching shadow's
+# 15s Jupiter sampling, the state proven to ride anchor runners further. exit_monitor is the
+# SOLE evaluator of these lanes' exits (sol-monitor skips them), so this in-process last-eval
+# map gives them a TRUE cadence without slowing the fast sweep for dense lanes like ride_vol.
+COARSE_EXIT_INTERVAL = float(os.getenv("COARSE_EXIT_INTERVAL", "15"))
+_coarse_last_eval: dict[int, float] = {}
 # Per-batch-miss throttle in the PAPER EXIT sweep. Was hardcoded to INTER_CALL_SLEEP
 # (0.5s), which stretched the exit sweep to 20-30s on busy days (batch-misses = fast
 # nano-caps), sampling the volatile coins COARSER than shadow_monitor and firing stale
@@ -460,19 +469,24 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
             a_peak    = peak_guard.guard_peak(f"monPA:{call_id}", current_mcap, a_db_peak)
             if a_peak > a_db_peak and a_entry > 0:
                 db.update_paper_position_peak(call_id, a_peak, a_peak / a_entry, is_strategy_b=False)
-            # Cap an un-corroborated up-spike for the exit trigger: a_peak holds at
-            # the real level on a phantom, so min() blocks a phantom take-profit while
-            # passing genuine climbs and pullbacks.
-            a_eff = min(current_mcap, a_peak) if a_peak > 0 else current_mcap
-            exit_result = paper_trader.check_exits(
-                call_id, a_eff, a_peak, a_entry,
-                mint=mint, is_strategy_b=False, exit_config=EXIT_A_PAPER,
-            )
-            if exit_result.should_exit:
-                exit_mcap = exit_result.exit_mcap or a_eff
-                paper_trader.close_position(call_id, exit_mcap, exit_result.reason, is_strategy_b=False)
-                peak_guard.clear(f"monPA:{call_id}")
-                print(f"  [paper] {symbol} closed — {exit_result.reason}")
+            # Coarse-routed lanes: peak is ratcheted above, but the EXIT DECISION is left to
+            # the dedicated exit_monitor sweep (its coarser cadence) so sol-monitor's dense
+            # watchlist poll can't fire it early. Non-coarse lanes exit here as before.
+            if not lane_policy.is_coarse_routed(pos_a.get("channel_handle"), pos_a.get("vip_tier"),
+                                                pos_a.get("skip_reason"), pos_a.get("entry_time")):
+                # Cap an un-corroborated up-spike for the exit trigger: a_peak holds at
+                # the real level on a phantom, so min() blocks a phantom take-profit while
+                # passing genuine climbs and pullbacks.
+                a_eff = min(current_mcap, a_peak) if a_peak > 0 else current_mcap
+                exit_result = paper_trader.check_exits(
+                    call_id, a_eff, a_peak, a_entry,
+                    mint=mint, is_strategy_b=False, exit_config=EXIT_A_PAPER,
+                )
+                if exit_result.should_exit:
+                    exit_mcap = exit_result.exit_mcap or a_eff
+                    paper_trader.close_position(call_id, exit_mcap, exit_result.reason, is_strategy_b=False)
+                    peak_guard.clear(f"monPA:{call_id}")
+                    print(f"  [paper] {symbol} closed — {exit_result.reason}")
 
         # ── Paper B exit ───────────────────────────────────────────────────────
         pos_b = db.get_open_paper_position(call_id, is_strategy_b=True)
@@ -482,16 +496,19 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
             b_peak    = peak_guard.guard_peak(f"monPB:{call_id}", current_mcap, b_db_peak)
             if b_peak > b_db_peak and b_entry > 0:
                 db.update_paper_position_peak(call_id, b_peak, b_peak / b_entry, is_strategy_b=True)
-            b_eff = min(current_mcap, b_peak) if b_peak > 0 else current_mcap
-            exit_result_b = paper_trader_b.check_exits(
-                call_id, b_eff, b_peak, b_entry,
-                mint=mint, is_strategy_b=True, exit_config=EXIT_B_PAPER,
-            )
-            if exit_result_b.should_exit:
-                exit_mcap_b = exit_result_b.exit_mcap or b_eff
-                paper_trader_b.close_position(call_id, exit_mcap_b, exit_result_b.reason, is_strategy_b=True)
-                peak_guard.clear(f"monPB:{call_id}")
-                print(f"  [paper_b] {symbol} closed — {exit_result_b.reason}")
+            # Coarse-routed lanes: exit decision left to the exit_monitor sweep (see Paper A).
+            if not lane_policy.is_coarse_routed(pos_b.get("channel_handle"), pos_b.get("vip_tier"),
+                                                pos_b.get("skip_reason"), pos_b.get("entry_time")):
+                b_eff = min(current_mcap, b_peak) if b_peak > 0 else current_mcap
+                exit_result_b = paper_trader_b.check_exits(
+                    call_id, b_eff, b_peak, b_entry,
+                    mint=mint, is_strategy_b=True, exit_config=EXIT_B_PAPER,
+                )
+                if exit_result_b.should_exit:
+                    exit_mcap_b = exit_result_b.exit_mcap or b_eff
+                    paper_trader_b.close_position(call_id, exit_mcap_b, exit_result_b.reason, is_strategy_b=True)
+                    peak_guard.clear(f"monPB:{call_id}")
+                    print(f"  [paper_b] {symbol} closed — {exit_result_b.reason}")
 
         # ── Live trade exit check ──────────────────────────────────────────────
         # Uses the live position's own DB-backed peak — independent of paper A's
@@ -610,7 +627,8 @@ async def _check_live_stale(dry_run: bool) -> None:
 # ── Paper position exit sweep ─────────────────────────────────────────────────
 
 async def _check_paper_exits(skip_call_ids: set[int] | None = None,
-                             include_live: bool = True) -> int:
+                             include_live: bool = True,
+                             handle_coarse: bool = True) -> int:
     """
     Exit sweep for all open paper positions, independent of watchlist age.
 
@@ -745,6 +763,24 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None,
                 if mcap_at_call_val > 0:
                     db.update_peak_multiplier(call_id, current_mcap / mcap_at_call_val)
 
+            # Coarse-routed lanes (WS_COARSE_EXIT_VARIANTS): the dedicated exit_monitor
+            # process (handle_coarse=True) owns their exit DECISION at its own cadence; the
+            # sol-monitor sweep (handle_coarse=False) still ratchets their peak + force-closes
+            # them but must NOT fire the exit here, so their effective exit cadence is the
+            # single dedicated sweep's interval rather than the OR of every driver.
+            _lane_coarse = lane_policy.is_coarse_routed(
+                (ref or {}).get("channel_handle"), (ref or {}).get("vip_tier"),
+                (ref or {}).get("skip_reason"), (ref or {}).get("entry_time"))
+            _decide_exit = handle_coarse or not _lane_coarse
+            # Throttle coarse lanes to COARSE_EXIT_INTERVAL (only this owner-sweep evaluates
+            # them, so an in-process timer is exact). Peak-ratchet/force-close still run below.
+            if _decide_exit and _lane_coarse:
+                _now = time.monotonic()
+                if _now - _coarse_last_eval.get(call_id, 0.0) < COARSE_EXIT_INTERVAL:
+                    _decide_exit = False
+                else:
+                    _coarse_last_eval[call_id] = _now
+
             paper_a_peak_mcap = 0.0  # tracked for live peak propagation below
             for strategy, pos in (("A", pos_a), ("B", pos_b)):
                 if not pos:
@@ -767,20 +803,21 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None,
                     pos["peak_multiplier"] = current_mult
 
                 if strategy == "A":
-                    paper_a_peak_mcap = peak_mcap  # propagate to live section
-                    exit_result = paper_trader.check_exits(
-                        call_id, current_mcap, peak_mcap, entry_price,
-                        mint=mint, is_strategy_b=False, exit_config=EXIT_A_PAPER,
-                    )
-                    if exit_result.should_exit:
-                        exit_mcap = exit_result.exit_mcap or current_mcap
-                        print(
-                            f"[paper] checking exit: {symbol}"
-                            f"  current={current_mult:.2f}x → closing ({exit_result.reason})"
+                    paper_a_peak_mcap = peak_mcap  # propagate to live section (always)
+                    if _decide_exit:
+                        exit_result = paper_trader.check_exits(
+                            call_id, current_mcap, peak_mcap, entry_price,
+                            mint=mint, is_strategy_b=False, exit_config=EXIT_A_PAPER,
                         )
-                        paper_trader.close_position(call_id, exit_mcap, exit_result.reason, is_strategy_b=False)
-                        closed += 1
-                else:
+                        if exit_result.should_exit:
+                            exit_mcap = exit_result.exit_mcap or current_mcap
+                            print(
+                                f"[paper] checking exit: {symbol}"
+                                f"  current={current_mult:.2f}x → closing ({exit_result.reason})"
+                            )
+                            paper_trader.close_position(call_id, exit_mcap, exit_result.reason, is_strategy_b=False)
+                            closed += 1
+                elif _decide_exit:
                     exit_result = paper_trader_b.check_exits(
                         call_id, current_mcap, peak_mcap, entry_price,
                         mint=mint, is_strategy_b=True, exit_config=EXIT_B_PAPER,
@@ -828,15 +865,21 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None,
 
 
 async def run_exit_sweep(skip_call_ids: set[int] | None = None,
-                         include_live: bool = True) -> int:
+                         include_live: bool = True,
+                         handle_coarse: bool = True) -> int:
     """
     Public entry point for the dedicated exit_monitor process.
 
     Delegates to the shared open-position exit sweep so the exit logic (peak
     ratchet, zero-mark guard, guard_trough, lane exit + order_flow, force-close)
     has a SINGLE source of truth used by both sol-monitor and sol-exit-monitor.
+
+    handle_coarse=True (default, used by exit_monitor) means this sweep OWNS the exit
+    decision for coarse-routed lanes; sol-monitor calls with False so those lanes exit
+    only on exit_monitor's cadence (EXIT_MONITOR_INTERVAL) instead of the fastest driver.
     """
-    return await _check_paper_exits(skip_call_ids=skip_call_ids, include_live=include_live)
+    return await _check_paper_exits(skip_call_ids=skip_call_ids, include_live=include_live,
+                                    handle_coarse=handle_coarse)
 
 
 # ── Full pass ─────────────────────────────────────────────────────────────────
@@ -923,8 +966,12 @@ async def run_pass(pass_num: int, dry_run: bool) -> dict:
         print(f"[monitor] WARNING: DexScreener returned no data for any of the {count} token(s)")
 
     # ── Paper trade exit sweep (all open positions, age-independent) ──────────
+    # handle_coarse=False: coarse-routed lanes are owned by the dedicated exit_monitor
+    # sweep, so sol-monitor ratchets their peaks + force-closes but does not fire their
+    # exit here (keeps their exit cadence = exit_monitor's interval, not this loop's).
     if not dry_run and (pass_num % PAPER_EXIT_SWEEP_EVERY_PASSES == 0):
-        paper_closed = await _check_paper_exits(skip_call_ids=checked_call_ids)
+        paper_closed = await _check_paper_exits(skip_call_ids=checked_call_ids,
+                                                handle_coarse=False)
         if paper_closed:
             print(f"[paper] exit sweep closed {paper_closed} position(s)")
 

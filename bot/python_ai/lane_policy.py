@@ -71,6 +71,27 @@ if PAPER_ANCHOR_NO_FLOOR:
     print("[lane_policy] PAPER_ANCHOR_NO_FLOOR ON — solhousesignal/low_score `early` "
           "paper exits skip profit_floor (paper-only; live + shadow unaffected)")
 
+# ── Coarse-routed lanes (WS_COARSE_EXIT_VARIANTS) ─────────────────────────────
+# A lane whose variant is listed here has its PAPER exit delegated off the dense
+# per-swap ws_monitor feed. Single source of truth for BOTH ws_monitor (which skips
+# firing their exit) and the sol-monitor sweep (which skips their exit decision so the
+# dedicated exit_monitor owns them at its own — coarser — cadence). Gamble lanes are
+# NEVER coarse-routed (they need the dense rug-catch, see shadow_overstates_gamble_lanes).
+COARSE_EXIT_VARIANTS = frozenset(
+    v.strip() for v in os.getenv("WS_COARSE_EXIT_VARIANTS", "").split(",") if v.strip()
+)
+
+
+def is_coarse_routed(channel, vip_tier, skip_reason, entry_time=None) -> bool:
+    """True if this lane's paper exit is delegated to the coarse (dedicated exit_monitor)
+    sweep rather than the dense ws_monitor feed. Resolves the lane's variant via lane_exit
+    (honoring per-day overrides) exactly like the exit resolver everything else uses."""
+    if not COARSE_EXIT_VARIANTS:
+        return False
+    if vip_tier in ("gamble", "gamble_risk"):
+        return False
+    return lane_exit(channel, vip_tier, skip_reason, entry_time) in COARSE_EXIT_VARIANTS
+
 # RVOL hold threshold for ride_vol (mirrors shadow's SHADOW_RVOL_HOLD so live matches
 # what was measured). RVOL = volume_m5 / (volume_h1 / 12); >=1 means the 5-min pace
 # is at/above the hourly average — the move is still alive, so keep riding.

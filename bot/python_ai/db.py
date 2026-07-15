@@ -1534,10 +1534,14 @@ def get_open_paper_positions(is_strategy_b: bool = False) -> list[dict]:
                 tp.entry_time,
                 tp.peak_mcap,
                 tp.peak_multiplier,
-                tp.peak_at
+                tp.peak_at,
+                tp.vip_tier,
+                c.skip_reason,
+                ch.handle AS channel_handle
             FROM trading_positions tp
             JOIN calls  c ON c.id       = tp.call_id
             JOIN tokens t ON t.id       = c.token_id
+            LEFT JOIN channels ch ON ch.id = c.channel_id
             WHERE tp.is_simulation = TRUE
               AND tp.is_strategy_b  = %s
               AND tp.status        = 'open'
