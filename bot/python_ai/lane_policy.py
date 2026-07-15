@@ -34,6 +34,8 @@ try:
 except ImportError:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
+from dataclasses import replace as _dc_replace
+
 from exit_config import EXIT_A_PAPER, EXIT_RIDE
 
 # ── Exit-strategy names ───────────────────────────────────────────────────────
@@ -41,6 +43,33 @@ EXIT_EARLY    = "early"
 EXIT_RIDE_S   = "ride"
 EXIT_RIDE_VOL = "ride_vol"
 VALID_EXITS   = {EXIT_EARLY, EXIT_RIDE_S, EXIT_RIDE_VOL}
+
+# ── PAPER-ONLY anchor profit_floor test (env-gated, reversible) ───────────────
+# 14d save-vs-cost (2026-07-15) on the solhousesignal/low_score `early` anchor: the
+# profit_floor COST 14.32 SOL (23 coins where shadow rode further) vs SAVED 5.75 (19
+# coins), net -8.6 — it banks anchor runners early on the dense feed where shadow rides
+# to +26.8. Systematic (not one outlier), so worth a forward test: strip the floor from
+# THIS lane's paper exits only. Live has a separate exit path and shadow a separate
+# resolver — neither is touched. Default OFF; set PAPER_ANCHOR_NO_FLOOR=1 + restart the
+# paper processes (ws-monitor, monitor, exit-monitor) to arm. Revert = unset + restart.
+PAPER_ANCHOR_NO_FLOOR = os.getenv("PAPER_ANCHOR_NO_FLOOR", "").strip().lower() \
+    not in ("", "0", "false", "no", "off")
+
+
+def strip_anchor_floor(cfg, variant, channel_handle, skip_reason):
+    """Return `cfg` with profit_floor disabled IFF the anchor no-floor test is armed and
+    this is the solhousesignal/low_score `early` lane. Empty profit_floor_channels fully
+    disables the floor (see exit_config.ExitConfig). No-op otherwise."""
+    if (PAPER_ANCHOR_NO_FLOOR and variant == EXIT_EARLY
+            and (channel_handle or "").lstrip("@") == "solhousesignal"
+            and (skip_reason or "") == "low_score"):
+        return _dc_replace(cfg, profit_floor_channels=frozenset())
+    return cfg
+
+
+if PAPER_ANCHOR_NO_FLOOR:
+    print("[lane_policy] PAPER_ANCHOR_NO_FLOOR ON — solhousesignal/low_score `early` "
+          "paper exits skip profit_floor (paper-only; live + shadow unaffected)")
 
 # RVOL hold threshold for ride_vol (mirrors shadow's SHADOW_RVOL_HOLD so live matches
 # what was measured). RVOL = volume_m5 / (volume_h1 / 12); >=1 means the 5-min pace

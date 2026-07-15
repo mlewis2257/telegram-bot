@@ -376,6 +376,8 @@ def check_exits(
         if _exit:
             flow = order_flow.metrics(mint, window=lane_policy.FLOW_WINDOW) if mint else None
             cfg = lane_policy.exit_config_for(_exit, flow=flow)
+            cfg = lane_policy.strip_anchor_floor(
+                cfg, _exit, channel_handle, position.get("skip_reason"))
             if _exit == lane_policy.EXIT_RIDE_VOL and flow:
                 _np = flow.get("net_pressure", 0.0)
                 print(f"[lane_flow B] call_id={call_id} net_pressure={_np} "
