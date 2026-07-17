@@ -258,8 +258,9 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # PER-DAY EXIT 2026-07-06: added Fri via day_exits{Fri:ride}. EARLY is red on Fri, but RIDE
     # on Fri is a clean repeating edge — dow-weeks Fri/ride: 3/4 weeks green, mean +3.21, AND
     # +3.20 with 2-of-3 green even after DROPPING the one +9.64 week (verified not an outlier
-    # fluke). early stays the exit Mon/Tue/Sat; Fri overrides to ride. Entry-day keyed (lane_exit).
-    ("solhousesignal_vip", "gamble", "vip_mcap_gate"):  {"trade": True, "size": 0.5, "exit": EXIT_EARLY, "watch": True, "days": {"Mon", "Tue", "Fri", "Sat"}, "day_exits": {"Fri": EXIT_RIDE_S}},
+    # fluke). early Mon/Tue/Sat. Fri (ride) CUT 2026-07-17 — review DEMOTEd it (+2.35 -> -0.02 mean,
+    # last 2 Fridays red); the two +4 weeks rolled over. See CUT_WATCH.
+    ("solhousesignal_vip", "gamble", "vip_mcap_gate"):  {"trade": True, "size": 0.5, "exit": EXIT_EARLY, "watch": True, "days": {"Mon", "Tue", "Sat"}},
     # solwhaletrending/none: re-homed from anchor. Only consistent green day is Wed, and it's
     # the RIDE variant that carries it (Wed ride +5.26/14d, +5.18/7d; early ~+2). THIN (one
     # day, ~12 trades) — probationary, smallest size, yank if Wed doesn't repeat.
@@ -267,8 +268,9 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # mean +1.85, and it SURVIVES dropping its best week (+0.69/3, 2/3 green) — same robustness
     # test that justified vip_mcap_gate Fri->ride. New DAY-cell on an existing lane, not a variant
     # dup. Probationary like Wed: watch B-only, day-keyed exit (Wed->ride, Sat->ride_vol). If next
-    # Sat is red (breaks the 3/4) or the review demotes it, yank. Default exit stays ride (Wed).
-    ("solwhaletrending",   "none",  "none"):            {"trade": True, "size": 0.1, "exit": EXIT_RIDE_S,   "watch": True, "days": {"Wed", "Sat"}, "day_exits": {"Sat": EXIT_RIDE_VOL}},
+    # Sat is red (breaks the 3/4) or the review demotes it, yank. Wed (ride) CUT 2026-07-17
+    # (SLIDING — its edge was one stale +5.18 spike, last 2 wks red). Sat-only (ride_vol) now. See CUT_WATCH.
+    ("solwhaletrending",   "none",  "none"):            {"trade": True, "size": 0.1, "exit": EXIT_RIDE_VOL, "watch": True, "days": {"Sat"}},
 
     # ── SKIP / CUT — confirmed losers, explicit so intent is auditable (NEVER traded) ──
     ("solhousesignal_vip", "gamble_risk", "vip_paused"):               {"trade": False},  # -471, worst lane
@@ -304,6 +306,9 @@ CUT_WATCH: list[tuple] = [
     # (a real 2-week slide, 3 of last 4 Fridays red). Watching for recovery at the KEEP bar.
     ("solhousesignal",   "none", "low_score", "Fri", EXIT_EARLY,    "cut 07-10, was Mon-Thu+Sat anchor"),
     ("solwhaletrending", "none", "low_score", "Fri", EXIT_RIDE_VOL, "cut 07-10, Tue+Fri -> Tue only"),
+    # 2026-07-17: two B-only pockets the review DEMOTEd once their edge decayed.
+    ("solhousesignal_vip", "gamble", "vip_mcap_gate", "Fri", EXIT_RIDE_S, "cut 07-17, ride Fri decayed +2.35 -> -0.02 (last 2 Fri red)"),
+    ("solwhaletrending",   "none",   "none",          "Wed", EXIT_RIDE_S, "cut 07-17, ride Wed SLIDING, was one stale +5.18 spike"),
 ]
 
 
