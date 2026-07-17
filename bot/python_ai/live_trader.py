@@ -35,6 +35,7 @@ import alert_bot
 import data_fetcher
 import peak_guard
 import wallet as _wallet
+import lane_policy
 from paper_trader import (
     TAKE_PROFIT_5X,
     TRAIL_PEAK_MIN,
@@ -116,6 +117,22 @@ def _max_positions() -> int:
 
 def _max_daily_loss() -> float:
     return float(os.getenv("MAX_DAILY_LOSS_SOL", "1.0"))
+
+
+# ── Lane-policy entry gate ──────────────────────────────────────────────────────
+# When ON (default), live opens ONLY lanes that lane_policy.resolve() approves for the
+# configured testbed strategy — so live mirrors the SAME refined Strategy A you tune in
+# lane_policy.py (same lanes, day-gates, Sunday skip, watch exclusion). Edit lane_policy
+# once and BOTH paper and live follow — no separate live lane config to keep in sync.
+# Live's own safety filters (mcap cap, quiet hours, blocked channels, balance/dup guards)
+# still apply on top, so live trades a SAFE SUBSET of refined-A, not looser.
+#   LIVE_USE_LANE_POLICY=false  -> fall back to strategy_engine-only entry (legacy)
+#   LIVE_LANE_STRATEGY=B        -> mirror the B lane set (anchors + watch pockets) instead
+LIVE_USE_LANE_POLICY = os.getenv("LIVE_USE_LANE_POLICY", "true").lower() == "true"
+LIVE_LANE_STRATEGY   = os.getenv("LIVE_LANE_STRATEGY", "A").strip().upper()
+print("[live] lane-policy gate: "
+      + (f"ON (mirrors testbed strategy {LIVE_LANE_STRATEGY})" if LIVE_USE_LANE_POLICY
+         else "OFF (strategy_engine entry, not lane-gated)"))
 
 
 def _rpc_url() -> str:
@@ -256,6 +273,22 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         score_val  = float(score_result.get("score") or 0)
         local_now  = datetime.now(timezone.utc).astimezone(LOCAL_TZ)
         local_hour = local_now.hour
+
+        # ── Lane-policy gate — mirror the paper testbed so live == refined Strategy A ──
+        # Same source of truth paper uses (lane_policy.resolve): only open a lane the
+        # configured testbed strategy trades on THIS weekday (handles day-gates, Sunday
+        # skip, and B-only watch exclusion). Edit lane_policy.py and both paper + live
+        # follow. NOTE: does NOT mutate the call's skip_reason — that's the shared lane
+        # label the paper testbed dispatch also reads (overwriting it would break paper).
+        if LIVE_USE_LANE_POLICY:
+            _cat  = db.get_call_skip_reason(call_id)
+            _lane = lane_policy.resolve(channel_handle, token_data.get("vip_tier"), _cat,
+                                        strategy=LIVE_LANE_STRATEGY)
+            if not _lane.get("trade"):
+                print(f"[live] {symbol} skipped — lane_policy({LIVE_LANE_STRATEGY}) "
+                      f"{_lane.get('reason', 'not_a_traded_lane')} "
+                      f"[{channel_handle}/{token_data.get('vip_tier') or 'none'}/{_cat or 'none'}]")
+                return False
 
         # ── Blocked channels ───────────────────────────────────────────────────
         _blocked = {c.strip() for c in os.getenv("LIVE_BLOCKED_CHANNELS", "solwhaletrending").split(",") if c.strip()}
