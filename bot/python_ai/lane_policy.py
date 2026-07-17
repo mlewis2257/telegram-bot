@@ -268,9 +268,10 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # mean +1.85, and it SURVIVES dropping its best week (+0.69/3, 2/3 green) — same robustness
     # test that justified vip_mcap_gate Fri->ride. New DAY-cell on an existing lane, not a variant
     # dup. Probationary like Wed: watch B-only, day-keyed exit (Wed->ride, Sat->ride_vol). If next
-    # Sat is red (breaks the 3/4) or the review demotes it, yank. Wed (ride) CUT 2026-07-17
-    # (SLIDING — its edge was one stale +5.18 spike, last 2 wks red). Sat-only (ride_vol) now. See CUT_WATCH.
-    ("solwhaletrending",   "none",  "none"):            {"trade": True, "size": 0.1, "exit": EXIT_RIDE_VOL, "watch": True, "days": {"Sat"}},
+    # Sat is red (breaks the 3/4) or the review demotes it, yank. Wed (ride) is SLIDING 2026-07-17
+    # (edge = one stale +5.18 spike, last 2 wks red) but still +EV (mean +0.98) -> HELD as WATCH per
+    # the review's "never cut a +EV cell" rule. Default exit ride (Wed); Sat -> ride_vol.
+    ("solwhaletrending",   "none",  "none"):            {"trade": True, "size": 0.1, "exit": EXIT_RIDE_S,   "watch": True, "days": {"Wed", "Sat"}, "day_exits": {"Sat": EXIT_RIDE_VOL}},
 
     # ── SKIP / CUT — confirmed losers, explicit so intent is auditable (NEVER traded) ──
     ("solhousesignal_vip", "gamble_risk", "vip_paused"):               {"trade": False},  # -471, worst lane
@@ -306,9 +307,8 @@ CUT_WATCH: list[tuple] = [
     # (a real 2-week slide, 3 of last 4 Fridays red). Watching for recovery at the KEEP bar.
     ("solhousesignal",   "none", "low_score", "Fri", EXIT_EARLY,    "cut 07-10, was Mon-Thu+Sat anchor"),
     ("solwhaletrending", "none", "low_score", "Fri", EXIT_RIDE_VOL, "cut 07-10, Tue+Fri -> Tue only"),
-    # 2026-07-17: two B-only pockets the review DEMOTEd once their edge decayed.
+    # 2026-07-17: vip_mcap_gate Fri DEMOTEd by the review once its edge decayed.
     ("solhousesignal_vip", "gamble", "vip_mcap_gate", "Fri", EXIT_RIDE_S, "cut 07-17, ride Fri decayed +2.35 -> -0.02 (last 2 Fri red)"),
-    ("solwhaletrending",   "none",   "none",          "Wed", EXIT_RIDE_S, "cut 07-17, ride Wed SLIDING, was one stale +5.18 spike"),
     # 2026-07-17: Sunday is a GLOBAL skip (LANE_SKIP_WEEKDAYS="Sun"), not a per-lane cut — so it
     # never showed in the review at all (the blind spot). Track the two anchors' Sundays here so
     # the review surfaces them weekly. Currently 2/5 green, positive only via the 07-12 +17.7
