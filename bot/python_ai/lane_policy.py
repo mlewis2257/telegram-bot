@@ -309,6 +309,12 @@ CUT_WATCH: list[tuple] = [
     # 2026-07-17: two B-only pockets the review DEMOTEd once their edge decayed.
     ("solhousesignal_vip", "gamble", "vip_mcap_gate", "Fri", EXIT_RIDE_S, "cut 07-17, ride Fri decayed +2.35 -> -0.02 (last 2 Fri red)"),
     ("solwhaletrending",   "none",   "none",          "Wed", EXIT_RIDE_S, "cut 07-17, ride Wed SLIDING, was one stale +5.18 spike"),
+    # 2026-07-17: Sunday is a GLOBAL skip (LANE_SKIP_WEEKDAYS="Sun"), not a per-lane cut — so it
+    # never showed in the review at all (the blind spot). Track the two anchors' Sundays here so
+    # the review surfaces them weekly. Currently 2/5 green, positive only via the 07-12 +17.7
+    # monster — stays SKIPPED until it earns a CONSISTENT record (>=60% green), not one spike.
+    ("solhousesignal",   "none", "low_score", "Sun", EXIT_EARLY,    "global Sun skip — monitor; 2/5 green, monster-carried (07-12 +17.7)"),
+    ("solwhaletrending", "none", "low_score", "Sun", EXIT_RIDE_VOL, "global Sun skip — monitor; 2/5 green, spike-carried"),
 ]
 
 
