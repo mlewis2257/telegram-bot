@@ -122,6 +122,24 @@ def _sol_price_cache_set(price_usd: float) -> None:
     _sol_price_cache = (price_usd, time.monotonic())
 
 
+def get_sol_price_usd() -> Optional[float]:
+    """
+    Public SOL/USD accessor — cache first, then Jupiter. Returns None on failure.
+    Used to convert real SOL fills into a USD mcap for fill-price recording.
+    """
+    cached = _sol_price_cache_get()
+    if cached:
+        return cached
+    try:
+        price = _fetch_jupiter_simple_price_usd(WSOL_MINT)
+        if price:
+            _sol_price_cache_set(price)
+            return price
+    except Exception:
+        pass
+    return None
+
+
 def _set_dex_mint_cooldown(mint: str) -> None:
     failures = _dex_mint_failures.get(mint, 0) + 1
     _dex_mint_failures[mint] = failures

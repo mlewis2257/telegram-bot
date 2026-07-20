@@ -319,6 +319,7 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         # ── Price fetch ────────────────────────────────────────────────────────
         msg_mcap      = float(token_data.get("mcap_at_call") or 0)
         actual_entry  = None
+        market: dict | None = None
         token_onchain: dict = {}
         if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
             try:
@@ -441,6 +442,14 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             f"  sol_spent={sol_spent:.4f}  tokens={tokens_received}"
             f"  router={router}  sig={sig[:16]}..."
         )
+        # Record the TRUE fill-derived entry mcap alongside the feed value, so we can
+        # audit how far the laggy feed (entry_price) sits from what we actually paid.
+        entry_fill = _effective_fill_mcap(mint, sol_spent, tokens_received, decimals, market=market)
+        if entry_fill is not None:
+            db.set_live_fill_price(call_id, entry_price_fill=entry_fill)
+            _ratio = (entry_fill / entry_price) if entry_price else 0
+            print(f"[live] ENTRY FILL  {symbol}  effective_mcap=${entry_fill/1000:.1f}k"
+                  f"  feed=${entry_price/1000:.1f}k  ratio={_ratio:.2f}x")
         await alert_bot.send_live_buy_alert(
             symbol=symbol,
             mint=mint,
@@ -452,6 +461,49 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
     finally:
         async with _pending_lock:
             _pending_mints.discard(mint)
+
+
+def _effective_fill_mcap(
+    mint: str,
+    sol_amount: float,
+    tokens_raw: int,
+    decimals: int | None = None,
+    market: dict | None = None,
+) -> float | None:
+    """
+    The TRUE mcap implied by an actual SOL<->token swap:
+        mcap = (sol_amount * sol_usd) * supply_whole / (tokens_raw / 10**decimals)
+    i.e. what you *really* paid/received per token, scaled to full supply — the
+    ground-truth price the laggy feed (entry_price/exit_price) does NOT capture.
+    Supply/decimals: tokens table first, feed-implied (mcap/price_usd) fallback,
+    pump.fun 1e9 default. Returns None on any failure — must never block a trade.
+    """
+    try:
+        if not mint or not tokens_raw or not sol_amount or sol_amount <= 0:
+            return None
+        supply_whole = None
+        try:
+            _s, _d = db.get_token_supply_and_decimals(mint)
+            if _d is not None:
+                decimals = int(_d)
+            if _s:
+                supply_whole = float(_s) / (10 ** (int(_d) if _d is not None else (decimals or 6)))
+        except Exception:
+            pass
+        if supply_whole is None and market and market.get("mcap") and market.get("price_usd"):
+            supply_whole = float(market["mcap"]) / float(market["price_usd"])
+        if supply_whole is None:
+            supply_whole = 1_000_000_000.0  # pump.fun standard total supply
+        sol_usd = data_fetcher.get_sol_price_usd()
+        if not sol_usd:
+            return None
+        tokens_whole = tokens_raw / (10 ** (decimals if decimals is not None else 6))
+        if tokens_whole <= 0 or supply_whole <= 0:
+            return None
+        return (sol_amount * sol_usd) * supply_whole / tokens_whole
+    except Exception as e:
+        print(f"[live] effective mcap calc failed: {e}")
+        return None
 
 
 async def close_live_position(
@@ -546,6 +598,14 @@ async def close_live_position(
         exit_reason=exit_reason,
         tx_signature=sig,
     )
+    # Record the TRUE fill-derived exit mcap alongside the feed value (current_mcap),
+    # so wallet-implied vs feed can be audited per leg without inferring from entry.
+    exit_fill = _effective_fill_mcap(mint, sol_received, tokens_held)
+    if exit_fill is not None:
+        db.set_live_fill_price(call_id, exit_price_fill=exit_fill)
+        _eratio = (exit_fill / current_mcap) if current_mcap else 0
+        print(f"[live] EXIT FILL  {symbol}  effective_mcap=${exit_fill/1000:.1f}k"
+              f"  feed=${current_mcap/1000:.1f}k  ratio={_eratio:.2f}x")
     print(
         f"[live] SELL OK  {symbol}  call_id={call_id}"
         f"  reason={exit_reason}  sol_received={sol_received:.4f}"

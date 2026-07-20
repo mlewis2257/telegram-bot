@@ -2314,6 +2314,43 @@ def close_live_position_db(
         conn.commit()
 
 
+def set_live_fill_price(
+    call_id: int,
+    entry_price_fill: float | None = None,
+    exit_price_fill: float | None = None,
+) -> None:
+    """
+    Best-effort: record the TRUE fill-derived mcap (from the real SOL<->token
+    exchange) alongside the feed-based entry_price/exit_price, for phantom-price
+    auditing. Never raises — a missing column (pre-migration) or bad value must
+    NOT affect trading. Requires columns entry_price_fill / exit_price_fill on
+    trading_positions (see ALTER TABLE in the fill-price migration).
+    """
+    sets, params = [], []
+    if entry_price_fill is not None:
+        sets.append("entry_price_fill = %s")
+        params.append(entry_price_fill)
+    if exit_price_fill is not None:
+        sets.append("exit_price_fill = %s")
+        params.append(exit_price_fill)
+    if not sets:
+        return
+    params.append(call_id)
+    try:
+        conn = get_conn()
+        safe_rollback()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE trading_positions SET {', '.join(sets)} "
+                f"WHERE call_id = %s AND is_simulation = FALSE",
+                params,
+            )
+            conn.commit()
+    except Exception as e:
+        safe_rollback()
+        print(f"[db] set_live_fill_price skipped (call_id={call_id}): {e}")
+
+
 def get_live_positions_count() -> int:
     """Count of currently open live positions."""
     conn = get_conn()
