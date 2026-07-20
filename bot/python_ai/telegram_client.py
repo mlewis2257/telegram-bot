@@ -346,6 +346,23 @@ async def _dispatch_lane_testbed(score_result: dict, extra: dict) -> None:
                 asyncio.create_task(paper_trader_b.open_lane_position(score_result, extra, pb)),
                 f"laneB call_id={call_id}",
             )
+        # Live execution mirrors the lane testbed: dispatch live on the SAME call
+        # events paper lane-A/B open on, gated by the live strategy's own lane_policy
+        # resolve (so live sees exactly the anchor-lane calls paper does). The anchor
+        # lane is low-score by definition, so the legacy alert-labelled dispatch never
+        # reached it — this is the trigger that makes live == testbed Strategy A.
+        # (Legacy alert-path live dispatch fires only when LIVE_USE_LANE_POLICY is off.)
+        try:
+            import live_trader
+            if live_trader.LIVE_USE_LANE_POLICY:
+                _live_lane = pb if live_trader.LIVE_LANE_STRATEGY == "B" else pa
+                if _live_lane.get("trade"):
+                    _track_task(
+                        asyncio.create_task(live_trader.open_live_position(score_result, extra)),
+                        f"live call_id={call_id}",
+                    )
+        except Exception as le:
+            print(f"[live_trader] testbed dispatch failed call_id={call_id}: {le}")
     except Exception as e:
         print(f"[lane_testbed] dispatch failed call_id={call_id}: {e}")
 
@@ -1371,7 +1388,12 @@ def run_listener() -> None:
                         )
                         try:
                             import live_trader
-                            asyncio.create_task(live_trader.open_live_position(score_result, extra))
+                            # When LIVE_USE_LANE_POLICY is on, live is dispatched from
+                            # _dispatch_lane_testbed on the same events paper lane-A opens.
+                            # This alert-path dispatch is the LEGACY (strategy_engine) trigger,
+                            # used only when the lane-policy gate is disabled.
+                            if not live_trader.LIVE_USE_LANE_POLICY:
+                                asyncio.create_task(live_trader.open_live_position(score_result, extra))
                         except Exception as le:
                             print(f"[live_trader] open failed: {le}")
             elif score_result and extra and score_result.get("score", 0) >= 63:
