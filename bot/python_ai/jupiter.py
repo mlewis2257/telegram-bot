@@ -117,6 +117,32 @@ async def get_order(
     return data
 
 
+async def get_sell_quote(mint_address: str, token_amount: int) -> float | None:
+    """
+    Real-time SELL quote: token_amount -> SOL, WITHOUT executing. Returns SOL out
+    (float) or None on any failure / no route. Reuses get_order (Ultra /order) and
+    discards the transaction. Used by live exit evaluation to price the bag at its
+    true sellable value instead of trusting the feed mcap.
+    """
+    if not mint_address or not token_amount or token_amount <= 0:
+        return None
+    try:
+        import wallet as _wallet
+        wallet_address    = str(_wallet.get_keypair().pubkey())
+        sell_slippage_bps = int(os.getenv("LIVE_SELL_SLIPPAGE_BPS", "1000"))
+        order = await get_order(
+            mint_address, SOL_MINT, token_amount, wallet_address,
+            slippage_bps_override=sell_slippage_bps,
+        )
+        out_lam = int(order.get("outAmount") or order.get("outputAmount") or 0)
+        if out_lam <= 0:
+            return None
+        return out_lam / 1_000_000_000
+    except Exception as e:
+        print(f"[jupiter] sell quote failed for {(mint_address or '?')[:8]}: {e}")
+        return None
+
+
 async def sign_transaction(order: dict, keypair: Keypair) -> str:
     """
     Sign the Jupiter-provided VersionedTransaction with our keypair.

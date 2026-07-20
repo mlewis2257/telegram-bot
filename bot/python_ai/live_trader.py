@@ -23,6 +23,7 @@ To re-enable: delete the flag file and restart.
 import asyncio
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -133,6 +134,16 @@ LIVE_LANE_STRATEGY   = os.getenv("LIVE_LANE_STRATEGY", "A").strip().upper()
 print("[live] lane-policy gate: "
       + (f"ON (mirrors testbed strategy {LIVE_LANE_STRATEGY})" if LIVE_USE_LANE_POLICY
          else "OFF (strategy_engine entry, not lane-gated)"))
+
+# ── Sell-quote exit source of truth (Phase 1: observation) ────────────────────
+# The feed mcap that drives live exits is unreliable at/after entry (under-reports
+# fresh coins), so live's exit multiple can be fictional (CSG "thought +80%", real
+# breakeven). LIVE_EXIT_QUOTE_LOG=true quotes the bag's REAL sellable value each tick
+# and logs real-vs-feed multiple — READ ONLY, drives no sells. Phase 2 (a future
+# LIVE_EXIT_USE_QUOTE flag) will let the quote drive exits once the logs confirm it.
+LIVE_EXIT_QUOTE_LOG = os.getenv("LIVE_EXIT_QUOTE_LOG", "false").lower() == "true"
+_SELL_QUOTE_TTL   = float(os.getenv("LIVE_SELL_QUOTE_TTL", "2.5"))  # seconds
+_sell_quote_cache: dict = {}  # mint -> (sol_out, monotonic_ts)
 
 
 def _rpc_url() -> str:
@@ -503,6 +514,42 @@ def _effective_fill_mcap(
         return (sol_amount * sol_usd) * supply_whole / tokens_whole
     except Exception as e:
         print(f"[live] effective mcap calc failed: {e}")
+        return None
+
+
+async def live_effective_current(pos: dict) -> tuple[float, float] | None:
+    """
+    Price a live position at its TRUE sellable value via a real Jupiter sell-quote
+    for the actual bag, expressed as a synthetic 'current mcap' that preserves the
+    real multiple (quote_sol_out / sol_in), anchored on the real fill entry.
+
+    Returns (synthetic_current_mcap, real_multiple) or None on any failure — callers
+    MUST fall back to the feed path on None. Cached per mint for _SELL_QUOTE_TTL so
+    the watchlist loop + end-sweep don't double-quote. Phase 1 uses this for logging
+    only; Phase 2 will let it drive check_live_exits.
+    """
+    try:
+        mint         = pos.get("mint_address")
+        tokens_held  = int(pos.get("tokens_held") or 0)
+        sol_in       = float(pos.get("sol_in") or 0)
+        # Anchor on the REAL fill, not the laggy feed entry; fall back to feed only if
+        # the fill wasn't recorded (pre-instrumentation position).
+        entry_anchor = float(pos.get("entry_price_fill") or pos.get("entry_price") or 0)
+        if not mint or tokens_held <= 0 or sol_in <= 0 or entry_anchor <= 0:
+            return None
+        now = time.monotonic()
+        cached = _sell_quote_cache.get(mint)
+        if cached and (now - cached[1]) < _SELL_QUOTE_TTL:
+            sol_out = cached[0]
+        else:
+            sol_out = await jupiter.get_sell_quote(mint, tokens_held)
+            if sol_out is None or sol_out <= 0:
+                return None
+            _sell_quote_cache[mint] = (sol_out, now)
+        real_mult = sol_out / sol_in
+        return entry_anchor * real_mult, real_mult
+    except Exception as e:
+        print(f"[live] effective current calc failed: {e}")
         return None
 
 

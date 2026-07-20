@@ -521,6 +521,15 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
                         f" @ ${exit_mcap/1000:.1f}k"
                     )
                 live_done = True
+            elif live_trader.LIVE_EXIT_QUOTE_LOG:
+                # Phase-1 observation: quote real sellable value, log real vs feed
+                # multiple. Read-only — drives no sells (see LIVE_EXIT_QUOTE_LOG).
+                _eff_obs = await live_trader.live_effective_current(position_live)
+                if _eff_obs:
+                    _synth, _rmult = _eff_obs
+                    _fmult = (current_mcap / entry_price) if entry_price else 0.0
+                    print(f"[ws_monitor] {mint[:8]} LIVE MULT call_id={call_id} "
+                          f"real={_rmult:.2f}x feed={_fmult:.2f}x")
         else:
             _live_realtime_peak_mcap.pop(call_id, None)
             live_done = True

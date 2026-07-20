@@ -1602,7 +1602,7 @@ def get_open_live_position(call_id: int) -> dict | None:
             """
             SELECT tp.entry_price, tp.sol_in, tp.entry_time,
                    tp.tokens_held, t.mint_address, t.symbol,
-                   tp.peak_mcap, tp.peak_multiplier
+                   tp.peak_mcap, tp.peak_multiplier, tp.entry_price_fill
             FROM trading_positions tp
             JOIN calls  c ON c.id  = tp.call_id
             JOIN tokens t ON t.id  = c.token_id
@@ -1624,6 +1624,7 @@ def get_open_live_position(call_id: int) -> dict | None:
         "symbol":           row[5],
         "peak_mcap":        float(row[6]) if row[6] is not None else 0.0,
         "peak_multiplier":  float(row[7]) if row[7] is not None else 0.0,
+        "entry_price_fill": float(row[8]) if row[8] is not None else None,
     }
 
 

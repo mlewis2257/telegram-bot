@@ -537,6 +537,15 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
                     await live_trader.close_live_position(call_id, exit_mcap_live, live_exit.reason)
                     peak_guard.clear(f"monL:{call_id}")
                     print(f"  [live] {symbol} closed — {live_exit.reason}")
+                elif live_trader.LIVE_EXIT_QUOTE_LOG:
+                    # Phase-1 observation: quote the real sellable value, log real vs
+                    # feed multiple. Read-only — drives no sells (see LIVE_EXIT_QUOTE_LOG).
+                    _eff_obs = await live_trader.live_effective_current(pos_live)
+                    if _eff_obs:
+                        _synth, _rmult = _eff_obs
+                        _fmult = (current_mcap / live_entry_price) if live_entry_price else 0.0
+                        print(f"  [live] MULT {symbol} call_id={call_id} "
+                              f"real={_rmult:.2f}x feed={_fmult:.2f}x")
         except Exception as le:
             print(f"  [live] exit check error for {symbol} call_id={call_id}: {le}")
 
