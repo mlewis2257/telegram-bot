@@ -218,6 +218,8 @@ async def buy_token(
         try:
             order      = await get_order(SOL_MINT, mint_address, lamports, wallet_address)
             order_time = time.time()
+            _q_out     = int(order.get("outAmount") or order.get("outputAmount") or 0)
+            _q_impact  = order.get("priceImpactPct")
             signed_tx  = await sign_transaction(order, keypair)
             sign_time  = time.time()
             print(f"[jupiter] sign took {sign_time - order_time:.2f}s")
@@ -253,6 +255,14 @@ async def buy_token(
                 f"[jupiter] buy OK  mint={mint_address[:8]}..."
                 f"  sol={sol_amount:.4f}  tokens={tokens_received}  sig={sig[:16]}..."
             )
+            # Fill quality: quoted output vs actual received (buy-side slippage) + Jupiter's
+            # price-impact estimate. This is the true execution cost paper never models.
+            if _q_out and tokens_received:
+                _slip = (_q_out - tokens_received) / _q_out * 100.0
+                print(
+                    f"[jupiter] buy FILL  mint={mint_address[:8]}...  quoted_tokens={_q_out}"
+                    f"  actual={tokens_received}  slip={_slip:+.2f}%  priceImpact={_q_impact}"
+                )
             return {
                 "success":         True,
                 "signature":       sig,
@@ -318,6 +328,8 @@ async def sell_token(
                 slippage_bps_override=sell_slippage_bps,
             )
             order_time = time.time()
+            _q_out_lam = int(order.get("outAmount") or order.get("outputAmount") or 0)
+            _q_impact  = order.get("priceImpactPct")
             signed_tx  = await sign_transaction(order, keypair)
             sign_time  = time.time()
             print(f"[jupiter] sign took {sign_time - order_time:.2f}s")
@@ -381,6 +393,15 @@ async def sell_token(
                 f"[jupiter] sell OK  mint={mint_address[:8]}..."
                 f"  tokens={token_amount}  sol={sol_received:.6f}  sig={sig[:16]}..."
             )
+            # Fill quality: quoted SOL out vs actual received (sell-side slippage) + Jupiter's
+            # price-impact estimate. Pairs with the buy FILL line to attribute the round-trip haircut.
+            if _q_out_lam and sol_received:
+                _q_sol = _q_out_lam / 1_000_000_000
+                _slip  = (_q_sol - sol_received) / _q_sol * 100.0
+                print(
+                    f"[jupiter] sell FILL  mint={mint_address[:8]}...  quoted_sol={_q_sol:.6f}"
+                    f"  actual={sol_received:.6f}  slip={_slip:+.2f}%  priceImpact={_q_impact}"
+                )
             return {
                 "success":      True,
                 "signature":    sig,
