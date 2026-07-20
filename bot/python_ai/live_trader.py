@@ -352,7 +352,14 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             return False
 
         # ── Strategy A entry gate (solhousesignal / VIP) ───────────────────────
-        if channel_handle in ("solhousesignal", "solhousesignal_vip"):
+        # This is the LEGACY strategy_engine entry (free_min_score=63 etc.). It is
+        # INCOMPATIBLE with the lane testbed: the testbed's anchor lane is
+        # solhousesignal/low_score — calls that scored BELOW 63 — which this gate
+        # rejects as "low_score". When LIVE_USE_LANE_POLICY is on, lane_policy.resolve
+        # (above) IS the entry decision, mirroring paper exactly, so this legacy gate
+        # is bypassed. Independent safety guards (security, mcap ceiling, blocked
+        # channels, balance, circuit breaker, dup/cooldown) still apply regardless.
+        if not LIVE_USE_LANE_POLICY and channel_handle in ("solhousesignal", "solhousesignal_vip"):
             bundle_pct = token_data.get("bundle_pct_remaining")
             fake_pct   = token_data.get("fake_vol_pct")
             if bundle_pct is None:
