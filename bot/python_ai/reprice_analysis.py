@@ -460,13 +460,13 @@ def review_reprice(days: int, min_n: int, min_weeks: int) -> None:
               f"   result means there is no consistently-positive honest edge to trade.)\n")
         return
 
-    hdr = (f"  {'channel/tier/lane/variant':<44} {'day':<4} {'n':>4} "
+    hdr = (f"  {'channel/tier/lane/variant':<50} {'day':<4} {'n':>4} "
            f"{'booked':>8} {'repric':>8} {'edge/SOL':>9} {'pos wks':>8} {'mean/wk':>8}")
     print(hdr); print("  " + "-" * (len(hdr) - 2))
     for edge, key, n, booked, rep, posw, totw, meanw in keepers:
         ch, tier, lane, variant, dow = key
         label = f"{ch}/{tier}/{lane}/{variant}"
-        print(f"  {label[:44]:<44} {_DOW[dow]:<4} {n:>4} {booked:>8.2f} {rep:>8.2f} "
+        print(f"  {label[:50]:<50} {_DOW[dow]:<4} {n:>4} {booked:>8.2f} {rep:>8.2f} "
               f"{edge:>+8.1%} {posw:>4}/{totw:<3} {meanw:>+8.2f}")
     print("  " + "-" * (len(hdr) - 2))
     print(f"\n  {len(keepers)} lane x weekday cells KEEP on honest entries "
