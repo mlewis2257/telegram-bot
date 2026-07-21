@@ -528,13 +528,19 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
                 if live_peak_mcap > live_db_peak and live_entry_price > 0:
                     db.update_live_position_peak(call_id, live_peak_mcap, live_peak_mcap / live_entry_price)
                 live_eff = min(current_mcap, live_peak_mcap) if live_peak_mcap > 0 else current_mcap
+                # Phase 2: swap the feed triple for the real (sell-quote) basis when armed;
+                # returns the feed triple unchanged when LIVE_EXIT_USE_QUOTE is off or a quote
+                # is unavailable. The feed peak above is still persisted for records/fallback.
+                exit_cur, exit_peak, exit_entry, _basis = await live_trader.live_exit_basis(
+                    call_id, pos_live, live_eff, live_peak_mcap, live_entry_price)
                 live_exit = live_trader.check_live_exits(
-                    call_id, live_eff, live_peak_mcap, live_entry_price,
+                    call_id, exit_cur, exit_peak, exit_entry,
                     exit_config=live_trader._LIVE_EXIT_CONFIG,
                 )
                 if live_exit.should_exit:
-                    exit_mcap_live = live_exit.exit_mcap or live_eff
-                    await live_trader.close_live_position(call_id, exit_mcap_live, live_exit.reason)
+                    # Decision uses the real basis; the RECORD keeps the feed exit mcap
+                    # (exit_price col) so it stays auditable against exit_price_fill.
+                    await live_trader.close_live_position(call_id, live_eff, live_exit.reason)
                     peak_guard.clear(f"monL:{call_id}")
                     print(f"  [live] {symbol} closed — {live_exit.reason}")
                 elif live_trader.LIVE_EXIT_QUOTE_LOG:
@@ -855,13 +861,16 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None,
                     )
                     if live_peak_mcap > float(pos_live["peak_mcap"] or 0) and live_entry_price > 0:
                         db.update_live_position_peak(call_id, live_peak_mcap, live_peak_mcap / live_entry_price)
+                    # Phase 2: real (sell-quote) basis when armed, else the feed triple unchanged.
+                    exit_cur, exit_peak, exit_entry, _basis = await live_trader.live_exit_basis(
+                        call_id, pos_live, current_mcap, live_peak_mcap, live_entry_price)
                     live_exit = live_trader.check_live_exits(
-                        call_id, current_mcap, live_peak_mcap, live_entry_price,
+                        call_id, exit_cur, exit_peak, exit_entry,
                         exit_config=live_trader._LIVE_EXIT_CONFIG,
                     )
                     if live_exit.should_exit:
-                        exit_mcap = live_exit.exit_mcap or current_mcap
-                        await live_trader.close_live_position(call_id, exit_mcap, live_exit.reason)
+                        # Decision on real basis; record keeps feed exit mcap (see site above).
+                        await live_trader.close_live_position(call_id, current_mcap, live_exit.reason)
                         print(f"  [live] {symbol} closed — {live_exit.reason}")
             except Exception as le:
                 print(f"  [live] exit check error for {symbol} call_id={call_id}: {le}")

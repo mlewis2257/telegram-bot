@@ -142,6 +142,11 @@ print("[live] lane-policy gate: "
 # and logs real-vs-feed multiple — READ ONLY, drives no sells. Phase 2 (a future
 # LIVE_EXIT_USE_QUOTE flag) will let the quote drive exits once the logs confirm it.
 LIVE_EXIT_QUOTE_LOG = os.getenv("LIVE_EXIT_QUOTE_LOG", "false").lower() == "true"
+# Phase 2: when ON, the real sell-quote DRIVES exits — check_live_exits keys off the
+# wallet's real (current, peak, entry) triple instead of the laggy feed. Requires the
+# real_peak_mcap column (see migration). Any quote failure or missing fill silently
+# falls back to the feed basis — a bad quote must never force or block a real sell.
+LIVE_EXIT_USE_QUOTE = os.getenv("LIVE_EXIT_USE_QUOTE", "false").lower() == "true"
 _SELL_QUOTE_TTL   = float(os.getenv("LIVE_SELL_QUOTE_TTL", "2.5"))  # seconds
 _sell_quote_cache: dict = {}  # mint -> (sol_out, monotonic_ts)
 
@@ -551,6 +556,52 @@ async def live_effective_current(pos: dict) -> tuple[float, float] | None:
     except Exception as e:
         print(f"[live] effective current calc failed: {e}")
         return None
+
+
+async def live_exit_basis(
+    call_id: int,
+    pos: dict,
+    feed_current: float,
+    feed_peak: float,
+    feed_entry: float,
+) -> tuple[float, float, float, str]:
+    """
+    Return the (current, peak, entry) triple to hand check_live_exits, plus a basis tag.
+
+    Phase 2: when LIVE_EXIT_USE_QUOTE is on AND we have a real fill anchor + a live
+    sell-quote, the triple is on the REAL (wallet) basis:
+        current = entry_price_fill * (quote_sol_out / sol_in)   (synthetic real mcap)
+        entry   = entry_price_fill                              (the real fill)
+        peak    = ratcheted real peak (guard-corroborated, DB-shared across processes)
+    so every exit ratio (drawdown-from-peak, multiple-from-entry) reflects what the bag
+    is really worth, not the laggy feed. On ANY failure (quote unavailable, no recorded
+    fill, flag off) it returns the FEED triple unchanged — a bad quote must never force
+    or block a sell. Returns (current, peak, entry, "real"|"feed").
+    """
+    if not LIVE_EXIT_USE_QUOTE:
+        return feed_current, feed_peak, feed_entry, "feed"
+    try:
+        real_entry = float(pos.get("entry_price_fill") or 0)
+        if real_entry <= 0:
+            return feed_current, feed_peak, feed_entry, "feed"  # pre-instrumentation position
+        eff = await live_effective_current(pos)
+        if not eff:
+            return feed_current, feed_peak, feed_entry, "feed"  # quote failed → feed fallback
+        synth_current, _real_mult = eff
+        if synth_current <= 0:
+            return feed_current, feed_peak, feed_entry, "feed"
+        # Ratchet the real peak off observed sell-quote value. Seed from the DB row so the
+        # peak is shared across sol-monitor + sol-ws-monitor and survives restarts; the
+        # guard adds the same single-tick corroboration used on the feed side.
+        prior_peak = float(db.get_live_real_peak(call_id) or 0.0)
+        real_peak  = peak_guard.guard_peak(f"realL:{call_id}", synth_current, prior_peak)
+        if real_peak > prior_peak:
+            db.update_live_real_peak(call_id, real_peak)
+        eff_current = min(synth_current, real_peak) if real_peak > 0 else synth_current
+        return eff_current, real_peak, real_entry, "real"
+    except Exception as e:
+        print(f"[live] exit-basis calc failed, using feed: {e}")
+        return feed_current, feed_peak, feed_entry, "feed"
 
 
 async def close_live_position(

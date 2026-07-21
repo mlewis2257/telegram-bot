@@ -1654,6 +1654,65 @@ def update_live_position_peak(
         conn.commit()
 
 
+def get_live_real_peak(call_id: int) -> float | None:
+    """
+    Best-effort read of the REAL-basis peak (ratcheted off Jupiter sell-quotes, not
+    the laggy feed) for one open live position. Returns None if the position is gone,
+    the value is unset, or the real_peak_mcap column doesn't exist yet (pre-migration).
+    Never raises — a missing column must NOT break the exit path (caller falls back to
+    the feed basis). Requires column real_peak_mcap on trading_positions (see the
+    Phase-2 quote-driven-exit migration).
+    """
+    try:
+        conn = get_conn()
+        safe_rollback()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT real_peak_mcap FROM trading_positions"
+                " WHERE call_id = %s AND is_simulation = FALSE AND status = 'open'",
+                (call_id,),
+            )
+            row = cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        return float(row[0])
+    except Exception as e:
+        safe_rollback()
+        print(f"[db] get_live_real_peak skipped (call_id={call_id}): {e}")
+        return None
+
+
+def update_live_real_peak(call_id: int, real_peak_mcap: float) -> None:
+    """
+    Best-effort ratchet of the REAL-basis peak for one open live position. Only raises
+    the stored value (never lowers it), so it is safe to call from both sol-monitor and
+    sol-ws-monitor — the DB row is the cross-process shared floor for the real-peak trail.
+    Never raises (missing column pre-migration is a silent no-op). See get_live_real_peak.
+    """
+    if not real_peak_mcap or real_peak_mcap <= 0:
+        return
+    try:
+        conn = get_conn()
+        safe_rollback()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE trading_positions
+                SET real_peak_mcap = %s,
+                    updated_at     = NOW()
+                WHERE call_id       = %s
+                  AND is_simulation = FALSE
+                  AND status        = 'open'
+                  AND (real_peak_mcap IS NULL OR real_peak_mcap < %s)
+                """,
+                (real_peak_mcap, call_id, real_peak_mcap),
+            )
+            conn.commit()
+    except Exception as e:
+        safe_rollback()
+        print(f"[db] update_live_real_peak skipped (call_id={call_id}): {e}")
+
+
 def has_open_live_position_for_mint(mint_address: str) -> bool:
     """Check if ANY open live position exists for this mint address."""
     conn = get_conn()
