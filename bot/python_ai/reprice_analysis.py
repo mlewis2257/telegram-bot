@@ -56,9 +56,13 @@ def _rows(sql: str, params: dict) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
-def _pnl(sol_in: float, exit_mcap: float, entry_mcap: float) -> float | None:
-    """Paper's own P&L model: sol_out = sol_in * (exit/entry); pnl = sol_out - sol_in."""
-    if not sol_in or not entry_mcap or entry_mcap <= 0 or exit_mcap is None:
+def _pnl(sol_in, exit_mcap, entry_mcap) -> float | None:
+    """Paper's own P&L model: sol_out = sol_in * (exit/entry); pnl = sol_out - sol_in.
+    Coerces Decimal (psycopg2 numeric) to float so the arithmetic never trips."""
+    if sol_in is None or exit_mcap is None or entry_mcap is None:
+        return None
+    sol_in, exit_mcap, entry_mcap = float(sol_in), float(exit_mcap), float(entry_mcap)
+    if not sol_in or entry_mcap <= 0:
         return None
     return sol_in * (exit_mcap / entry_mcap) - sol_in
 
