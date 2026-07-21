@@ -304,6 +304,94 @@ def shadow_reprice(days: int, min_n: int) -> None:
     print("  edge/SOL = repriced pnl / SOL deployed — the size-neutral honest return per lane.\n")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. DAY-SPLIT — repriced pnl per weekday for one lane (honest lane_policy_review)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DOW = {1: "Mon", 2: "Tue", 3: "Wed", 4: "Thu", 5: "Fri", 6: "Sat", 7: "Sun"}
+KEEP_RATIO = float(os.getenv("REVIEW_KEEP_RATIO", "0.60"))  # match lane_policy_review
+
+DAYSPLIT_SHADOW_SQL = """
+SELECT EXTRACT(ISODOW FROM (sp.entry_time AT TIME ZONE 'UTC'))::int      AS dow,
+       date_trunc('week', (sp.entry_time AT TIME ZONE 'UTC'))::date      AS wk,
+       sp.sol_in, sp.exit_price, c.mcap_at_call, sp.pnl_sol
+FROM shadow_positions sp
+JOIN calls c ON c.id = sp.call_id
+WHERE sp.status = 'closed'
+  AND sp.entry_time >= now() - (%(days)s || ' days')::interval
+  AND COALESCE(c.skip_reason, 'none') LIKE %(lane)s
+  AND (%(variant)s = 'all' OR sp.exit_variant = %(variant)s)
+  AND NOT (COALESCE(sp.peak_multiplier,0) > %(max_peak)s
+        OR COALESCE(sp.pnl_pct,0) > %(max_pnl)s
+        OR COALESCE(sp.pnl_pct,0) < %(min_pnl)s)
+"""
+
+DAYSPLIT_PAPER_SQL = """
+SELECT EXTRACT(ISODOW FROM (tp.entry_time AT TIME ZONE 'UTC'))::int      AS dow,
+       date_trunc('week', (tp.entry_time AT TIME ZONE 'UTC'))::date      AS wk,
+       tp.sol_in, tp.exit_price, c.mcap_at_call, tp.pnl_sol
+FROM trading_positions tp
+JOIN calls c ON c.id = tp.call_id
+WHERE tp.is_simulation = TRUE
+  AND tp.status = 'closed'
+  AND tp.entry_time >= now() - (%(days)s || ' days')::interval
+  AND COALESCE(c.skip_reason, 'none') LIKE %(lane)s
+  AND NOT (COALESCE(tp.peak_multiplier,0) > %(max_peak)s
+        OR COALESCE(tp.pnl_pct,0) > %(max_pnl)s
+        OR COALESCE(tp.pnl_pct,0) < %(min_pnl)s)
+"""
+
+
+def _daysplit_table(rows: list[dict], title: str) -> None:
+    print(f"\n  {title}")
+    if not rows:
+        print("    (no trades)\n")
+        return
+    # dow -> {'n','booked','rep','soli', weeks: {wk: rep_sum}}
+    days: dict[int, dict] = {}
+    for r in rows:
+        d = days.setdefault(int(r["dow"]), {"n": 0, "booked": 0.0, "rep": 0.0,
+                                            "soli": 0.0, "weeks": {}})
+        booked = float(r["pnl_sol"]) if r["pnl_sol"] is not None else 0.0
+        rep = _pnl(r["sol_in"], r["exit_price"], r["mcap_at_call"])
+        rep = rep if rep is not None else booked
+        d["n"] += 1; d["booked"] += booked; d["rep"] += rep
+        d["soli"] += float(r["sol_in"] or 0)
+        d["weeks"][r["wk"]] = d["weeks"].get(r["wk"], 0.0) + rep
+
+    print(f"    {'day':<4} {'n':>4} {'booked':>8} {'repriced':>9} {'edge/SOL':>9} "
+          f"{'pos wks':>8} {'mean/wk':>8}  verdict")
+    print("    " + "-" * 68)
+    for dow in sorted(days):
+        d = days[dow]
+        edge = (d["rep"] / d["soli"]) if d["soli"] else 0.0
+        wk_vals = list(d["weeks"].values())
+        posw = sum(1 for v in wk_vals if v > 0)
+        totw = len(wk_vals)
+        meanw = sum(wk_vals) / totw if totw else 0.0
+        keep = (totw > 0 and posw / totw >= KEEP_RATIO and meanw > 0 and d["rep"] > 0)
+        verdict = "KEEP" if keep else ("thin" if d["rep"] > 0 else "cut")
+        print(f"    {_DOW[dow]:<4} {d['n']:>4} {d['booked']:>8.2f} {d['rep']:>9.2f} "
+              f"{edge:>+8.1%} {posw:>4}/{totw:<3} {meanw:>+8.2f}  {verdict}")
+    print("    " + "-" * 68)
+
+
+def day_split(days: int, lane_substr: str, variant: str) -> None:
+    lane_pat = f"%{lane_substr}%"
+    base = {"days": days, "lane": lane_pat, "max_peak": MAX_SANE_PEAK,
+            "max_pnl": MAX_SANE_PNL_PCT, "min_pnl": MIN_SANE_PNL_PCT}
+    print("=" * 82)
+    print(f"  DAY-SPLIT — lane ~ '{lane_substr}'  variant='{variant}'   (repriced honest entries)")
+    print(f"  window: last {days}d   KEEP = >={KEEP_RATIO:.0%} weeks positive & mean>0 & total>0")
+    print("=" * 82)
+    shadow = _rows(DAYSPLIT_SHADOW_SQL, {**base, "variant": variant})
+    paper  = _rows(DAYSPLIT_PAPER_SQL, base)
+    _daysplit_table(shadow, f"SHADOW (all days, coarse exits) — pick candidate days here")
+    _daysplit_table(paper,  f"PAPER  (gated days, REALIZED exits) — reality check")
+    print("  KEEP days survive honest entries AND week-to-week consistency. Trust a day only")
+    print("  where BOTH shadow flags it AND paper (where it has samples) is not negative.\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -313,10 +401,17 @@ def main() -> None:
     ap.add_argument("--shadow", action="store_true",
                     help="edge hunt: reprice EVERY shadow lane cell instead of the paper strategy")
     ap.add_argument("--min-n", type=int, default=8, help="min trades per shadow cell (default 8)")
+    ap.add_argument("--daysplit", metavar="LANE",
+                    help="repriced pnl per weekday for one lane (substring of skip_reason, "
+                         "e.g. vip_mcap_gate) — shadow + paper, with week consistency")
+    ap.add_argument("--variant", default="early",
+                    help="exit variant for the shadow day-split (early|ride|ride_vol|all; default early)")
     args = ap.parse_args()
 
     live_validation(args.live_days)
-    if args.shadow:
+    if args.daysplit:
+        day_split(args.days, args.daysplit, args.variant)
+    elif args.shadow:
         shadow_reprice(args.days, args.min_n)
     else:
         paper_reprice(args.days, is_b=(args.strategy == "b"))
