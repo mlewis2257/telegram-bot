@@ -228,16 +228,98 @@ def paper_reprice(days: int, is_b: bool) -> None:
     print("  'repriced' books the honest entry; a negative haircut = the feed was inflating this lane.\n")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. SHADOW EDGE HUNT — which lane cells SURVIVE the honest-entry reprice?
+# ─────────────────────────────────────────────────────────────────────────────
+
+SHADOW_SQL = """
+SELECT COALESCE(ch.handle, '?')          AS channel,
+       COALESCE(sp.vip_tier, 'none')     AS vip_tier,
+       COALESCE(c.skip_reason, 'none')   AS lane,
+       sp.exit_variant                   AS variant,
+       c.mcap_at_call,
+       sp.entry_price, sp.exit_price,
+       sp.sol_in, sp.pnl_sol,
+       sp.peak_multiplier, sp.pnl_pct
+FROM shadow_positions sp
+JOIN calls  c  ON c.id = sp.call_id
+LEFT JOIN channels ch ON ch.id = c.channel_id
+WHERE sp.status = 'closed'
+  AND sp.entry_time >= now() - (%(days)s || ' days')::interval
+  AND NOT (
+      COALESCE(sp.peak_multiplier, 0) > %(max_peak)s
+   OR COALESCE(sp.pnl_pct, 0)         > %(max_pnl)s
+   OR COALESCE(sp.pnl_pct, 0)         < %(min_pnl)s
+  )
+"""
+
+
+def shadow_reprice(days: int, min_n: int) -> None:
+    rows = _rows(SHADOW_SQL, {"days": days, "max_peak": MAX_SANE_PEAK,
+                             "max_pnl": MAX_SANE_PNL_PCT, "min_pnl": MIN_SANE_PNL_PCT})
+    print("=" * 90)
+    print(f"  SHADOW EDGE HUNT — every lane cell repriced (entry -> mcap_at_call)")
+    print(f"  window: last {days}d   n = {len(rows)} closed shadow trades   min cell size: {min_n}")
+    print("=" * 90)
+    if not rows:
+        print("  no closed shadow trades in window\n")
+        return
+
+    # cell -> [n, booked_sum, repriced_sum, sol_in_sum]
+    cells: dict[tuple, list[float]] = {}
+    for r in rows:
+        key = (r["channel"], r["vip_tier"], r["lane"], r["variant"])
+        acc = cells.setdefault(key, [0, 0.0, 0.0, 0.0])
+        booked = float(r["pnl_sol"]) if r["pnl_sol"] is not None else 0.0
+        rep = _pnl(r["sol_in"], r["exit_price"], r["mcap_at_call"])
+        acc[0] += 1
+        acc[1] += booked
+        acc[2] += (rep if rep is not None else booked)
+        acc[3] += float(r["sol_in"] or 0)
+
+    # keep only cells with enough samples; rank by repriced SOL-per-SOL edge
+    ranked = []
+    for key, (n, booked, rep, soli) in cells.items():
+        if n < min_n:
+            continue
+        edge = (rep / soli) if soli else 0.0   # repriced return per SOL deployed
+        ranked.append((edge, key, n, booked, rep, soli))
+    ranked.sort(reverse=True)
+
+    if not ranked:
+        print(f"  no cells with >= {min_n} trades\n")
+        return
+
+    hdr = (f"  {'lane cell (channel/tier/lane/variant)':<48} {'n':>4} "
+           f"{'booked':>8} {'repric':>8} {'edge/SOL':>9}")
+    print(hdr); print("  " + "-" * (len(hdr) - 2))
+    for edge, key, n, booked, rep, soli in ranked:
+        label = "/".join(str(k) for k in key)
+        star = "  <== survives +" if rep > 0 else ""
+        print(f"  {label[:48]:<48} {n:>4} {booked:>8.2f} {rep:>8.2f} {edge:>+8.1%}{star}")
+    print("  " + "-" * (len(hdr) - 2))
+    surv = [r for r in ranked if r[4] > 0]
+    print(f"\n  {len(surv)}/{len(ranked)} cells stay POSITIVE on honest entries "
+          f"(booked total {sum(r[3] for r in ranked):+.1f} -> repriced {sum(r[4] for r in ranked):+.1f} SOL).")
+    print("  edge/SOL = repriced pnl / SOL deployed — the size-neutral honest return per lane.\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--days", type=int, default=14, help="paper reprice window (default 14)")
     ap.add_argument("--live-days", type=int, default=30, help="live validation window (default 30)")
     ap.add_argument("--strategy", choices=["a", "b"], default="a", help="paper strategy (default a)")
+    ap.add_argument("--shadow", action="store_true",
+                    help="edge hunt: reprice EVERY shadow lane cell instead of the paper strategy")
+    ap.add_argument("--min-n", type=int, default=8, help="min trades per shadow cell (default 8)")
     args = ap.parse_args()
 
     live_validation(args.live_days)
-    paper_reprice(args.days, is_b=(args.strategy == "b"))
+    if args.shadow:
+        shadow_reprice(args.days, args.min_n)
+    else:
+        paper_reprice(args.days, is_b=(args.strategy == "b"))
 
 
 if __name__ == "__main__":
