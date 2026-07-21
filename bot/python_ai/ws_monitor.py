@@ -523,7 +523,7 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
                     _live_realtime_peak_mcap.pop(call_id, None)
                     print(
                         f"[ws_monitor] {mint[:8]} LIVE closed — {result_live.reason}"
-                        f" @ ${exit_mcap/1000:.1f}k"
+                        f" @ ${exit_mcap/1000:.1f}k [basis={_basis}]"
                     )
                 live_done = True
             elif live_trader.LIVE_EXIT_QUOTE_LOG:

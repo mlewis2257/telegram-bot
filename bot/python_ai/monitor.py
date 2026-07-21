@@ -542,7 +542,7 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
                     # (exit_price col) so it stays auditable against exit_price_fill.
                     await live_trader.close_live_position(call_id, live_eff, live_exit.reason)
                     peak_guard.clear(f"monL:{call_id}")
-                    print(f"  [live] {symbol} closed — {live_exit.reason}")
+                    print(f"  [live] {symbol} closed — {live_exit.reason} [basis={_basis}]")
                 elif live_trader.LIVE_EXIT_QUOTE_LOG:
                     # Phase-1 observation: quote the real sellable value, log real vs
                     # feed multiple. Read-only — drives no sells (see LIVE_EXIT_QUOTE_LOG).
@@ -871,7 +871,7 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None,
                     if live_exit.should_exit:
                         # Decision on real basis; record keeps feed exit mcap (see site above).
                         await live_trader.close_live_position(call_id, current_mcap, live_exit.reason)
-                        print(f"  [live] {symbol} closed — {live_exit.reason}")
+                        print(f"  [live] {symbol} closed — {live_exit.reason} [basis={_basis}]")
             except Exception as le:
                 print(f"  [live] exit check error for {symbol} call_id={call_id}: {le}")
 
