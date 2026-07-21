@@ -392,6 +392,88 @@ def day_split(days: int, lane_substr: str, variant: str) -> None:
     print("  where BOTH shadow flags it AND paper (where it has samples) is not negative.\n")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. REVIEW — honest (repriced) lane_policy_review across EVERY lane x weekday
+# ─────────────────────────────────────────────────────────────────────────────
+
+REVIEW_SQL = """
+SELECT COALESCE(ch.handle, '?')          AS channel,
+       COALESCE(sp.vip_tier, 'none')     AS vip_tier,
+       COALESCE(c.skip_reason, 'none')   AS lane,
+       sp.exit_variant                   AS variant,
+       EXTRACT(ISODOW FROM (sp.entry_time AT TIME ZONE 'UTC'))::int AS dow,
+       date_trunc('week', (sp.entry_time AT TIME ZONE 'UTC'))::date AS wk,
+       sp.sol_in, sp.exit_price, c.mcap_at_call, sp.pnl_sol
+FROM shadow_positions sp
+JOIN calls c ON c.id = sp.call_id
+LEFT JOIN channels ch ON ch.id = c.channel_id
+WHERE sp.status = 'closed'
+  AND sp.entry_time >= now() - (%(days)s || ' days')::interval
+  AND NOT (COALESCE(sp.peak_multiplier,0) > %(max_peak)s
+        OR COALESCE(sp.pnl_pct,0) > %(max_pnl)s
+        OR COALESCE(sp.pnl_pct,0) < %(min_pnl)s)
+"""
+
+
+def review_reprice(days: int, min_n: int, min_weeks: int) -> None:
+    rows = _rows(REVIEW_SQL, {"days": days, "max_peak": MAX_SANE_PEAK,
+                             "max_pnl": MAX_SANE_PNL_PCT, "min_pnl": MIN_SANE_PNL_PCT})
+    print("=" * 92)
+    print(f"  HONEST LANE REVIEW — every lane x weekday, repriced entries + week consistency")
+    print(f"  window: last {days}d   KEEP = n>={min_n}, weeks>={min_weeks}, "
+          f">={KEEP_RATIO:.0%} weeks positive, mean>0")
+    print("=" * 92)
+    if not rows:
+        print("  no closed shadow trades in window\n")
+        return
+
+    # (channel,tier,lane,variant,dow) -> {n, booked, rep, soli, weeks{wk:rep}}
+    cells: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["channel"], r["vip_tier"], r["lane"], r["variant"], int(r["dow"]))
+        c = cells.setdefault(key, {"n": 0, "booked": 0.0, "rep": 0.0, "soli": 0.0, "weeks": {}})
+        booked = float(r["pnl_sol"]) if r["pnl_sol"] is not None else 0.0
+        rep = _pnl(r["sol_in"], r["exit_price"], r["mcap_at_call"])
+        rep = rep if rep is not None else booked
+        c["n"] += 1; c["booked"] += booked; c["rep"] += rep
+        c["soli"] += float(r["sol_in"] or 0)
+        c["weeks"][r["wk"]] = c["weeks"].get(r["wk"], 0.0) + rep
+
+    keepers = []
+    for key, c in cells.items():
+        if c["n"] < min_n:
+            continue
+        wk_vals = list(c["weeks"].values())
+        totw = len(wk_vals)
+        if totw < min_weeks:
+            continue
+        posw  = sum(1 for v in wk_vals if v > 0)
+        meanw = sum(wk_vals) / totw
+        edge  = (c["rep"] / c["soli"]) if c["soli"] else 0.0
+        if posw / totw >= KEEP_RATIO and meanw > 0 and c["rep"] > 0:
+            keepers.append((edge, key, c["n"], c["booked"], c["rep"], posw, totw, meanw))
+
+    keepers.sort(reverse=True)
+    if not keepers:
+        print(f"  NO lane x weekday cell passes the honest KEEP test in this window.\n"
+              f"  (Loosen with --min-n / --min-weeks, or widen --days — but a clean empty\n"
+              f"   result means there is no consistently-positive honest edge to trade.)\n")
+        return
+
+    hdr = (f"  {'channel/tier/lane/variant':<44} {'day':<4} {'n':>4} "
+           f"{'booked':>8} {'repric':>8} {'edge/SOL':>9} {'pos wks':>8} {'mean/wk':>8}")
+    print(hdr); print("  " + "-" * (len(hdr) - 2))
+    for edge, key, n, booked, rep, posw, totw, meanw in keepers:
+        ch, tier, lane, variant, dow = key
+        label = f"{ch}/{tier}/{lane}/{variant}"
+        print(f"  {label[:44]:<44} {_DOW[dow]:<4} {n:>4} {booked:>8.2f} {rep:>8.2f} "
+              f"{edge:>+8.1%} {posw:>4}/{totw:<3} {meanw:>+8.2f}")
+    print("  " + "-" * (len(hdr) - 2))
+    print(f"\n  {len(keepers)} lane x weekday cells KEEP on honest entries "
+          f"(sorted by edge/SOL). These are SHADOW-derived candidates — before trading a")
+    print(f"  cell, confirm it with --daysplit <lane> (paper realized) and/or live fills.\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -406,10 +488,15 @@ def main() -> None:
                          "e.g. vip_mcap_gate) — shadow + paper, with week consistency")
     ap.add_argument("--variant", default="early",
                     help="exit variant for the shadow day-split (early|ride|ride_vol|all; default early)")
+    ap.add_argument("--review", action="store_true",
+                    help="honest lane_policy_review: every lane x weekday that KEEPs on repriced entries")
+    ap.add_argument("--min-weeks", type=int, default=2, help="min ISO weeks a cell must span (default 2)")
     args = ap.parse_args()
 
     live_validation(args.live_days)
-    if args.daysplit:
+    if args.review:
+        review_reprice(args.days, args.min_n, args.min_weeks)
+    elif args.daysplit:
         day_split(args.days, args.daysplit, args.variant)
     elif args.shadow:
         shadow_reprice(args.days, args.min_n)
