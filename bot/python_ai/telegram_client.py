@@ -355,7 +355,15 @@ async def _dispatch_lane_testbed(score_result: dict, extra: dict) -> None:
         try:
             import live_trader
             if live_trader.LIVE_USE_LANE_POLICY:
-                _live_lane = pb if live_trader.LIVE_LANE_STRATEGY == "B" else pa
+                # LIVE_LANE_STRATEGY: "A"/"B" mirror the paper testbed bench; "LIVE" uses the
+                # narrow live-only allowlist (resolve_live) so live dispatches ONLY its
+                # realized-confirmed lanes, not whatever the wide paper bench trades.
+                if live_trader.LIVE_LANE_STRATEGY == "LIVE":
+                    _live_lane = lane_policy.resolve_live(channel, vip_tier, category)
+                elif live_trader.LIVE_LANE_STRATEGY == "B":
+                    _live_lane = pb
+                else:
+                    _live_lane = pa
                 if _live_lane.get("trade"):
                     _track_task(
                         asyncio.create_task(live_trader.open_live_position(score_result, extra)),
