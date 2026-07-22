@@ -260,7 +260,13 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # +3.20 with 2-of-3 green even after DROPPING the one +9.64 week (verified not an outlier
     # fluke). early Mon/Tue/Sat. Fri (ride) CUT 2026-07-17 — review DEMOTEd it (+2.35 -> -0.02 mean,
     # last 2 Fridays red); the two +4 weeks rolled over. See CUT_WATCH.
-    ("solhousesignal_vip", "gamble", "vip_mcap_gate"):  {"trade": True, "size": 0.5, "exit": EXIT_EARLY, "watch": True, "days": {"Mon", "Tue", "Sat"}},
+    # 2026-07-21 CUT Tue (reprice_analysis.py --daysplit): honest entries + paper-REALIZED exits
+    # show Tue LOSES -5..-7%/SOL on n~100. The old "green Mon/Tue/Sat" read was inflated by the
+    # feed under-recording entries — shadow flagged Tue KEEP (+16%), realized loses. Mon+Sat early
+    # hold up realized (Sat +16.6%/SOL 3/3 wks, Mon +3.5% 3/4). Wed/Fri/Sun NOT added: Wed/Fri
+    # ride are exactly the "fat-cell" flips this note already distrusts (Fri cut 07-17), Sun is a
+    # global skip. Confirmed-realized days only.
+    ("solhousesignal_vip", "gamble", "vip_mcap_gate"):  {"trade": True, "size": 0.5, "exit": EXIT_EARLY, "watch": True, "days": {"Mon", "Sat"}},
     # solwhaletrending/none: re-homed from anchor. Only consistent green day is Wed, and it's
     # the RIDE variant that carries it (Wed ride +5.26/14d, +5.18/7d; early ~+2). THIN (one
     # day, ~12 trades) — probationary, smallest size, yank if Wed doesn't repeat.
@@ -309,6 +315,11 @@ CUT_WATCH: list[tuple] = [
     ("solwhaletrending", "none", "low_score", "Fri", EXIT_RIDE_VOL, "cut 07-10, Tue+Fri -> Tue only"),
     # 2026-07-17: vip_mcap_gate Fri DEMOTEd by the review once its edge decayed.
     ("solhousesignal_vip", "gamble", "vip_mcap_gate", "Fri", EXIT_RIDE_S, "cut 07-17, ride Fri decayed +2.35 -> -0.02 (last 2 Fri red)"),
+    # 2026-07-21: vip_mcap_gate Tue CUT via reprice cross-check. Shadow flagged KEEP (+16%, 4/5 wks)
+    # but on honest entries + paper-REALIZED exits Tue LOSES -5..-7%/SOL on n~100 — an entry-inflation
+    # + shadow-overstatement mirage the booked review couldn't see. Watch for a genuine REALIZED
+    # recovery (not a shadow spike) before reconsidering.
+    ("solhousesignal_vip", "gamble", "vip_mcap_gate", "Tue", EXIT_EARLY, "cut 07-21 reprice: shadow KEEP but paper-realized -5..-7%/SOL n~100"),
     # 2026-07-17: Sunday is a GLOBAL skip (LANE_SKIP_WEEKDAYS="Sun"), not a per-lane cut — so it
     # never showed in the review at all (the blind spot). Track the two anchors' Sundays here so
     # the review surfaces them weekly. Currently 2/5 green, positive only via the 07-12 +17.7
