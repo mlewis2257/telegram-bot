@@ -260,13 +260,17 @@ LANE_POLICY: dict[tuple[str, str, str], dict] = {
     # +3.20 with 2-of-3 green even after DROPPING the one +9.64 week (verified not an outlier
     # fluke). early Mon/Tue/Sat. Fri (ride) CUT 2026-07-17 — review DEMOTEd it (+2.35 -> -0.02 mean,
     # last 2 Fridays red); the two +4 weeks rolled over. See CUT_WATCH.
-    # 2026-07-21 CUT Tue (reprice_analysis.py --daysplit): honest entries + paper-REALIZED exits
-    # show Tue LOSES -5..-7%/SOL on n~100. The old "green Mon/Tue/Sat" read was inflated by the
-    # feed under-recording entries — shadow flagged Tue KEEP (+16%), realized loses. Mon+Sat early
-    # hold up realized (Sat +16.6%/SOL 3/3 wks, Mon +3.5% 3/4). Wed/Fri/Sun NOT added: Wed/Fri
-    # ride are exactly the "fat-cell" flips this note already distrusts (Fri cut 07-17), Sun is a
-    # global skip. Confirmed-realized days only.
-    ("solhousesignal_vip", "gamble", "vip_mcap_gate"):  {"trade": True, "size": 0.5, "exit": EXIT_EARLY, "watch": True, "days": {"Mon", "Sat"}},
+    # 2026-07-21 RESEARCH MODE (live PAUSED — paper is a data collector, not capital at risk):
+    # reprice_analysis.py --daysplit vs paper-REALIZED separates confirmed edge from shadow mirage.
+    #   CONFIRMED (early): Mon (+3.5%/SOL, 3/4 wks) + Sat (+16.6%, 3/3) — realized-green.
+    #   PROBATION (early): Tue — shadow KEEP (+16%) but realized -7.3% n~100 (2/4); ride shadow only
+    #     +0.9%. Both honest views weak, but KEPT to gather more realized weeks (free while paused).
+    #   TEST (ride): Wed/Fri/Sun — strong in shadow, ZERO realized data. ride is the variant shadow
+    #     prefers on these; Sun opts in past the global skip (see resolve opt-in). day_exits below.
+    # GUARDRAIL: this WIDE gate is PAPER research. The LIVE gate (when un-paused) must be the strict
+    # CONFIRMED subset = Mon/Sat early. Lane is watch:True (B-only) so live (mirrors A) can't reach
+    # it unless LIVE_LANE_STRATEGY=B — but NARROW to Mon/Sat before any live repoint regardless.
+    ("solhousesignal_vip", "gamble", "vip_mcap_gate"):  {"trade": True, "size": 0.5, "exit": EXIT_EARLY, "watch": True, "days": {"Mon", "Sat", "Tue", "Wed", "Fri", "Sun"}, "day_exits": {"Wed": EXIT_RIDE_S, "Fri": EXIT_RIDE_S, "Sun": EXIT_RIDE_S}},
     # solwhaletrending/none: re-homed from anchor. Only consistent green day is Wed, and it's
     # the RIDE variant that carries it (Wed ride +5.26/14d, +5.18/7d; early ~+2). THIN (one
     # day, ~12 trades) — probationary, smallest size, yank if Wed doesn't repeat.
@@ -315,11 +319,6 @@ CUT_WATCH: list[tuple] = [
     ("solwhaletrending", "none", "low_score", "Fri", EXIT_RIDE_VOL, "cut 07-10, Tue+Fri -> Tue only"),
     # 2026-07-17: vip_mcap_gate Fri DEMOTEd by the review once its edge decayed.
     ("solhousesignal_vip", "gamble", "vip_mcap_gate", "Fri", EXIT_RIDE_S, "cut 07-17, ride Fri decayed +2.35 -> -0.02 (last 2 Fri red)"),
-    # 2026-07-21: vip_mcap_gate Tue CUT via reprice cross-check. Shadow flagged KEEP (+16%, 4/5 wks)
-    # but on honest entries + paper-REALIZED exits Tue LOSES -5..-7%/SOL on n~100 — an entry-inflation
-    # + shadow-overstatement mirage the booked review couldn't see. Watch for a genuine REALIZED
-    # recovery (not a shadow spike) before reconsidering.
-    ("solhousesignal_vip", "gamble", "vip_mcap_gate", "Tue", EXIT_EARLY, "cut 07-21 reprice: shadow KEEP but paper-realized -5..-7%/SOL n~100"),
     # 2026-07-17: Sunday is a GLOBAL skip (LANE_SKIP_WEEKDAYS="Sun"), not a per-lane cut — so it
     # never showed in the review at all (the blind spot). Track the two anchors' Sundays here so
     # the review surfaces them weekly. Currently 2/5 green, positive only via the 07-12 +17.7
@@ -340,22 +339,28 @@ def resolve(channel: Optional[str], vip_tier: Optional[str], category: Optional[
     a `reason`: global skipped weekday -> "skip_day"; a B-only watch pocket seen by A ->
     "watch_excluded"; a day-gated lane off its weekday -> "off_day". Pass the call/entry
     timestamp (naive -> treated as UTC); defaults to the current time.
+
+    OPT-IN to a globally-skipped weekday: a lane whose own "days" set explicitly lists the
+    current (SKIP_WEEKDAYS) day trades it anyway — the per-lane gate wins over the global
+    skip. Lanes that don't name the day still get skipped. Lets one lane research e.g. Sunday
+    without lifting the global skip for everything.
     """
-    if is_skipped_day(now):
-        return {"trade": False, "reason": "skip_day", "weekday": gate_weekday(now)}
     ch   = (channel or "").lstrip("@").strip()
     tier = (vip_tier or "none").strip()
     cat  = (category or "none").strip()
     policy = LANE_POLICY.get((ch, tier, cat), DEFAULT)
+    wd = gate_weekday(now)
+    _days = policy.get("days") if policy.get("trade") else None
+    if is_skipped_day(now) and not (_days and wd in _days):
+        return {"trade": False, "reason": "skip_day", "weekday": wd}
     if not policy.get("trade"):
         return policy
     # B-only watch pockets: an unconfirmed day-pocket inside a net-negative lane.
     if policy.get("watch") and str(strategy).upper() != "B":
         return {"trade": False, "reason": "watch_excluded"}
     # Per-lane weekday restriction (the day-gate): only trade on the lane's good day(s).
-    days = policy.get("days")
-    if days and gate_weekday(now) not in days:
-        return {"trade": False, "reason": "off_day", "weekday": gate_weekday(now)}
+    if _days and wd not in _days:
+        return {"trade": False, "reason": "off_day", "weekday": wd}
     # Uniform-size override (paper measurement mode): every traded lane at LANE_UNIFORM_SIZE.
     # Return a COPY so the LANE_POLICY table itself is never mutated.
     if LANE_UNIFORM_SIZE > 0 and policy.get("size") is not None:
