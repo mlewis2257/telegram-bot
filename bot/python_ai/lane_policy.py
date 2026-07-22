@@ -368,6 +368,47 @@ def resolve(channel: Optional[str], vip_tier: Optional[str], category: Optional[
     return policy
 
 
+# ── LIVE-ONLY lane allowlist ──────────────────────────────────────────────────
+# Live's one dial (LIVE_LANE_STRATEGY) otherwise mirrors the WHOLE paper A or B bench —
+# too blunt to say "trade only THIS lane on THESE days at THIS size". This explicit
+# allowlist lets live trade a narrow, realized-CONFIRMED subset while the paper LANE_POLICY
+# above stays wide for research. Used only when LIVE_LANE_STRATEGY=LIVE (see live_trader).
+# Value: {"days": {weekdays}, "exit": <variant, documentary>, "size": <SOL>}.
+#   * "days" honors the same globally-skipped-day OPT-IN as resolve() (list Sun to trade it).
+#   * "exit" documents the intended variant, but live's ACTUAL exit config is the process-wide
+#     EXIT_STRATEGY env — set it to `paper_a` so exits match the validated `early`
+#     (EXIT_A_PAPER, incl. profit floor). EXIT_LIVE_V2 (live default) has NO floor -> mismatch.
+# vip_mcap_gate: realized-confirmed Mon (+3.5%/SOL) + Sat (+16.6%). ZERO live fills yet and it
+# reprices in the untested "feed over-records" direction — start small (0.05).
+LIVE_LANES: dict[tuple[str, str, str], dict] = {
+    ("solhousesignal_vip", "gamble", "vip_mcap_gate"): {"days": {"Mon", "Sat"}, "exit": EXIT_EARLY, "size": 0.05},
+}
+
+
+def resolve_live(channel: Optional[str], vip_tier: Optional[str], category: Optional[str],
+                 now: Optional[datetime] = None) -> dict:
+    """
+    LIVE-only lane resolver (used when LIVE_LANE_STRATEGY=LIVE). Consults LIVE_LANES and
+    applies the SAME weekday gate + globally-skipped-day opt-in as resolve(), independent of
+    the wide paper LANE_POLICY research bench. Returns {"trade": False, "reason": ...} for a
+    miss/off-day/skip, or {"trade": True, "size", "exit"} on a hit.
+    """
+    ch   = (channel or "").lstrip("@").strip()
+    tier = (vip_tier or "none").strip()
+    cat  = (category or "none").strip()
+    spec = LIVE_LANES.get((ch, tier, cat))
+    if not spec:
+        return {"trade": False, "reason": "not_live_lane"}
+    wd    = gate_weekday(now)
+    days  = spec.get("days")
+    # A listed day opts in past the global SKIP_WEEKDAYS skip (same rule as resolve()).
+    if is_skipped_day(now) and not (days and wd in days):
+        return {"trade": False, "reason": "skip_day", "weekday": wd}
+    if days and wd not in days:
+        return {"trade": False, "reason": "off_day", "weekday": wd}
+    return {"trade": True, "size": spec.get("size"), "exit": spec.get("exit")}
+
+
 def lane_exit(channel: Optional[str], vip_tier: Optional[str], category: Optional[str],
               entry_time: Optional[datetime] = None) -> Optional[str]:
     """

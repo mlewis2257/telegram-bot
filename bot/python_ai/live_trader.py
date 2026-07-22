@@ -264,8 +264,37 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
                 db.set_call_skip_reason(call_id, "reentry_cooldown")
                 return False
 
-        # ── Guard 6: SOL balance ───────────────────────────────────────────────
-        size = _position_size(label)
+        # ── Channel / score / hour setup ───────────────────────────────────────
+        channel_handle = (
+            token_data.get("channel_tag") or
+            token_data.get("channel_handle") or
+            ""
+        ).lstrip("@")
+        score_val  = float(score_result.get("score") or 0)
+        local_now  = datetime.now(timezone.utc).astimezone(LOCAL_TZ)
+        local_hour = local_now.hour
+
+        # ── Lane-policy gate — resolved BEFORE size so a LIVE-allowlist lane sets its own size ──
+        # LIVE_LANE_STRATEGY "A"/"B" mirror the paper testbed bench (research-wide); "LIVE" uses
+        # lane_policy.resolve_live() — a NARROW live-only allowlist (LIVE_LANES) so live trades a
+        # realized-CONFIRMED subset while paper stays wide. Both handle day-gates + Sunday opt-in.
+        # Does NOT mutate the call's skip_reason (shared lane label the paper dispatch also reads).
+        _lane: dict = {"trade": True}
+        if LIVE_USE_LANE_POLICY:
+            _cat  = db.get_call_skip_reason(call_id)
+            if LIVE_LANE_STRATEGY == "LIVE":
+                _lane = lane_policy.resolve_live(channel_handle, token_data.get("vip_tier"), _cat)
+            else:
+                _lane = lane_policy.resolve(channel_handle, token_data.get("vip_tier"), _cat,
+                                            strategy=LIVE_LANE_STRATEGY)
+            if not _lane.get("trade"):
+                print(f"[live] {symbol} skipped — lane_policy({LIVE_LANE_STRATEGY}) "
+                      f"{_lane.get('reason', 'not_a_traded_lane')} "
+                      f"[{channel_handle}/{token_data.get('vip_tier') or 'none'}/{_cat or 'none'}]")
+                return False
+
+        # ── Guard 6: SOL balance (allowlist per-lane size overrides the default when set) ──
+        size = float(_lane.get("size") or _position_size(label))
         try:
             balance = _wallet.get_sol_balance(_rpc_url())
             if balance < size + 0.05:
@@ -279,32 +308,6 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             print(f"[live] {symbol} skipped — balance check failed: {e}")
             db.set_call_skip_reason(call_id, "balance")
             return False
-
-        # ── Channel / score / hour setup ───────────────────────────────────────
-        channel_handle = (
-            token_data.get("channel_tag") or
-            token_data.get("channel_handle") or
-            ""
-        ).lstrip("@")
-        score_val  = float(score_result.get("score") or 0)
-        local_now  = datetime.now(timezone.utc).astimezone(LOCAL_TZ)
-        local_hour = local_now.hour
-
-        # ── Lane-policy gate — mirror the paper testbed so live == refined Strategy A ──
-        # Same source of truth paper uses (lane_policy.resolve): only open a lane the
-        # configured testbed strategy trades on THIS weekday (handles day-gates, Sunday
-        # skip, and B-only watch exclusion). Edit lane_policy.py and both paper + live
-        # follow. NOTE: does NOT mutate the call's skip_reason — that's the shared lane
-        # label the paper testbed dispatch also reads (overwriting it would break paper).
-        if LIVE_USE_LANE_POLICY:
-            _cat  = db.get_call_skip_reason(call_id)
-            _lane = lane_policy.resolve(channel_handle, token_data.get("vip_tier"), _cat,
-                                        strategy=LIVE_LANE_STRATEGY)
-            if not _lane.get("trade"):
-                print(f"[live] {symbol} skipped — lane_policy({LIVE_LANE_STRATEGY}) "
-                      f"{_lane.get('reason', 'not_a_traded_lane')} "
-                      f"[{channel_handle}/{token_data.get('vip_tier') or 'none'}/{_cat or 'none'}]")
-                return False
 
         # ── Blocked channels ───────────────────────────────────────────────────
         _blocked = {c.strip() for c in os.getenv("LIVE_BLOCKED_CHANNELS", "solwhaletrending").split(",") if c.strip()}
