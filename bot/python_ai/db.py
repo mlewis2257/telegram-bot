@@ -1602,10 +1602,12 @@ def get_open_live_position(call_id: int) -> dict | None:
             """
             SELECT tp.entry_price, tp.sol_in, tp.entry_time,
                    tp.tokens_held, t.mint_address, t.symbol,
-                   tp.peak_mcap, tp.peak_multiplier, tp.entry_price_fill
+                   tp.peak_mcap, tp.peak_multiplier, tp.entry_price_fill,
+                   c.vip_tier, ch.handle
             FROM trading_positions tp
             JOIN calls  c ON c.id  = tp.call_id
             JOIN tokens t ON t.id  = c.token_id
+            LEFT JOIN channels ch ON ch.id = c.channel_id
             WHERE tp.call_id       = %s
               AND tp.is_simulation = FALSE
               AND tp.status        = 'open'
@@ -1625,6 +1627,11 @@ def get_open_live_position(call_id: int) -> dict | None:
         "peak_mcap":        float(row[6]) if row[6] is not None else 0.0,
         "peak_multiplier":  float(row[7]) if row[7] is not None else 0.0,
         "entry_price_fill": float(row[8]) if row[8] is not None else None,
+        # vip_tier + channel_handle so check_live_exits can apply the vip_gamble hard-stop
+        # (0.30) and the channel-gated profit floor — without these, live silently runs the
+        # generic no-floor/0.35 config and won't reproduce the validated `early` exit.
+        "vip_tier":         row[9],
+        "channel_handle":   row[10],
     }
 
 
