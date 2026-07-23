@@ -1447,6 +1447,133 @@ def close_shadow_position(call_id: int, exit_variant: str, exit_price: float, so
         conn.commit()
 
 
+# ── Quote-priced sim positions (qsim) ─────────────────────────────────────────
+# "Live minus the swap": entries priced off a real Jupiter BUY quote, exits monitored
+# off real SELL quotes — the SAME executable numbers live uses — but NOTHING executes.
+# Makes crypto paper as honest as a stock tape (feed prices lie for thin coins; a swap
+# quote is the true fill). Scoped to curated candidate lanes only (API budget). Table
+# self-creates on startup like shadow_positions — no manual migration.
+
+def ensure_qsim_positions_table() -> None:
+    """Create the qsim_positions table if absent. Idempotent; app owns it (no sudo)."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS qsim_positions (
+                id              bigserial PRIMARY KEY,
+                call_id         integer NOT NULL UNIQUE,
+                token_id        integer NOT NULL,
+                lane            text,
+                variant         text NOT NULL DEFAULT 'early',
+                vip_tier        text,
+                channel_handle  text,
+                status          text NOT NULL DEFAULT 'open',
+                entry_price     numeric NOT NULL,        -- REAL executable entry mcap (buy quote)
+                entry_tokens    numeric NOT NULL,        -- raw token bag the buy quote returned
+                entry_decimals  integer,
+                sol_in          numeric NOT NULL,
+                entry_time      timestamptz NOT NULL DEFAULT now(),
+                peak_mcap       numeric,                 -- REAL peak (sell-quote ratcheted)
+                peak_multiplier numeric,
+                peak_at         timestamptz,
+                exit_price      numeric,                 -- REAL exit mcap (sell quote at exit)
+                sol_out         numeric,                 -- SOL the exit sell-quote returned
+                exit_time       timestamptz,
+                exit_reason     text,
+                pnl_sol numeric GENERATED ALWAYS AS (sol_out - sol_in) STORED,
+                pnl_pct numeric(8,2) GENERATED ALWAYS AS (
+                    CASE WHEN sol_in > 0 THEN round((sol_out - sol_in) / sol_in * 100, 2)
+                         ELSE NULL END) STORED,
+                created_at      timestamptz NOT NULL DEFAULT now(),
+                updated_at      timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_qsim_status ON qsim_positions (status)")
+        conn.commit()
+
+
+def open_qsim_position(call_id: int, entry_price: float, entry_tokens: int,
+                       entry_decimals: int | None, sol_in: float, lane: str | None,
+                       variant: str, vip_tier: str | None, channel_handle: str | None,
+                       entry_time: datetime | None = None) -> bool:
+    """Open a quote-priced sim position. No-ops if one already exists for this call."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO qsim_positions
+                (call_id, token_id, lane, variant, vip_tier, channel_handle,
+                 entry_price, entry_tokens, entry_decimals, sol_in, entry_time, status)
+            SELECT %s, c.token_id, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open'
+            FROM calls c WHERE c.id = %s
+            ON CONFLICT (call_id) DO NOTHING
+            """,
+            (call_id, lane, variant, vip_tier, channel_handle, entry_price, entry_tokens,
+             entry_decimals, sol_in, entry_time or datetime.now(timezone.utc), call_id),
+        )
+        affected = cur.rowcount
+        conn.commit()
+        return affected > 0
+
+
+def get_open_qsim_positions() -> list[dict]:
+    """All open qsim positions with the context the qsim monitor needs to price + exit them."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT qp.call_id, qp.lane, qp.variant, qp.vip_tier, qp.channel_handle,
+                   qp.entry_price, qp.entry_tokens, qp.entry_decimals, qp.sol_in,
+                   qp.entry_time, qp.peak_mcap, qp.peak_multiplier,
+                   t.symbol, t.mint_address
+            FROM qsim_positions qp
+            JOIN tokens t ON t.id = qp.token_id
+            WHERE qp.status = 'open'
+            ORDER BY qp.entry_time DESC
+            """,
+        )
+        cols = [d.name for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def update_qsim_peak(call_id: int, peak_mcap: float, peak_mult: float) -> bool:
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE qsim_positions
+            SET peak_mcap = %s, peak_multiplier = %s, peak_at = NOW(), updated_at = NOW()
+            WHERE call_id = %s AND status = 'open'
+              AND (peak_multiplier IS NULL OR peak_multiplier < %s)
+            """,
+            (peak_mcap, peak_mult, call_id, peak_mult),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def close_qsim_position(call_id: int, exit_price: float, sol_out: float, exit_reason: str) -> None:
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE qsim_positions SET
+                exit_price = %s, sol_out = %s, exit_time = NOW(),
+                exit_reason = %s, status = 'closed', updated_at = NOW()
+            WHERE call_id = %s AND status = 'open'
+            """,
+            (exit_price, sol_out, exit_reason, call_id),
+        )
+        conn.commit()
+
+
 def get_paper_pnl_summary(is_strategy_b: bool = False) -> dict:
     """
     Return aggregate P&L stats for all closed simulation positions,
