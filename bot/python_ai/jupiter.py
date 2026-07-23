@@ -143,6 +143,35 @@ async def get_sell_quote(mint_address: str, token_amount: int) -> float | None:
         return None
 
 
+async def get_buy_quote(mint_address: str, sol_amount: float) -> int | None:
+    """
+    Real-time BUY quote: sol_amount SOL -> tokens (raw outAmount), WITHOUT executing.
+    Returns the raw token amount (int) or None on any failure / no route. The executable-
+    ENTRY analog of get_sell_quote: it prices what a real swap of THIS size would actually
+    fill (pool depth + slippage), not the laggy feed mcap. Convert the returned token count
+    to an implied entry mcap with the SAME supply/decimals math the live fill uses
+    (live_trader._effective_fill_mcap). Reuses get_order (Ultra /order) and discards the tx.
+    """
+    if not mint_address or not sol_amount or sol_amount <= 0:
+        return None
+    try:
+        import wallet as _wallet
+        wallet_address   = str(_wallet.get_keypair().pubkey())
+        buy_slippage_bps = int(os.getenv("LIVE_SLIPPAGE_BPS", "500"))
+        amount_lamports  = int(sol_amount * 1_000_000_000)
+        order = await get_order(
+            SOL_MINT, mint_address, amount_lamports, wallet_address,
+            slippage_bps_override=buy_slippage_bps,
+        )
+        out_tokens = int(order.get("outAmount") or order.get("outputAmount") or 0)
+        if out_tokens <= 0:
+            return None
+        return out_tokens
+    except Exception as e:
+        print(f"[jupiter] buy quote failed for {(mint_address or '?')[:8]}: {e}")
+        return None
+
+
 async def sign_transaction(order: dict, keypair: Keypair) -> str:
     """
     Sign the Jupiter-provided VersionedTransaction with our keypair.
