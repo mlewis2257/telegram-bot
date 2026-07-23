@@ -474,6 +474,84 @@ def review_reprice(days: int, min_n: int, min_weeks: int) -> None:
     print(f"  cell, confirm it with --daysplit <lane> (paper realized) and/or live fills.\n")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. QSIM — quote-priced sim P&L + calibration against live wallet fills
+# ─────────────────────────────────────────────────────────────────────────────
+
+QSIM_STANDALONE_SQL = """
+SELECT COALESCE(q.channel_handle,'?') AS channel, COALESCE(q.lane,'none') AS lane,
+       q.variant,
+       EXTRACT(ISODOW FROM (q.entry_time AT TIME ZONE 'UTC'))::int AS dow,
+       q.sol_in, q.pnl_sol
+FROM qsim_positions q
+WHERE q.status = 'closed'
+  AND q.entry_time >= now() - (%(days)s || ' days')::interval
+"""
+
+# Same calls traded by BOTH qsim and live — the calibration: qsim P&L must match the wallet.
+QSIM_VS_LIVE_SQL = """
+SELECT t.symbol, q.pnl_sol AS qsim_pnl, tp.pnl_sol AS live_pnl,
+       q.exit_reason AS qsim_reason, tp.exit_reason AS live_reason
+FROM qsim_positions q
+JOIN trading_positions tp ON tp.call_id = q.call_id AND tp.is_simulation = FALSE
+JOIN tokens t ON t.id = q.token_id
+WHERE q.status = 'closed' AND tp.status = 'closed'
+  AND q.entry_time >= now() - (%(days)s || ' days')::interval
+ORDER BY q.entry_time
+"""
+
+_DOWQ = {1: "Mon", 2: "Tue", 3: "Wed", 4: "Thu", 5: "Fri", 6: "Sat", 7: "Sun"}
+
+
+def qsim_report(days: int) -> None:
+    print("=" * 82)
+    print(f"  QSIM — quote-priced sim (real buy/sell quotes, no execution)   last {days}d")
+    print("=" * 82)
+    try:
+        standalone = _rows(QSIM_STANDALONE_SQL, {"days": days})
+    except Exception as e:
+        db.safe_rollback()
+        print(f"  no qsim data yet (table absent or empty) — start qsim + wait for closes. [{e}]\n")
+        return
+    if not standalone:
+        print("  no closed qsim positions in window yet.\n")
+        return
+
+    # per lane×day
+    cells: dict[tuple, list[float]] = {}
+    for r in standalone:
+        key = (f"{r['channel']}/{r['lane']}/{r['variant']}", _DOWQ.get(int(r["dow"]), "?"))
+        acc = cells.setdefault(key, [0, 0.0, 0, 0.0])
+        acc[0] += 1
+        acc[1] += float(r["pnl_sol"] or 0)
+        acc[2] += 1 if float(r["pnl_sol"] or 0) > 0 else 0
+        acc[3] += float(r["sol_in"] or 0)
+    print(f"  {'lane/variant':<40} {'day':<4} {'n':>4} {'pnl_sol':>9} {'win%':>6} {'edge/SOL':>9}")
+    print("  " + "-" * 76)
+    for (label, day), (n, pnl, wins, soli) in sorted(cells.items(), key=lambda kv: kv[1][1], reverse=True):
+        edge = (pnl / soli) if soli else 0.0
+        print(f"  {label[:40]:<40} {day:<4} {n:>4} {pnl:>9.4f} {100*wins/n:>5.0f}% {edge:>+8.1%}")
+    print("  " + "-" * 76)
+
+    # calibration vs live
+    print("\n  CALIBRATION — same calls, qsim vs LIVE wallet (they should match):")
+    cal = _rows(QSIM_VS_LIVE_SQL, {"days": days})
+    if not cal:
+        print("    no calls yet traded by BOTH qsim and live — need overlap to calibrate.\n")
+        return
+    q_pnls, l_pnls = [], []
+    print(f"    {'symbol':<12} {'qsim':>9} {'live':>9} {'diff':>9}  qsim_r/live_r")
+    for r in cal:
+        qp, lp = float(r["qsim_pnl"] or 0), float(r["live_pnl"] or 0)
+        q_pnls.append(qp); l_pnls.append(lp)
+        print(f"    {r['symbol'][:12]:<12} {qp:>9.4f} {lp:>9.4f} {qp-lp:>+9.4f}  "
+              f"{r['qsim_reason']}/{r['live_reason']}")
+    mae, bias = _mae_bias(q_pnls, l_pnls)
+    print(f"    {'—':<12} {sum(q_pnls):>9.4f} {sum(l_pnls):>9.4f}")
+    print(f"\n    n={len(cal)}  MAE={mae:.4f}  bias={bias:+.4f} SOL/trade  "
+          f"(low MAE = qsim reproduces the wallet -> trust it, then widen lanes)\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -491,8 +569,13 @@ def main() -> None:
     ap.add_argument("--review", action="store_true",
                     help="honest lane_policy_review: every lane x weekday that KEEPs on repriced entries")
     ap.add_argument("--min-weeks", type=int, default=2, help="min ISO weeks a cell must span (default 2)")
+    ap.add_argument("--qsim", action="store_true",
+                    help="quote-priced sim P&L per lane/day + calibration vs live wallet fills")
     args = ap.parse_args()
 
+    if args.qsim:
+        qsim_report(args.days)
+        return
     live_validation(args.live_days)
     if args.review:
         review_reprice(args.days, args.min_n, args.min_weeks)
