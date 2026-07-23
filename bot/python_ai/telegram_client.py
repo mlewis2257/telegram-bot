@@ -371,6 +371,18 @@ async def _dispatch_lane_testbed(score_result: dict, extra: dict) -> None:
                     )
         except Exception as le:
             print(f"[live_trader] testbed dispatch failed call_id={call_id}: {le}")
+        # Quote-priced sim (qsim): fires on the SAME call events, prices off real Jupiter
+        # quotes, executes nothing. Gated internally by QSIM_ENABLED + qsim_resolve (lane/day),
+        # so this is a no-op unless a call hits a curated candidate lane on a traded day.
+        try:
+            import qsim
+            if qsim.QSIM_ENABLED:
+                _track_task(
+                    asyncio.create_task(qsim.qsim_open(score_result, extra)),
+                    f"qsim call_id={call_id}",
+                )
+        except Exception as qe:
+            print(f"[qsim] dispatch failed call_id={call_id}: {qe}")
     except Exception as e:
         print(f"[lane_testbed] dispatch failed call_id={call_id}: {e}")
 
