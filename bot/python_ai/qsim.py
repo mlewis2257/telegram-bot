@@ -46,9 +46,13 @@ QSIM_ENABLED = os.getenv("QSIM_ENABLED", "false").lower() == "true"
 # Widen this dict (one line per lane) once qsim is calibrated. "days" honors the same
 # globally-skipped-day OPT-IN as lane_policy (list Sun to trade it).
 QSIM_LANES: dict[tuple[str, str, str], dict] = {
-    # CALIBRATION lane — mirrors the live vip_mcap_gate gate so qsim P&L is directly
-    # comparable to real wallet fills. Confirm they match, THEN widen to shadow's candidates.
-    ("solhousesignal_vip", "gamble", "vip_mcap_gate"): {"days": {"Mon", "Sat"}, "size": 0.05, "exit": "early"},
+    # vip_mcap_gate EVERY day: qsim costs no money, so trade all days to (a) smoke-test the
+    # pipeline immediately instead of waiting for Sat, and (b) gather HONEST realized data on
+    # the days we've been unsure about (Tue/Wed/Fri/Sun). Live still trades only Mon/Sat, so
+    # the qsim-vs-live CALIBRATION overlap is naturally that subset — nothing lost. Sun trades
+    # via the day-set opt-in past the global skip. exit=early held constant across days (clean
+    # test: hold the exit, vary the day). Widen to other lanes once the machinery is proven.
+    ("solhousesignal_vip", "gamble", "vip_mcap_gate"): {"days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}, "size": 0.05, "exit": "early"},
 }
 
 # variant string -> the SAME ExitConfig shadow/paper use (keep in sync with shadow_monitor).
