@@ -48,6 +48,12 @@ class ExecutionError(Exception):
         self.code = code
 
 
+class RateLimitError(Exception):
+    """Jupiter returned HTTP 429. Transient rate-limit — the bag is NOT unsellable.
+    Callers that opt in (raise_on_ratelimit=True) get this instead of a None so they
+    can back off and retry rather than mistaking a throttle for a no-route/rug."""
+
+
 # ── HTTP client singleton ──────────────────────────────────────────────────────
 
 _client: httpx.AsyncClient | None = None
@@ -117,12 +123,18 @@ async def get_order(
     return data
 
 
-async def get_sell_quote(mint_address: str, token_amount: int) -> float | None:
+async def get_sell_quote(mint_address: str, token_amount: int,
+                         raise_on_ratelimit: bool = False) -> float | None:
     """
     Real-time SELL quote: token_amount -> SOL, WITHOUT executing. Returns SOL out
     (float) or None on any failure / no route. Reuses get_order (Ultra /order) and
     discards the transaction. Used by live exit evaluation to price the bag at its
     true sellable value instead of trusting the feed mcap.
+
+    raise_on_ratelimit: if True, a Jupiter 429 raises RateLimitError instead of
+    returning None. Live/paper exit callers leave this False (a None just falls back
+    to the feed), but qsim MUST set it True — otherwise a throttle looks identical to
+    a no-route and gets booked as a fake rug.
     """
     if not mint_address or not token_amount or token_amount <= 0:
         return None
@@ -138,12 +150,18 @@ async def get_sell_quote(mint_address: str, token_amount: int) -> float | None:
         if out_lam <= 0:
             return None
         return out_lam / 1_000_000_000
+    except httpx.HTTPStatusError as e:
+        if raise_on_ratelimit and e.response.status_code == 429:
+            raise RateLimitError("jupiter /order 429 (sell)") from e
+        print(f"[jupiter] sell quote failed for {(mint_address or '?')[:8]}: {e}")
+        return None
     except Exception as e:
         print(f"[jupiter] sell quote failed for {(mint_address or '?')[:8]}: {e}")
         return None
 
 
-async def get_buy_quote(mint_address: str, sol_amount: float) -> int | None:
+async def get_buy_quote(mint_address: str, sol_amount: float,
+                        raise_on_ratelimit: bool = False) -> int | None:
     """
     Real-time BUY quote: sol_amount SOL -> tokens (raw outAmount), WITHOUT executing.
     Returns the raw token amount (int) or None on any failure / no route. The executable-
@@ -167,6 +185,11 @@ async def get_buy_quote(mint_address: str, sol_amount: float) -> int | None:
         if out_tokens <= 0:
             return None
         return out_tokens
+    except httpx.HTTPStatusError as e:
+        if raise_on_ratelimit and e.response.status_code == 429:
+            raise RateLimitError("jupiter /order 429 (buy)") from e
+        print(f"[jupiter] buy quote failed for {(mint_address or '?')[:8]}: {e}")
+        return None
     except Exception as e:
         print(f"[jupiter] buy quote failed for {(mint_address or '?')[:8]}: {e}")
         return None

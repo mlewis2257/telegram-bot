@@ -70,16 +70,23 @@ QSIM_LANES: dict[tuple[str, str, str], dict] = {
 # variant string -> the SAME ExitConfig shadow/paper use (keep in sync with shadow_monitor).
 _VARIANT_CONFIGS = {"early": EXIT_A_PAPER, "ride": EXIT_RIDE, "ride_vol": EXIT_RIDE}
 
-QSIM_MAX_QUOTES_PER_MIN = int(os.getenv("QSIM_MAX_QUOTES_PER_MIN", "40"))
-QSIM_TICK_SECS          = float(os.getenv("QSIM_TICK_SECS", "20"))   # per-position quote cadence
+# Defaults are DELIBERATELY conservative: the Jupiter /order endpoint qsim quotes off has
+# its OWN rate limit (separate from the DexScreener api_rate_budget) and is SHARED with live
+# exit quoting. Overshoot it and (a) we 429-storm live's exits too, and (b) every 429 that
+# reaches _qsim_tick as a no-route would book a FAKE rug. Tune QSIM_MAX_QUOTES_PER_MIN up via
+# .env only after watching the logs stay 429-free. Backoff auto-protects if we overshoot.
+QSIM_MAX_QUOTES_PER_MIN = int(os.getenv("QSIM_MAX_QUOTES_PER_MIN", "12"))
+QSIM_TICK_SECS          = float(os.getenv("QSIM_TICK_SECS", "30"))   # per-position quote cadence
 QSIM_LOOP_SECS          = float(os.getenv("QSIM_LOOP_SECS", "3"))    # monitor pass interval
 QSIM_RUG_FAILS          = int(os.getenv("QSIM_RUG_FAILS", "6"))      # consecutive no-route quotes -> close as rug
+QSIM_BACKOFF_SECS       = float(os.getenv("QSIM_BACKOFF_SECS", "30"))  # pause all quoting after a 429
 
 _ensured = False
 # monitor-process in-memory state
 _last_quote_ts: dict[int, float] = {}     # call_id -> monotonic time of last sell-quote
 _noroute_streak: dict[int, int] = {}      # call_id -> consecutive no-route sell quotes
 _quote_window: list[float] = []           # monotonic timestamps of recent quotes (budget window)
+_backoff_until: float = 0.0               # monotonic time until which quoting is paused (429 backoff)
 
 
 def _ensure_table() -> None:
@@ -133,7 +140,12 @@ async def qsim_open(score_result: dict, token_data: dict) -> None:
 
         _ensure_table()
         size = float(spec["size"])
-        tokens_raw = await jupiter.get_buy_quote(mint, size)
+        try:
+            tokens_raw = await jupiter.get_buy_quote(mint, size, raise_on_ratelimit=True)
+        except jupiter.RateLimitError:
+            # Throttle, not a dead token — just drop this sample (a missed open, never a rug).
+            print(f"[qsim] {symbol} open skipped — jupiter 429 (rate-limited) call_id={call_id}")
+            return
         if not tokens_raw or tokens_raw <= 0:
             print(f"[qsim] {symbol} skipped — no buy route call_id={call_id}")
             return
@@ -175,7 +187,16 @@ async def _qsim_tick(pos: dict) -> None:
     if sol_in <= 0 or entry <= 0 or tokens <= 0:
         return
 
-    sol_out = await jupiter.get_sell_quote(mint, tokens)
+    try:
+        sol_out = await jupiter.get_sell_quote(mint, tokens, raise_on_ratelimit=True)
+    except jupiter.RateLimitError:
+        # 429 = throttle, NOT a rug. Back off ALL quoting for a bit and skip this tick; leave
+        # the rug streak untouched so a rate-limit can never be booked as a fake -100% close.
+        global _backoff_until
+        _backoff_until = time.monotonic() + QSIM_BACKOFF_SECS
+        _quote_window.append(time.monotonic())
+        _last_quote_ts[call_id] = time.monotonic()
+        return
     _quote_window.append(time.monotonic())
     _last_quote_ts[call_id] = time.monotonic()
 
@@ -232,7 +253,8 @@ async def run_qsim_monitor() -> None:
           f"cap={QSIM_MAX_QUOTES_PER_MIN}/min cadence={QSIM_TICK_SECS}s enabled={QSIM_ENABLED}")
     while True:
         try:
-            if QSIM_ENABLED:
+            # Skip the whole quoting pass while in 429 backoff (the loop-end sleep still runs).
+            if QSIM_ENABLED and time.monotonic() >= _backoff_until:
                 now = time.monotonic()
                 positions = db.get_open_qsim_positions()
                 for pos in positions:
@@ -243,6 +265,8 @@ async def run_qsim_monitor() -> None:
                     if not _budget_ok():
                         break   # over budget this minute — the rest wait for the next pass
                     await _qsim_tick(pos)
+                    if time.monotonic() < _backoff_until:
+                        break   # a 429 mid-pass tripped backoff — stop quoting immediately
         except Exception as e:
             db.safe_rollback()
             print(f"[qsim] monitor pass error: {e}")
