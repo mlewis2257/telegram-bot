@@ -53,6 +53,18 @@ QSIM_LANES: dict[tuple[str, str, str], dict] = {
     # via the day-set opt-in past the global skip. exit=early held constant across days (clean
     # test: hold the exit, vary the day). Widen to other lanes once the machinery is proven.
     ("solhousesignal_vip", "gamble", "vip_mcap_gate"): {"days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}, "size": 0.05, "exit": "early"},
+    # Widen 2026-07-24: the faithfully-testable POSITIVE lanes off the clean 14d shadow window
+    # (post-07-11 fixes, so no phantom/June contamination). Both are the "early" variant —
+    # early maps to a real ExitConfig (EXIT_A_PAPER); ride_vol positives are HELD because qsim
+    # maps ride_vol->plain EXIT_RIDE (no order_flow), which is negative on those lanes = a lie.
+    #   * solwhaletrending/none/none early (+10.06/14d): cleanest row on the board — 10/13 days
+    #     green, reds are rounding errors, NOT spike-carried. The real widen candidate.
+    #   * solhousesignal/none/low_score early (+30.05/14d): the ADVERSARIAL referee — reprice
+    #     already convicted this anchor (booked +12.9, honest -8.4). If qsim lands near -8 it's a
+    #     second independent confirmation qsim catches the entry-inflation lie (front-loaded on
+    #     07-12 +17.7, then 5 straight red days — expect qsim to gut it).
+    ("solwhaletrending", "none", "none"):      {"days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}, "size": 0.05, "exit": "early"},
+    ("solhousesignal",   "none", "low_score"): {"days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}, "size": 0.05, "exit": "early"},
 }
 
 # variant string -> the SAME ExitConfig shadow/paper use (keep in sync with shadow_monitor).
