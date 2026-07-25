@@ -41,6 +41,15 @@ import lane_policy
 # suppressed. Default off — no behaviour change until set.
 LANE_TESTBED_ENABLED = os.getenv("LANE_TESTBED_ENABLED", "false").lower() == "true"
 
+# Paper A/B opens can be paused WITHOUT disabling the testbed dispatch (which also drives
+# live + qsim, both of which we still rely on). Default on = unchanged behaviour. Set
+# PAPER_TESTBED_ENABLED=false to stop opening NEW paper positions — we no longer use paper
+# as a signal (qsim + reprice replaced it), so this frees price-feed API budget for shadow.
+# The pa/pb lane resolves still run (live reuses them); only the paper open tasks are gated.
+# Already-open paper positions drain out via the normal exit sweep; nothing is deleted, and
+# all historical paper data stays repriceable.
+PAPER_TESTBED_ENABLED = os.getenv("PAPER_TESTBED_ENABLED", "true").lower() == "true"
+
 # Entry-side rug gate (trending channels only). A high holder count AT DETECTION is a
 # rug/dud signal on the early/realtime channels — shadow backtest on solwhale/low_score:
 # runners cluster low (~450 holders), rugs high (~765); skipping hodl_count > threshold
@@ -334,14 +343,16 @@ async def _dispatch_lane_testbed(score_result: dict, extra: dict) -> None:
         channel  = (extra.get("channel_tag") or extra.get("channel_handle") or "").lstrip("@")
         vip_tier = extra.get("vip_tier")
         category = db.get_call_skip_reason(call_id)  # the lane label; None -> "none"
+        # Resolve pa/pb unconditionally — live reuses them below — but only OPEN paper
+        # positions when paper is enabled (PAPER_TESTBED_ENABLED). qsim/live are untouched.
         pa = lane_policy.resolve(channel, vip_tier, category, strategy="A")
-        if pa.get("trade"):
+        if PAPER_TESTBED_ENABLED and pa.get("trade"):
             _track_task(
                 asyncio.create_task(paper_trader.open_lane_position(score_result, extra, pa)),
                 f"laneA call_id={call_id}",
             )
         pb = lane_policy.resolve(channel, vip_tier, category, strategy="B")
-        if pb.get("trade"):
+        if PAPER_TESTBED_ENABLED and pb.get("trade"):
             _track_task(
                 asyncio.create_task(paper_trader_b.open_lane_position(score_result, extra, pb)),
                 f"laneB call_id={call_id}",
