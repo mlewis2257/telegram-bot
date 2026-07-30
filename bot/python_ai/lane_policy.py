@@ -378,10 +378,17 @@ def resolve(channel: Optional[str], vip_tier: Optional[str], category: Optional[
 #   * "exit" documents the intended variant, but live's ACTUAL exit config is the process-wide
 #     EXIT_STRATEGY env — set it to `paper_a` so exits match the validated `early`
 #     (EXIT_A_PAPER, incl. profit floor). EXIT_LIVE_V2 (live default) has NO floor -> mismatch.
-# vip_mcap_gate: realized-confirmed Mon (+3.5%/SOL) + Sat (+16.6%). ZERO live fills yet and it
-# reprices in the untested "feed over-records" direction — start small (0.05).
+# CALIBRATION RUN 2026-07-29: vip_mcap_gate REMOVED. qsim proved it the reject pile — the
+# strategy engine gates it as already-pumped/manipulated (entry_mcap >= gamble ceiling OR
+# high bundle+fake vol), and it was ~83% of qsim's total loss. So we calibrate instead on the
+# two NEAR-BREAKEVEN lanes qsim already trades — same pricing-calibration value (quote-vs-fill
+# is lane-agnostic) at a fraction of the cost. days={"Wed","Thu"} = a ~1-day window; flip
+# LIVE_TRADING_ENABLED=false (or drop these lines) once a handful of trades close. "exit" is
+# documentary — live's ACTUAL exit is the process-wide EXIT_STRATEGY=paper_a (kill any
+# exit_live_v2 dupe in .env or the qsim-vs-wallet compare is polluted).
 LIVE_LANES: dict[tuple[str, str, str], dict] = {
-    ("solhousesignal_vip", "gamble", "vip_mcap_gate"): {"days": {"Mon", "Sat"}, "exit": EXIT_EARLY, "size": 0.05},
+    ("solhousesignal",   "none", "low_score"): {"days": {"Wed", "Thu"}, "exit": EXIT_EARLY, "size": 0.05},
+    ("solwhaletrending", "none", "none"):       {"days": {"Wed", "Thu"}, "exit": EXIT_EARLY, "size": 0.05},
 }
 
 
