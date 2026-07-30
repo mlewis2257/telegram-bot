@@ -477,7 +477,9 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
     try:
         position_live = db.get_open_live_position(call_id)
         if position_live:
-            entry_price   = position_live["entry_price"]
+            # Anchor exit multiples on the REAL fill, not the laggy feed entry (see monitor.py):
+            # the feed under-records entry on fast risers, inflating multiples and mis-timing exits.
+            entry_price   = position_live.get("entry_price_fill") or position_live["entry_price"]
             peak_mcap_db  = position_live["peak_mcap"]
             peak_mult_db  = position_live["peak_multiplier"]
             current_mult  = (current_mcap / entry_price) if entry_price else 0.0

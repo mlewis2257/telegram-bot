@@ -516,7 +516,12 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
         try:
             pos_live = db.get_open_live_position(call_id)
             if pos_live:
-                live_entry_price  = pos_live["entry_price"]
+                # Anchor exit multiples on the REAL fill, not the laggy feed entry: the feed
+                # under-records entry on fast risers, which inflates peak/current multiples —
+                # arming trails/floors early AND masking losers past the hard-stop. The quote
+                # path already anchors on the fill; this fixes the feed-fallback + peak column.
+                # Feed entry is the fallback only for pre-instrumentation positions.
+                live_entry_price  = pos_live.get("entry_price_fill") or pos_live["entry_price"]
                 live_current_mult = (current_mcap / live_entry_price) if live_entry_price else 0.0
                 # Use the higher of: live's own DB peak, paper A's (already
                 # guard-corroborated) peak, or the guarded current price. peak_mcap
@@ -852,7 +857,12 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None,
             try:
                 pos_live = db.get_open_live_position(call_id) if include_live else None
                 if pos_live:
-                    live_entry_price  = pos_live["entry_price"]
+                    # Anchor exit multiples on the REAL fill, not the laggy feed entry: the feed
+                    # under-records entry on fast risers, which inflates peak/current multiples —
+                    # arming trails/floors early AND masking losers past the hard-stop. The quote
+                    # path already anchors on the fill; this fixes the feed-fallback + peak column.
+                    # Feed entry is the fallback only for pre-instrumentation positions.
+                    live_entry_price  = pos_live.get("entry_price_fill") or pos_live["entry_price"]
                     live_current_mult = (current_mcap / live_entry_price) if live_entry_price else 0.0
                     live_peak_mcap = max(
                         float(pos_live["peak_mcap"] or 0),
