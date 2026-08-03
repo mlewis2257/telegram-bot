@@ -387,8 +387,11 @@ def resolve(channel: Optional[str], vip_tier: Optional[str], category: Optional[
 # documentary — live's ACTUAL exit is the process-wide EXIT_STRATEGY=paper_a (kill any
 # exit_live_v2 dupe in .env or the qsim-vs-wallet compare is polluted).
 LIVE_LANES: dict[tuple[str, str, str], dict] = {
-    ("solhousesignal",   "none", "low_score"): {"days": {"Wed", "Thu"}, "exit": EXIT_EARLY, "size": 0.05},
-    ("solwhaletrending", "none", "none"):       {"days": {"Wed", "Thu"}, "exit": EXIT_EARLY, "size": 0.05},
+    # Calibration lanes pointed at the ONLY days that survived qsim's real-quote ruler
+    # (30d --qsim): low_score green on Mon (+6.0%), solwhaletrending green on Tue (+11.6%).
+    # Every other day was deep red on executable prices; prove these two, then widen.
+    ("solhousesignal",   "none", "low_score"): {"days": {"Mon"}, "exit": EXIT_EARLY, "size": 0.05},
+    ("solwhaletrending", "none", "none"):       {"days": {"Tue"}, "exit": EXIT_EARLY, "size": 0.05},
 }
 
 
