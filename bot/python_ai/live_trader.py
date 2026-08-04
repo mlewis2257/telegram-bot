@@ -149,6 +149,14 @@ LIVE_EXIT_QUOTE_LOG = os.getenv("LIVE_EXIT_QUOTE_LOG", "false").lower() == "true
 LIVE_EXIT_USE_QUOTE = os.getenv("LIVE_EXIT_USE_QUOTE", "false").lower() == "true"
 _SELL_QUOTE_TTL   = float(os.getenv("LIVE_SELL_QUOTE_TTL", "2.5"))  # seconds
 _sell_quote_cache: dict = {}  # mint -> (sol_out, monotonic_ts)
+# Exit quotes are the highest-value quote we make (real money on the line), so a
+# transient Jupiter 429 is retried briefly before we surrender to the feed basis —
+# the feed is exactly the liar the quote path exists to bypass (measured: ~2/3 of live
+# exits were deciding on feed because a raw 429 dropped straight to fallback). A genuine
+# no-route (None, no 429) is NOT retried: the coin is unsellable this tick, so retrying
+# won't help and the caller must fall back. Bounded so a sell never waits > retries*ms.
+_EXIT_QUOTE_RETRIES  = int(os.getenv("LIVE_EXIT_QUOTE_RETRIES", "2"))       # extra tries after the first
+_EXIT_QUOTE_RETRY_MS = float(os.getenv("LIVE_EXIT_QUOTE_RETRY_MS", "180"))  # backoff between tries (ms)
 
 
 def _rpc_url() -> str:
@@ -525,6 +533,34 @@ def _effective_fill_mcap(
         return None
 
 
+async def _exit_sell_quote(mint: str, tokens_held: int) -> float | None:
+    """
+    Sell-quote for the live EXIT path, hardened against transient Jupiter 429s.
+    Opts into RateLimitError (raise_on_ratelimit=True) so a rate-limit is distinguished
+    from a genuine no-route: a 429 is retried up to _EXIT_QUOTE_RETRIES times with a
+    short backoff (the quote usually clears within a few hundred ms), while a no-route
+    (None with no 429) returns immediately — the bag is unsellable this tick and the
+    caller falls back to feed. Never raises; never blocks a sell beyond retries*retry_ms.
+    """
+    attempts = _EXIT_QUOTE_RETRIES + 1
+    for i in range(attempts):
+        try:
+            out = await jupiter.get_sell_quote(mint, tokens_held, raise_on_ratelimit=True)
+            if out is None:
+                return None  # genuine no-route — retrying won't conjure liquidity
+            return out
+        except jupiter.RateLimitError:
+            if i < attempts - 1:
+                await asyncio.sleep(_EXIT_QUOTE_RETRY_MS / 1000.0)
+                continue
+            print(f"[live] exit quote 429 after {attempts} tries for {mint[:8]} — feed fallback")
+            return None
+        except Exception as e:
+            print(f"[live] exit quote error for {mint[:8]}: {e} — feed fallback")
+            return None
+    return None
+
+
 async def live_effective_current(pos: dict) -> tuple[float, float] | None:
     """
     Price a live position at its TRUE sellable value via a real Jupiter sell-quote
@@ -550,7 +586,7 @@ async def live_effective_current(pos: dict) -> tuple[float, float] | None:
         if cached and (now - cached[1]) < _SELL_QUOTE_TTL:
             sol_out = cached[0]
         else:
-            sol_out = await jupiter.get_sell_quote(mint, tokens_held)
+            sol_out = await _exit_sell_quote(mint, tokens_held)
             if sol_out is None or sol_out <= 0:
                 return None
             _sell_quote_cache[mint] = (sol_out, now)
@@ -596,7 +632,11 @@ async def live_exit_basis(
         # Ratchet the real peak off observed sell-quote value. Seed from the DB row so the
         # peak is shared across sol-monitor + sol-ws-monitor and survives restarts; the
         # guard adds the same single-tick corroboration used on the feed side.
-        prior_peak = float(db.get_live_real_peak(call_id) or 0.0)
+        # Seed the real-peak floor from the fill: a coin that dips right after entry (first
+        # successful quote below the fill) must not leave real_peak reading absurdly below
+        # entry — trail/floor arm off peak/entry, so a sub-entry peak understates every ratio
+        # (this is what left `buy`'s real_peak at 3711 under an 3838 fill).
+        prior_peak = max(float(db.get_live_real_peak(call_id) or 0.0), real_entry)
         real_peak  = peak_guard.guard_peak(f"realL:{call_id}", synth_current, prior_peak)
         if real_peak > prior_peak:
             db.update_live_real_peak(call_id, real_peak)
