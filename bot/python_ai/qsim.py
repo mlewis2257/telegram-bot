@@ -52,7 +52,11 @@ QSIM_LANES: dict[tuple[str, str, str], dict] = {
     # the qsim-vs-live CALIBRATION overlap is naturally that subset — nothing lost. Sun trades
     # via the day-set opt-in past the global skip. exit=early held constant across days (clean
     # test: hold the exit, vary the day). Widen to other lanes once the machinery is proven.
-    ("solhousesignal_vip", "gamble", "vip_mcap_gate"): {"days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}, "size": 0.05, "exit": "early"},
+    # EDGE SCAN (2026-08-05): RETIRED vip_mcap_gate here — proven the reject pile (worst qsim
+    # mean, most feed mirages AND most lying exits across 74 rows; live already dropped it). Its
+    # budget is reallocated to the top UNCONFIRMED shadow candidate below (solwhaletrending/
+    # low_score) so qsim can finally referee it. (Existing open vip positions still close out;
+    # the monitor reads open rows from the DB, not this gate. Reversible — just re-add the key.)
     # Widen 2026-07-24: the faithfully-testable POSITIVE lanes off the clean 14d shadow window
     # (post-07-11 fixes, so no phantom/June contamination). Both are the "early" variant —
     # early maps to a real ExitConfig (EXIT_A_PAPER); ride_vol positives are HELD because qsim
@@ -65,6 +69,11 @@ QSIM_LANES: dict[tuple[str, str, str], dict] = {
     #     07-12 +17.7, then 5 straight red days — expect qsim to gut it).
     ("solwhaletrending", "none", "none"):      {"days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}, "size": 0.05, "exit": "early"},
     ("solhousesignal",   "none", "low_score"): {"days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}, "size": 0.05, "exit": "early"},
+    # EDGE-SCAN candidate (2026-08-05): the biggest UNCONFIRMED shadow winner (+15.8/7d), on our
+    # best-performing channel, that qsim has never priced. All 7 days for day-cell discovery;
+    # early = EXIT_A_PAPER (ride_vol still held — qsim lacks order_flow). Higher volume than the
+    # others, so watch qsim logs for 429/backoff; if it starves the budget, gate to fewer days.
+    ("solwhaletrending", "none", "low_score"): {"days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}, "size": 0.05, "exit": "early"},
 }
 
 # variant string -> the SAME ExitConfig shadow/paper use (keep in sync with shadow_monitor).
