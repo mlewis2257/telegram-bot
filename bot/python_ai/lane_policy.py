@@ -387,15 +387,17 @@ def resolve(channel: Optional[str], vip_tier: Optional[str], category: Optional[
 # documentary — live's ACTUAL exit is the process-wide EXIT_STRATEGY=paper_a (kill any
 # exit_live_v2 dupe in .env or the qsim-vs-wallet compare is polluted).
 LIVE_LANES: dict[tuple[str, str, str], dict] = {
-    # RULE (2026-08-05): real money only where a REAL-QUOTE ruler (qsim or the live wallet) shows
-    # it's not a loser. Shadow can nominate a lane for qsim to test; it can NEVER justify spending.
-    #   * solwhaletrending/none      Tue — qsim +7.3% (n=14, weeks of data): SOLID.
-    #   * solwhaletrending/low_score Thu — qsim +7.5% (n=9, new lane): thin, ON PROBATION.
-    # HELD OUT: Mon solwhaletrending/low_score — shadow +36.8 but qsim has NO data on it yet (lane
-    #   added today). Shadow-only = not enough to risk money; let qsim price ~2 weeks of Mondays,
-    #   then decide. DROPPED solhousesignal/low_score: reprice -211% + qsim red every day = mirage.
-    ("solwhaletrending", "none", "none"):       {"days": {"Tue"}, "exit": EXIT_EARLY, "size": 0.05},
-    ("solwhaletrending", "none", "low_score"): {"days": {"Thu"}, "exit": EXIT_EARLY, "size": 0.05},
+    # FRAMEWORK (2026-08-05): the truth is BRACKETED  qsim(low) <= TRUTH <= shadow(high).
+    # qsim only proves a FLOOR (qsim>0 => certainly good); shadow only proves a CEILING (shadow<0
+    # => certainly dead). The qsim<0<shadow middle is UNKNOWN — only LIVE resolves it. So:
+    #   * CONFIRMED (qsim>0): solwhaletrending/none Tue (+7.3%), solwhaletrending/low_score Thu (+7.5%).
+    #   * UNKNOWN, live-test prioritized by shadow consistency + shallow floor:
+    #       solwhaletrending/low_score Mon — shadow +36.8 across 4/5 weeks (strong, reliable ceiling),
+    #       qsim no floor yet => top unknown to test. Bounded by 5-pos cap + 1 SOL/day breaker.
+    #   * DEAD (shadow<0 or reprice-damned): Friday (all lanes), solhousesignal/low_score (-211% reprice).
+    #   * Sunday is UNKNOWN-but-skip: ceiling flimsy (2/5 wks) + qsim floor -50% too deep to clear.
+    ("solwhaletrending", "none", "none"):       {"days": {"Tue"},        "exit": EXIT_EARLY, "size": 0.05},
+    ("solwhaletrending", "none", "low_score"): {"days": {"Mon", "Thu"}, "exit": EXIT_EARLY, "size": 0.05},
 }
 
 
