@@ -387,11 +387,15 @@ def resolve(channel: Optional[str], vip_tier: Optional[str], category: Optional[
 # documentary — live's ACTUAL exit is the process-wide EXIT_STRATEGY=paper_a (kill any
 # exit_live_v2 dupe in .env or the qsim-vs-wallet compare is polluted).
 LIVE_LANES: dict[tuple[str, str, str], dict] = {
-    # Calibration lanes pointed at the ONLY days that survived qsim's real-quote ruler
-    # (30d --qsim): low_score green on Mon (+6.0%), solwhaletrending green on Tue (+11.6%).
-    # Every other day was deep red on executable prices; prove these two, then widen.
-    ("solhousesignal",   "none", "low_score"): {"days": {"Mon"}, "exit": EXIT_EARLY, "size": 0.05},
-    ("solwhaletrending", "none", "none"):       {"days": {"Tue"}, "exit": EXIT_EARLY, "size": 0.05},
+    # Day×lane edge (2026-08-05) from the 3-ruler synthesis (shadow consistency + qsim + reprice):
+    #   * solwhaletrending/none    Tue       — qsim-confirmed +7.3% (real quotes), low volume.
+    #   * solwhaletrending/low_score Mon+Thu — Mon shadow +36.8 (4/5 wks), Thu qsim +7.5%. Higher
+    #     volume, but exposure is bounded by MAX_OPEN_LIVE_POSITIONS(5) + MAX_DAILY_LOSS_SOL(1.0).
+    # DROPPED solhousesignal/low_score: reprice -211% haircut + qsim negative every day = mirage.
+    # qsim is a FLOOR, not a gate (proven ~+27%/trade pessimistic vs the live wallet) — live is the
+    # referee on these marginal days. Cut any day the WALLET reds for 2-3 straight weeks.
+    ("solwhaletrending", "none", "none"):       {"days": {"Tue"},        "exit": EXIT_EARLY, "size": 0.05},
+    ("solwhaletrending", "none", "low_score"): {"days": {"Mon", "Thu"}, "exit": EXIT_EARLY, "size": 0.05},
 }
 
 
