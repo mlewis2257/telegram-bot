@@ -387,15 +387,15 @@ def resolve(channel: Optional[str], vip_tier: Optional[str], category: Optional[
 # documentary — live's ACTUAL exit is the process-wide EXIT_STRATEGY=paper_a (kill any
 # exit_live_v2 dupe in .env or the qsim-vs-wallet compare is polluted).
 LIVE_LANES: dict[tuple[str, str, str], dict] = {
-    # Day×lane edge (2026-08-05) from the 3-ruler synthesis (shadow consistency + qsim + reprice):
-    #   * solwhaletrending/none    Tue       — qsim-confirmed +7.3% (real quotes), low volume.
-    #   * solwhaletrending/low_score Mon+Thu — Mon shadow +36.8 (4/5 wks), Thu qsim +7.5%. Higher
-    #     volume, but exposure is bounded by MAX_OPEN_LIVE_POSITIONS(5) + MAX_DAILY_LOSS_SOL(1.0).
-    # DROPPED solhousesignal/low_score: reprice -211% haircut + qsim negative every day = mirage.
-    # qsim is a FLOOR, not a gate (proven ~+27%/trade pessimistic vs the live wallet) — live is the
-    # referee on these marginal days. Cut any day the WALLET reds for 2-3 straight weeks.
-    ("solwhaletrending", "none", "none"):       {"days": {"Tue"},        "exit": EXIT_EARLY, "size": 0.05},
-    ("solwhaletrending", "none", "low_score"): {"days": {"Mon", "Thu"}, "exit": EXIT_EARLY, "size": 0.05},
+    # RULE (2026-08-05): real money only where a REAL-QUOTE ruler (qsim or the live wallet) shows
+    # it's not a loser. Shadow can nominate a lane for qsim to test; it can NEVER justify spending.
+    #   * solwhaletrending/none      Tue — qsim +7.3% (n=14, weeks of data): SOLID.
+    #   * solwhaletrending/low_score Thu — qsim +7.5% (n=9, new lane): thin, ON PROBATION.
+    # HELD OUT: Mon solwhaletrending/low_score — shadow +36.8 but qsim has NO data on it yet (lane
+    #   added today). Shadow-only = not enough to risk money; let qsim price ~2 weeks of Mondays,
+    #   then decide. DROPPED solhousesignal/low_score: reprice -211% + qsim red every day = mirage.
+    ("solwhaletrending", "none", "none"):       {"days": {"Tue"}, "exit": EXIT_EARLY, "size": 0.05},
+    ("solwhaletrending", "none", "low_score"): {"days": {"Thu"}, "exit": EXIT_EARLY, "size": 0.05},
 }
 
 
