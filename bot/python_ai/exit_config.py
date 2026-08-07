@@ -226,15 +226,17 @@ EXIT_A_PAPER = ExitConfig(
         (1.6,  1.30),   # peaked 1.6x → exit if it falls back to 1.30x (~+30%)
         (1.35, 1.15),   # peaked 1.35x → exit if it falls back to 1.15x (~+15%)
     ),
-    profit_floor_channels=frozenset({"solhousesignal", "solhousesignal_vip"}),
+    # solwhaletrending added 2026-08-07: backtest (real tick paths, 30d) showed its unprotected
+    # faders — 46% of its losers peaked >=+20% then rode back to the -35% stop — gain +3.5-4
+    # pts/trade with this floor and win rate 28->45%, WITHOUT choking runners. Forward-validating
+    # on qsim real quotes; revert (drop it from this set) if the real-quote number disappoints.
+    profit_floor_channels=frozenset({"solhousesignal", "solhousesignal_vip", "solwhaletrending"}),
     max_hours=24.0,
 )
 
-# Test variant (2026-08-07): EXIT_A_PAPER with the SAME gain-protection floor turned ON for
-# solwhaletrending. That lane's faders pump +30-80% then ride all the way back to the -35% hard
-# stop with NO protection (it isn't in profit_floor_channels) — measured: 46% of its losers
-# peaked >=+20% first. This isolates the "protect solwhaletrending's green trades" hypothesis;
-# everything else is identical. Backtest/forward-test before enabling live.
+# A/B template. solwhaletrending was baked into EXIT_A_PAPER above (2026-08-07), so this is
+# currently IDENTICAL to it. Kept as the backtest lever for the NEXT idea: change the frozenset
+# below to a different channel to A/B "turn the profit-floor on for channel X" in backtest_lanes.
 from dataclasses import replace as _replace
 EXIT_A_FLOOR = _replace(
     EXIT_A_PAPER,
