@@ -230,6 +230,18 @@ EXIT_A_PAPER = ExitConfig(
     max_hours=24.0,
 )
 
+# Test variant (2026-08-07): EXIT_A_PAPER with the SAME gain-protection floor turned ON for
+# solwhaletrending. That lane's faders pump +30-80% then ride all the way back to the -35% hard
+# stop with NO protection (it isn't in profit_floor_channels) — measured: 46% of its losers
+# peaked >=+20% first. This isolates the "protect solwhaletrending's green trades" hypothesis;
+# everything else is identical. Backtest/forward-test before enabling live.
+from dataclasses import replace as _replace
+EXIT_A_FLOOR = _replace(
+    EXIT_A_PAPER,
+    name="exit_a_floor",
+    profit_floor_channels=EXIT_A_PAPER.profit_floor_channels | frozenset({"solwhaletrending"}),
+)
+
 # Paper Strategy B — conservative.
 # 3x TP caps most positions early. Profit floor protects accumulated gains on
 # solhousesignal by exiting if price retraces significantly from a peak.

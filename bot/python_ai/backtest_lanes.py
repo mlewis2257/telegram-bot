@@ -35,10 +35,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import db
 import peak_guard
-from exit_config import EXIT_A_PAPER, EXIT_RIDE, apply_exit_config
+from exit_config import EXIT_A_PAPER, EXIT_RIDE, EXIT_A_FLOOR, apply_exit_config
 
 NOTIONAL_SOL = 0.5
-VARIANTS = {"early": EXIT_A_PAPER, "ride": EXIT_RIDE}
+VARIANTS = {"early": EXIT_A_PAPER, "e_flr": EXIT_A_FLOOR, "ride": EXIT_RIDE}
 
 CALLS_QUERY = """
 SELECT DISTINCT
@@ -115,22 +115,22 @@ def main() -> None:
         chan = (c["channel"] or "").lstrip("@")
         for variant, cfg in VARIANTS.items():
             ex, pk, _ = simulate(variant, cfg, entry, mcaps, chan, is_gamble, cid)
-            agg[(c["vip_tier"], c["skip_reason"], variant)].append((ex, pk))
+            agg[(chan, c["skip_reason"], variant)].append((ex, pk))
 
     print(f"\nLane backtest — last {args.days}d  ({n_used} calls with usable ticks)\n")
     if not agg:
         print("  No lanes with tick data in window.\n")
         return
 
-    hdr = (f"{'tier':<11} {'skip_reason':<15} {'var':<6} {'n':>4} {'win%':>6} "
+    hdr = (f"{'channel':<14} {'lane':<11} {'var':<6} {'n':>4} {'win%':>6} "
            f"{'avg%':>7} {'total_sol':>10} {'avg_pk':>7} {'2x%':>5}")
     print(hdr)
     print("-" * len(hdr))
 
-    # group lanes together so early/ride sit adjacent
-    lanes = sorted({(t, s) for (t, s, _) in agg})
-    for (tier, skip) in lanes:
-        rows = [(v, agg.get((tier, skip, v), [])) for v in ("early", "ride")]
+    # group by channel×lane so early / e_flr / ride sit adjacent
+    lanes = sorted({(ch, s) for (ch, s, _) in agg})
+    for (chan_, skip) in lanes:
+        rows = [(v, agg.get((chan_, skip, v), [])) for v in ("early", "e_flr", "ride")]
         if max(len(r) for _, r in rows) < args.min:
             continue
         for variant, data in rows:
@@ -142,13 +142,14 @@ def main() -> None:
             total_sol = sum(NOTIONAL_SOL * (ex - 1.0) for ex, _ in data)
             avg_pk = sum(pk for _, pk in data) / n
             pct_2x = sum(1 for _, pk in data if pk >= 2.0) / n * 100
-            print(f"{tier[:11]:<11} {skip[:15]:<15} {variant:<6} {n:>4} "
+            print(f"{chan_[:14]:<14} {skip[:11]:<11} {variant:<6} {n:>4} "
                   f"{round(100*wins/n):>6} {round(avg_pct,1):>7} {round(total_sol,3):>10} "
                   f"{round(avg_pk,2):>7} {round(pct_2x):>5}")
         print()
 
-    print("Read it per lane: does 'ride' beat 'early' on total_sol? (it should show a bigger")
-    print("avg_pk and — if the thesis holds — higher total_sol despite a lower win rate.)")
+    print("Read per channel×lane: does 'e_flr' beat 'early' on total_sol / avg%? e_flr = same exit")
+    print("but with the profit-floor turned ON for solwhaletrending. If it lifts total_sol without")
+    print("gutting avg_pk (i.e. it protects faders without choking runners), enabling the floor helps.")
     print("Caveat: short history, ticks capped at what we logged — directional only.\n")
 
 
