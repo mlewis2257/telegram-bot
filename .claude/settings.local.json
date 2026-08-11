@@ -10,7 +10,8 @@
       "Bash(python3 -c ' *)",
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('ws_monitor.py'\\).read\\(\\)\\); print\\('ws_monitor.py OK'\\)\")",
       "Bash(python3 -c 'import ast; ast.parse\\(open\\('\\\\''__TRACKED_VAR__'\\\\''\\).read\\(\\)\\); print\\('\\\\''__TRACKED_VAR__ OK'\\\\''\\)')",
-      "Bash(grep -oE \"[\\\\\"'][a-z_]+[\\\\\"']$\")"
+      "Bash(grep -oE \"[\\\\\"'][a-z_]+[\\\\\"']$\")",
+      "Bash(python3 -m py_compile jupiter.py)"
     ]
   }
 }

@@ -85,14 +85,157 @@ def simulate(variant: str, cfg, entry: float, mcaps: list[float], channel: str, 
     return mcaps[-1] / entry, peak / entry, "open_end"
 
 
+# ── scale-into-strength (the "filter during the trade, not at entry" test) ──────
+# You can't tell the monster from the rug at second zero (AUC ~0.60), but monsters
+# take a median ~18 min to run, so information accrues AFTER entry. This tests:
+# enter a small base on every call, then ADD size to the coins that show early
+# strength (up >= threshold within a window). If concentrating capital into
+# developing strength lifts edge/SOL over flat entry, the filter works.
+OBS_QUERY_T = """
+SELECT mcap, observed_at
+FROM ws_market_observations
+WHERE call_id = %s AND mcap IS NOT NULL AND mcap > 0
+ORDER BY observed_at
+"""
+
+
+def _find_exit(cfg, entry, ticks, channel, is_gamble, cid):
+    """Walk the tick path with the real exit logic. -> (exit_mcap, reason, t_exit_secs)."""
+    key = f"si:{cid}"
+    peak_guard.clear(key)
+    peak = 0.0
+    for cur, t in ticks:
+        peak = peak_guard.guard_peak(key, cur, peak)
+        res = apply_exit_config(
+            cfg, current_mcap=cur, peak_mcap=peak, entry_mcap=entry,
+            is_vip_gamble=is_gamble, channel_handle=channel, entry_time=None,
+        )
+        if res.should_exit:
+            peak_guard.clear(key)
+            return (res.exit_mcap or cur), res.reason, t
+    peak_guard.clear(key)
+    return ticks[-1][0], "open_end", ticks[-1][1]
+
+
+def _find_add(entry, ticks, threshold, window_s, t_exit):
+    """First tick within the window (and before exit) where the coin is up >= threshold.
+    Returns the mcap you'd add at, or None if strength never showed in time."""
+    for cur, t in ticks:
+        if t > window_s or t >= t_exit:
+            break
+        if cur / entry - 1.0 >= threshold:
+            return cur
+    return None
+
+
+def run_scalein(conn, args) -> None:
+    thresholds = [float(x) for x in args.thresholds.split(",")]
+    cfg = EXIT_A_FLOOR if args.exit == "e_flr" else EXIT_A_PAPER
+    base_n = args.base_frac * NOTIONAL_SOL   # SOL deployed at entry, always
+    add_n = args.add_frac * NOTIONAL_SOL     # SOL added when strength triggers
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(CALLS_QUERY, (args.days,))
+        calls = cur.fetchall()
+
+    # Compute each call's exit ONCE (exit is threshold-independent); keep the tick
+    # path so we can locate the add point per threshold without re-walking exits.
+    lane_calls: dict[tuple, list] = defaultdict(list)
+    n_used = 0
+    for c in calls:
+        cid = c["call_id"]
+        with conn.cursor() as cur:
+            cur.execute(OBS_QUERY_T, (cid,))
+            rows = cur.fetchall()
+        if len(rows) < 3:
+            continue
+        t0 = rows[0][1]
+        ticks = [(float(m), (ts - t0).total_seconds()) for m, ts in rows]
+        entry = ticks[0][0]
+        if entry <= 0:
+            continue
+        n_used += 1
+        chan = (c["channel"] or "").lstrip("@")
+        is_gamble = c["vip_tier"] in ("gamble", "gamble_risk")
+        exit_mcap, _reason, t_exit = _find_exit(cfg, entry, ticks, chan, is_gamble, cid)
+        lane_calls[(chan, c["skip_reason"])].append(
+            {"entry": entry, "exit_mcap": exit_mcap, "t_exit": t_exit, "ticks": ticks}
+        )
+
+    trig = args.base_frac + args.add_frac
+    print(f"\nScale-into-strength backtest — last {args.days}d  ({n_used} calls with usable ticks)")
+    print(f"exit={args.exit}  add-window={args.add_window:g}s  base={args.base_frac:g}x  add={args.add_frac:g}x")
+    print(f"  → a strong trade deploys {trig:g}x, a weak trade {args.base_frac:g}x (1x = {NOTIONAL_SOL:g} SOL)\n")
+
+    hdr = (f"{'channel':<14} {'lane':<11} {'mode':<9} {'n':>4} {'%add':>5} "
+           f"{'tot_sol':>9} {'edge/SOL':>9} {'win%':>5}")
+    print(hdr)
+    print("-" * len(hdr))
+
+    for (chan_, skip) in sorted(lane_calls):
+        rows = lane_calls[(chan_, skip)]
+        n = len(rows)
+        if n < args.min:
+            continue
+        # flat baseline: full notional at entry on every call
+        f_pnl = sum(NOTIONAL_SOL * (r["exit_mcap"] / r["entry"] - 1.0) for r in rows)
+        f_inv = NOTIONAL_SOL * n
+        f_win = sum(1 for r in rows if r["exit_mcap"] > r["entry"])
+        print(f"{chan_[:14]:<14} {skip[:11]:<11} {'flat':<9} {n:>4} {'--':>5} "
+              f"{round(f_pnl,3):>9} {round(f_pnl/f_inv,4):>9} {round(100*f_win/n):>5}")
+        for thr in thresholds:
+            s_pnl = s_inv = 0.0
+            s_win = n_add = 0
+            for r in rows:
+                mult = r["exit_mcap"] / r["entry"]
+                pnl = base_n * (mult - 1.0)
+                inv = base_n
+                add_mcap = _find_add(r["entry"], r["ticks"], thr, args.add_window, r["t_exit"])
+                if add_mcap:
+                    n_add += 1
+                    pnl += add_n * (r["exit_mcap"] / add_mcap - 1.0)
+                    inv += add_n
+                s_pnl += pnl
+                s_inv += inv
+                if pnl > 0:
+                    s_win += 1
+            tag = f"+{int(thr*100)}%"
+            print(f"{'':<14} {'':<11} {tag:<9} {n:>4} {round(100*n_add/n):>5} "
+                  f"{round(s_pnl,3):>9} {round(s_pnl/s_inv,4):>9} {round(100*s_win/n):>5}")
+        print()
+
+    print("Read: does any '+X%' row beat 'flat' on edge/SOL (return per SOL deployed)?")
+    print("edge/SOL is the fair metric — it normalizes for the extra capital scale-in commits.")
+    print("If scale-in's edge/SOL <= flat, adding into strength does NOT help: 'early strength'")
+    print("is still a coin flip and you paid more to learn it. %add = how often the trigger fired.")
+    print("Caveat: exit anchored on original entry; ticks capped at what we logged — directional.\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=3)
     ap.add_argument("--min", type=int, default=5, help="min calls per lane to display")
+    ap.add_argument("--scalein", action="store_true",
+                    help="run the scale-into-strength comparison instead of the exit-variant table")
+    ap.add_argument("--exit", choices=["early", "e_flr"], default="early",
+                    help="exit config for the scale-in test (default: early = EXIT_A_PAPER)")
+    ap.add_argument("--add-window", type=float, default=300.0, dest="add_window",
+                    help="seconds: only add if strength shows within this window (default 300)")
+    ap.add_argument("--base-frac", type=float, default=0.5, dest="base_frac",
+                    help="base position deployed at entry, in units of full notional (default 0.5)")
+    ap.add_argument("--add-frac", type=float, default=1.0, dest="add_frac",
+                    help="size added when strength triggers, in units of full notional (default 1.0)")
+    ap.add_argument("--thresholds", default="0.10,0.20,0.35,0.50",
+                    help="comma list of add triggers as fractional gains (default 0.10,0.20,0.35,0.50)")
     args = ap.parse_args()
 
     conn = db.get_conn()
     db.safe_rollback()
+
+    if args.scalein:
+        run_scalein(conn, args)
+        return
+
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(CALLS_QUERY, (args.days,))
         calls = cur.fetchall()
