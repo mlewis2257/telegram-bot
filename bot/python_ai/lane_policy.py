@@ -387,17 +387,27 @@ def resolve(channel: Optional[str], vip_tier: Optional[str], category: Optional[
 # documentary — live's ACTUAL exit is the process-wide EXIT_STRATEGY=paper_a (kill any
 # exit_live_v2 dupe in .env or the qsim-vs-wallet compare is polluted).
 LIVE_LANES: dict[tuple[str, str, str], dict] = {
-    # FRAMEWORK (2026-08-05): the truth is BRACKETED  qsim(low) <= TRUTH <= shadow(high).
-    # qsim only proves a FLOOR (qsim>0 => certainly good); shadow only proves a CEILING (shadow<0
-    # => certainly dead). The qsim<0<shadow middle is UNKNOWN — only LIVE resolves it. So:
-    #   * CONFIRMED (qsim>0): solwhaletrending/none Tue (+7.3%), solwhaletrending/low_score Thu (+7.5%).
-    #   * UNKNOWN, live-test prioritized by shadow consistency + shallow floor:
-    #       solwhaletrending/low_score Mon — shadow +36.8 across 4/5 weeks (strong, reliable ceiling),
-    #       qsim no floor yet => top unknown to test. Bounded by 5-pos cap + 1 SOL/day breaker.
-    #   * DEAD (shadow<0 or reprice-damned): Friday (all lanes), solhousesignal/low_score (-211% reprice).
-    #   * Sunday is UNKNOWN-but-skip: ceiling flimsy (2/5 wks) + qsim floor -50% too deep to clear.
-    ("solwhaletrending", "none", "none"):       {"days": {"Tue"},        "exit": EXIT_EARLY, "size": 0.05},
-    ("solwhaletrending", "none", "low_score"): {"days": {"Mon", "Thu"}, "exit": EXIT_EARLY, "size": 0.05},
+    # LIVE EXECUTION TEST (2026-08-15): resolve the ONE question the sims can't — does live's
+    # real execution CAPTURE the fast spikes qsim is blind to? (DONALD ripped 6x in a single 30s
+    # candle qsim's sampling missed and booked -99.7%; ALING peaked 4.32x then rugged to -98.7%.
+    # On those coins, exit SPEED is the whole difference between +0.15 and a near-total loss.)
+    #
+    # ONE lane, ALL 7 DAYS, no day-gate. Day-of-week is NOISE — proven repeatedly: the "good day"
+    # reshuffles every window (shadow-28d says Mon is best +39.7; qsim-14d says Mon is worst -0.99;
+    # Fridays are green here 3/4, not "bad"). Gating days would just re-import that mirage and, on
+    # a short budget, let one cherry-picked day decide the whole result. So we trade every day and
+    # let monster arrival fall where it falls. "Sun" is listed explicitly to opt past the global
+    # Sunday skip. solwhaletrending/none left OUT for now — thinner; add once low_score proves out.
+    #
+    # Guardrails live in .env (NOT here): LIVE_LANE_STRATEGY=LIVE (use this allowlist, not the wide
+    # A bench), MAX_TOTAL_LOSS_SOL=0.35 net since LIVE_PNL_SINCE, MAX_DAILY_LOSS_SOL=0 (no daily
+    # stop), MAX_OPEN_LIVE_POSITIONS=3, EXIT_STRATEGY=paper_a (EXIT_A_PAPER: early + profit_floor,
+    # now enabled for solwhaletrending). "exit"/"size" below are the lane defaults; process-wide
+    # EXIT_STRATEGY is the real exit — keep any exit_live_v2 out of .env.
+    ("solwhaletrending", "none", "low_score"): {
+        "days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"},
+        "exit": EXIT_EARLY, "size": 0.05,
+    },
 }
 
 
