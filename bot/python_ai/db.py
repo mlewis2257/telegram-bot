@@ -2578,6 +2578,31 @@ def get_today_live_losses() -> float:
         return float(cur.fetchone()[0])
 
 
+def get_live_net_loss_since(since) -> float:
+    """
+    Net loss (SOL) on closed live positions with exit_time >= `since`.
+    Returns a positive number only when net-negative over that window; 0 otherwise.
+    Winners offset losers, exactly like get_today_live_losses — so the total-loss
+    breaker trips on real drawdown, not gross losses. Scoping to `since` keeps the
+    running total from counting pre-test history (e.g. the old contaminated trades),
+    so it reflects only the current test window's realized P&L.
+    """
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT GREATEST(0, COALESCE(-SUM(pnl_sol), 0))
+            FROM trading_positions
+            WHERE is_simulation = FALSE
+              AND status        = 'closed'
+              AND exit_time     >= %s::timestamptz
+            """,
+            (since,),
+        )
+        return float(cur.fetchone()[0])
+
+
 def get_live_pnl_summary() -> dict:
     """Aggregate P&L stats for all closed live positions."""
     conn = get_conn()

@@ -120,6 +120,18 @@ def _max_daily_loss() -> float:
     return float(os.getenv("MAX_DAILY_LOSS_SOL", "1.0"))
 
 
+def _max_total_loss() -> float:
+    # Cumulative net-loss kill across the whole test window. 0/unset = disabled.
+    return float(os.getenv("MAX_TOTAL_LOSS_SOL", "0") or "0")
+
+
+def _pnl_since() -> str:
+    # Count realized P&L only from this timestamp onward, so the total breaker
+    # ignores pre-test history (the old contaminated live trades). Set to the test
+    # start date, e.g. LIVE_PNL_SINCE=2026-08-13. Unset = beginning of time.
+    return os.getenv("LIVE_PNL_SINCE", "").strip() or "1970-01-01"
+
+
 # ── Lane-policy entry gate ──────────────────────────────────────────────────────
 # When ON (default), live opens ONLY lanes that lane_policy.resolve() approves for the
 # configured testbed strategy — so live mirrors the SAME refined Strategy A you tune in
@@ -165,24 +177,25 @@ def _rpc_url() -> str:
 
 # ── Circuit breaker ────────────────────────────────────────────────────────────
 
-async def _trip_circuit_breaker(today_losses: float) -> None:
+async def _trip_circuit_breaker(loss: float, limit: float, kind: str = "daily") -> None:
     global _circuit_broken
     _circuit_broken = True
     _STATE_DIR.mkdir(exist_ok=True)
     _CIRCUIT_FLAG_FILE.write_text(
         f"tripped={datetime.now(timezone.utc).isoformat()}\n"
-        f"today_losses={today_losses:.4f} SOL\n"
-        f"limit={_max_daily_loss():.4f} SOL\n"
+        f"kind={kind}\n"
+        f"net_loss={loss:.4f} SOL\n"
+        f"limit={limit:.4f} SOL\n"
     )
     print(
-        f"[live] ⛔ CIRCUIT BREAKER TRIPPED"
-        f"  today_losses={today_losses:.4f} SOL  limit={_max_daily_loss():.4f} SOL"
+        f"[live] ⛔ CIRCUIT BREAKER TRIPPED ({kind})"
+        f"  net_loss={loss:.4f} SOL  limit={limit:.4f} SOL"
     )
     try:
         msg = (
-            f"🛑 <b>LIVE TRADING HALTED — circuit breaker triggered</b>\n"
-            f"Today's losses: {today_losses:.3f} SOL\n"
-            f"Limit:          {_max_daily_loss():.3f} SOL\n\n"
+            f"🛑 <b>LIVE TRADING HALTED — {kind} circuit breaker</b>\n"
+            f"Net loss: {loss:.3f} SOL\n"
+            f"Limit:    {limit:.3f} SOL\n\n"
             f"To re-enable: delete <code>{_CIRCUIT_FLAG_FILE}</code> and restart."
         )
         await alert_bot._get_bot().send_message(
@@ -236,11 +249,23 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             )
             return False
 
-        # ── Guard 4: daily loss circuit check ──────────────────────────────────
-        today_losses = db.get_today_live_losses()
-        if today_losses > _max_daily_loss():
-            await _trip_circuit_breaker(today_losses)
-            return False
+        # ── Guard 4: loss circuit breakers (net P&L — winners offset losers) ───
+        # Daily breaker: disabled when MAX_DAILY_LOSS_SOL <= 0.
+        max_daily = _max_daily_loss()
+        if max_daily > 0:
+            today_losses = db.get_today_live_losses()
+            if today_losses > max_daily:
+                await _trip_circuit_breaker(today_losses, max_daily, "daily")
+                return False
+
+        # Total breaker: cumulative net loss since LIVE_PNL_SINCE (the test start),
+        # so it ignores pre-test history. Disabled when MAX_TOTAL_LOSS_SOL <= 0.
+        max_total = _max_total_loss()
+        if max_total > 0:
+            total_losses = db.get_live_net_loss_since(_pnl_since())
+            if total_losses > max_total:
+                await _trip_circuit_breaker(total_losses, max_total, "total")
+                return False
 
         # ── Guard 5: duplicate position ────────────────────────────────────────
         if not call_id or not mint:
