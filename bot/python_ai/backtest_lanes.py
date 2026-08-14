@@ -28,6 +28,7 @@ import argparse
 import os
 import sys
 from collections import defaultdict
+from dataclasses import replace as _replace
 
 from psycopg2.extras import RealDictCursor
 
@@ -211,6 +212,77 @@ def run_scalein(conn, args) -> None:
     print("Caveat: exit anchored on original entry; ticks capped at what we logged — directional.\n")
 
 
+def run_hardstop_sweep(conn, args) -> None:
+    """Sweep hard_stop_pct on EXIT_A_PAPER (the live 'early' exit) over the real tick
+    paths. Isolates the hard-stop lever: profit-floor and trail stay fixed, only the
+    -X% stop moves. Feed-basis replay, so read it as a RELATIVE compare across stops."""
+    hs_values = [float(x) for x in args.hard_stop.split(",")]
+    variants = [(f"-{int(hs*100)}%", _replace(EXIT_A_PAPER, hard_stop_pct=hs)) for hs in hs_values]
+    chan_filter = (args.channel or "").lstrip("@").lower() or None
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(CALLS_QUERY, (args.days,))
+        calls = cur.fetchall()
+
+    agg: dict[tuple, list] = defaultdict(list)
+    n_used = 0
+    for c in calls:
+        chan = (c["channel"] or "").lstrip("@")
+        if chan_filter and chan.lower() != chan_filter:
+            continue
+        cid = c["call_id"]
+        with conn.cursor() as cur:
+            cur.execute(OBS_QUERY, (cid,))
+            mcaps = [float(r[0]) for r in cur.fetchall()]
+        if len(mcaps) < 3:
+            continue
+        entry = mcaps[0]
+        if entry <= 0:
+            continue
+        n_used += 1
+        is_gamble = c["vip_tier"] in ("gamble", "gamble_risk")
+        for label, cfg in variants:
+            ex, pk, _ = simulate(f"hs{label}", cfg, entry, mcaps, chan, is_gamble, cid)
+            agg[(chan, c["skip_reason"], label)].append((ex, pk))
+
+    scope = f" [channel={chan_filter}]" if chan_filter else ""
+    print(f"\nHard-stop sweep on EXIT_A_PAPER — last {args.days}d{scope}  ({n_used} calls with usable ticks)")
+    print("Only hard_stop_pct varies; profit-floor + trail held fixed. Feed-basis = RELATIVE compare.\n")
+    if not agg:
+        print("  No lanes with tick data in window.\n")
+        return
+
+    hdr = (f"{'channel':<14} {'lane':<11} {'stop':<6} {'n':>4} {'win%':>6} "
+           f"{'avg%':>7} {'total_sol':>10} {'avg_pk':>7} {'2x%':>5}")
+    print(hdr)
+    print("-" * len(hdr))
+
+    labels = [lab for lab, _ in variants]
+    lanes = sorted({(ch, s) for (ch, s, _) in agg})
+    for (chan_, skip) in lanes:
+        rows = [(lab, agg.get((chan_, skip, lab), [])) for lab in labels]
+        if max(len(r) for _, r in rows) < args.min:
+            continue
+        for label, data in rows:
+            if not data:
+                continue
+            n = len(data)
+            wins = sum(1 for ex, _ in data if ex > 1.0)
+            avg_pct = sum((ex - 1.0) for ex, _ in data) / n * 100
+            total_sol = sum(NOTIONAL_SOL * (ex - 1.0) for ex, _ in data)
+            avg_pk = sum(pk for _, pk in data) / n
+            pct_2x = sum(1 for _, pk in data if pk >= 2.0) / n * 100
+            print(f"{chan_[:14]:<14} {skip[:11]:<11} {label:<6} {n:>4} "
+                  f"{round(100*wins/n):>6} {round(avg_pct,1):>7} {round(total_sol,3):>10} "
+                  f"{round(avg_pk,2):>7} {round(pct_2x):>5}")
+        print()
+
+    print("Read: which stop gives the most total_sol? A TIGHTER stop (-25%) cuts each dud's cost but")
+    print("stops out coins that dip THEN run — so watch avg_pk / 2x% across the rows: if they hold, the")
+    print("tighter stop isn't choking runners; if they collapse, it is. Best = most total_sol, 2x% intact.")
+    print("Caveat: feed-basis entry (under-records real fill), ticks capped at logged obs — relative only.\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=3)
@@ -227,6 +299,10 @@ def main() -> None:
                     help="size added when strength triggers, in units of full notional (default 1.0)")
     ap.add_argument("--thresholds", default="0.10,0.20,0.35,0.50",
                     help="comma list of add triggers as fractional gains (default 0.10,0.20,0.35,0.50)")
+    ap.add_argument("--hard-stop", dest="hard_stop", default=None,
+                    help="comma list of hard_stop_pct to sweep on EXIT_A_PAPER, e.g. 0.20,0.25,0.30,0.35,0.40")
+    ap.add_argument("--channel", default=None,
+                    help="restrict the sweep to one channel handle (e.g. solwhaletrending)")
     args = ap.parse_args()
 
     conn = db.get_conn()
@@ -234,6 +310,9 @@ def main() -> None:
 
     if args.scalein:
         run_scalein(conn, args)
+        return
+    if args.hard_stop:
+        run_hardstop_sweep(conn, args)
         return
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
