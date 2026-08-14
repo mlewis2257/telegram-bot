@@ -43,6 +43,7 @@ from paper_trader import (
     HARD_STOP_PCT,
     MAX_HOURS,
 )
+from dataclasses import replace as _replace
 from exit_config import ExitConfig, ExitResult, apply_exit_config, get_exit_config, EXIT_LIVE_V2
 from strategy_config import STRATEGY_A_V2026_05_22
 from strategy_engine import StrategyCallContext, evaluate_strategy_a_entry
@@ -62,6 +63,25 @@ try:
         print(f"[live] exit strategy: {_LIVE_EXIT_CONFIG.name} (default)")
 except ValueError as _e:
     print(f"[live] WARNING: invalid EXIT_STRATEGY env — {_e}. Using {_LIVE_EXIT_CONFIG.name}.")
+
+# LIVE-ONLY hard-stop override. Backtest (30d real ticks, solwhaletrending) showed a
+# -20% stop strictly beats the -35% default: identical runner capture (2x% flat at its
+# max) with ~10% less dud bleed; tighter than ~-18% starts choking runners. Applied via
+# replace() on the frozen config, so it copies _LIVE_EXIT_CONFIG and leaves paper-A's
+# EXIT_A_PAPER constant untouched. Blank/unset keeps the config's own stop. Reverting =
+# clear LIVE_HARD_STOP_PCT and restart.
+_hs_env = os.getenv("LIVE_HARD_STOP_PCT", "").strip()
+if _hs_env:
+    try:
+        _hs = float(_hs_env)
+        if 0.0 < _hs < 1.0:
+            _prev = _LIVE_EXIT_CONFIG.hard_stop_pct
+            _LIVE_EXIT_CONFIG = _replace(_LIVE_EXIT_CONFIG, hard_stop_pct=_hs)
+            print(f"[live] hard_stop override: -{_hs*100:.0f}% (was -{_prev*100:.0f}%)")
+        else:
+            print(f"[live] WARNING: LIVE_HARD_STOP_PCT={_hs_env} out of (0,1) — ignored")
+    except ValueError:
+        print(f"[live] WARNING: LIVE_HARD_STOP_PCT={_hs_env} not a number — ignored")
 
 # ── In-flight mint guard (prevents race-condition duplicate buys) ──────────────
 
