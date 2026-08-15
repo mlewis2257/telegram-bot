@@ -2479,6 +2479,65 @@ def get_recent_ws_market_observation_counts(hours: int = 24) -> list[dict]:
         return cur.fetchall()
 
 
+def ensure_manual_exit_calls_table() -> None:
+    """Log of the operator's real-time 'I'd sell here' calls, for scoring the human exit
+    read against the mechanical rules. App-owned table, self-creates."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS manual_exit_calls (
+                id             BIGSERIAL PRIMARY KEY,
+                symbol         TEXT NOT NULL,
+                note           TEXT,
+                called_at      TIMESTAMPTZ NOT NULL,
+                call_id        BIGINT,
+                matched_symbol TEXT,
+                raw_text       TEXT,
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        conn.commit()
+
+
+def find_open_position_by_symbol(symbol: str) -> dict | None:
+    """Most recent OPEN position (paper or live) whose token symbol matches — best-effort
+    tie of a logged exit call to a live position at log time."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT tp.call_id, tk.symbol, tp.entry_time, tp.is_simulation
+            FROM trading_positions tp
+            JOIN tokens tk ON tk.id = tp.token_id
+            WHERE tp.status = 'open' AND tk.symbol ILIKE %s
+            ORDER BY tp.entry_time DESC
+            LIMIT 1
+            """,
+            (symbol,),
+        )
+        return cur.fetchone()
+
+
+def insert_manual_exit_call(*, symbol, note, called_at, call_id,
+                            matched_symbol, raw_text) -> None:
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO manual_exit_calls
+                (symbol, note, called_at, call_id, matched_symbol, raw_text)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (symbol, note, called_at, call_id, matched_symbol, raw_text),
+        )
+        conn.commit()
+
+
 def close_live_position_db(
     call_id: int,
     exit_price: float,

@@ -992,6 +992,51 @@ def handle_vip(message, caller_id: int, channel_id: int | None) -> tuple:
     return 'noise', None, None
 
 
+# ── Exit-log channel ──────────────────────────────────────────────────────────
+
+_exit_log_ready = False
+
+
+async def _handle_exit_log(msg) -> None:
+    """Operator posts a ticker (+ optional note) the moment they'd manually sell. We
+    stamp the message time as their exit call and tie it to an open position if one
+    matches. No parsing pipeline, no trading — pure measurement of the human read."""
+    global _exit_log_ready
+    if not _exit_log_ready:
+        try:
+            db.ensure_manual_exit_calls_table()
+            _exit_log_ready = True
+        except Exception as e:
+            print(f"[exit_log] table ensure failed: {e}")
+
+    text = (msg.text or "").strip()
+    if not text:
+        return
+    parts = text.split()
+    symbol = parts[0].lstrip("$").strip(".,!?").upper()
+    if not symbol:
+        return
+    note = " ".join(parts[1:]).strip() or None
+    called_at = msg.date                      # telethon: UTC-aware datetime of the post
+
+    pos = None
+    try:
+        pos = db.find_open_position_by_symbol(symbol)
+    except Exception as e:
+        print(f"[exit_log] position lookup failed for {symbol}: {e}")
+    try:
+        db.insert_manual_exit_call(
+            symbol=symbol, note=note, called_at=called_at,
+            call_id=(pos or {}).get("call_id"),
+            matched_symbol=(pos or {}).get("symbol"),
+            raw_text=text,
+        )
+        tag = f"matched call_id={pos['call_id']}" if pos else "no open position"
+        print(f"[exit_log] {symbol} @ {called_at.isoformat()} ({tag})")
+    except Exception as e:
+        print(f"[exit_log] insert failed for {symbol}: {e}")
+
+
 # ── Catchup ───────────────────────────────────────────────────────────────────
 
 def _catchup(client, entity, channel_cfg: dict, caller_id: int) -> int:
@@ -1122,7 +1167,11 @@ def run_listener() -> None:
             name=getattr(entity, "title", tg_handle),
         )
 
-        highest_id = _catchup(client, entity, channel_cfg, caller_id)
+        # Don't replay history for the exit-log channel — we only want live "sell now"
+        # posts, not a re-log of old tickers on every restart.
+        highest_id = 0
+        if channel_cfg.get("channel_type") != "exit_log":
+            highest_id = _catchup(client, entity, channel_cfg, caller_id)
 
         if highest_id:
             _write_last_message_id(tg_handle, highest_id)
@@ -1190,6 +1239,15 @@ def run_listener() -> None:
         cfg      = info["cfg"]
         handle   = info["handle"]
         msg      = event.message
+
+        # Exit-log channel: operator's manual "sell here" ticker. Record + return; never
+        # runs the call-parsing pipeline (a bare ticker wouldn't pass is_candidate anyway).
+        if cfg.get("channel_type") == "exit_log":
+            try:
+                await _handle_exit_log(msg)
+            except Exception as e:
+                print(f"[exit_log] handler error: {e}")
+            return
 
         if not msg.text or not is_candidate(msg.text):
             return
