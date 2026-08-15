@@ -284,6 +284,66 @@ async def _run_all(days: int, window: int, max_sigs: int):
     print("runner, it's a real (narrow) dump-exit. If duds/runners spike too, it isn't.\n")
 
 
+async def _run_ath(days: int, max_sigs: int):
+    """Entry-quality test: for every live trade, reconstruct the coin's swap price for
+    30 min BEFORE we bought, and measure how close to its pre-entry high we entered.
+    ath_frac ~1.0 = bought at the local top; pre_run = how far it had already pumped.
+    The question: do near-top entries (high ath_frac after a big pre_run) dump?"""
+    PRE = 1800
+    conn = db.get_conn(); db.safe_rollback()
+    mint_col = _mint_col(conn)
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT tp.call_id, tk.symbol, tk.{mint_col}, tp.entry_time, tp.exit_time,
+                   tp.real_peak_mcap, tp.entry_price_fill, tp.pnl_pct, tp.exit_reason
+            FROM trading_positions tp JOIN tokens tk ON tk.id = tp.token_id
+            WHERE tp.is_simulation = FALSE AND tp.status = 'closed'
+              AND tp.exit_time IS NOT NULL
+              AND tp.entry_time >= now() - (%s || ' days')::interval
+            ORDER BY tp.exit_time
+        """, (days,))
+        rows = cur.fetchall()
+
+    def _px(s):
+        return (s["sol_size"] / s["token_amount"]) if s.get("token_amount") else None
+
+    results = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        for call_id, sym, mint, entry_t, exit_t, rpeak, efill, pnl, reason in rows:
+            entry_dt = entry_t if entry_t.tzinfo else entry_t.replace(tzinfo=timezone.utc)
+            exit_dt = exit_t if exit_t.tzinfo else exit_t.replace(tzinfo=timezone.utc)
+            ent = int(entry_dt.timestamp())
+            seed = _seed_sig(conn, call_id, exit_dt)
+            sigs = await _signatures(client, mint, ent - PRE - 30, int(exit_dt.timestamp()),
+                                     max_sigs, before=seed)
+            swaps = await _all_swaps(client, mint, sigs)
+            pre = [p for p in (_px(s) for s in swaps if ent - PRE <= s["ts"] < ent) if p]
+            at_entry = [p for p in (_px(s) for s in swaps if abs(s["ts"] - ent) <= 30) if p]
+            pnl_f = float(pnl) if pnl is not None else None
+            peak_x = (float(rpeak) / float(efill)) if (rpeak and efill) else None
+            if not pre or not at_entry:
+                results.append((sym, None, None, len(pre), peak_x, pnl_f, reason)); continue
+            e = statistics.median(at_entry)
+            ath_frac = e / max(pre) if max(pre) else None
+            pre_run = (max(pre) / min(pre)) if min(pre) else None
+            results.append((sym, ath_frac, pre_run, len(pre), peak_x, pnl_f, reason))
+
+    print(f"\nEntry-vs-ATH probe — {len(results)} live trades, last {days}d.")
+    print("ath_frac = entry price / pre-entry high (~1.0 = bought the local top).")
+    print("pre_run  = how far it pumped in the 30min before we bought.  (bought-top at top)\n")
+    print(f"  {'ath_frac':>8} {'pre_run':>7} {'npre':>5} {'peak_x':>6} {'pnl%':>6}  symbol / reason")
+    print("  " + "-" * 62)
+    for sym, af, pr, npre, peak_x, pnl, reason in sorted(results, key=lambda r: -(r[1] or -1)):
+        afs = f"{af:.2f}" if af else "-"
+        prs = f"{pr:.1f}" if pr else "-"
+        px = f"{peak_x:.2f}" if peak_x else "-"
+        ps = f"{pnl:+.0f}" if pnl is not None else "-"
+        print(f"  {afs:>8} {prs:>7} {npre:>5} {px:>6} {ps:>6}  {sym[:16]} / {reason}")
+    print("\nRead: do the BOUGHT-THE-TOP trades (ath_frac near 1.0, big pre_run) cluster as")
+    print("losers (low peak_x, big -pnl)? If entering near the pre-entry high reliably dumps,")
+    print("an 'ATH proximity' entry gate is real. If winners are up there too, it isn't.\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("symbols", nargs="*", help="token symbols, e.g. Shadow Bros Cupsey")
@@ -296,7 +356,12 @@ def main():
                     help="batch mode: buy:sell ratio for EVERY live trade in the last DAYS")
     ap.add_argument("--window", type=int, default=60,
                     help="pre-exit window (secs) for the batch ratio (default 60)")
+    ap.add_argument("--ath", type=int, default=None, metavar="DAYS",
+                    help="entry-vs-ATH probe: how close to the pre-entry high each trade bought")
     args = ap.parse_args()
+    if args.ath is not None:
+        asyncio.run(_run_ath(args.ath, args.max_sigs))
+        return
     if args.all is not None:
         asyncio.run(_run_all(args.all, args.window, args.max_sigs))
         return
