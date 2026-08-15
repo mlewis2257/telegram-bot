@@ -23,7 +23,7 @@ import asyncio
 import os
 import sys
 from collections import defaultdict
-from datetime import timezone
+from datetime import timezone, timedelta
 
 import httpx
 
@@ -55,10 +55,13 @@ async def _rpc(client: httpx.AsyncClient, method: str, params: list, tries: int 
     return None
 
 
-async def _signatures(client, mint: str, start_ts: int, end_ts: int, max_sigs: int) -> list[str]:
-    """Page getSignaturesForAddress(mint) newest-first until we pass start_ts."""
+async def _signatures(client, mint: str, start_ts: int, end_ts: int, max_sigs: int,
+                      before: str | None = None) -> list[str]:
+    """Page getSignaturesForAddress(mint) from `before` (or newest) back past start_ts.
+    Seeding `before` at a signature near the trade window avoids paging through the
+    coin's entire recent history, which throttles out on still-active coins and leaves
+    us with only post-exit swaps."""
     sigs: list[str] = []
-    before = None
     while len(sigs) < max_sigs:
         params = [mint, {"limit": 1000, **({"before": before} if before else {})}]
         rows = await _rpc(client, "getSignaturesForAddress", params)
@@ -115,14 +118,32 @@ def _mint_col(conn) -> str:
 def _lookup_trade(conn, symbol: str, mint_col: str):
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT tk.{mint_col}, tp.entry_time, tp.exit_time,
+            SELECT tp.call_id, tk.{mint_col}, tp.entry_time, tp.exit_time,
                    tp.entry_price_fill, tp.exit_price_fill, tp.pnl_pct, tp.exit_reason
             FROM trading_positions tp
             JOIN tokens tk ON tk.id = tp.token_id
             WHERE tp.is_simulation = FALSE AND tk.symbol ILIKE %s
             ORDER BY tp.exit_time DESC LIMIT 1
         """, (symbol,))
-        return cur.fetchone()
+        row = cur.fetchone()
+    if not row:
+        return None
+    keys = ["call_id", "mint", "entry_time", "exit_time",
+            "entry_fill", "exit_fill", "pnl", "reason"]
+    return dict(zip(keys, row))
+
+
+def _seed_sig(conn, call_id, end_dt):
+    """Latest logged swap signature at//before the trade window — used to anchor the
+    Helius pagination so we don't page from 'now' through a still-active coin."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT signature FROM ws_market_observations
+            WHERE call_id = %s AND signature IS NOT NULL AND observed_at <= %s
+            ORDER BY observed_at DESC LIMIT 1
+        """, (call_id, end_dt))
+        row = cur.fetchone()
+    return row[0] if row else None
 
 
 def _bucketize(swaps: list[dict], bucket: int) -> dict[int, dict]:
@@ -142,11 +163,12 @@ def _bucketize(swaps: list[dict], bucket: int) -> dict[int, dict]:
     return b
 
 
-def _report(symbol, trade, swaps, bucket, mint_col_val):
-    _mint, entry_t, exit_t, entry_fill, exit_fill, pnl, reason = trade
+def _report(symbol, trade, swaps, bucket):
+    exit_t = trade["exit_time"]
     exit_ts = exit_t.replace(tzinfo=timezone.utc).timestamp() if exit_t.tzinfo is None \
         else exit_t.timestamp()
-    print(f"\n=== {symbol}  [{reason} {pnl:+.1f}%]  mint={mint_col_val[:6]}…  swaps={len(swaps)} ===")
+    print(f"\n=== {symbol}  [{trade['reason']} {trade['pnl']:+.1f}%]  "
+          f"mint={trade['mint'][:6]}…  swaps={len(swaps)} ===")
     if not swaps:
         print("  no swaps parsed in window — mint may not be the swap-bearing account, "
               "or Helius history is thin here.")
@@ -191,12 +213,15 @@ async def _run(symbols, bucket, pre, post, max_sigs):
             if not trade:
                 print(f"\n=== {sym} === no live trade found for that symbol.")
                 continue
-            mint, entry_t, exit_t = trade[0], trade[1], trade[2]
+            entry_t, exit_t = trade["entry_time"], trade["exit_time"]
             e0 = (entry_t.replace(tzinfo=timezone.utc) if entry_t.tzinfo is None else entry_t).timestamp()
             e1 = (exit_t.replace(tzinfo=timezone.utc) if exit_t.tzinfo is None else exit_t).timestamp()
-            sigs = await _signatures(client, mint, int(e0 - pre), int(e1 + post), max_sigs)
-            swaps = await _all_swaps(client, mint, sigs)
-            _report(sym, trade, swaps, bucket, mint)
+            end_dt = (exit_t if exit_t.tzinfo else exit_t.replace(tzinfo=timezone.utc)) + timedelta(seconds=post)
+            seed = _seed_sig(conn, trade["call_id"], end_dt)   # anchor pagination at the window
+            sigs = await _signatures(client, trade["mint"], int(e0 - pre), int(e1 + post),
+                                     max_sigs, before=seed)
+            swaps = await _all_swaps(client, trade["mint"], sigs)
+            _report(sym, trade, swaps, bucket)
 
 
 def main():
