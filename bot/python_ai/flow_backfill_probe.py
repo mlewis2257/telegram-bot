@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import statistics
 import sys
 from collections import defaultdict
 from datetime import timezone, timedelta
@@ -225,9 +226,10 @@ async def _run(symbols, bucket, pre, post, max_sigs):
 
 
 async def _run_all(days: int, window: int, max_sigs: int):
-    """Batch: for every live closed trade in the window, compute the pre-exit buy:sell
-    volume ratio and print one sorted line per coin — so we can see whether the ratio
-    actually separates runners from rugs AND duds, or just the handful we hand-picked."""
+    """Batch: for every live closed trade, compute two features and print sorted by the
+    sell-wall spike — testing whether a SUDDEN concentrated dump (max single-bucket sell
+    vol vs the coin's own baseline) isolates the rugs, where the 60s buy:sell AVERAGE
+    (kept as 'r60') failed. BASE window pulls enough history to set a baseline."""
     conn = db.get_conn(); db.safe_rollback()
     mint_col = _mint_col(conn)
     with conn.cursor() as cur:
@@ -242,35 +244,44 @@ async def _run_all(days: int, window: int, max_sigs: int):
         """, (days,))
         rows = cur.fetchall()
 
+    BASE, BUK = max(window, 300), 10          # 5min history for baseline, 10s buckets
     results = []
     async with httpx.AsyncClient(timeout=30) as client:
         for call_id, sym, mint, exit_t, rpeak, efill, pnl, reason in rows:
             exit_dt = exit_t if exit_t.tzinfo else exit_t.replace(tzinfo=timezone.utc)
-            end = int(exit_dt.timestamp()); start = end - window
+            end = int(exit_dt.timestamp()); start = end - BASE
             seed = _seed_sig(conn, call_id, exit_dt)
             sigs = await _signatures(client, mint, start - 30, end, max_sigs, before=seed)
-            swaps = await _all_swaps(client, mint, sigs)
-            bvol = sum(s["sol_size"] for s in swaps if s["side"] == "buy"  and start <= s["ts"] <= end)
-            svol = sum(s["sol_size"] for s in swaps if s["side"] == "sell" and start <= s["ts"] <= end)
-            ratio = (bvol / svol) if svol > 0 else (float("inf") if bvol > 0 else None)
+            swaps = [s for s in await _all_swaps(client, mint, sigs) if start <= s["ts"] <= end]
+            buks: dict[int, dict] = defaultdict(lambda: {"b": 0.0, "s": 0.0})
+            for s in swaps:
+                buks[int(s["ts"] // BUK)]["b" if s["side"] == "buy" else "s"] += s["sol_size"]
+            # 60s buy:sell average (the feature that failed)
+            bv = sum(s["sol_size"] for s in swaps if s["side"] == "buy"  and s["ts"] >= end - 60)
+            sv = sum(s["sol_size"] for s in swaps if s["side"] == "sell" and s["ts"] >= end - 60)
+            r60 = (bv / sv) if sv > 0 else (float("inf") if bv > 0 else None)
+            # sell-wall spike: biggest single-bucket SELL vol in last 120s vs median bucket vol
+            totals = [v["b"] + v["s"] for v in buks.values() if (v["b"] + v["s"]) > 0]
+            med = statistics.median(totals) if totals else 0.0
+            peak_sell = max((v["s"] for k, v in buks.items() if k * BUK >= end - 120), default=0.0)
+            spike = peak_sell / max(med, 0.1)
             peak_x = (float(rpeak) / float(efill)) if (rpeak and efill) else None
-            results.append((sym, ratio, peak_x, float(pnl) if pnl is not None else None, reason,
-                            len([s for s in swaps if start <= s["ts"] <= end])))
+            results.append((sym, spike, peak_sell, r60, peak_x,
+                            float(pnl) if pnl is not None else None, reason))
 
-    print(f"\nFlow separability — {len(results)} live trades, last {days}d, "
-          f"{window}s pre-exit buy:sell volume ratio (sell-heavy at top)\n")
-    print(f"  {'ratio':>7} {'peak_x':>6} {'pnl%':>6} {'nswp':>5}  symbol / reason")
-    print("  " + "-" * 52)
-    def _k(r):
-        return 1e12 if (r[1] is None or r[1] == float("inf")) else r[1]
-    for sym, ratio, peak_x, pnl, reason, n in sorted(results, key=_k):
-        rs = "inf" if ratio == float("inf") else ("-" if ratio is None else f"{ratio:.2f}")
+    print(f"\nSell-wall probe — {len(results)} live trades, last {days}d.")
+    print("spike = biggest single 10s-bucket SELL vol in the last 120s / median bucket vol"
+          " (a sudden dump).\n")
+    print(f"  {'spike':>6} {'peakSell':>8} {'r60':>6} {'peak_x':>6} {'pnl%':>6}  symbol / reason")
+    print("  " + "-" * 60)
+    for sym, spike, peak_sell, r60, peak_x, pnl, reason in sorted(results, key=lambda r: -r[1]):
+        rs = "inf" if r60 == float("inf") else ("-" if r60 is None else f"{r60:.2f}")
         px = f"{peak_x:.2f}" if peak_x else "-"
         ps = f"{pnl:+.0f}" if pnl is not None else "-"
-        print(f"  {rs:>7} {px:>6} {ps:>6} {n:>5}  {sym[:16]} / {reason}")
-    print("\nRead: do the RUNNERS (high peak_x, or +pnl) sit at the BUY-heavy bottom and")
-    print("the RUGS + DUDS (low peak_x, big -pnl) at the SELL-heavy top? If they cleanly")
-    print("split, buy:sell volume is a real exit feature. If they interleave, it isn't.\n")
+        print(f"  {spike:>6.1f} {peak_sell:>8.1f} {rs:>6} {px:>6} {ps:>6}  {sym[:16]} / {reason}")
+    print("\nRead: do the RUGS (big -pnl, peak_x that round-tripped) own the biggest spikes,")
+    print("cleanly above the runners? If a spike cutoff isolates rugs without catching a")
+    print("runner, it's a real (narrow) dump-exit. If duds/runners spike too, it isn't.\n")
 
 
 def main():
