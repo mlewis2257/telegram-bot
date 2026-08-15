@@ -224,15 +224,73 @@ async def _run(symbols, bucket, pre, post, max_sigs):
             _report(sym, trade, swaps, bucket)
 
 
+async def _run_all(days: int, window: int, max_sigs: int):
+    """Batch: for every live closed trade in the window, compute the pre-exit buy:sell
+    volume ratio and print one sorted line per coin — so we can see whether the ratio
+    actually separates runners from rugs AND duds, or just the handful we hand-picked."""
+    conn = db.get_conn(); db.safe_rollback()
+    mint_col = _mint_col(conn)
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT tp.call_id, tk.symbol, tk.{mint_col}, tp.exit_time,
+                   tp.real_peak_mcap, tp.entry_price_fill, tp.pnl_pct, tp.exit_reason
+            FROM trading_positions tp JOIN tokens tk ON tk.id = tp.token_id
+            WHERE tp.is_simulation = FALSE AND tp.status = 'closed'
+              AND tp.exit_time IS NOT NULL
+              AND tp.entry_time >= now() - (%s || ' days')::interval
+            ORDER BY tp.exit_time
+        """, (days,))
+        rows = cur.fetchall()
+
+    results = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        for call_id, sym, mint, exit_t, rpeak, efill, pnl, reason in rows:
+            exit_dt = exit_t if exit_t.tzinfo else exit_t.replace(tzinfo=timezone.utc)
+            end = int(exit_dt.timestamp()); start = end - window
+            seed = _seed_sig(conn, call_id, exit_dt)
+            sigs = await _signatures(client, mint, start - 30, end, max_sigs, before=seed)
+            swaps = await _all_swaps(client, mint, sigs)
+            bvol = sum(s["sol_size"] for s in swaps if s["side"] == "buy"  and start <= s["ts"] <= end)
+            svol = sum(s["sol_size"] for s in swaps if s["side"] == "sell" and start <= s["ts"] <= end)
+            ratio = (bvol / svol) if svol > 0 else (float("inf") if bvol > 0 else None)
+            peak_x = (float(rpeak) / float(efill)) if (rpeak and efill) else None
+            results.append((sym, ratio, peak_x, float(pnl) if pnl is not None else None, reason,
+                            len([s for s in swaps if start <= s["ts"] <= end])))
+
+    print(f"\nFlow separability — {len(results)} live trades, last {days}d, "
+          f"{window}s pre-exit buy:sell volume ratio (sell-heavy at top)\n")
+    print(f"  {'ratio':>7} {'peak_x':>6} {'pnl%':>6} {'nswp':>5}  symbol / reason")
+    print("  " + "-" * 52)
+    def _k(r):
+        return 1e12 if (r[1] is None or r[1] == float("inf")) else r[1]
+    for sym, ratio, peak_x, pnl, reason, n in sorted(results, key=_k):
+        rs = "inf" if ratio == float("inf") else ("-" if ratio is None else f"{ratio:.2f}")
+        px = f"{peak_x:.2f}" if peak_x else "-"
+        ps = f"{pnl:+.0f}" if pnl is not None else "-"
+        print(f"  {rs:>7} {px:>6} {ps:>6} {n:>5}  {sym[:16]} / {reason}")
+    print("\nRead: do the RUNNERS (high peak_x, or +pnl) sit at the BUY-heavy bottom and")
+    print("the RUGS + DUDS (low peak_x, big -pnl) at the SELL-heavy top? If they cleanly")
+    print("split, buy:sell volume is a real exit feature. If they interleave, it isn't.\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("symbols", nargs="+", help="token symbols, e.g. Shadow Bros Cupsey")
+    ap.add_argument("symbols", nargs="*", help="token symbols, e.g. Shadow Bros Cupsey")
     ap.add_argument("--bucket", type=int, default=10, help="seconds per flow bucket (default 10)")
     ap.add_argument("--pre", type=int, default=180, help="secs before entry to pull (default 180)")
     ap.add_argument("--post", type=int, default=90, help="secs after exit to pull (default 90)")
     ap.add_argument("--max-sigs", type=int, default=6000, dest="max_sigs",
                     help="safety cap on signatures fetched per coin (default 6000)")
+    ap.add_argument("--all", type=int, default=None, metavar="DAYS",
+                    help="batch mode: buy:sell ratio for EVERY live trade in the last DAYS")
+    ap.add_argument("--window", type=int, default=60,
+                    help="pre-exit window (secs) for the batch ratio (default 60)")
     args = ap.parse_args()
+    if args.all is not None:
+        asyncio.run(_run_all(args.all, args.window, args.max_sigs))
+        return
+    if not args.symbols:
+        ap.error("give token symbols, or use --all DAYS for batch mode")
     asyncio.run(_run(args.symbols, args.bucket, args.pre, args.post, args.max_sigs))
 
 
