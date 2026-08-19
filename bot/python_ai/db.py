@@ -1455,7 +1455,7 @@ def close_shadow_position(call_id: int, exit_variant: str, exit_price: float, so
 # self-creates on startup like shadow_positions — no manual migration.
 
 def ensure_qsim_positions_table() -> None:
-    """Create the qsim_positions table if absent. Idempotent; app owns it (no sudo)."""
+    """Create the qsim tables if absent. Idempotent; app owns them (no sudo)."""
     conn = get_conn()
     safe_rollback()
     with conn.cursor() as cur:
@@ -1492,6 +1492,40 @@ def ensure_qsim_positions_table() -> None:
             """
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_qsim_status ON qsim_positions (status)")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS qsim_quote_observations (
+                id              bigserial PRIMARY KEY,
+                call_id         integer NOT NULL,
+                observed_at     timestamptz NOT NULL DEFAULT now(),
+                sol_out         numeric,
+                real_mult       numeric,
+                synth_mcap      numeric,
+                eff_mcap        numeric,
+                prior_peak_mcap numeric,
+                real_peak_mcap  numeric,
+                peak_mult       numeric,
+                exit_reason     text,
+                should_exit     boolean NOT NULL DEFAULT false,
+                no_route        boolean NOT NULL DEFAULT false,
+                rate_limited    boolean NOT NULL DEFAULT false,
+                noroute_streak  integer,
+                note            text
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_qsim_quote_observations_call_id
+                ON qsim_quote_observations(call_id, observed_at DESC)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_qsim_quote_observations_observed_at
+                ON qsim_quote_observations(observed_at DESC)
+            """
+        )
         conn.commit()
 
 
@@ -1572,6 +1606,51 @@ def close_qsim_position(call_id: int, exit_price: float, sol_out: float, exit_re
             (exit_price, sol_out, exit_reason, call_id),
         )
         conn.commit()
+
+
+def insert_qsim_quote_observation(
+    *,
+    call_id: int,
+    sol_out: float | None = None,
+    real_mult: float | None = None,
+    synth_mcap: float | None = None,
+    eff_mcap: float | None = None,
+    prior_peak_mcap: float | None = None,
+    real_peak_mcap: float | None = None,
+    peak_mult: float | None = None,
+    exit_reason: str | None = None,
+    should_exit: bool = False,
+    no_route: bool = False,
+    rate_limited: bool = False,
+    noroute_streak: int | None = None,
+    note: str | None = None,
+) -> None:
+    """Best-effort qsim quote path log; never let diagnostics affect qsim trading."""
+    try:
+        conn = get_conn()
+        safe_rollback()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO qsim_quote_observations (
+                    call_id, sol_out, real_mult, synth_mcap, eff_mcap,
+                    prior_peak_mcap, real_peak_mcap, peak_mult,
+                    exit_reason, should_exit, no_route, rate_limited,
+                    noroute_streak, note
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    call_id, sol_out, real_mult, synth_mcap, eff_mcap,
+                    prior_peak_mcap, real_peak_mcap, peak_mult,
+                    exit_reason, should_exit, no_route, rate_limited,
+                    noroute_streak, note,
+                ),
+            )
+            conn.commit()
+    except Exception as e:
+        safe_rollback()
+        print(f"[db] insert_qsim_quote_observation skipped call_id={call_id}: {e}")
 
 
 def get_paper_pnl_summary(is_strategy_b: bool = False) -> dict:

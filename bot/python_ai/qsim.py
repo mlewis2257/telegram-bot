@@ -205,6 +205,11 @@ async def _qsim_tick(pos: dict) -> None:
         _backoff_until = time.monotonic() + QSIM_BACKOFF_SECS
         _quote_window.append(time.monotonic())
         _last_quote_ts[call_id] = time.monotonic()
+        db.insert_qsim_quote_observation(
+            call_id=call_id,
+            rate_limited=True,
+            note="sell quote rate-limited",
+        )
         return
     _quote_window.append(time.monotonic())
     _last_quote_ts[call_id] = time.monotonic()
@@ -212,6 +217,12 @@ async def _qsim_tick(pos: dict) -> None:
     if sol_out is None or sol_out <= 0:
         # No sell route = the bag isn't sellable (rug/illiquid). After a streak, realize it at 0.
         _noroute_streak[call_id] = _noroute_streak.get(call_id, 0) + 1
+        db.insert_qsim_quote_observation(
+            call_id=call_id,
+            no_route=True,
+            noroute_streak=_noroute_streak[call_id],
+            note="sell quote no-route",
+        )
         if _noroute_streak[call_id] >= QSIM_RUG_FAILS:
             db.close_qsim_position(call_id, exit_price=0.0, sol_out=0.0, exit_reason="rug")
             peak_guard.clear(f"qsim:{call_id}")
@@ -238,6 +249,19 @@ async def _qsim_tick(pos: dict) -> None:
         cfg, current_mcap=eff_cur, peak_mcap=real_peak, entry_mcap=entry,
         is_vip_gamble=is_vip_gamble, channel_handle=channel_handle,
         entry_time=pos.get("entry_time"),
+    )
+    db.insert_qsim_quote_observation(
+        call_id=call_id,
+        sol_out=sol_out,
+        real_mult=real_mult,
+        synth_mcap=synth_cur,
+        eff_mcap=eff_cur,
+        prior_peak_mcap=prior_peak,
+        real_peak_mcap=real_peak,
+        peak_mult=(real_peak / entry) if entry else None,
+        exit_reason=result.reason,
+        should_exit=result.should_exit,
+        noroute_streak=0,
     )
     if result.should_exit:
         db.close_qsim_position(call_id, exit_price=(result.exit_mcap or eff_cur),

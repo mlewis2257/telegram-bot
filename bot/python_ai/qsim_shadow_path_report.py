@@ -98,7 +98,13 @@ SELECT
     obs.max_ws_after_qsim_before_shadow,
     CASE WHEN m.shadow_entry > 0 THEN obs.max_ws_mcap / m.shadow_entry ELSE NULL END AS max_ws_mult,
     CASE WHEN m.shadow_entry > 0 THEN obs.max_ws_before_qsim_exit / m.shadow_entry ELSE NULL END AS max_ws_before_qsim_mult,
-    CASE WHEN m.shadow_entry > 0 THEN obs.max_ws_after_qsim_before_shadow / m.shadow_entry ELSE NULL END AS max_ws_after_qsim_mult
+    CASE WHEN m.shadow_entry > 0 THEN obs.max_ws_after_qsim_before_shadow / m.shadow_entry ELSE NULL END AS max_ws_after_qsim_mult,
+    qobs.qobs_count,
+    qobs.qobs_exit_signals,
+    qobs.qobs_no_routes,
+    qobs.max_qobs_mult,
+    qobs.last_qobs_mult,
+    qobs.max_qobs_before_shadow_exit
 FROM matched m
 LEFT JOIN LATERAL (
     SELECT
@@ -124,6 +130,21 @@ LEFT JOIN LATERAL (
       AND o.observed_at BETWEEN LEAST(m.shadow_entry_time, m.qsim_entry_time)
                             AND GREATEST(m.shadow_exit_time, m.qsim_exit_time)
 ) obs ON TRUE
+LEFT JOIN LATERAL (
+    SELECT
+        COUNT(*) AS qobs_count,
+        COUNT(*) FILTER (WHERE qo.should_exit) AS qobs_exit_signals,
+        COUNT(*) FILTER (WHERE qo.no_route) AS qobs_no_routes,
+        MAX(qo.real_mult) AS max_qobs_mult,
+        (ARRAY_AGG(qo.real_mult ORDER BY qo.observed_at DESC))[1] AS last_qobs_mult,
+        MAX(qo.real_mult) FILTER (
+            WHERE m.shadow_exit_time IS NOT NULL
+              AND qo.observed_at <= m.shadow_exit_time
+        ) AS max_qobs_before_shadow_exit
+    FROM qsim_quote_observations qo
+    WHERE qo.call_id = m.call_id
+      AND qo.observed_at BETWEEN m.qsim_entry_time AND COALESCE(m.qsim_exit_time, m.shadow_exit_time)
+) qobs ON TRUE
 ORDER BY m.qsim_entry_time DESC
 """
 
@@ -145,6 +166,8 @@ def _rows(sql: str, params: dict) -> list[dict]:
     from psycopg2.extras import RealDictCursor
     import db
 
+    db.ensure_qsim_positions_table()
+    db.ensure_ws_market_observations_table()
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -260,6 +283,7 @@ def _print_summary(views: list[RowView]) -> None:
     peak_gaps = [v.peak_gap for v in views if v.peak_gap is not None]
     exit_gaps = [v.exit_gap for v in views if v.exit_gap is not None]
     obs_rows = [v for v in views if int(v.row.get("obs_count") or 0) > 0]
+    qobs_rows = [v for v in views if int(v.row.get("qobs_count") or 0) > 0]
     same_reason = sum(1 for v in views if v.row.get("qsim_reason") == v.row.get("shadow_reason"))
     shadow_better = sum(1 for v in views if v.edge > 0.05)
     qsim_better = sum(1 for v in views if v.edge < -0.05)
@@ -279,6 +303,7 @@ def _print_summary(views: list[RowView]) -> None:
     if exit_gaps:
         print(f"avg exit-mult gap:  {sum(exit_gaps) / len(exit_gaps):+.2f}x")
     print(f"rows with ws path:  {len(obs_rows)}/{n}")
+    print(f"rows with qsim path:{len(qobs_rows)}/{n}")
 
 
 def _print_buckets(views: list[RowView]) -> None:
@@ -312,7 +337,7 @@ def _print_detail(views: list[RowView], limit: int) -> None:
     print("\nDetail — largest absolute normalized edge first")
     hdr = (
         f"{'call':>7} {'symbol':<12} {'q/s ent':>7} {'qpk':>5} {'spk':>5} "
-        f"{'qret':>7} {'sret':>7} {'edge':>7} {'wsmax':>6} {'afterQ':>6} "
+        f"{'qret':>7} {'sret':>7} {'edge':>7} {'wsmax':>6} {'qmax':>6} "
         f"{'q_reason/shadow_reason':<28} bucket"
     )
     print(hdr)
@@ -330,7 +355,7 @@ def _print_detail(views: list[RowView], limit: int) -> None:
             f"{_pct(view.shadow_return):>7} "
             f"{_pct(view.edge):>7} "
             f"{_fmt(_f(row.get('max_ws_mult')), 2):>6} "
-            f"{_fmt(_f(row.get('max_ws_after_qsim_mult')), 2):>6} "
+            f"{_fmt(_f(row.get('max_qobs_mult')), 2):>6} "
             f"{view.reason_pair[:28]:<28} "
             f"{view.bucket}"
         )
