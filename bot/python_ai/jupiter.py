@@ -411,6 +411,21 @@ async def sell_token(
             signed_tx  = await sign_transaction(order, keypair)
             sign_time  = time.time()
             print(f"[jupiter] sign took {sign_time - order_time:.2f}s")
+            # Pre-sell SOL balance for the outputAmount-missing fallback below. Best-effort:
+            # on failure leave None so the fallback is SKIPPED, not crashed. Previously
+            # sol_before was referenced (l.435/447/461) but never defined -> NameError on a
+            # zero/missing outputAmount, caught as a transient error and RETRIED a sell that
+            # may already have executed on-chain (double-sell risk).
+            sol_before = None
+            try:
+                async with httpx.AsyncClient(timeout=10) as _bc:
+                    _bresp = await _bc.post(_rpc_url(), json={
+                        "jsonrpc": "2.0", "id": 1, "method": "getBalance",
+                        "params": [wallet_address, {"commitment": "confirmed"}],
+                    })
+                    sol_before = _bresp.json()["result"]["value"] / 1_000_000_000
+            except Exception as _be:
+                print(f"[jupiter] sell: pre-sell balance fetch failed ({_be}); delta fallback disabled")
             result     = await execute_order(signed_tx, order["requestId"])
             exec_time  = time.time()
             print(f"[jupiter] total order→execute: {exec_time - order_time:.2f}s")
