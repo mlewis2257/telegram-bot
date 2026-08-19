@@ -11,7 +11,11 @@
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('ws_monitor.py'\\).read\\(\\)\\); print\\('ws_monitor.py OK'\\)\")",
       "Bash(python3 -c 'import ast; ast.parse\\(open\\('\\\\''__TRACKED_VAR__'\\\\''\\).read\\(\\)\\); print\\('\\\\''__TRACKED_VAR__ OK'\\\\''\\)')",
       "Bash(grep -oE \"[\\\\\"'][a-z_]+[\\\\\"']$\")",
-      "Bash(python3 -m py_compile jupiter.py)"
+      "Bash(python3 -m py_compile jupiter.py)",
+      "Bash(python3 -m py_compile bot/python_ai/flow_backfill_probe.py)",
+      "Bash(git add *)",
+      "Bash(git commit -q -m ' *)",
+      "Bash(git push *)"
     ]
   }
 }

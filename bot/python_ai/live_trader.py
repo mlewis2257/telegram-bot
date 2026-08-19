@@ -701,111 +701,167 @@ async def close_live_position(
     Verify on-chain token balance, execute sell, record the close.
     Never raises.
     """
-    pos = db.get_open_live_position(call_id)
-    if not pos:
-        return False
+    sell_executed = False
+    mint = None
+    symbol = "?"
 
-    mint    = pos.get("mint_address")
-    symbol  = pos.get("symbol", "?")
-    sol_in  = float(pos["sol_in"])
+    def _release_claim() -> None:
+        try:
+            db.release_live_position_exit_claim(call_id)
+        except Exception as release_error:
+            print(f"[live] exit-claim release failed call_id={call_id}: {release_error}")
 
-    if not mint:
-        print(f"[live] close skipped call_id={call_id} — no mint in position")
-        return False
+    try:
+        pos = db.get_open_live_position(call_id)
+        if not pos:
+            return False
+        try:
+            claimed = db.claim_live_position_exit(call_id)
+        except Exception as claim_error:
+            print(f"[live] close skipped call_id={call_id} — claim failed: {claim_error}")
+            return False
+        if not claimed:
+            print(f"[live] close skipped call_id={call_id} — sell already in progress")
+            return False
 
-    # ── Use stored token amount — avoids an extra RPC round-trip before sell ───
-    # tokens_held is the raw integer amount received at buy time.
-    # If it turns out to be 0 or stale, sell_token will fail gracefully and
-    # we fall back to a live balance check before retrying next cycle.
-    wallet_addr = _wallet.get_public_key()
-    tokens_held = int(pos.get("tokens_held") or 0)
-    if tokens_held == 0:
-        # Rare: DB value missing — verify on-chain before giving up
-        tokens_held, _ = await jupiter.get_token_balance(mint, wallet_addr, _rpc_url())
+        mint    = pos.get("mint_address")
+        symbol  = pos.get("symbol", "?")
+        sol_in  = float(pos["sol_in"])
+
+        if not mint:
+            print(f"[live] close skipped call_id={call_id} — no mint in position")
+            _release_claim()
+            return False
+
+        # ── Use stored token amount — avoids an extra RPC round-trip before sell ───
+        # tokens_held is the raw integer amount received at buy time.
+        # If it turns out to be 0 or stale, sell_token will fail gracefully and
+        # we fall back to a live balance check before retrying next cycle.
+        wallet_addr = _wallet.get_public_key()
+        tokens_held = int(pos.get("tokens_held") or 0)
         if tokens_held == 0:
+            # Rare: DB value missing — verify on-chain before giving up
+            tokens_held, _ = await jupiter.get_token_balance(mint, wallet_addr, _rpc_url())
+            if tokens_held == 0:
+                print(
+                    f"[live] ⚠️ tokens_held=0 for {symbol} call_id={call_id}"
+                    f" — sell skipped, will retry next cycle  mint={mint}"
+                )
+                try:
+                    await alert_bot._get_bot().send_message(
+                        chat_id=alert_bot._chat_id(),
+                        text=f"⚠️ Balance 0 for ${symbol} — sell skipped, retrying",
+                        disable_web_page_preview=True,
+                    )
+                except Exception as alert_error:
+                    print(f"[live] balance=0 alert failed: {alert_error}")
+                _release_claim()
+                return False
+
+        # ── Execute sell ───────────────────────────────────────────────────────
+        print(
+            f"[live] SELL {symbol}  call_id={call_id}"
+            f"  tokens={tokens_held}  reason={exit_reason}"
+        )
+        result = await jupiter.sell_token(mint, tokens_held)
+        print(f"[live_sell] sell_token result: {result}")
+
+        if not result["success"]:
             print(
-                f"[live] ⚠️ tokens_held=0 for {symbol} call_id={call_id}"
-                f" — sell skipped, will retry next cycle  mint={mint}"
+                f"[live] SELL FAILED {symbol}  call_id={call_id}"
+                f"  error={result.get('error')} — MANUAL INTERVENTION REQUIRED"
+            )
+            try:
+                await alert_bot.send_live_sell_failed_alert(symbol=symbol, mint=mint)
+            except Exception as alert_error:
+                print(f"[live] sell-failed alert failed: {alert_error}")
+            _release_claim()
+            return False
+
+        sell_executed = True
+        sig          = result["signature"]
+        sol_received = result["sol_received"]
+
+        if sol_received <= 0:
+            print(
+                f"[live] SELL executed but sol_received=0 for {symbol} "
+                f"call_id={call_id} — NOT closing position, will retry. "
+                f"Check tx: {sig}"
             )
             try:
                 await alert_bot._get_bot().send_message(
                     chat_id=alert_bot._chat_id(),
-                    text=f"⚠️ Balance 0 for ${symbol} — sell skipped, retrying",
+                    text=(
+                        f"⚠️ Sell executed for ${symbol} but SOL received = 0. "
+                        f"Position kept open. Check Solscan."
+                    ),
                     disable_web_page_preview=True,
                 )
-            except Exception as e:
-                print(f"[live] balance=0 alert failed: {e}")
+            except Exception as alert_error:
+                print(f"[live] sol_received=0 alert failed: {alert_error}")
+            _release_claim()
             return False
 
-    # ── Execute sell ───────────────────────────────────────────────────────────
-    print(
-        f"[live] SELL {symbol}  call_id={call_id}"
-        f"  tokens={tokens_held}  reason={exit_reason}"
-    )
-    result = await jupiter.sell_token(mint, tokens_held)
-    print(f"[live_sell] sell_token result: {result}")
+        pnl = sol_received - sol_in
 
-    if not result["success"]:
+        try:
+            db.close_live_position_db(
+                call_id=call_id,
+                exit_price=current_mcap,
+                sol_out=sol_received,
+                exit_reason=exit_reason,
+                tx_signature=sig,
+            )
+        except Exception as close_error:
+            print(
+                f"[live] SELL OK BUT DB CLOSE FAILED {symbol} call_id={call_id}"
+                f" sig={sig} error={close_error} — leaving status=closing"
+            )
+            try:
+                await alert_bot._get_bot().send_message(
+                    chat_id=alert_bot._chat_id(),
+                    text=(
+                        f"🚨 ${symbol} sold on-chain but DB close failed. "
+                        f"call_id={call_id} sig={sig}"
+                    ),
+                    disable_web_page_preview=True,
+                )
+            except Exception as alert_error:
+                print(f"[live] db-close-failed alert failed: {alert_error}")
+            return False
+
+        # Record the TRUE fill-derived exit mcap alongside the feed value (current_mcap),
+        # so wallet-implied vs feed can be audited per leg without inferring from entry.
+        exit_fill = _effective_fill_mcap(mint, sol_received, tokens_held)
+        if exit_fill is not None:
+            db.set_live_fill_price(call_id, exit_price_fill=exit_fill)
+            _eratio = (exit_fill / current_mcap) if current_mcap else 0
+            print(f"[live] EXIT FILL  {symbol}  effective_mcap=${exit_fill/1000:.1f}k"
+                  f"  feed=${current_mcap/1000:.1f}k  ratio={_eratio:.2f}x")
         print(
-            f"[live] SELL FAILED {symbol}  call_id={call_id}"
-            f"  error={result.get('error')} — MANUAL INTERVENTION REQUIRED"
-        )
-        await alert_bot.send_live_sell_failed_alert(symbol=symbol, mint=mint)
-        return False
-
-    sig          = result["signature"]
-    sol_received = result["sol_received"]
-
-    if sol_received <= 0:
-        print(
-            f"[live] SELL executed but sol_received=0 for {symbol} "
-            f"call_id={call_id} — NOT closing position, will retry. "
-            f"Check tx: {sig}"
+            f"[live] SELL OK  {symbol}  call_id={call_id}"
+            f"  reason={exit_reason}  sol_received={sol_received:.4f}"
+            f"  pnl={pnl:+.4f}  sig={sig[:16]}..."
         )
         try:
-            await alert_bot._get_bot().send_message(
-                chat_id=alert_bot._chat_id(),
-                text=(
-                    f"⚠️ Sell executed for ${symbol} but SOL received = 0. "
-                    f"Position kept open. Check Solscan."
-                ),
-                disable_web_page_preview=True,
+            await alert_bot.send_live_sell_alert(
+                symbol=symbol,
+                mint=mint,
+                sol_received=sol_received,
+                pnl=pnl,
+                exit_reason=exit_reason,
+                signature=sig,
             )
-        except Exception as e:
-            print(f"[live] sol_received=0 alert failed: {e}")
+        except Exception as alert_error:
+            print(f"[live] sell-ok alert failed: {alert_error}")
+        return True
+    except Exception as close_error:
+        print(f"[live] close error {symbol} call_id={call_id}: {close_error}")
+        if not sell_executed:
+            _release_claim()
+        else:
+            print(f"[live] sell may have executed for {symbol}; leaving claim in place")
         return False
-
-    pnl = sol_received - sol_in
-
-    db.close_live_position_db(
-        call_id=call_id,
-        exit_price=current_mcap,
-        sol_out=sol_received,
-        exit_reason=exit_reason,
-        tx_signature=sig,
-    )
-    # Record the TRUE fill-derived exit mcap alongside the feed value (current_mcap),
-    # so wallet-implied vs feed can be audited per leg without inferring from entry.
-    exit_fill = _effective_fill_mcap(mint, sol_received, tokens_held)
-    if exit_fill is not None:
-        db.set_live_fill_price(call_id, exit_price_fill=exit_fill)
-        _eratio = (exit_fill / current_mcap) if current_mcap else 0
-        print(f"[live] EXIT FILL  {symbol}  effective_mcap=${exit_fill/1000:.1f}k"
-              f"  feed=${current_mcap/1000:.1f}k  ratio={_eratio:.2f}x")
-    print(
-        f"[live] SELL OK  {symbol}  call_id={call_id}"
-        f"  reason={exit_reason}  sol_received={sol_received:.4f}"
-        f"  pnl={pnl:+.4f}  sig={sig[:16]}..."
-    )
-    await alert_bot.send_live_sell_alert(
-        symbol=symbol,
-        mint=mint,
-        sol_received=sol_received,
-        pnl=pnl,
-        exit_reason=exit_reason,
-        signature=sig,
-    )
-    return True
 
 
 def check_live_exits(

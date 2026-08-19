@@ -156,7 +156,14 @@ CREATE TABLE IF NOT EXISTS calls (
         'mcap_too_high', 'no_data', 'dex_circuit_open', 'vip_mcap_gate',
         'momentum_dump', 'mcap_too_low', 'unconfirmed', 'vip_paused',
         'high_bundle', 'serial_rugger', 'low_quality_bucket',
-        'vip_low_score', 'no_entry_mcap'
+        'vip_low_score', 'no_entry_mcap', 'vip_mcap_too_low',
+        'high_fake_vol', 'no_base_position', 'pending_duplicate',
+        'paper_open_failed', 'blocked_channel', 'reentry_cooldown',
+        'shadow_only', 'vip_missing_tier', 'vip_unhandled_tier',
+        'vip_route_fallthrough', 'vip_gamble_allowed_hours',
+        'vip_safe_allowed_hours', 'vip_gamble_weak_pocket',
+        'free_allowed_bucket', 'free_blocked_hour', 'free_weak_pocket',
+        'high_holders', 'unsupported_channel', 'paper_dispatch_fallthrough'
     )),
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -289,7 +296,7 @@ CREATE TABLE IF NOT EXISTS trading_positions (
     call_id          INTEGER     REFERENCES calls(id) ON DELETE SET NULL,
     token_id         INTEGER     NOT NULL REFERENCES tokens(id) ON DELETE RESTRICT,
     status           TEXT        NOT NULL DEFAULT 'open'
-                                 CHECK (status IN ('open', 'closed', 'cancelled')),
+                                 CHECK (status IN ('open', 'closing', 'closed', 'cancelled')),
 
     -- Entry
     entry_price      NUMERIC     NOT NULL,             -- SOL per token at buy
@@ -298,12 +305,18 @@ CREATE TABLE IF NOT EXISTS trading_positions (
     entry_time       TIMESTAMPTZ,
     sol_in           NUMERIC     NOT NULL,             -- SOL spent
     tokens_received  NUMERIC,
+    tokens_held      BIGINT,                            -- raw token units held for live sells
+    tx_signature     TEXT,                              -- most recent live swap signature
+    router           TEXT,                              -- swap router used by Jupiter
+    entry_price_fill NUMERIC,                           -- fill-implied entry mcap
     peak_mcap        NUMERIC,                          -- highest observed mcap after entry
     peak_multiplier  NUMERIC(10,4),                   -- highest observed multiplier from entry
     peak_at          TIMESTAMPTZ,                      -- when peak_mcap / peak_multiplier were seen
+    real_peak_mcap   DOUBLE PRECISION,                 -- sell-quote ratcheted peak for live exits
 
     -- Exit
     exit_price       NUMERIC,                          -- SOL per token at sell
+    exit_price_fill  NUMERIC,                          -- fill-implied exit mcap
     exit_mcap        NUMERIC,
     exit_tx_hash     TEXT,
     exit_time        TIMESTAMPTZ,

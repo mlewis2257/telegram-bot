@@ -1847,6 +1847,52 @@ def update_live_real_peak(call_id: int, real_peak_mcap: float) -> None:
         print(f"[db] update_live_real_peak skipped (call_id={call_id}): {e}")
 
 
+def claim_live_position_exit(call_id: int) -> bool:
+    """
+    Atomically claim one open live position for selling.
+
+    Live exits can be evaluated by both sol-monitor and sol-ws-monitor. The real
+    Jupiter sell happens before the DB close is recorded, so a guarded status flip
+    prevents two processes from submitting a sell for the same bag.
+    """
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE trading_positions
+            SET status = 'closing',
+                updated_at = NOW()
+            WHERE call_id = %s
+              AND is_simulation = FALSE
+              AND status = 'open'
+            """,
+            (call_id,),
+        )
+        claimed = cur.rowcount == 1
+        conn.commit()
+        return claimed
+
+
+def release_live_position_exit_claim(call_id: int) -> None:
+    """Release a live sell claim after a failed/aborted sell attempt."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE trading_positions
+            SET status = 'open',
+                updated_at = NOW()
+            WHERE call_id = %s
+              AND is_simulation = FALSE
+              AND status = 'closing'
+            """,
+            (call_id,),
+        )
+        conn.commit()
+
+
 def has_open_live_position_for_mint(mint_address: str) -> bool:
     """Check if ANY open live position exists for this mint address."""
     conn = get_conn()
@@ -1859,7 +1905,7 @@ def has_open_live_position_for_mint(mint_address: str) -> bool:
             JOIN tokens t ON t.id = c.token_id
             WHERE t.mint_address = %s
               AND tp.is_simulation = FALSE
-              AND tp.status = 'open'
+              AND tp.status IN ('open', 'closing')
             LIMIT 1
             """,
             (mint_address,),
@@ -2546,25 +2592,32 @@ def close_live_position_db(
     tx_signature: str | None,
 ) -> None:
     """Update a live position to closed with exit data."""
-    conn = get_conn()
-    safe_rollback()
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE trading_positions SET
-                exit_price   = %s,
-                sol_out      = %s,
-                exit_time    = NOW(),
-                exit_reason  = %s,
-                tx_signature = COALESCE(%s, tx_signature),
-                status       = 'closed'
-            WHERE call_id       = %s
-              AND is_simulation  = FALSE
-              AND status         = 'open'
-            """,
-            (exit_price, sol_out, exit_reason, tx_signature, call_id),
-        )
-        conn.commit()
+    try:
+        conn = get_conn()
+        safe_rollback()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE trading_positions SET
+                    exit_price   = %s,
+                    sol_out      = %s,
+                    exit_time    = NOW(),
+                    exit_reason  = %s,
+                    tx_signature = COALESCE(%s, tx_signature),
+                    updated_at   = NOW(),
+                    status       = 'closed'
+                WHERE call_id       = %s
+                  AND is_simulation  = FALSE
+                  AND status         IN ('open', 'closing')
+                """,
+                (exit_price, sol_out, exit_reason, tx_signature, call_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(f"live close affected {cur.rowcount} rows for call_id={call_id}")
+            conn.commit()
+    except Exception:
+        safe_rollback()
+        raise
 
 
 def set_live_fill_price(
@@ -2605,13 +2658,13 @@ def set_live_fill_price(
 
 
 def get_live_positions_count() -> int:
-    """Count of currently open live positions."""
+    """Count of currently open-or-closing live positions."""
     conn = get_conn()
     safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             "SELECT COUNT(*) FROM trading_positions"
-            " WHERE is_simulation = FALSE AND status = 'open'"
+            " WHERE is_simulation = FALSE AND status IN ('open', 'closing')"
         )
         return int(cur.fetchone()[0])
 
