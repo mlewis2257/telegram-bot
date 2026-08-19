@@ -16,6 +16,7 @@ Examples:
     python3 qsim_shadow_path_report.py --days 30 --channel solwhaletrending --lane low_score --variant early
     python3 qsim_shadow_path_report.py --days 30 --channel solwhaletrending --lane none --variant early --detail
     python3 qsim_shadow_path_report.py --days 30 --reason-pair hard_stop/profit_floor --limit 100
+    python3 qsim_shadow_path_report.py --days 30 --require-ws --detail
 """
 
 from __future__ import annotations
@@ -75,6 +76,8 @@ WITH matched AS (
       AND (%(channel)s = 'any' OR COALESCE(ch.handle, '?') = %(channel)s)
       AND (%(lane)s = 'any' OR COALESCE(c.skip_reason, 'none') = %(lane)s)
       AND (%(variant)s = 'any' OR q.variant = %(variant)s)
+      AND (%(min_entry_ratio)s IS NULL OR q.entry_price / NULLIF(sp.entry_price, 0) >= %(min_entry_ratio)s)
+      AND (%(max_entry_ratio)s IS NULL OR q.entry_price / NULLIF(sp.entry_price, 0) <= %(max_entry_ratio)s)
       AND (%(raw)s OR NOT (
           COALESCE(sp.peak_multiplier, 0) > %(max_peak)s
        OR COALESCE(sp.pnl_pct, 0) > %(max_pnl)s
@@ -173,18 +176,23 @@ def _bucket(row: dict, edge: float, entry_ratio: float | None,
             peak_gap: float | None, reason_pair: str) -> str:
     q_reason = row.get("qsim_reason")
     s_reason = row.get("shadow_reason")
+    obs_count = int(row.get("obs_count") or 0)
     max_after = _f(row.get("max_ws_after_qsim_mult"))
     max_ws = _f(row.get("max_ws_mult"))
     q_peak = _f(row.get("qsim_peak"))
     s_peak = _f(row.get("shadow_peak"))
 
+    if entry_ratio is not None and (entry_ratio >= 10.0 or entry_ratio <= 0.10):
+        return "extreme_entry_ratio_check_source"
     if q_reason == s_reason and abs(edge) < 0.10:
         return "aligned"
     if q_reason == "hard_stop" and _reason_is_bank(s_reason):
-        if max_after >= 1.0:
+        if obs_count > 0 and max_after >= 1.0:
             return "qsim_hard_stop_before_feed_recovery"
+        if obs_count > 0 and max_ws < 1.2:
+            return "shadow_bank_not_ws_confirmed"
         if s_peak >= 1.5 and (q_peak < 1.2 or (peak_gap and peak_gap >= 1.5)):
-            return "shadow_peak_not_seen_by_qsim"
+            return "shadow_peak_not_seen_by_qsim_no_path" if obs_count == 0 else "shadow_peak_not_seen_by_qsim"
         return "hard_stop_vs_shadow_bank"
     if _reason_is_bank(q_reason) and s_reason == "hard_stop":
         return "qsim_bank_shadow_hard_stop"
@@ -192,8 +200,10 @@ def _bucket(row: dict, edge: float, entry_ratio: float | None,
         return "executable_entry_haircut"
     if entry_ratio is not None and entry_ratio <= 0.75:
         return "qsim_entry_cheaper_than_feed"
-    if peak_gap is not None and peak_gap >= 1.75 and max_ws >= s_peak * 0.8:
+    if obs_count > 0 and peak_gap is not None and peak_gap >= 1.75 and max_ws >= s_peak * 0.8:
         return "feed_path_outran_qsim_quotes"
+    if obs_count == 0 and peak_gap is not None and peak_gap >= 1.75:
+        return "shadow_peak_gap_no_path"
     if reason_pair.split("/")[:1] != reason_pair.split("/")[1:]:
         return "reason_mismatch"
     if edge >= 0.20:
@@ -337,6 +347,12 @@ def main() -> None:
     parser.add_argument("--reason-pair", default="any",
                         help="Filter to qsim_reason/shadow_reason, e.g. hard_stop/profit_floor")
     parser.add_argument("--bucket", default="any", help="Filter detail rows to one bucket")
+    parser.add_argument("--require-ws", action="store_true",
+                        help="only include rows with websocket market observations")
+    parser.add_argument("--min-entry-ratio", type=float, default=None,
+                        help="only include qsim_entry / shadow_entry >= this value")
+    parser.add_argument("--max-entry-ratio", type=float, default=None,
+                        help="only include qsim_entry / shadow_entry <= this value")
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--raw", action="store_true", help="include phantom-price rows")
     parser.add_argument("--detail", action="store_true", help="print per-trade rows")
@@ -347,6 +363,8 @@ def main() -> None:
         "channel": args.channel,
         "lane": args.lane,
         "variant": args.variant,
+        "min_entry_ratio": args.min_entry_ratio,
+        "max_entry_ratio": args.max_entry_ratio,
         "raw": args.raw,
         "max_peak": MAX_SANE_PEAK,
         "max_pnl": MAX_SANE_PNL_PCT,
@@ -354,6 +372,8 @@ def main() -> None:
     }
     rows = _rows(SQL, params)
     views = [_view(row) for row in rows]
+    if args.require_ws:
+        views = [view for view in views if int(view.row.get("obs_count") or 0) > 0]
     if args.reason_pair != "any":
         views = [view for view in views if view.reason_pair == args.reason_pair]
     if args.bucket != "any":
@@ -361,7 +381,8 @@ def main() -> None:
 
     print(
         f"filters: days={args.days} channel={args.channel} lane={args.lane} "
-        f"variant={args.variant} reason_pair={args.reason_pair} bucket={args.bucket}"
+        f"variant={args.variant} reason_pair={args.reason_pair} bucket={args.bucket} "
+        f"require_ws={args.require_ws}"
     )
     _print_summary(views)
     if views:
