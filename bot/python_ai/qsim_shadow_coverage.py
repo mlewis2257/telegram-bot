@@ -69,6 +69,8 @@ annotated AS (
         q.status AS qsim_status,
         q.pnl_sol AS qsim_pnl,
         q.pnl_pct AS qsim_pnl_pct,
+        q.peak_multiplier AS qsim_peak,
+        q.exit_reason AS qsim_reason,
         q.entry_time AS qsim_entry_time,
         q.exit_time AS qsim_exit_time,
         COALESCE(qobs.qobs_count, 0) AS qobs_count,
@@ -127,8 +129,8 @@ def _date(value: Any) -> str:
 
 def _print_bucket_summary(rows: list[dict[str, Any]]) -> None:
     print("\nCoverage Buckets")
-    print(f"{'coverage':<18} {'n':>6} {'shadow':>10} {'qsim':>10} {'avg_spk':>8} {'avg_qmax':>8}")
-    print("-" * 68)
+    print(f"{'coverage':<18} {'n':>6} {'shadow':>10} {'qsim':>10} {'avg_spk':>8} {'avg_qpk':>8} {'avg_qmax':>8}")
+    print("-" * 78)
     for coverage in ("has_qsim_quotes", "qsim_no_quotes", "no_qsim_position"):
         bucket = [row for row in rows if row["coverage"] == coverage]
         if not bucket:
@@ -136,10 +138,15 @@ def _print_bucket_summary(rows: list[dict[str, Any]]) -> None:
         shadow = sum(_f(row.get("pnl_sol")) for row in bucket)
         qsim = sum(_f(row.get("qsim_pnl")) for row in bucket if row.get("qsim_pnl") is not None)
         peaks = [_f(row.get("peak_multiplier")) for row in bucket if row.get("peak_multiplier") is not None]
+        qpeaks = [_f(row.get("qsim_peak")) for row in bucket if row.get("qsim_peak") is not None]
         qmaxes = [_f(row.get("max_qobs_mult")) for row in bucket if row.get("max_qobs_mult") is not None]
         avg_peak = sum(peaks) / len(peaks) if peaks else 0.0
+        avg_qpeak = sum(qpeaks) / len(qpeaks) if qpeaks else 0.0
         avg_qmax = sum(qmaxes) / len(qmaxes) if qmaxes else 0.0
-        print(f"{coverage:<18} {len(bucket):>6} {shadow:>+10.2f} {qsim:>+10.2f} {avg_peak:>8.2f} {avg_qmax:>8.2f}")
+        print(
+            f"{coverage:<18} {len(bucket):>6} {shadow:>+10.2f} {qsim:>+10.2f} "
+            f"{avg_peak:>8.2f} {avg_qpeak:>8.2f} {avg_qmax:>8.2f}"
+        )
 
 
 def _print_day_summary(rows: list[dict[str, Any]]) -> None:
@@ -176,6 +183,32 @@ def _print_missing_examples(rows: list[dict[str, Any]], limit: int) -> None:
         )
 
 
+def _print_no_path_disagreements(rows: list[dict[str, Any]], limit: int) -> None:
+    no_path = [row for row in rows if row["coverage"] == "qsim_no_quotes"]
+    no_path.sort(
+        key=lambda row: abs(_f(row.get("pnl_sol")) - _f(row.get("qsim_pnl"))),
+        reverse=True,
+    )
+    if not no_path:
+        return
+    print("\nLargest qsim positions with no quote-path log")
+    hdr = (
+        f"{'call':>7} {'day':<8} {'symbol':<12} {'shadow':>9} {'qsim':>9} "
+        f"{'edge':>9} {'spk':>6} {'qpk':>6} {'q_reason':<14}"
+    )
+    print(hdr)
+    print("-" * len(hdr))
+    for row in no_path[:limit]:
+        shadow = _f(row.get("pnl_sol"))
+        qsim = _f(row.get("qsim_pnl"))
+        print(
+            f"{int(row['call_id']):>7} {_date(row['entry_time']):<8} "
+            f"{(row.get('symbol') or '?')[:12]:<12} {shadow:>+9.2f} {qsim:>+9.2f} "
+            f"{shadow - qsim:>+9.2f} {_f(row.get('peak_multiplier')):>6.2f} "
+            f"{_f(row.get('qsim_peak')):>6.2f} {(row.get('qsim_reason') or '?')[:14]:<14}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Audit shadow rows missing qsim coverage.")
     parser.add_argument("--days", type=int, default=7)
@@ -206,6 +239,7 @@ def main() -> None:
         return
     _print_bucket_summary(rows)
     _print_day_summary(rows)
+    _print_no_path_disagreements(rows, args.limit)
     _print_missing_examples(rows, args.limit)
 
 
