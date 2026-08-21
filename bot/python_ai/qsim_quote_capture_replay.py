@@ -39,6 +39,8 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from exit_config import EXIT_A_PAPER, EXIT_RIDE, apply_exit_config
+
 
 MAX_SANE_PEAK = 50.0
 MAX_SANE_PNL_PCT = 5000.0
@@ -54,6 +56,7 @@ WITH base AS (
         COALESCE(ch.handle, '?') AS channel,
         COALESCE(c.skip_reason, 'none') AS lane,
         q.variant,
+        q.vip_tier,
         q.entry_time,
         q.exit_time,
         q.entry_price AS qsim_entry,
@@ -220,6 +223,45 @@ def _confirmed_cross(mults: list[float], threshold: float) -> float | None:
     return None
 
 
+def _config_for_variant(variant: str | None):
+    if variant in {"ride", "ride_vol"}:
+        return EXIT_RIDE
+    return EXIT_A_PAPER
+
+
+def _raw_config_exit(row: dict[str, Any], mults: list[float]) -> tuple[float, str]:
+    """
+    Replay the real exit_config over raw Jupiter quote multiples.
+
+    This intentionally bypasses peak_guard/trough_guard and treats a Jupiter
+    sell quote as the executable current price. Time-stop is not simulated here
+    because qobs contains quote samples, not a complete wall-clock runner path
+    for older partially instrumented positions.
+    """
+    if not mults:
+        return (_ratio(row.get("qsim_pnl"), row.get("qsim_sol_in")) or 0.0, "current")
+
+    cfg = _config_for_variant(row.get("variant"))
+    channel_handle = (row.get("channel") or "").lstrip("@")
+    is_vip_gamble = row.get("vip_tier") in {"gamble", "gamble_risk"}
+    peak_mult = 0.0
+    for mult in mults:
+        peak_mult = max(peak_mult, mult)
+        result = apply_exit_config(
+            cfg,
+            current_mcap=mult,
+            peak_mcap=peak_mult,
+            entry_mcap=1.0,
+            is_vip_gamble=is_vip_gamble,
+            channel_handle=channel_handle,
+            entry_time=None,
+        )
+        if result.should_exit:
+            return mult - 1.0, result.reason or "raw_config"
+
+    return (_ratio(row.get("qsim_pnl"), row.get("qsim_sol_in")) or 0.0, "held_to_current")
+
+
 def _view(row: dict[str, Any]) -> ReplayRow:
     qsim_return = _ratio(row.get("qsim_pnl"), row.get("qsim_sol_in")) or 0.0
     shadow_return = _ratio(row.get("shadow_pnl"), row.get("shadow_sol_in"))
@@ -232,6 +274,10 @@ def _view(row: dict[str, Any]) -> ReplayRow:
         returns["best_raw"] = max_quote_mult - 1.0
     else:
         returns["best_raw"] = qsim_return
+
+    raw_config_return, raw_config_reason = _raw_config_exit(row, mults)
+    returns["raw_config"] = raw_config_return
+    row["raw_config_reason"] = raw_config_reason
 
     for threshold in THRESHOLDS:
         suffix = f"{int(threshold)}x"
@@ -292,7 +338,7 @@ def _print_summary(views: list[ReplayRow]) -> None:
     print(f"{'policy':<14} {'sum':>10} {'delta':>10} {'hits':>7} {'avg_hit':>9}")
     print("-" * 56)
     policies = [
-        "best_raw",
+        "best_raw", "raw_config",
         "floor_2x", "obs_2x", "confirm_2x",
         "floor_3x", "obs_3x", "confirm_3x",
         "floor_5x", "obs_5x", "confirm_5x",
@@ -301,6 +347,12 @@ def _print_summary(views: list[ReplayRow]) -> None:
         total = sum(view.returns[policy] for view in views)
         if policy == "best_raw":
             hit_values = [view.max_quote_mult for view in views if view.max_quote_mult is not None]
+        elif policy == "raw_config":
+            hit_values = [
+                view.returns[policy] + 1.0
+                for view in views
+                if view.row.get("raw_config_reason") not in {"current", "held_to_current"}
+            ]
         elif policy.startswith("confirm_"):
             threshold = float(policy.split("_")[1].replace("x", ""))
             hit_values = [_confirmed_cross(_quote_mults(view.row), threshold) for view in views]
@@ -323,8 +375,8 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
     print("\nDetail — biggest obs_2x improvement first")
     hdr = (
         f"{'call':>7} {'symbol':<12} {'ent':>5} {'qpk':>5} {'qmax':>5} {'spk':>5} "
-        f"{'cur':>8} {'obs2':>8} {'floor2':>8} {'conf2':>8} {'shadow':>8} "
-        f"{'q_reason/shadow_reason':<28}"
+        f"{'cur':>8} {'rawcfg':>8} {'obs2':>8} {'conf2':>8} {'shadow':>8} "
+        f"{'raw_reason':<12} {'q_reason/shadow_reason':<28}"
     )
     print(hdr)
     print("-" * len(hdr))
@@ -339,10 +391,11 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
             f"{_mult(view.max_quote_mult):>5} "
             f"{_mult(_f(row.get('shadow_peak'))):>5} "
             f"{_pct(view.returns['current']):>8} "
+            f"{_pct(view.returns['raw_config']):>8} "
             f"{_pct(view.returns['obs_2x']):>8} "
-            f"{_pct(view.returns['floor_2x']):>8} "
             f"{_pct(view.returns['confirm_2x']):>8} "
             f"{_pct(view.shadow_return):>8} "
+            f"{(row.get('raw_config_reason') or '?')[:12]:<12} "
             f"{reason_pair[:28]:<28}"
         )
 
