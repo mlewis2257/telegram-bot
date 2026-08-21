@@ -65,7 +65,7 @@ SQL = """
 WITH base AS (
     SELECT
         q.call_id,
-        t.symbol,
+        tok.symbol,
         COALESCE(ch.handle, '?') AS channel,
         COALESCE(c.skip_reason, 'none') AS lane,
         q.variant,
