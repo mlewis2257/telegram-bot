@@ -21,6 +21,17 @@ comparison column. The replay variants are intentionally simple:
         Same as obs_*, but requires two consecutive quote observations above the
         threshold. Useful for measuring whether a rule would be too slow.
 
+    bank_1.2x ... bank_2x
+        Exit at the first observed quote multiple at/above that level.
+
+    lock_1.5x_1.2x
+        Arm after quote reaches 1.5x, then exit if it falls back to 1.2x.
+
+    lock_or_bank_1.5x_1.2x
+        Same as lock_*, but if the floor never fires before qsim closes, bank at
+        the final observed quote. This tests "never let an armed winner become a
+        full loser" and is intentionally less conservative.
+
 Examples:
     python3 qsim_quote_capture_replay.py --days 1 --channel solwhaletrending --lane low_score --variant early --detail
     python3 qsim_quote_capture_replay.py --days 7 --channel solwhaletrending --lane low_score --variant early --max-entry-ratio 2
@@ -46,6 +57,14 @@ MAX_SANE_PEAK = 50.0
 MAX_SANE_PNL_PCT = 5000.0
 MIN_SANE_PNL_PCT = -100.5
 THRESHOLDS = (2.0, 3.0, 5.0)
+BANK_LEVELS = (1.20, 1.30, 1.40, 1.50, 1.75, 2.0)
+LOCK_FLOORS = (
+    (1.30, 1.10),
+    (1.40, 1.15),
+    (1.50, 1.20),
+    (1.75, 1.35),
+    (2.00, 1.55),
+)
 
 
 SQL = """
@@ -223,6 +242,66 @@ def _confirmed_cross(mults: list[float], threshold: float) -> float | None:
     return None
 
 
+def _bank_return(mults: list[float], level: float, current_return: float) -> float:
+    """Exit at the first observed quote >= level; fallback to current qsim result."""
+    first = _first_cross(mults, level)
+    return first - 1.0 if first is not None else current_return
+
+
+def _confirm_bank_return(mults: list[float], level: float, current_return: float) -> float:
+    """Exit at the second consecutive observed quote >= level."""
+    confirmed = _confirmed_cross(mults, level)
+    return confirmed - 1.0 if confirmed is not None else current_return
+
+
+def _lock_floor_return(
+    mults: list[float],
+    trigger: float,
+    floor: float,
+    current_return: float,
+) -> float:
+    """
+    Arm after quote peak reaches trigger, then exit if quote falls to floor.
+
+    This models "bank the move before it round-trips" without pretending the bot
+    could sell at the peak. If the floor never fires, fallback to current qsim.
+    """
+    armed = False
+    for mult in mults:
+        if not armed and mult >= trigger:
+            armed = True
+            continue
+        if armed and mult <= floor:
+            return mult - 1.0
+    return current_return
+
+
+def _lock_floor_or_bank_return(
+    mults: list[float],
+    trigger: float,
+    floor: float,
+    current_return: float,
+) -> float:
+    """
+    Arm at trigger; if floor never fires, bank at the final observed quote.
+
+    This is an optimistic-but-plausible "don't let an armed trade become a full
+    loser" replay. It is less conservative than lock_floor_*.
+    """
+    armed = False
+    last_mult = None
+    for mult in mults:
+        last_mult = mult
+        if not armed and mult >= trigger:
+            armed = True
+            continue
+        if armed and mult <= floor:
+            return mult - 1.0
+    if armed and last_mult is not None:
+        return last_mult - 1.0
+    return current_return
+
+
 def _config_for_variant(variant: str | None):
     if variant in {"ride", "ride_vol"}:
         return EXIT_RIDE
@@ -279,6 +358,18 @@ def _view(row: dict[str, Any]) -> ReplayRow:
     returns["raw_config"] = raw_config_return
     row["raw_config_reason"] = raw_config_reason
 
+    for level in BANK_LEVELS:
+        suffix = _level_suffix(level)
+        returns[f"bank_{suffix}"] = _bank_return(mults, level, qsim_return)
+        returns[f"confirm_bank_{suffix}"] = _confirm_bank_return(mults, level, qsim_return)
+
+    for trigger, floor in LOCK_FLOORS:
+        suffix = f"{_level_suffix(trigger)}_{_level_suffix(floor)}"
+        returns[f"lock_{suffix}"] = _lock_floor_return(mults, trigger, floor, qsim_return)
+        returns[f"lock_or_bank_{suffix}"] = _lock_floor_or_bank_return(
+            mults, trigger, floor, qsim_return
+        )
+
     for threshold in THRESHOLDS:
         suffix = f"{int(threshold)}x"
         first = _first_cross(mults, threshold)
@@ -308,6 +399,10 @@ def _mult(value: float | None) -> str:
     if value is None:
         return "  n/a"
     return f"{value:>5.2f}"
+
+
+def _level_suffix(level: float) -> str:
+    return f"{level:g}x".replace(".", "p")
 
 
 def _entry_ratio(view: ReplayRow) -> float | None:
@@ -344,38 +439,94 @@ def _print_summary(views: list[ReplayRow]) -> None:
         "floor_5x", "obs_5x", "confirm_5x",
     ]
     for policy in policies:
-        total = sum(view.returns[policy] for view in views)
-        if policy == "best_raw":
-            hit_values = [view.max_quote_mult for view in views if view.max_quote_mult is not None]
-        elif policy == "raw_config":
-            hit_values = [
-                view.returns[policy] + 1.0
-                for view in views
-                if view.row.get("raw_config_reason") not in {"current", "held_to_current"}
-            ]
-        elif policy.startswith("confirm_"):
-            threshold = float(policy.split("_")[1].replace("x", ""))
-            hit_values = [_confirmed_cross(_quote_mults(view.row), threshold) for view in views]
-            hit_values = [value for value in hit_values if value is not None]
-        else:
-            threshold = float(policy.split("_")[1].replace("x", ""))
-            hit_values = [view.first_hits[f"{int(threshold)}x"] for view in views]
-            hit_values = [value for value in hit_values if value is not None]
-        avg_hit = sum(hit_values) / len(hit_values) if hit_values else None
-        print(f"{policy:<14} {total:>+10.2f} {total - current:>+10.2f} {len(hit_values):>7} {_mult(avg_hit):>9}")
+        _print_policy_row(policy, views, current)
+
+    print("\nEarly Bank Totals")
+    print(f"{'policy':<18} {'sum':>10} {'delta':>10} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 60)
+    for level in BANK_LEVELS:
+        suffix = _level_suffix(level)
+        _print_policy_row(f"bank_{suffix}", views, current, width=18)
+        _print_policy_row(f"confirm_bank_{suffix}", views, current, width=18)
+
+    print("\nPeak Lock Totals")
+    print(f"{'policy':<22} {'sum':>10} {'delta':>10} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 64)
+    for trigger, floor in LOCK_FLOORS:
+        suffix = f"{_level_suffix(trigger)}_{_level_suffix(floor)}"
+        _print_policy_row(f"lock_{suffix}", views, current, width=22)
+        _print_policy_row(f"lock_or_bank_{suffix}", views, current, width=22)
+
+
+def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
+    if policy == "best_raw":
+        return [view.max_quote_mult for view in views if view.max_quote_mult is not None]
+    if policy == "raw_config":
+        return [
+            view.returns[policy] + 1.0
+            for view in views
+            if view.row.get("raw_config_reason") not in {"current", "held_to_current"}
+        ]
+    if policy.startswith("confirm_"):
+        level = _level_from_policy(policy)
+        return [
+            value
+            for view in views
+            if (value := _confirmed_cross(_quote_mults(view.row), level)) is not None
+        ]
+    if policy.startswith("bank_") or policy.startswith("floor_") or policy.startswith("obs_"):
+        level = _level_from_policy(policy)
+        return [
+            value
+            for view in views
+            if (value := _first_cross(_quote_mults(view.row), level)) is not None
+        ]
+    if policy.startswith("lock_") or policy.startswith("lock_or_bank_"):
+        return [
+            view.returns[policy] + 1.0
+            for view in views
+            if view.returns[policy] != view.returns["current"]
+        ]
+    return []
+
+
+def _level_from_policy(policy: str) -> float:
+    parts = policy.split("_")
+    token = next(part for part in reversed(parts) if part.endswith("x"))
+    return float(token.removesuffix("x").replace("p", "."))
+
+
+def _print_policy_row(
+    policy: str,
+    views: list[ReplayRow],
+    current: float,
+    *,
+    width: int = 14,
+) -> None:
+    total = sum(view.returns[policy] for view in views)
+    hit_values = _policy_hit_mults(policy, views)
+    avg_hit = sum(hit_values) / len(hit_values) if hit_values else None
+    print(
+        f"{policy:<{width}} {total:>+10.2f} {total - current:>+10.2f} "
+        f"{len(hit_values):>7} {_mult(avg_hit):>9}"
+    )
 
 
 def _print_detail(views: list[ReplayRow], limit: int) -> None:
     rows = sorted(
         views,
-        key=lambda view: view.returns["obs_2x"] - view.returns["current"],
+        key=lambda view: max(
+            view.returns["bank_1p3x"],
+            view.returns["lock_or_bank_1p5x_1p2x"],
+            view.returns["obs_2x"],
+        ) - view.returns["current"],
         reverse=True,
     )[:limit]
 
-    print("\nDetail — biggest obs_2x improvement first")
+    print("\nDetail — biggest bank/lock improvement first")
     hdr = (
         f"{'call':>7} {'symbol':<12} {'ent':>5} {'qpk':>5} {'qmax':>5} {'spk':>5} "
-        f"{'cur':>8} {'rawcfg':>8} {'obs2':>8} {'conf2':>8} {'shadow':>8} "
+        f"{'cur':>8} {'bank13':>8} {'bank15':>8} {'lock15':>8} {'obs2':>8} {'shadow':>8} "
         f"{'raw_reason':<12} {'q_reason/shadow_reason':<28}"
     )
     print(hdr)
@@ -391,9 +542,10 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
             f"{_mult(view.max_quote_mult):>5} "
             f"{_mult(_f(row.get('shadow_peak'))):>5} "
             f"{_pct(view.returns['current']):>8} "
-            f"{_pct(view.returns['raw_config']):>8} "
+            f"{_pct(view.returns['bank_1p3x']):>8} "
+            f"{_pct(view.returns['bank_1p5x']):>8} "
+            f"{_pct(view.returns['lock_or_bank_1p5x_1p2x']):>8} "
             f"{_pct(view.returns['obs_2x']):>8} "
-            f"{_pct(view.returns['confirm_2x']):>8} "
             f"{_pct(view.shadow_return):>8} "
             f"{(row.get('raw_config_reason') or '?')[:12]:<12} "
             f"{reason_pair[:28]:<28}"
