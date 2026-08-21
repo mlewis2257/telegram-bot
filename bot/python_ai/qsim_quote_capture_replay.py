@@ -32,6 +32,10 @@ comparison column. The replay variants are intentionally simple:
         Sell 50% at 1.3x, then exit the remaining 50% if the quote falls back
         to 1x. Tests de-risking plus "do not let the moonbag round-trip."
 
+    no_1.2x_stop_0.85x
+        Exit if quote falls to 0.85x before ever reaching 1.2x. Tests cutting
+        dead-on-arrival trades before the standard hard stop.
+
     lock_1.5x_1.2x
         Arm after quote reaches 1.5x, then exit if it falls back to 1.2x.
 
@@ -68,6 +72,8 @@ THRESHOLDS = (2.0, 3.0, 5.0)
 BANK_LEVELS = (1.20, 1.30, 1.40, 1.50, 1.75, 2.0)
 BANK_FRACTIONS = (0.25, 0.50, 0.75)
 BANK_REMAINDER_STOPS = (0.85, 1.0, 1.10)
+NO_BOUNCE_THRESHOLDS = (1.10, 1.20, 1.30)
+NO_BOUNCE_STOPS = (0.90, 0.85, 0.80, 0.75)
 LOCK_FLOORS = (
     (1.30, 1.10),
     (1.40, 1.15),
@@ -328,6 +334,27 @@ def _partial_bank_with_stop_return(
     return fraction * banked_return + (1.0 - fraction) * current_return
 
 
+def _no_bounce_stop_return(
+    mults: list[float],
+    bounce: float,
+    stop: float,
+    current_return: float,
+) -> float:
+    """
+    Exit if quote falls to stop before the trade ever proves a bounce.
+
+    Once the quote reaches bounce, this defensive rule stands down and the row
+    falls back to the original qsim result. This targets the majority bucket:
+    trades that never reach even 1.1x-1.3x and then bleed into ugly exits.
+    """
+    for mult in mults:
+        if mult >= bounce:
+            return current_return
+        if mult <= stop:
+            return mult - 1.0
+    return current_return
+
+
 def _lock_floor_return(
     mults: list[float],
     trigger: float,
@@ -459,6 +486,14 @@ def _view(row: dict[str, Any]) -> ReplayRow:
             mults, trigger, floor, qsim_return
         )
 
+    for bounce in NO_BOUNCE_THRESHOLDS:
+        bounce_suffix = _level_suffix(bounce)
+        for stop in NO_BOUNCE_STOPS:
+            stop_suffix = _level_suffix(stop)
+            returns[f"no_{bounce_suffix}_stop_{stop_suffix}"] = _no_bounce_stop_return(
+                mults, bounce, stop, qsim_return
+            )
+
     for threshold in THRESHOLDS:
         suffix = f"{int(threshold)}x"
         first = _first_cross(mults, threshold)
@@ -570,6 +605,20 @@ def _print_summary(views: list[ReplayRow]) -> None:
                     width=32,
                 )
 
+    print("\nNo-Bounce Stop Totals")
+    print(f"{'policy':<24} {'sum':>10} {'delta':>10} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 66)
+    for bounce in NO_BOUNCE_THRESHOLDS:
+        bounce_suffix = _level_suffix(bounce)
+        for stop in NO_BOUNCE_STOPS:
+            stop_suffix = _level_suffix(stop)
+            _print_policy_row(
+                f"no_{bounce_suffix}_stop_{stop_suffix}",
+                views,
+                current,
+                width=24,
+            )
+
     print("\nPeak Lock Totals")
     print(f"{'policy':<22} {'sum':>10} {'delta':>10} {'hits':>7} {'avg_hit':>9}")
     print("-" * 64)
@@ -596,6 +645,12 @@ def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
             if (value := _confirmed_cross(_quote_mults(view.row), level)) is not None
         ]
     if policy.startswith("lock_") or policy.startswith("lock_or_bank_"):
+        return [
+            view.returns[policy] + 1.0
+            for view in views
+            if view.returns[policy] != view.returns["current"]
+        ]
+    if policy.startswith("no_"):
         return [
             view.returns[policy] + 1.0
             for view in views
