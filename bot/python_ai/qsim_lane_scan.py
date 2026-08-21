@@ -213,6 +213,13 @@ def main() -> None:
         shadow_views = [view for view in views if view.shadow_return is not None]
         shadow = sum(view.shadow_return or 0.0 for view in shadow_views)
         best_raw = sum(view.returns["best_raw"] for view in views)
+        entry_times = [
+            view.row.get("entry_time")
+            for view in views
+            if view.row.get("entry_time") is not None
+        ]
+        first_entry = min(entry_times) if entry_times else None
+        last_entry = max(entry_times) if entry_times else None
         best_policy = max(
             policy_names,
             key=lambda policy: sum(view.returns[policy] for view in views),
@@ -227,6 +234,8 @@ def main() -> None:
             "avg": current / len(views),
             "shadow": shadow,
             "shadow_n": len(shadow_views),
+            "first_entry": first_entry,
+            "last_entry": last_entry,
             "best_raw": best_raw,
             "best_policy": best_policy,
             "best_total": best_total,
@@ -247,17 +256,23 @@ def main() -> None:
         f"\nQSIM LANE SCAN — days={args.days} channel={args.channel} lane={args.lane} "
         f"variant={args.variant} min_n={args.min_n}"
     )
-    print("PnL normalized per 1 SOL deployed; only rows with qsim quote observations.\n")
+    print(
+        "PnL normalized per 1 SOL deployed; only rows with qsim quote observations.\n"
+        "`shadow` is the matched shadow PnL for these same qsim rows, not the full shadow_report lane.\n"
+    )
     hdr = (
-        f"{'channel':<16} {'lane':<14} {'var':<8} {'n':>5} {'cur':>9} {'avg':>7} "
+        f"{'channel':<16} {'lane':<14} {'var':<8} {'first':<10} {'last':<10} {'n':>5} {'cur':>9} {'avg':>7} "
         f"{'shadow':>9} {'best':>9} {'impr':>8} {'r1.5':>5} {'d1.1':>5} best_policy"
     )
     print(hdr)
     print("-" * len(hdr))
     for row in summaries:
         channel, lane, variant = row["key"]
+        first = _date(row["first_entry"])
+        last = _date(row["last_entry"])
         print(
             f"{channel[:16]:<16} {lane[:14]:<14} {variant[:8]:<8} "
+            f"{first:<10} {last:<10} "
             f"{row['n']:>5} {row['current']:>+9.2f} {row['avg']:>+7.2f} "
             f"{row['shadow']:>+9.2f} {row['best_total']:>+9.2f} "
             f"{row['improve']:>+8.2f} {row['runner_15']:>5} {row['dead_11']:>5} "
@@ -267,7 +282,15 @@ def main() -> None:
     if not summaries:
         print("No lanes met that min_n/filter yet.")
     else:
-        print("\nRead: prioritize positive `cur`; otherwise only chase lanes where `best` is near/above 0.")
+        print("\nRead: compare this to shadow_report only when the date/sample sizes line up.")
+
+
+def _date(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, datetime):
+        return value.strftime("%m/%d")
+    return str(value)[:10]
 
 
 if __name__ == "__main__":
