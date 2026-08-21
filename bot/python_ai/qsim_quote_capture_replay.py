@@ -357,6 +357,8 @@ def main() -> None:
     parser.add_argument("--variant", default="early")
     parser.add_argument("--min-entry-ratio", type=float, default=None)
     parser.add_argument("--max-entry-ratio", type=float, default=None)
+    parser.add_argument("--require-qobs", action="store_true",
+                        help="only include rows with quote observations")
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--raw", action="store_true", help="include phantom-price rows")
     parser.add_argument("--detail", action="store_true", help="print per-trade rows")
@@ -377,10 +379,12 @@ def main() -> None:
 
     rows = _rows(params)
     views = [_view(row) for row in rows]
+    if args.require_qobs:
+        views = [view for view in views if int(view.row.get("qobs_count") or 0) > 0]
     print(
         f"filters: days={args.days} channel={args.channel} lane={args.lane} "
         f"variant={args.variant} min_entry_ratio={args.min_entry_ratio} "
-        f"max_entry_ratio={args.max_entry_ratio}"
+        f"max_entry_ratio={args.max_entry_ratio} require_qobs={args.require_qobs}"
     )
     _print_summary(views)
     if views and args.detail:
