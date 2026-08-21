@@ -202,6 +202,7 @@ def _bucket(row: dict, edge: float, entry_ratio: float | None,
     obs_count = int(row.get("obs_count") or 0)
     max_after = _f(row.get("max_ws_after_qsim_mult"))
     max_ws = _f(row.get("max_ws_mult"))
+    max_qobs = _f(row.get("max_qobs_mult"))
     q_peak = _f(row.get("qsim_peak"))
     s_peak = _f(row.get("shadow_peak"))
 
@@ -210,6 +211,8 @@ def _bucket(row: dict, edge: float, entry_ratio: float | None,
     if q_reason == s_reason and abs(edge) < 0.10:
         return "aligned"
     if q_reason == "hard_stop" and _reason_is_bank(s_reason):
+        if max_qobs >= 2.0 and (q_peak < 1.5 or q_peak < max_qobs * 0.5):
+            return "qsim_raw_quote_spike_not_banked"
         if obs_count > 0 and max_after >= 1.0:
             return "qsim_hard_stop_before_feed_recovery"
         if obs_count > 0 and max_ws < 1.2:
