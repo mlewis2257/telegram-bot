@@ -28,6 +28,10 @@ comparison column. The replay variants are intentionally simple:
         Sell 50% at the first observed quote >= 1.3x, then let the remaining
         50% use the original qsim outcome. Tests runner-preserving de-risking.
 
+    p50_bank_1.3x_stop_1x
+        Sell 50% at 1.3x, then exit the remaining 50% if the quote falls back
+        to 1x. Tests de-risking plus "do not let the moonbag round-trip."
+
     lock_1.5x_1.2x
         Arm after quote reaches 1.5x, then exit if it falls back to 1.2x.
 
@@ -63,6 +67,7 @@ MIN_SANE_PNL_PCT = -100.5
 THRESHOLDS = (2.0, 3.0, 5.0)
 BANK_LEVELS = (1.20, 1.30, 1.40, 1.50, 1.75, 2.0)
 BANK_FRACTIONS = (0.25, 0.50, 0.75)
+BANK_REMAINDER_STOPS = (0.85, 1.0, 1.10)
 LOCK_FLOORS = (
     (1.30, 1.10),
     (1.40, 1.15),
@@ -291,6 +296,38 @@ def _confirm_partial_bank_return(
     return fraction * banked_return + (1.0 - fraction) * current_return
 
 
+def _partial_bank_with_stop_return(
+    mults: list[float],
+    level: float,
+    fraction: float,
+    stop: float,
+    current_return: float,
+) -> float:
+    """
+    Sell fraction at first quote >= level; remainder exits if it later falls to stop.
+
+    If the remainder stop never fires, the remainder follows the original qsim
+    result. This is the practical candidate live shape: take money when the
+    quote proves strength, then stop the remaining bag from becoming a disaster.
+    """
+    banked_mult = None
+    armed = False
+    for mult in mults:
+        if not armed and mult >= level:
+            banked_mult = mult
+            armed = True
+            continue
+        if armed and mult <= stop:
+            banked_return = (banked_mult or level) - 1.0
+            stop_return = mult - 1.0
+            return fraction * banked_return + (1.0 - fraction) * stop_return
+
+    if banked_mult is None:
+        return current_return
+    banked_return = banked_mult - 1.0
+    return fraction * banked_return + (1.0 - fraction) * current_return
+
+
 def _lock_floor_return(
     mults: list[float],
     trigger: float,
@@ -407,6 +444,13 @@ def _view(row: dict[str, Any]) -> ReplayRow:
             returns[f"confirm_{frac_suffix}_bank_{suffix}"] = _confirm_partial_bank_return(
                 mults, level, fraction, qsim_return
             )
+            for stop in BANK_REMAINDER_STOPS:
+                stop_suffix = _level_suffix(stop)
+                returns[f"{frac_suffix}_bank_{suffix}_stop_{stop_suffix}"] = (
+                    _partial_bank_with_stop_return(
+                        mults, level, fraction, stop, qsim_return
+                    )
+                )
 
     for trigger, floor in LOCK_FLOORS:
         suffix = f"{_level_suffix(trigger)}_{_level_suffix(floor)}"
@@ -510,6 +554,22 @@ def _print_summary(views: list[ReplayRow]) -> None:
                 f"confirm_{frac_suffix}_bank_{suffix}", views, current, width=24
             )
 
+    print("\nPartial Bank + Remainder Stop Totals")
+    print(f"{'policy':<32} {'sum':>10} {'delta':>10} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 74)
+    for level in (1.30, 1.40, 1.50):
+        suffix = _level_suffix(level)
+        for fraction in BANK_FRACTIONS:
+            frac_suffix = _fraction_suffix(fraction)
+            for stop in BANK_REMAINDER_STOPS:
+                stop_suffix = _level_suffix(stop)
+                _print_policy_row(
+                    f"{frac_suffix}_bank_{suffix}_stop_{stop_suffix}",
+                    views,
+                    current,
+                    width=32,
+                )
+
     print("\nPeak Lock Totals")
     print(f"{'policy':<22} {'sum':>10} {'delta':>10} {'hits':>7} {'avg_hit':>9}")
     print("-" * 64)
@@ -547,7 +607,7 @@ def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
         or policy.startswith("obs_")
         or "_bank_" in policy
     ):
-        level = _level_from_policy(policy)
+        level = _bank_level_from_policy(policy) if "_bank_" in policy else _level_from_policy(policy)
         return [
             value
             for view in views
@@ -559,6 +619,13 @@ def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
 def _level_from_policy(policy: str) -> float:
     parts = policy.split("_")
     token = next(part for part in reversed(parts) if part.endswith("x"))
+    return float(token.removesuffix("x").replace("p", "."))
+
+
+def _bank_level_from_policy(policy: str) -> float:
+    parts = policy.split("_")
+    bank_idx = parts.index("bank")
+    token = parts[bank_idx + 1]
     return float(token.removesuffix("x").replace("p", "."))
 
 
