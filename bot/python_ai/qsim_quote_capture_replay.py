@@ -24,6 +24,10 @@ comparison column. The replay variants are intentionally simple:
     bank_1.2x ... bank_2x
         Exit at the first observed quote multiple at/above that level.
 
+    p50_bank_1.3x
+        Sell 50% at the first observed quote >= 1.3x, then let the remaining
+        50% use the original qsim outcome. Tests runner-preserving de-risking.
+
     lock_1.5x_1.2x
         Arm after quote reaches 1.5x, then exit if it falls back to 1.2x.
 
@@ -58,6 +62,7 @@ MAX_SANE_PNL_PCT = 5000.0
 MIN_SANE_PNL_PCT = -100.5
 THRESHOLDS = (2.0, 3.0, 5.0)
 BANK_LEVELS = (1.20, 1.30, 1.40, 1.50, 1.75, 2.0)
+BANK_FRACTIONS = (0.25, 0.50, 0.75)
 LOCK_FLOORS = (
     (1.30, 1.10),
     (1.40, 1.15),
@@ -254,6 +259,38 @@ def _confirm_bank_return(mults: list[float], level: float, current_return: float
     return confirmed - 1.0 if confirmed is not None else current_return
 
 
+def _partial_bank_return(
+    mults: list[float],
+    level: float,
+    fraction: float,
+    current_return: float,
+) -> float:
+    """
+    Sell fraction at first quote >= level; remainder follows current qsim result.
+
+    This keeps tail upside from existing winners while reducing the round-trip
+    damage on trades that briefly touch 1.2x-1.7x before collapsing.
+    """
+    first = _first_cross(mults, level)
+    if first is None:
+        return current_return
+    banked_return = first - 1.0
+    return fraction * banked_return + (1.0 - fraction) * current_return
+
+
+def _confirm_partial_bank_return(
+    mults: list[float],
+    level: float,
+    fraction: float,
+    current_return: float,
+) -> float:
+    confirmed = _confirmed_cross(mults, level)
+    if confirmed is None:
+        return current_return
+    banked_return = confirmed - 1.0
+    return fraction * banked_return + (1.0 - fraction) * current_return
+
+
 def _lock_floor_return(
     mults: list[float],
     trigger: float,
@@ -362,6 +399,14 @@ def _view(row: dict[str, Any]) -> ReplayRow:
         suffix = _level_suffix(level)
         returns[f"bank_{suffix}"] = _bank_return(mults, level, qsim_return)
         returns[f"confirm_bank_{suffix}"] = _confirm_bank_return(mults, level, qsim_return)
+        for fraction in BANK_FRACTIONS:
+            frac_suffix = _fraction_suffix(fraction)
+            returns[f"{frac_suffix}_bank_{suffix}"] = _partial_bank_return(
+                mults, level, fraction, qsim_return
+            )
+            returns[f"confirm_{frac_suffix}_bank_{suffix}"] = _confirm_partial_bank_return(
+                mults, level, fraction, qsim_return
+            )
 
     for trigger, floor in LOCK_FLOORS:
         suffix = f"{_level_suffix(trigger)}_{_level_suffix(floor)}"
@@ -403,6 +448,10 @@ def _mult(value: float | None) -> str:
 
 def _level_suffix(level: float) -> str:
     return f"{level:g}x".replace(".", "p")
+
+
+def _fraction_suffix(fraction: float) -> str:
+    return f"p{int(round(fraction * 100))}"
 
 
 def _entry_ratio(view: ReplayRow) -> float | None:
@@ -449,6 +498,18 @@ def _print_summary(views: list[ReplayRow]) -> None:
         _print_policy_row(f"bank_{suffix}", views, current, width=18)
         _print_policy_row(f"confirm_bank_{suffix}", views, current, width=18)
 
+    print("\nPartial Bank Totals")
+    print(f"{'policy':<24} {'sum':>10} {'delta':>10} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 66)
+    for level in BANK_LEVELS:
+        suffix = _level_suffix(level)
+        for fraction in BANK_FRACTIONS:
+            frac_suffix = _fraction_suffix(fraction)
+            _print_policy_row(f"{frac_suffix}_bank_{suffix}", views, current, width=24)
+            _print_policy_row(
+                f"confirm_{frac_suffix}_bank_{suffix}", views, current, width=24
+            )
+
     print("\nPeak Lock Totals")
     print(f"{'policy':<22} {'sum':>10} {'delta':>10} {'hits':>7} {'avg_hit':>9}")
     print("-" * 64)
@@ -474,18 +535,23 @@ def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
             for view in views
             if (value := _confirmed_cross(_quote_mults(view.row), level)) is not None
         ]
-    if policy.startswith("bank_") or policy.startswith("floor_") or policy.startswith("obs_"):
-        level = _level_from_policy(policy)
-        return [
-            value
-            for view in views
-            if (value := _first_cross(_quote_mults(view.row), level)) is not None
-        ]
     if policy.startswith("lock_") or policy.startswith("lock_or_bank_"):
         return [
             view.returns[policy] + 1.0
             for view in views
             if view.returns[policy] != view.returns["current"]
+        ]
+    if (
+        policy.startswith("bank_")
+        or policy.startswith("floor_")
+        or policy.startswith("obs_")
+        or "_bank_" in policy
+    ):
+        level = _level_from_policy(policy)
+        return [
+            value
+            for view in views
+            if (value := _first_cross(_quote_mults(view.row), level)) is not None
         ]
     return []
 
@@ -517,6 +583,7 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
         views,
         key=lambda view: max(
             view.returns["bank_1p3x"],
+            view.returns["p50_bank_1p3x"],
             view.returns["lock_or_bank_1p5x_1p2x"],
             view.returns["obs_2x"],
         ) - view.returns["current"],
@@ -526,7 +593,7 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
     print("\nDetail — biggest bank/lock improvement first")
     hdr = (
         f"{'call':>7} {'symbol':<12} {'ent':>5} {'qpk':>5} {'qmax':>5} {'spk':>5} "
-        f"{'cur':>8} {'bank13':>8} {'bank15':>8} {'lock15':>8} {'obs2':>8} {'shadow':>8} "
+        f"{'cur':>8} {'bank13':>8} {'p50b13':>8} {'bank15':>8} {'obs2':>8} {'shadow':>8} "
         f"{'raw_reason':<12} {'q_reason/shadow_reason':<28}"
     )
     print(hdr)
@@ -543,8 +610,8 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
             f"{_mult(_f(row.get('shadow_peak'))):>5} "
             f"{_pct(view.returns['current']):>8} "
             f"{_pct(view.returns['bank_1p3x']):>8} "
+            f"{_pct(view.returns['p50_bank_1p3x']):>8} "
             f"{_pct(view.returns['bank_1p5x']):>8} "
-            f"{_pct(view.returns['lock_or_bank_1p5x_1p2x']):>8} "
             f"{_pct(view.returns['obs_2x']):>8} "
             f"{_pct(view.shadow_return):>8} "
             f"{(row.get('raw_config_reason') or '?')[:12]:<12} "
