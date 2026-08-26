@@ -229,7 +229,14 @@ def main() -> None:
     parser.add_argument("--min-coverage", type=float, default=0.80)
     parser.add_argument("--min-qmax-n", type=int, default=25)
     parser.add_argument("--raw", action="store_true")
+    parser.add_argument(
+        "--max-qmax",
+        type=float,
+        default=replay.MAX_QOBS_MULT,
+        help="ignore quote observations above this multiple as quote artifacts",
+    )
     args = parser.parse_args()
+    replay.MAX_QOBS_MULT = args.max_qmax
 
     params = {
         "days": args.days,
@@ -249,7 +256,7 @@ def main() -> None:
 
     print(
         f"\nQSIM FORWARD REFEREE — days={args.days} channel={args.channel} "
-        f"lane={args.lane} variant={args.variant}"
+        f"lane={args.lane} variant={args.variant} max_qmax={args.max_qmax}"
     )
     print("PnL is normalized per 1 SOL deployed. Verdict only trusts qmax-covered rows.\n")
     hdr = (

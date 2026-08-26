@@ -68,6 +68,7 @@ from exit_config import EXIT_A_PAPER, EXIT_RIDE, apply_exit_config
 MAX_SANE_PEAK = 50.0
 MAX_SANE_PNL_PCT = 5000.0
 MIN_SANE_PNL_PCT = -100.5
+MAX_QOBS_MULT = float(os.getenv("QSIM_REPLAY_MAX_QOBS_MULT", "50"))
 THRESHOLDS = (2.0, 3.0, 5.0)
 BANK_LEVELS = (1.20, 1.30, 1.40, 1.50, 1.75, 2.0)
 BANK_FRACTIONS = (0.25, 0.50, 0.75)
@@ -236,7 +237,7 @@ def _quote_mults(row: dict[str, Any]) -> list[float]:
     mults: list[float] = []
     for obs in _observations(row.get("observations")):
         mult = _f(obs.get("real_mult"))
-        if mult > 0:
+        if 0 < mult <= MAX_QOBS_MULT:
             mults.append(mult)
     return mults
 
@@ -742,6 +743,8 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
 
 
 def main() -> None:
+    global MAX_QOBS_MULT
+
     parser = argparse.ArgumentParser(
         description="Replay qsim using raw Jupiter quote observations."
     )
@@ -755,8 +758,15 @@ def main() -> None:
                         help="only include rows with quote observations")
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--raw", action="store_true", help="include phantom-price rows")
+    parser.add_argument(
+        "--max-qmax",
+        type=float,
+        default=MAX_QOBS_MULT,
+        help="ignore quote observations above this multiple as quote artifacts",
+    )
     parser.add_argument("--detail", action="store_true", help="print per-trade rows")
     args = parser.parse_args()
+    MAX_QOBS_MULT = args.max_qmax
 
     params = {
         "days": args.days,
@@ -778,7 +788,8 @@ def main() -> None:
     print(
         f"filters: days={args.days} channel={args.channel} lane={args.lane} "
         f"variant={args.variant} min_entry_ratio={args.min_entry_ratio} "
-        f"max_entry_ratio={args.max_entry_ratio} require_qobs={args.require_qobs}"
+        f"max_entry_ratio={args.max_entry_ratio} require_qobs={args.require_qobs} "
+        f"max_qmax={args.max_qmax}"
     )
     _print_summary(views)
     if views and args.detail:

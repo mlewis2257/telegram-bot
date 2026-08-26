@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 MAX_SANE_PEAK = 50.0
 MAX_SANE_PNL_PCT = 5000.0
 MIN_SANE_PNL_PCT = -100.5
+MAX_QOBS_MULT = 50.0
 
 
 SQL = """
@@ -91,6 +92,8 @@ annotated AS (
         FROM qsim_quote_observations qo
         WHERE qo.call_id = sb.call_id
           AND q.id IS NOT NULL
+          AND qo.real_mult > 0
+          AND qo.real_mult <= %(max_qmax)s
           AND qo.observed_at BETWEEN q.entry_time AND COALESCE(q.exit_time, now())
     ) qobs ON TRUE
 )
@@ -238,6 +241,12 @@ def main() -> None:
     parser.add_argument("--variant", default="early")
     parser.add_argument("--limit", type=int, default=30)
     parser.add_argument("--raw", action="store_true")
+    parser.add_argument(
+        "--max-qmax",
+        type=float,
+        default=MAX_QOBS_MULT,
+        help="ignore quote observations above this multiple as quote artifacts",
+    )
     args = parser.parse_args()
 
     params = {
@@ -249,11 +258,12 @@ def main() -> None:
         "max_peak": MAX_SANE_PEAK,
         "max_pnl": MAX_SANE_PNL_PCT,
         "min_pnl": MIN_SANE_PNL_PCT,
+        "max_qmax": args.max_qmax,
     }
     rows = _rows(params)
     print(
         f"\nQSIM/SHADOW COVERAGE — days={args.days} channel={args.channel} "
-        f"lane={args.lane} variant={args.variant}"
+        f"lane={args.lane} variant={args.variant} max_qmax={args.max_qmax}"
     )
     print(f"shadow rows: {len(rows)}")
     if not rows:

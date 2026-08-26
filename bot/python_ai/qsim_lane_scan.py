@@ -182,8 +182,15 @@ def main() -> None:
     parser.add_argument("--min-entry-ratio", type=float, default=None)
     parser.add_argument("--max-entry-ratio", type=float, default=None)
     parser.add_argument("--raw", action="store_true")
+    parser.add_argument(
+        "--max-qmax",
+        type=float,
+        default=replay.MAX_QOBS_MULT,
+        help="ignore quote observations above this multiple as quote artifacts",
+    )
     parser.add_argument("--sort", choices=("current", "best", "improve", "shadow"), default="best")
     args = parser.parse_args()
+    replay.MAX_QOBS_MULT = args.max_qmax
 
     params = {
         "days": args.days,
@@ -254,7 +261,7 @@ def main() -> None:
 
     print(
         f"\nQSIM LANE SCAN — days={args.days} channel={args.channel} lane={args.lane} "
-        f"variant={args.variant} min_n={args.min_n}"
+        f"variant={args.variant} min_n={args.min_n} max_qmax={args.max_qmax}"
     )
     print(
         "PnL normalized per 1 SOL deployed; only rows with qsim quote observations.\n"
