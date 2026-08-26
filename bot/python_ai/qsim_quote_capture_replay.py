@@ -139,6 +139,86 @@ DYNAMIC_EXIT_POLICIES = (
         "dead_stop": 0.90,
     },
 )
+WINNER_ONLY_POLICIES = (
+    {
+        "name": "win_bank_a1p3",
+        "arm": 1.30,
+        "mode": "bank",
+        "confirm_ticks": 1,
+    },
+    {
+        "name": "win_bank_a1p4",
+        "arm": 1.40,
+        "mode": "bank",
+        "confirm_ticks": 1,
+    },
+    {
+        "name": "win_bank_a1p5",
+        "arm": 1.50,
+        "mode": "bank",
+        "confirm_ticks": 1,
+    },
+    {
+        "name": "win_c2_bank_a1p3",
+        "arm": 1.30,
+        "mode": "bank",
+        "confirm_ticks": 2,
+    },
+    {
+        "name": "win_c2_bank_a1p4",
+        "arm": 1.40,
+        "mode": "bank",
+        "confirm_ticks": 2,
+    },
+    {
+        "name": "win_c2_bank_a1p5",
+        "arm": 1.50,
+        "mode": "bank",
+        "confirm_ticks": 2,
+    },
+    {
+        "name": "win_a1p3_f1p05",
+        "arm": 1.30,
+        "floor": 1.05,
+        "mode": "floor",
+        "confirm_ticks": 1,
+    },
+    {
+        "name": "win_a1p4_f1p1",
+        "arm": 1.40,
+        "floor": 1.10,
+        "mode": "floor",
+        "confirm_ticks": 1,
+    },
+    {
+        "name": "win_a1p5_f1p15",
+        "arm": 1.50,
+        "floor": 1.15,
+        "mode": "floor",
+        "confirm_ticks": 1,
+    },
+    {
+        "name": "win_a1p3_stall3",
+        "arm": 1.30,
+        "stall_ticks": 3,
+        "mode": "stall",
+        "confirm_ticks": 1,
+    },
+    {
+        "name": "win_a1p4_stall3",
+        "arm": 1.40,
+        "stall_ticks": 3,
+        "mode": "stall",
+        "confirm_ticks": 1,
+    },
+    {
+        "name": "win_a1p5_stall3",
+        "arm": 1.50,
+        "stall_ticks": 3,
+        "mode": "stall",
+        "confirm_ticks": 1,
+    },
+)
 
 FILTER_ALIASES = {
     "score": "score",
@@ -622,6 +702,55 @@ def _dynamic_exit_return(
     return current_return
 
 
+def _winner_only_return(
+    mults: list[float],
+    *,
+    arm: float,
+    mode: str,
+    confirm_ticks: int,
+    current_return: float,
+    floor: float | None = None,
+    stall_ticks: int | None = None,
+) -> float:
+    """
+    Winner-only quote management.
+
+    Unlike _dynamic_exit_return, this never cuts losers early. It only changes
+    the outcome after the quote path proves strength at the arm level.
+    """
+    armed = False
+    arm_streak = 0
+    armed_peak = 0.0
+    ticks_since_high = 0
+
+    for mult in mults:
+        if not armed:
+            if mult >= arm:
+                arm_streak += 1
+                if arm_streak >= confirm_ticks:
+                    if mode == "bank":
+                        return mult - 1.0
+                    armed = True
+                    armed_peak = mult
+                    ticks_since_high = 0
+            else:
+                arm_streak = 0
+            continue
+
+        if mult > armed_peak:
+            armed_peak = mult
+            ticks_since_high = 0
+            continue
+
+        ticks_since_high += 1
+        if mode == "floor" and floor is not None and mult <= floor:
+            return mult - 1.0
+        if mode == "stall" and stall_ticks is not None and ticks_since_high >= stall_ticks:
+            return mult - 1.0
+
+    return current_return
+
+
 def _config_for_variant(variant: str | None):
     if variant in {"ride", "ride_vol"}:
         return EXIT_RIDE
@@ -715,6 +844,17 @@ def _view(row: dict[str, Any]) -> ReplayRow:
             bounce=policy["bounce"],
             dead_stop=policy["dead_stop"],
             current_return=qsim_return,
+        )
+
+    for policy in WINNER_ONLY_POLICIES:
+        returns[policy["name"]] = _winner_only_return(
+            mults,
+            arm=policy["arm"],
+            mode=policy["mode"],
+            confirm_ticks=policy["confirm_ticks"],
+            current_return=qsim_return,
+            floor=policy.get("floor"),
+            stall_ticks=policy.get("stall_ticks"),
         )
 
     for bounce in NO_BOUNCE_THRESHOLDS:
@@ -864,6 +1004,12 @@ def _print_summary(views: list[ReplayRow]) -> None:
     for policy in DYNAMIC_EXIT_POLICIES:
         _print_policy_row(policy["name"], views, current, width=32)
 
+    print("\nWinner-Only Exit Totals")
+    print(f"{'policy':<22} {'sum':>10} {'delta':>10} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 64)
+    for policy in WINNER_ONLY_POLICIES:
+        _print_policy_row(policy["name"], views, current, width=22)
+
 
 def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
     if policy == "best_raw":
@@ -888,6 +1034,12 @@ def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
             if view.returns[policy] != view.returns["current"]
         ]
     if policy.startswith("dyn_"):
+        return [
+            view.returns[policy] + 1.0
+            for view in views
+            if view.returns[policy] != view.returns["current"]
+        ]
+    if policy.startswith("win_"):
         return [
             view.returns[policy] + 1.0
             for view in views
@@ -951,6 +1103,7 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
             view.returns["p50_bank_1p3x"],
             view.returns["lock_or_bank_1p5x_1p2x"],
             view.returns["dyn_a1p4_f1p1_s3_nb1p2_0p9"],
+            view.returns["win_a1p4_stall3"],
             view.returns["obs_2x"],
         ) - view.returns["current"],
         reverse=True,
@@ -959,7 +1112,7 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
     print("\nDetail — biggest bank/lock improvement first")
     hdr = (
         f"{'call':>7} {'symbol':<12} {'ent':>5} {'qpk':>5} {'qmax':>5} {'spk':>5} "
-        f"{'cur':>8} {'bank13':>8} {'dyn14':>8} {'bank15':>8} {'obs2':>8} {'shadow':>8} "
+        f"{'cur':>8} {'bank13':>8} {'win14s':>8} {'bank15':>8} {'obs2':>8} {'shadow':>8} "
         f"{'raw_reason':<12} {'q_reason/shadow_reason':<28}"
     )
     print(hdr)
@@ -976,7 +1129,7 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
             f"{_mult(_f(row.get('shadow_peak'))):>5} "
             f"{_pct(view.returns['current']):>8} "
             f"{_pct(view.returns['bank_1p3x']):>8} "
-            f"{_pct(view.returns['dyn_a1p4_f1p1_s3_nb1p2_0p9']):>8} "
+            f"{_pct(view.returns['win_a1p4_stall3']):>8} "
             f"{_pct(view.returns['bank_1p5x']):>8} "
             f"{_pct(view.returns['obs_2x']):>8} "
             f"{_pct(view.shadow_return):>8} "
