@@ -189,7 +189,14 @@ LIVE_QUOTE_PEAK_PENDING_TTL_SECS = float(
 LIVE_NO_BOUNCE_STOP_ENABLED = os.getenv("LIVE_NO_BOUNCE_STOP_ENABLED", "false").lower() == "true"
 NO_BOUNCE_ARM_MULT          = float(os.getenv("NO_BOUNCE_ARM_MULT", "1.3"))
 NO_BOUNCE_STOP_MULT         = float(os.getenv("NO_BOUNCE_STOP_MULT", "0.9"))
+LIVE_RUNNER_WINDOW_ENABLED  = os.getenv("LIVE_RUNNER_WINDOW_ENABLED", "false").lower() == "true"
+RUNNER_WINDOW_ARM_MULT      = float(os.getenv("RUNNER_WINDOW_ARM_MULT", "2.0"))
+RUNNER_WINDOW_RELEASE_MULT  = float(os.getenv("RUNNER_WINDOW_RELEASE_MULT", "5.0"))
+RUNNER_WINDOW_MINS          = float(os.getenv("RUNNER_WINDOW_MINS", "10"))
+RUNNER_WINDOW_FLOOR_MULT    = float(os.getenv("RUNNER_WINDOW_FLOOR_MULT", "1.0"))
+RUNNER_WINDOW_PROTECTED_REASONS = {"trail_stop", "profit_floor"}
 _sell_quote_cache: dict = {}  # mint -> (sol_out, monotonic_ts)
+_runner_window_until: dict[int, float] = {}
 # Exit quotes are the highest-value quote we make (real money on the line), so a
 # transient Jupiter 429 is retried briefly before we surrender to the feed basis —
 # the feed is exactly the liar the quote path exists to bypass (measured: ~2/3 of live
@@ -857,6 +864,7 @@ async def close_live_position(
             f"  reason={exit_reason}  sol_received={sol_received:.4f}"
             f"  pnl={pnl:+.4f}  sig={sig[:16]}..."
         )
+        _runner_window_until.pop(call_id, None)
         try:
             await alert_bot.send_live_sell_alert(
                 symbol=symbol,
@@ -932,7 +940,7 @@ def check_live_exits(
     ):
         return ExitResult(True, "no_bounce_stop", exit_mcap=current_mcap)
 
-    return apply_exit_config(
+    result = apply_exit_config(
         cfg,
         current_mcap=current_mcap,
         peak_mcap=peak_mcap,
@@ -941,6 +949,32 @@ def check_live_exits(
         channel_handle=channel_handle,
         entry_time=entry_time,
     )
+    if (
+        not LIVE_RUNNER_WINDOW_ENABLED
+        or RUNNER_WINDOW_ARM_MULT <= 0
+        or RUNNER_WINDOW_RELEASE_MULT <= RUNNER_WINDOW_ARM_MULT
+        or RUNNER_WINDOW_MINS <= 0
+        or RUNNER_WINDOW_FLOOR_MULT <= 0
+    ):
+        return result
+
+    now = time.monotonic()
+    armed = peak_mult >= RUNNER_WINDOW_ARM_MULT and peak_mult < RUNNER_WINDOW_RELEASE_MULT
+    if armed and call_id not in _runner_window_until:
+        _runner_window_until[call_id] = now + RUNNER_WINDOW_MINS * 60.0
+
+    until = _runner_window_until.get(call_id)
+    if until is None:
+        return result
+    if current_mult <= RUNNER_WINDOW_FLOOR_MULT:
+        _runner_window_until.pop(call_id, None)
+        return ExitResult(True, "runner_floor_stop", exit_mcap=current_mcap)
+    if peak_mult >= RUNNER_WINDOW_RELEASE_MULT or now >= until:
+        _runner_window_until.pop(call_id, None)
+        return result
+    if result.should_exit and result.reason in RUNNER_WINDOW_PROTECTED_REASONS:
+        return ExitResult(False)
+    return result
 
 
 def get_live_pnl_summary() -> dict:

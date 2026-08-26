@@ -102,11 +102,18 @@ QSIM_POST_EXIT_OBS_ENABLED  = os.getenv("QSIM_POST_EXIT_OBS_ENABLED", "false").l
 QSIM_POST_EXIT_OBS_MINS     = float(os.getenv("QSIM_POST_EXIT_OBS_MINS", "90"))
 QSIM_POST_EXIT_OBS_CADENCE_SECS = float(os.getenv("QSIM_POST_EXIT_OBS_CADENCE_SECS", "60"))
 QSIM_POST_EXIT_OBS_LIMIT    = int(os.getenv("QSIM_POST_EXIT_OBS_LIMIT", "50"))
+QSIM_RUNNER_WINDOW_ENABLED  = os.getenv("QSIM_RUNNER_WINDOW_ENABLED", "true").lower() == "true"
+RUNNER_WINDOW_ARM_MULT      = float(os.getenv("RUNNER_WINDOW_ARM_MULT", "2.0"))
+RUNNER_WINDOW_RELEASE_MULT  = float(os.getenv("RUNNER_WINDOW_RELEASE_MULT", "5.0"))
+RUNNER_WINDOW_MINS          = float(os.getenv("RUNNER_WINDOW_MINS", "10"))
+RUNNER_WINDOW_FLOOR_MULT    = float(os.getenv("RUNNER_WINDOW_FLOOR_MULT", "1.0"))
+RUNNER_WINDOW_PROTECTED_REASONS = {"trail_stop", "profit_floor"}
 
 _ensured = False
 # monitor-process in-memory state
 _last_quote_ts: dict[int, float] = {}     # call_id -> monotonic time of last sell-quote
 _last_post_exit_quote_ts: dict[int, float] = {}  # call_id -> monotonic time of last post-exit quote
+_runner_window_until: dict[int, float] = {}  # call_id -> monotonic expiry for temporary loose-runner mode
 _noroute_streak: dict[int, int] = {}      # call_id -> consecutive no-route sell quotes
 _quote_window: list[float] = []           # monotonic timestamps of recent quotes (budget window)
 _backoff_until: float = 0.0               # monotonic time until which quoting is paused (429 backoff)
@@ -122,6 +129,45 @@ def _no_bounce_stop_result(current_mult: float, peak_mult: float) -> ExitResult:
     ):
         return ExitResult(True, "no_bounce_stop")
     return ExitResult(False)
+
+
+def _apply_runner_window(
+    *,
+    call_id: int,
+    current_mult: float,
+    peak_mult: float,
+    result: ExitResult,
+) -> tuple[ExitResult, str | None]:
+    if (
+        not QSIM_RUNNER_WINDOW_ENABLED
+        or RUNNER_WINDOW_ARM_MULT <= 0
+        or RUNNER_WINDOW_RELEASE_MULT <= RUNNER_WINDOW_ARM_MULT
+        or RUNNER_WINDOW_MINS <= 0
+        or RUNNER_WINDOW_FLOOR_MULT <= 0
+    ):
+        return result, None
+
+    now = time.monotonic()
+    armed = peak_mult >= RUNNER_WINDOW_ARM_MULT and peak_mult < RUNNER_WINDOW_RELEASE_MULT
+    if armed and call_id not in _runner_window_until:
+        _runner_window_until[call_id] = now + RUNNER_WINDOW_MINS * 60.0
+
+    until = _runner_window_until.get(call_id)
+    if until is None:
+        return result, None
+
+    if current_mult <= RUNNER_WINDOW_FLOOR_MULT:
+        _runner_window_until.pop(call_id, None)
+        return ExitResult(True, "runner_floor_stop"), "runner_window_floor"
+
+    if peak_mult >= RUNNER_WINDOW_RELEASE_MULT or now >= until:
+        _runner_window_until.pop(call_id, None)
+        return result, "runner_window_released"
+
+    if result.should_exit and result.reason in RUNNER_WINDOW_PROTECTED_REASONS:
+        return ExitResult(False), f"runner_window_hold:{result.reason}"
+
+    return result, "runner_window_active"
 
 
 def _ensure_table() -> None:
@@ -287,6 +333,12 @@ async def _qsim_tick(pos: dict) -> None:
     )
     if no_bounce_result.should_exit and not result.should_exit:
         result = ExitResult(True, no_bounce_result.reason, exit_mcap=eff_cur)
+    result, runner_note = _apply_runner_window(
+        call_id=call_id,
+        current_mult=eff_cur / entry,
+        peak_mult=(real_peak / entry) if real_peak > 0 else real_mult,
+        result=result,
+    )
     db.insert_qsim_quote_observation(
         call_id=call_id,
         sol_out=sol_out,
@@ -299,6 +351,7 @@ async def _qsim_tick(pos: dict) -> None:
         exit_reason=result.reason,
         should_exit=result.should_exit,
         noroute_streak=0,
+        note=runner_note,
     )
     if result.should_exit:
         db.close_qsim_position(call_id, exit_price=(result.exit_mcap or eff_cur),
@@ -363,6 +416,7 @@ async def _qsim_post_exit_tick(pos: dict) -> None:
 def _cleanup(call_id: int) -> None:
     _last_quote_ts.pop(call_id, None)
     _noroute_streak.pop(call_id, None)
+    _runner_window_until.pop(call_id, None)
 
 
 async def run_qsim_monitor() -> None:

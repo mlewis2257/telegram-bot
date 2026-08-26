@@ -57,7 +57,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -82,6 +82,36 @@ LOCK_FLOORS = (
     (1.50, 1.20),
     (1.75, 1.35),
     (2.00, 1.55),
+)
+RUNNER_WINDOW_POLICIES = (
+    {
+        "name": "runner_a2x_w10m_f1x_r5x",
+        "arm": 2.0,
+        "window_mins": 10.0,
+        "floor": 1.0,
+        "release": 5.0,
+    },
+    {
+        "name": "runner_a2x_w12m_f1x_r5x",
+        "arm": 2.0,
+        "window_mins": 12.0,
+        "floor": 1.0,
+        "release": 5.0,
+    },
+    {
+        "name": "runner_a2x_w10m_f1p2_r5x",
+        "arm": 2.0,
+        "window_mins": 10.0,
+        "floor": 1.2,
+        "release": 5.0,
+    },
+    {
+        "name": "runner_a3x_w10m_f1p2_r5x",
+        "arm": 3.0,
+        "window_mins": 10.0,
+        "floor": 1.2,
+        "release": 5.0,
+    },
 )
 DYNAMIC_EXIT_POLICIES = (
     {
@@ -363,7 +393,12 @@ LEFT JOIN LATERAL (
         ) AS observations
     FROM qsim_quote_observations qo
     WHERE qo.call_id = b.call_id
-      AND qo.observed_at BETWEEN b.entry_time AND COALESCE(b.exit_time, now())
+      AND qo.observed_at BETWEEN b.entry_time AND
+          CASE
+              WHEN %(include_post_exit)s AND b.exit_time IS NOT NULL
+                  THEN b.exit_time + (%(post_exit_mins)s || ' minutes')::interval
+              ELSE COALESCE(b.exit_time, now())
+          END
 ) qobs ON TRUE
 ORDER BY b.entry_time DESC
 """
@@ -440,6 +475,27 @@ def _quote_mults(row: dict[str, Any]) -> list[float]:
         if 0 < mult <= MAX_QOBS_MULT:
             mults.append(mult)
     return mults
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _quote_points(row: dict[str, Any]) -> list[tuple[datetime | None, float]]:
+    points: list[tuple[datetime | None, float]] = []
+    for obs in _observations(row.get("observations")):
+        mult = _f(obs.get("real_mult"))
+        if 0 < mult <= MAX_QOBS_MULT:
+            points.append((_parse_dt(obs.get("observed_at")), mult))
+    return points
 
 
 def _parse_where(where_values: list[str] | None) -> list[tuple[str, str, float]]:
@@ -790,10 +846,70 @@ def _raw_config_exit(row: dict[str, Any], mults: list[float]) -> tuple[float, st
     return (_ratio(row.get("qsim_pnl"), row.get("qsim_sol_in")) or 0.0, "held_to_current")
 
 
+def _runner_window_return(
+    row: dict[str, Any],
+    points: list[tuple[datetime | None, float]],
+    *,
+    arm: float,
+    window_mins: float,
+    floor: float,
+    release: float,
+    current_return: float,
+) -> float:
+    if not points:
+        return current_return
+
+    cfg = _config_for_variant(row.get("variant"))
+    channel_handle = (row.get("channel") or "").lstrip("@")
+    is_vip_gamble = row.get("vip_tier") in {"gamble", "gamble_risk"}
+    protected_reasons = {"trail_stop", "profit_floor"}
+    peak_mult = 0.0
+    runner_until: float | None = None
+    last_mult = points[-1][1]
+
+    for observed_at, mult in points:
+        last_mult = mult
+        peak_mult = max(peak_mult, mult)
+        if runner_until is None and arm <= peak_mult < release and observed_at is not None:
+            runner_until = observed_at.timestamp() + window_mins * 60.0
+
+        result = apply_exit_config(
+            cfg,
+            current_mcap=mult,
+            peak_mcap=peak_mult,
+            entry_mcap=1.0,
+            is_vip_gamble=is_vip_gamble,
+            channel_handle=channel_handle,
+            entry_time=None,
+        )
+        if runner_until is None:
+            if result.should_exit:
+                return mult - 1.0
+            continue
+
+        if mult <= floor:
+            return mult - 1.0
+        if peak_mult >= release:
+            if result.should_exit:
+                return mult - 1.0
+            continue
+        if observed_at is not None and observed_at.timestamp() >= runner_until:
+            if result.should_exit:
+                return mult - 1.0
+            continue
+        if result.should_exit and result.reason in protected_reasons:
+            continue
+        if result.should_exit:
+            return mult - 1.0
+
+    return last_mult - 1.0
+
+
 def _view(row: dict[str, Any]) -> ReplayRow:
     qsim_return = _ratio(row.get("qsim_pnl"), row.get("qsim_sol_in")) or 0.0
     shadow_return = _ratio(row.get("shadow_pnl"), row.get("shadow_sol_in"))
     mults = _quote_mults(row)
+    points = _quote_points(row)
     max_quote_mult = max(mults) if mults else None
     returns = {"current": qsim_return}
     first_hits: dict[str, float | None] = {}
@@ -855,6 +971,17 @@ def _view(row: dict[str, Any]) -> ReplayRow:
             current_return=qsim_return,
             floor=policy.get("floor"),
             stall_ticks=policy.get("stall_ticks"),
+        )
+
+    for policy in RUNNER_WINDOW_POLICIES:
+        returns[policy["name"]] = _runner_window_return(
+            row,
+            points,
+            arm=policy["arm"],
+            window_mins=policy["window_mins"],
+            floor=policy["floor"],
+            release=policy["release"],
+            current_return=qsim_return,
         )
 
     for bounce in NO_BOUNCE_THRESHOLDS:
@@ -1009,6 +1136,12 @@ def _print_summary(views: list[ReplayRow]) -> None:
     print("-" * 64)
     for policy in WINNER_ONLY_POLICIES:
         _print_policy_row(policy["name"], views, current, width=22)
+
+    print("\nRunner Window Totals")
+    print(f"{'policy':<28} {'sum':>10} {'delta':>10} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 70)
+    for policy in RUNNER_WINDOW_POLICIES:
+        _print_policy_row(policy["name"], views, current, width=28)
 
 
 def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
@@ -1166,6 +1299,17 @@ def main() -> None:
         default=MAX_QOBS_MULT,
         help="ignore quote observations above this multiple as quote artifacts",
     )
+    parser.add_argument(
+        "--include-post-exit",
+        action="store_true",
+        help="include qsim post-exit quote probes in replay observations",
+    )
+    parser.add_argument(
+        "--post-exit-mins",
+        type=float,
+        default=90.0,
+        help="minutes of post-exit qsim quote probes to include with --include-post-exit",
+    )
     parser.add_argument("--detail", action="store_true", help="print per-trade rows")
     args = parser.parse_args()
     MAX_QOBS_MULT = args.max_qmax
@@ -1183,6 +1327,8 @@ def main() -> None:
         "max_pnl": MAX_SANE_PNL_PCT,
         "min_pnl": MIN_SANE_PNL_PCT,
         "max_qmax": args.max_qmax,
+        "include_post_exit": args.include_post_exit,
+        "post_exit_mins": args.post_exit_mins,
     }
 
     rows = _rows(params)
@@ -1194,7 +1340,8 @@ def main() -> None:
         f"filters: days={args.days} channel={args.channel} lane={args.lane} "
         f"variant={args.variant} min_entry_ratio={args.min_entry_ratio} "
         f"max_entry_ratio={args.max_entry_ratio} require_qobs={args.require_qobs} "
-        f"max_qmax={args.max_qmax} where={args.where or 'none'}"
+        f"max_qmax={args.max_qmax} include_post_exit={args.include_post_exit} "
+        f"post_exit_mins={args.post_exit_mins:g} where={args.where or 'none'}"
     )
     _print_summary(views)
     if views and args.detail:
