@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from dataclasses import dataclass
 from typing import Any
@@ -33,6 +34,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 MAX_SANE_PEAK = 50.0
 MAX_SANE_PNL_PCT = 5000.0
 MIN_SANE_PNL_PCT = -100.5
+MAX_QOBS_MULT = 50.0
 
 FEATURES = [
     ("score", "score", None),
@@ -59,6 +61,23 @@ FEATURES = [
     ("bundle_count", "bundle_cnt", None),
     ("sniper_count", "sniper_cnt", None),
 ]
+
+FEATURE_ALIASES = {
+    feature: feature
+    for feature, _, _ in FEATURES
+}
+FEATURE_ALIASES.update({
+    label.replace("/", "_"): feature
+    for feature, label, _ in FEATURES
+})
+FEATURE_ALIASES.update({
+    "vol_mcap": "vol_to_mcap",
+    "vol_to_mcap": "vol_to_mcap",
+    "vol_liq": "turnover",
+    "turnover": "turnover",
+    "holders": "holder_count",
+    "hodlers": "hodl_count",
+})
 
 
 SQL = """
@@ -109,6 +128,8 @@ WITH base AS (
         SELECT COUNT(*) AS qobs_count, MAX(qo.real_mult) AS max_qobs_mult
         FROM qsim_quote_observations qo
         WHERE qo.call_id = q.call_id
+          AND qo.real_mult > 0
+          AND qo.real_mult <= %(max_qmax)s
           AND qo.observed_at BETWEEN q.entry_time AND COALESCE(q.exit_time, now())
     ) qobs ON TRUE
     WHERE q.status = 'closed'
@@ -172,6 +193,38 @@ def _median(values: list[float]) -> float | None:
 
 def _keep(value: float, direction: str, threshold: float) -> bool:
     return value >= threshold if direction == ">=" else value <= threshold
+
+
+def _parse_where(where: str | None) -> tuple[str, str, float] | None:
+    if not where:
+        return None
+    match = re.fullmatch(r"\s*([A-Za-z0-9_/-]+)\s*(<=|>=|<|>)\s*(-?\d+(?:\.\d+)?)\s*", where)
+    if not match:
+        raise SystemExit("Invalid --where. Use a known numeric feature like vol_mcap>=1.331")
+    raw_feature, op, raw_threshold = match.groups()
+    feature_key = raw_feature.replace("/", "_")
+    feature = FEATURE_ALIASES.get(feature_key)
+    if feature is None:
+        known = ", ".join(sorted(FEATURE_ALIASES))
+        raise SystemExit(f"Unknown --where feature '{raw_feature}'. Known: {known}")
+    return feature, op, float(raw_threshold)
+
+
+def _passes_where(row: dict[str, Any], where: tuple[str, str, float] | None) -> bool:
+    if where is None:
+        return True
+    feature, op, threshold = where
+    value = row.get(feature)
+    if value is None:
+        return False
+    value_f = _f(value)
+    if op == ">=":
+        return value_f >= threshold
+    if op == ">":
+        return value_f > threshold
+    if op == "<=":
+        return value_f <= threshold
+    return value_f < threshold
 
 
 def _best_stump(rows: list[dict[str, Any]], feature: str, label: str,
@@ -264,8 +317,20 @@ def main() -> None:
     parser.add_argument("--loser", type=float, default=1.1)
     parser.add_argument("--min-entry-ratio", type=float, default=None)
     parser.add_argument("--max-entry-ratio", type=float, default=None)
+    parser.add_argument(
+        "--where",
+        default=None,
+        help="pre-filter rows with one numeric condition, e.g. vol_mcap>=1.331",
+    )
+    parser.add_argument(
+        "--max-qmax",
+        type=float,
+        default=MAX_QOBS_MULT,
+        help="ignore quote observations above this multiple as quote artifacts",
+    )
     parser.add_argument("--raw", action="store_true")
     args = parser.parse_args()
+    where = _parse_where(args.where)
 
     params = {
         "days": args.days,
@@ -278,10 +343,13 @@ def main() -> None:
         "max_peak": MAX_SANE_PEAK,
         "max_pnl": MAX_SANE_PNL_PCT,
         "min_pnl": MIN_SANE_PNL_PCT,
+        "max_qmax": args.max_qmax,
     }
     rows = _rows(params)
     labeled = []
     for row in rows:
+        if not _passes_where(row, where):
+            continue
         qmax = _f(row.get("max_qobs_mult"))
         if qmax >= args.runner:
             row["_is_runner"] = True
@@ -297,12 +365,12 @@ def main() -> None:
     total_return = sum(row["_return"] for row in labeled)
     print(
         f"\nQSIM FEATURE EDGE — days={args.days} channel={args.channel} "
-        f"lane={args.lane} variant={args.variant}"
+        f"lane={args.lane} variant={args.variant} max_qmax={args.max_qmax}"
     )
     print(
         f"labels: runner=qmax>={args.runner}x loser=qmax<{args.loser}x "
         f"rows={len(labeled)} runners={len(runners)} losers={len(losers)} "
-        f"baseline_pnl={total_return:+.2f}\n"
+        f"baseline_pnl={total_return:+.2f} where={args.where or 'none'}\n"
     )
     if len(runners) < 3 or len(losers) < 10:
         print("Not enough labeled rows yet. Let qsim quote-path accumulate more.")
