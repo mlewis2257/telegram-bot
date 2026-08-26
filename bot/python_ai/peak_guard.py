@@ -62,7 +62,15 @@ _pending_low: dict[str, tuple[float, float]] = {}   # craters awaiting corrobora
 _trough_ref:  dict[str, tuple[float, float]] = {}   # last accepted mcap (the drop baseline)
 
 
-def guard_peak(key: str, current_mcap: float, prior_peak: float) -> float:
+def guard_peak(
+    key: str,
+    current_mcap: float,
+    prior_peak: float,
+    *,
+    max_jump_pct: float | None = None,
+    pending_ttl_secs: float | None = None,
+    confirm_tolerance: float | None = None,
+) -> float:
     """
     Return the peak that should be recorded given a new reading.
 
@@ -75,7 +83,15 @@ def guard_peak(key: str, current_mcap: float, prior_peak: float) -> float:
 
     Returns the accepted peak: either `prior_peak` unchanged (candidate held for
     corroboration) or an advanced value.
+
+    The optional threshold overrides let slower quote-based monitors use the same
+    two-reading protection without forcing feed/ws monitors to hold pending spikes
+    longer than their normal tick cadence.
     """
+    max_jump_pct = MAX_UNCONFIRMED_JUMP_PCT if max_jump_pct is None else max_jump_pct
+    pending_ttl_secs = PENDING_TTL_SECS if pending_ttl_secs is None else pending_ttl_secs
+    confirm_tolerance = CONFIRM_TOLERANCE if confirm_tolerance is None else confirm_tolerance
+
     if current_mcap is None or current_mcap <= 0:
         return prior_peak
 
@@ -91,7 +107,7 @@ def guard_peak(key: str, current_mcap: float, prior_peak: float) -> float:
         return current_mcap
 
     jump = current_mcap / prior_peak
-    if jump <= 1.0 + MAX_UNCONFIRMED_JUMP_PCT:
+    if jump <= 1.0 + max_jump_pct:
         # Plausible incremental advance — accept immediately.
         _pending.pop(key, None)
         return current_mcap
@@ -101,8 +117,8 @@ def guard_peak(key: str, current_mcap: float, prior_peak: float) -> float:
     pend = _pending.get(key)
     if (
         pend is not None
-        and (now - pend[1]) <= PENDING_TTL_SECS
-        and current_mcap >= pend[0] * (1.0 - CONFIRM_TOLERANCE)
+        and (now - pend[1]) <= pending_ttl_secs
+        and current_mcap >= pend[0] * (1.0 - confirm_tolerance)
     ):
         # Corroborated: two readings in a row agree the price moved up sharply.
         _pending.pop(key, None)

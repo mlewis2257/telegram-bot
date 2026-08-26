@@ -180,6 +180,12 @@ LIVE_EXIT_QUOTE_LOG = os.getenv("LIVE_EXIT_QUOTE_LOG", "false").lower() == "true
 # falls back to the feed basis — a bad quote must never force or block a real sell.
 LIVE_EXIT_USE_QUOTE = os.getenv("LIVE_EXIT_USE_QUOTE", "false").lower() == "true"
 _SELL_QUOTE_TTL   = float(os.getenv("LIVE_SELL_QUOTE_TTL", "2.5"))  # seconds
+LIVE_QUOTE_PEAK_PENDING_TTL_SECS = float(
+    os.getenv(
+        "LIVE_QUOTE_PEAK_PENDING_TTL_SECS",
+        str(max(peak_guard.PENDING_TTL_SECS, _SELL_QUOTE_TTL * 4.0)),
+    )
+)
 _sell_quote_cache: dict = {}  # mint -> (sol_out, monotonic_ts)
 # Exit quotes are the highest-value quote we make (real money on the line), so a
 # transient Jupiter 429 is retried briefly before we surrender to the feed basis —
@@ -682,7 +688,12 @@ async def live_exit_basis(
         # entry — trail/floor arm off peak/entry, so a sub-entry peak understates every ratio
         # (this is what left `buy`'s real_peak at 3711 under an 3838 fill).
         prior_peak = max(float(db.get_live_real_peak(call_id) or 0.0), real_entry)
-        real_peak  = peak_guard.guard_peak(f"realL:{call_id}", synth_current, prior_peak)
+        real_peak  = peak_guard.guard_peak(
+            f"realL:{call_id}",
+            synth_current,
+            prior_peak,
+            pending_ttl_secs=LIVE_QUOTE_PEAK_PENDING_TTL_SECS,
+        )
         if real_peak > prior_peak:
             db.update_live_real_peak(call_id, real_peak)
         eff_current = min(synth_current, real_peak) if real_peak > 0 else synth_current

@@ -89,6 +89,12 @@ QSIM_TICK_SECS          = float(os.getenv("QSIM_TICK_SECS", "30"))   # per-posit
 QSIM_LOOP_SECS          = float(os.getenv("QSIM_LOOP_SECS", "3"))    # monitor pass interval
 QSIM_RUG_FAILS          = int(os.getenv("QSIM_RUG_FAILS", "6"))      # consecutive no-route quotes -> close as rug
 QSIM_BACKOFF_SECS       = float(os.getenv("QSIM_BACKOFF_SECS", "30"))  # pause all quoting after a 429
+QSIM_PEAK_PENDING_TTL_SECS = float(
+    os.getenv(
+        "QSIM_PEAK_PENDING_TTL_SECS",
+        str(max(peak_guard.PENDING_TTL_SECS, QSIM_TICK_SECS * 2.5)),
+    )
+)
 
 _ensured = False
 # monitor-process in-memory state
@@ -234,7 +240,12 @@ async def _qsim_tick(pos: dict) -> None:
     real_mult   = sol_out / sol_in
     synth_cur   = entry * real_mult
     prior_peak  = float(pos.get("peak_mcap") or 0.0)
-    real_peak   = peak_guard.guard_peak(f"qsim:{call_id}", synth_cur, prior_peak)
+    real_peak   = peak_guard.guard_peak(
+        f"qsim:{call_id}",
+        synth_cur,
+        prior_peak,
+        pending_ttl_secs=QSIM_PEAK_PENDING_TTL_SECS,
+    )
     if real_peak > prior_peak:
         db.update_qsim_peak(call_id, real_peak, real_peak / entry)
     eff_cur = min(synth_cur, real_peak) if real_peak > 0 else synth_cur
