@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -83,6 +84,46 @@ LOCK_FLOORS = (
     (2.00, 1.55),
 )
 
+FILTER_ALIASES = {
+    "score": "score",
+    "entry_mcap": "qsim_entry",
+    "qsim_entry": "qsim_entry",
+    "shadow_entry": "shadow_entry",
+    "feed_entry": "feed_entry_mcap",
+    "feed_entry_mcap": "feed_entry_mcap",
+    "q_feed_entry": "feed_entry_ratio",
+    "liquidity": "liquidity",
+    "vol_1h": "vol_1h",
+    "turnover": "turnover",
+    "vol_liq": "turnover",
+    "vol_mcap": "vol_to_mcap",
+    "vol_to_mcap": "vol_to_mcap",
+    "age_min": "age_min",
+    "holders": "holder_count",
+    "holder_count": "holder_count",
+    "hodlers": "hodl_count",
+    "hodl_count": "hodl_count",
+    "top10_pct": "top10_pct",
+    "first20_pct": "first20_pct",
+    "detector_sol": "detector_sol",
+    "spent_sol": "detecting_sol_spent",
+    "detecting_sol_spent": "detecting_sol_spent",
+    "dev_best_mc": "dev_best_mcap",
+    "dev_best_mcap": "dev_best_mcap",
+    "dev_held_pct": "dev_pct_held",
+    "dev_pct_held": "dev_pct_held",
+    "dev_sold_pct": "dev_sold_pct",
+    "dev_tokens": "dev_tokens_made",
+    "dev_tokens_made": "dev_tokens_made",
+    "bundle_pct": "bundle_pct",
+    "fake_vol_pct": "fake_vol_pct",
+    "sniper_pct": "sniper_pct",
+    "bundle_cnt": "bundle_count",
+    "bundle_count": "bundle_count",
+    "sniper_cnt": "sniper_count",
+    "sniper_count": "sniper_count",
+}
+
 
 SQL = """
 WITH base AS (
@@ -108,7 +149,30 @@ WITH base AS (
         sp.sol_in AS shadow_sol_in,
         sp.pnl_sol AS shadow_pnl,
         sp.pnl_pct AS shadow_pnl_pct,
-        sp.exit_reason AS shadow_reason
+        sp.exit_reason AS shadow_reason,
+        c.mcap_at_call AS feed_entry_mcap,
+        c.conviction_score AS score,
+        t.liq_at_detection AS liquidity,
+        t.vol_1h_at_detection AS vol_1h,
+        t.vol_1h_at_detection / NULLIF(t.liq_at_detection, 0) AS turnover,
+        t.vol_1h_at_detection / NULLIF(q.entry_price, 0) AS vol_to_mcap,
+        t.token_age_minutes AS age_min,
+        t.holder_count,
+        t.hodl_count,
+        t.top_10_holder_pct AS top10_pct,
+        t.first_20_pct AS first20_pct,
+        t.detecting_wallet_sol AS detector_sol,
+        t.detecting_sol_spent,
+        t.dev_best_mcap,
+        t.dev_pct_held,
+        t.dev_sold_pct,
+        t.dev_tokens_made,
+        t.bundle_pct_remaining AS bundle_pct,
+        t.fake_vol_pct,
+        t.sniper_pct_remaining AS sniper_pct,
+        t.bundle_count,
+        t.sniper_count,
+        q.entry_price / NULLIF(c.mcap_at_call, 0) AS feed_entry_ratio
     FROM qsim_positions q
     JOIN calls c ON c.id = q.call_id
     JOIN tokens t ON t.id = q.token_id
@@ -240,6 +304,45 @@ def _quote_mults(row: dict[str, Any]) -> list[float]:
         if 0 < mult <= MAX_QOBS_MULT:
             mults.append(mult)
     return mults
+
+
+def _parse_where(where_values: list[str] | None) -> list[tuple[str, str, float]]:
+    clauses = []
+    for where in where_values or []:
+        match = re.fullmatch(
+            r"\s*([A-Za-z0-9_/-]+)\s*(<=|>=|<|>)\s*(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)\s*",
+            where,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            raise SystemExit(
+                "Invalid --where. Use a known numeric feature like --where vol_mcap>=1.331"
+            )
+        raw_feature, op, raw_threshold = match.groups()
+        feature_key = raw_feature.replace("/", "_")
+        feature = FILTER_ALIASES.get(feature_key)
+        if feature is None:
+            known = ", ".join(sorted(FILTER_ALIASES))
+            raise SystemExit(f"Unknown --where feature '{raw_feature}'. Known: {known}")
+        clauses.append((feature, op, float(raw_threshold)))
+    return clauses
+
+
+def _passes_where(row: dict[str, Any], clauses: list[tuple[str, str, float]]) -> bool:
+    for feature, op, threshold in clauses:
+        value = row.get(feature)
+        if value is None:
+            return False
+        value_f = _f(value)
+        if op == ">=" and value_f < threshold:
+            return False
+        if op == ">" and value_f <= threshold:
+            return False
+        if op == "<=" and value_f > threshold:
+            return False
+        if op == "<" and value_f >= threshold:
+            return False
+    return True
 
 
 def _first_cross(mults: list[float], threshold: float) -> float | None:
@@ -754,6 +857,12 @@ def main() -> None:
     parser.add_argument("--variant", default="early")
     parser.add_argument("--min-entry-ratio", type=float, default=None)
     parser.add_argument("--max-entry-ratio", type=float, default=None)
+    parser.add_argument(
+        "--where",
+        action="append",
+        default=[],
+        help="pre-filter rows with a numeric condition; repeat for combos",
+    )
     parser.add_argument("--require-qobs", action="store_true",
                         help="only include rows with quote observations")
     parser.add_argument("--limit", type=int, default=50)
@@ -767,6 +876,7 @@ def main() -> None:
     parser.add_argument("--detail", action="store_true", help="print per-trade rows")
     args = parser.parse_args()
     MAX_QOBS_MULT = args.max_qmax
+    where_clauses = _parse_where(args.where)
 
     params = {
         "days": args.days,
@@ -779,9 +889,11 @@ def main() -> None:
         "max_peak": MAX_SANE_PEAK,
         "max_pnl": MAX_SANE_PNL_PCT,
         "min_pnl": MIN_SANE_PNL_PCT,
+        "max_qmax": args.max_qmax,
     }
 
     rows = _rows(params)
+    rows = [row for row in rows if _passes_where(row, where_clauses)]
     views = [_view(row) for row in rows]
     if args.require_qobs:
         views = [view for view in views if int(view.row.get("qobs_count") or 0) > 0]
@@ -789,7 +901,7 @@ def main() -> None:
         f"filters: days={args.days} channel={args.channel} lane={args.lane} "
         f"variant={args.variant} min_entry_ratio={args.min_entry_ratio} "
         f"max_entry_ratio={args.max_entry_ratio} require_qobs={args.require_qobs} "
-        f"max_qmax={args.max_qmax}"
+        f"max_qmax={args.max_qmax} where={args.where or 'none'}"
     )
     _print_summary(views)
     if views and args.detail:
