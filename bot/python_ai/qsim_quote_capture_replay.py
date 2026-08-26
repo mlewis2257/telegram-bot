@@ -83,6 +83,62 @@ LOCK_FLOORS = (
     (1.75, 1.35),
     (2.00, 1.55),
 )
+DYNAMIC_EXIT_POLICIES = (
+    {
+        "name": "dyn_a1p3_f1p05_s3_nb1p2_0p9",
+        "arm": 1.30,
+        "floor": 1.05,
+        "stall_ticks": 3,
+        "confirm_ticks": 1,
+        "bounce": 1.20,
+        "dead_stop": 0.90,
+    },
+    {
+        "name": "dyn_a1p4_f1p1_s3_nb1p2_0p9",
+        "arm": 1.40,
+        "floor": 1.10,
+        "stall_ticks": 3,
+        "confirm_ticks": 1,
+        "bounce": 1.20,
+        "dead_stop": 0.90,
+    },
+    {
+        "name": "dyn_a1p5_f1p15_s3_nb1p2_0p9",
+        "arm": 1.50,
+        "floor": 1.15,
+        "stall_ticks": 3,
+        "confirm_ticks": 1,
+        "bounce": 1.20,
+        "dead_stop": 0.90,
+    },
+    {
+        "name": "dyn_c2_a1p3_f1p05_s3_nb1p2_0p9",
+        "arm": 1.30,
+        "floor": 1.05,
+        "stall_ticks": 3,
+        "confirm_ticks": 2,
+        "bounce": 1.20,
+        "dead_stop": 0.90,
+    },
+    {
+        "name": "dyn_c2_a1p4_f1p1_s3_nb1p2_0p9",
+        "arm": 1.40,
+        "floor": 1.10,
+        "stall_ticks": 3,
+        "confirm_ticks": 2,
+        "bounce": 1.20,
+        "dead_stop": 0.90,
+    },
+    {
+        "name": "dyn_c2_a1p5_f1p15_s3_nb1p2_0p9",
+        "arm": 1.50,
+        "floor": 1.15,
+        "stall_ticks": 3,
+        "confirm_ticks": 2,
+        "bounce": 1.20,
+        "dead_stop": 0.90,
+    },
+)
 
 FILTER_ALIASES = {
     "score": "score",
@@ -507,6 +563,65 @@ def _lock_floor_or_bank_return(
     return current_return
 
 
+def _dynamic_exit_return(
+    mults: list[float],
+    *,
+    arm: float,
+    floor: float,
+    stall_ticks: int,
+    confirm_ticks: int,
+    bounce: float,
+    dead_stop: float,
+    current_return: float,
+) -> float:
+    """
+    Path-aware quote exit:
+      * before a bounce proves itself, cut dead trades at dead_stop
+      * after arm is confirmed, exit on round-trip floor or stalled quote highs
+
+    This intentionally sells at the observed quote on the triggering tick, not
+    the theoretical floor/arm level.
+    """
+    if not mults:
+        return current_return
+
+    bounced = False
+    armed = False
+    arm_streak = 0
+    armed_peak = 0.0
+    ticks_since_high = 0
+
+    for mult in mults:
+        if mult >= bounce:
+            bounced = True
+        elif not bounced and mult <= dead_stop:
+            return mult - 1.0
+
+        if not armed:
+            if mult >= arm:
+                arm_streak += 1
+                if arm_streak >= confirm_ticks:
+                    armed = True
+                    armed_peak = mult
+                    ticks_since_high = 0
+            else:
+                arm_streak = 0
+            continue
+
+        if mult > armed_peak:
+            armed_peak = mult
+            ticks_since_high = 0
+            continue
+
+        ticks_since_high += 1
+        if mult <= floor:
+            return mult - 1.0
+        if ticks_since_high >= stall_ticks:
+            return mult - 1.0
+
+    return current_return
+
+
 def _config_for_variant(variant: str | None):
     if variant in {"ride", "ride_vol"}:
         return EXIT_RIDE
@@ -588,6 +703,18 @@ def _view(row: dict[str, Any]) -> ReplayRow:
         returns[f"lock_{suffix}"] = _lock_floor_return(mults, trigger, floor, qsim_return)
         returns[f"lock_or_bank_{suffix}"] = _lock_floor_or_bank_return(
             mults, trigger, floor, qsim_return
+        )
+
+    for policy in DYNAMIC_EXIT_POLICIES:
+        returns[policy["name"]] = _dynamic_exit_return(
+            mults,
+            arm=policy["arm"],
+            floor=policy["floor"],
+            stall_ticks=policy["stall_ticks"],
+            confirm_ticks=policy["confirm_ticks"],
+            bounce=policy["bounce"],
+            dead_stop=policy["dead_stop"],
+            current_return=qsim_return,
         )
 
     for bounce in NO_BOUNCE_THRESHOLDS:
@@ -731,6 +858,12 @@ def _print_summary(views: list[ReplayRow]) -> None:
         _print_policy_row(f"lock_{suffix}", views, current, width=22)
         _print_policy_row(f"lock_or_bank_{suffix}", views, current, width=22)
 
+    print("\nDynamic Exit Totals")
+    print(f"{'policy':<32} {'sum':>10} {'delta':>10} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 74)
+    for policy in DYNAMIC_EXIT_POLICIES:
+        _print_policy_row(policy["name"], views, current, width=32)
+
 
 def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
     if policy == "best_raw":
@@ -749,6 +882,12 @@ def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
             if (value := _confirmed_cross(_quote_mults(view.row), level)) is not None
         ]
     if policy.startswith("lock_") or policy.startswith("lock_or_bank_"):
+        return [
+            view.returns[policy] + 1.0
+            for view in views
+            if view.returns[policy] != view.returns["current"]
+        ]
+    if policy.startswith("dyn_"):
         return [
             view.returns[policy] + 1.0
             for view in views
@@ -811,6 +950,7 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
             view.returns["bank_1p3x"],
             view.returns["p50_bank_1p3x"],
             view.returns["lock_or_bank_1p5x_1p2x"],
+            view.returns["dyn_a1p4_f1p1_s3_nb1p2_0p9"],
             view.returns["obs_2x"],
         ) - view.returns["current"],
         reverse=True,
@@ -819,7 +959,7 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
     print("\nDetail — biggest bank/lock improvement first")
     hdr = (
         f"{'call':>7} {'symbol':<12} {'ent':>5} {'qpk':>5} {'qmax':>5} {'spk':>5} "
-        f"{'cur':>8} {'bank13':>8} {'p50b13':>8} {'bank15':>8} {'obs2':>8} {'shadow':>8} "
+        f"{'cur':>8} {'bank13':>8} {'dyn14':>8} {'bank15':>8} {'obs2':>8} {'shadow':>8} "
         f"{'raw_reason':<12} {'q_reason/shadow_reason':<28}"
     )
     print(hdr)
@@ -836,7 +976,7 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
             f"{_mult(_f(row.get('shadow_peak'))):>5} "
             f"{_pct(view.returns['current']):>8} "
             f"{_pct(view.returns['bank_1p3x']):>8} "
-            f"{_pct(view.returns['p50_bank_1p3x']):>8} "
+            f"{_pct(view.returns['dyn_a1p4_f1p1_s3_nb1p2_0p9']):>8} "
             f"{_pct(view.returns['bank_1p5x']):>8} "
             f"{_pct(view.returns['obs_2x']):>8} "
             f"{_pct(view.shadow_return):>8} "
