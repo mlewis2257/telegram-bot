@@ -1494,6 +1494,12 @@ def ensure_qsim_positions_table() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_qsim_status ON qsim_positions (status)")
         cur.execute(
             """
+            CREATE INDEX IF NOT EXISTS idx_qsim_status_exit_time
+                ON qsim_positions(status, exit_time DESC)
+            """
+        )
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS qsim_quote_observations (
                 id              bigserial PRIMARY KEY,
                 call_id         integer NOT NULL,
@@ -1570,6 +1576,31 @@ def get_open_qsim_positions() -> list[dict]:
             WHERE qp.status = 'open'
             ORDER BY qp.entry_time DESC
             """,
+        )
+        cols = [d.name for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def get_recent_closed_qsim_positions_for_post_exit(minutes: float, limit: int = 50) -> list[dict]:
+    """Closed qsim positions still inside the research-only post-exit quote window."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT qp.call_id, qp.lane, qp.variant, qp.vip_tier, qp.channel_handle,
+                   qp.entry_price, qp.entry_tokens, qp.entry_decimals, qp.sol_in,
+                   qp.entry_time, qp.exit_time, qp.exit_reason,
+                   t.symbol, t.mint_address
+            FROM qsim_positions qp
+            JOIN tokens t ON t.id = qp.token_id
+            WHERE qp.status = 'closed'
+              AND qp.exit_time IS NOT NULL
+              AND qp.exit_time >= now() - (%s || ' minutes')::interval
+            ORDER BY qp.exit_time DESC
+            LIMIT %s
+            """,
+            (minutes, limit),
         )
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]

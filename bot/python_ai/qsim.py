@@ -98,10 +98,15 @@ QSIM_PEAK_PENDING_TTL_SECS = float(
 QSIM_NO_BOUNCE_STOP_ENABLED = os.getenv("QSIM_NO_BOUNCE_STOP_ENABLED", "true").lower() == "true"
 NO_BOUNCE_ARM_MULT          = float(os.getenv("NO_BOUNCE_ARM_MULT", "1.3"))
 NO_BOUNCE_STOP_MULT         = float(os.getenv("NO_BOUNCE_STOP_MULT", "0.9"))
+QSIM_POST_EXIT_OBS_ENABLED  = os.getenv("QSIM_POST_EXIT_OBS_ENABLED", "false").lower() == "true"
+QSIM_POST_EXIT_OBS_MINS     = float(os.getenv("QSIM_POST_EXIT_OBS_MINS", "90"))
+QSIM_POST_EXIT_OBS_CADENCE_SECS = float(os.getenv("QSIM_POST_EXIT_OBS_CADENCE_SECS", "60"))
+QSIM_POST_EXIT_OBS_LIMIT    = int(os.getenv("QSIM_POST_EXIT_OBS_LIMIT", "50"))
 
 _ensured = False
 # monitor-process in-memory state
 _last_quote_ts: dict[int, float] = {}     # call_id -> monotonic time of last sell-quote
+_last_post_exit_quote_ts: dict[int, float] = {}  # call_id -> monotonic time of last post-exit quote
 _noroute_streak: dict[int, int] = {}      # call_id -> consecutive no-route sell quotes
 _quote_window: list[float] = []           # monotonic timestamps of recent quotes (budget window)
 _backoff_until: float = 0.0               # monotonic time until which quoting is paused (429 backoff)
@@ -305,6 +310,56 @@ async def _qsim_tick(pos: dict) -> None:
               f"pnl={sol_out - sol_in:+.4f} ({real_mult:.2f}x)")
 
 
+async def _qsim_post_exit_tick(pos: dict) -> None:
+    """Research-only sell quote after qsim has closed, so hold-longer tests have real data."""
+    call_id = pos["call_id"]
+    mint    = pos["mint_address"]
+    symbol  = pos.get("symbol", "?")
+    sol_in  = float(pos["sol_in"])
+    entry   = float(pos["entry_price"])
+    tokens  = int(float(pos["entry_tokens"]))
+    if sol_in <= 0 or entry <= 0 or tokens <= 0:
+        return
+
+    try:
+        sol_out = await jupiter.get_sell_quote(mint, tokens, raise_on_ratelimit=True)
+    except jupiter.RateLimitError:
+        global _backoff_until
+        _backoff_until = time.monotonic() + QSIM_BACKOFF_SECS
+        _quote_window.append(time.monotonic())
+        _last_post_exit_quote_ts[call_id] = time.monotonic()
+        db.insert_qsim_quote_observation(
+            call_id=call_id,
+            rate_limited=True,
+            note="post_exit_probe rate-limited",
+        )
+        return
+    _quote_window.append(time.monotonic())
+    _last_post_exit_quote_ts[call_id] = time.monotonic()
+
+    if sol_out is None or sol_out <= 0:
+        db.insert_qsim_quote_observation(
+            call_id=call_id,
+            no_route=True,
+            note="post_exit_probe no-route",
+        )
+        return
+
+    real_mult = sol_out / sol_in
+    synth_cur = entry * real_mult
+    db.insert_qsim_quote_observation(
+        call_id=call_id,
+        sol_out=sol_out,
+        real_mult=real_mult,
+        synth_mcap=synth_cur,
+        eff_mcap=synth_cur,
+        peak_mult=real_mult,
+        should_exit=False,
+        note="post_exit_probe",
+    )
+    print(f"[qsim] POST-EXIT QUOTE {symbol} call_id={call_id} {real_mult:.2f}x")
+
+
 def _cleanup(call_id: int) -> None:
     _last_quote_ts.pop(call_id, None)
     _noroute_streak.pop(call_id, None)
@@ -332,6 +387,21 @@ async def run_qsim_monitor() -> None:
                     await _qsim_tick(pos)
                     if time.monotonic() < _backoff_until:
                         break   # a 429 mid-pass tripped backoff — stop quoting immediately
+                if QSIM_POST_EXIT_OBS_ENABLED and time.monotonic() >= _backoff_until:
+                    now = time.monotonic()
+                    closed_positions = db.get_recent_closed_qsim_positions_for_post_exit(
+                        QSIM_POST_EXIT_OBS_MINS,
+                        QSIM_POST_EXIT_OBS_LIMIT,
+                    )
+                    for pos in closed_positions:
+                        cid = pos["call_id"]
+                        if now - _last_post_exit_quote_ts.get(cid, 0.0) < QSIM_POST_EXIT_OBS_CADENCE_SECS:
+                            continue
+                        if not _budget_ok():
+                            break
+                        await _qsim_post_exit_tick(pos)
+                        if time.monotonic() < _backoff_until:
+                            break
         except Exception as e:
             db.safe_rollback()
             print(f"[qsim] monitor pass error: {e}")
