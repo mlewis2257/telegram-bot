@@ -37,7 +37,7 @@ import jupiter
 import peak_guard
 import lane_policy
 import live_trader                       # reuse the PURE _effective_fill_mcap only
-from exit_config import EXIT_A_PAPER, EXIT_RIDE, apply_exit_config
+from exit_config import EXIT_A_PAPER, EXIT_RIDE, ExitResult, apply_exit_config
 
 QSIM_ENABLED = os.getenv("QSIM_ENABLED", "false").lower() == "true"
 
@@ -95,6 +95,9 @@ QSIM_PEAK_PENDING_TTL_SECS = float(
         str(max(peak_guard.PENDING_TTL_SECS, QSIM_TICK_SECS * 2.5)),
     )
 )
+QSIM_NO_BOUNCE_STOP_ENABLED = os.getenv("QSIM_NO_BOUNCE_STOP_ENABLED", "true").lower() == "true"
+NO_BOUNCE_ARM_MULT          = float(os.getenv("NO_BOUNCE_ARM_MULT", "1.3"))
+NO_BOUNCE_STOP_MULT         = float(os.getenv("NO_BOUNCE_STOP_MULT", "0.9"))
 
 _ensured = False
 # monitor-process in-memory state
@@ -102,6 +105,18 @@ _last_quote_ts: dict[int, float] = {}     # call_id -> monotonic time of last se
 _noroute_streak: dict[int, int] = {}      # call_id -> consecutive no-route sell quotes
 _quote_window: list[float] = []           # monotonic timestamps of recent quotes (budget window)
 _backoff_until: float = 0.0               # monotonic time until which quoting is paused (429 backoff)
+
+
+def _no_bounce_stop_result(current_mult: float, peak_mult: float) -> ExitResult:
+    if (
+        QSIM_NO_BOUNCE_STOP_ENABLED
+        and NO_BOUNCE_ARM_MULT > 0
+        and NO_BOUNCE_STOP_MULT > 0
+        and peak_mult < NO_BOUNCE_ARM_MULT
+        and current_mult <= NO_BOUNCE_STOP_MULT
+    ):
+        return ExitResult(True, "no_bounce_stop")
+    return ExitResult(False)
 
 
 def _ensure_table() -> None:
@@ -261,6 +276,12 @@ async def _qsim_tick(pos: dict) -> None:
         is_vip_gamble=is_vip_gamble, channel_handle=channel_handle,
         entry_time=pos.get("entry_time"),
     )
+    no_bounce_result = _no_bounce_stop_result(
+        current_mult=eff_cur / entry,
+        peak_mult=(real_peak / entry) if real_peak > 0 else real_mult,
+    )
+    if no_bounce_result.should_exit and not result.should_exit:
+        result = ExitResult(True, no_bounce_result.reason, exit_mcap=eff_cur)
     db.insert_qsim_quote_observation(
         call_id=call_id,
         sol_out=sol_out,

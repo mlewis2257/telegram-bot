@@ -186,6 +186,9 @@ LIVE_QUOTE_PEAK_PENDING_TTL_SECS = float(
         str(max(peak_guard.PENDING_TTL_SECS, _SELL_QUOTE_TTL * 4.0)),
     )
 )
+LIVE_NO_BOUNCE_STOP_ENABLED = os.getenv("LIVE_NO_BOUNCE_STOP_ENABLED", "false").lower() == "true"
+NO_BOUNCE_ARM_MULT          = float(os.getenv("NO_BOUNCE_ARM_MULT", "1.3"))
+NO_BOUNCE_STOP_MULT         = float(os.getenv("NO_BOUNCE_STOP_MULT", "0.9"))
 _sell_quote_cache: dict = {}  # mint -> (sol_out, monotonic_ts)
 # Exit quotes are the highest-value quote we make (real money on the line), so a
 # transient Jupiter 429 is retried briefly before we surrender to the feed basis —
@@ -917,6 +920,17 @@ def check_live_exits(
     is_vip_gamble = position.get("vip_tier") in ("gamble_risk", "gamble")
     channel_handle = (position.get("channel_handle") or "").lstrip("@")
     entry_time = position.get("entry_time")
+
+    current_mult = current_mcap / entry_mcap
+    peak_mult = (peak_mcap / entry_mcap) if peak_mcap > 0 else current_mult
+    if (
+        LIVE_NO_BOUNCE_STOP_ENABLED
+        and NO_BOUNCE_ARM_MULT > 0
+        and NO_BOUNCE_STOP_MULT > 0
+        and peak_mult < NO_BOUNCE_ARM_MULT
+        and current_mult <= NO_BOUNCE_STOP_MULT
+    ):
+        return ExitResult(True, "no_bounce_stop", exit_mcap=current_mcap)
 
     return apply_exit_config(
         cfg,
