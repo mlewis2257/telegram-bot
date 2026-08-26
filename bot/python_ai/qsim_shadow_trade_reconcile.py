@@ -197,6 +197,8 @@ def _bucket(row: dict[str, Any], edge: float) -> str:
         return "shadow_only"
     if has_qsim and not has_shadow:
         return "qsim_only"
+    if row.get("qsim_status") != "closed":
+        return "qsim_open"
 
     entry_ratio = _ratio(row.get("qsim_entry"), row.get("shadow_entry"))
     shadow_peak = _f(row.get("shadow_peak"))
@@ -256,6 +258,34 @@ def _annotate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _filtered(rows: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:
+    out = []
+    for row in rows:
+        if args.closed_only and (
+            row.get("shadow_status") != "closed" or row.get("qsim_status") != "closed"
+        ):
+            continue
+        if args.require_qobs and int(row.get("qobs_count") or 0) <= 0:
+            continue
+        if args.min_entry_ratio is not None:
+            ratio = row.get("_entry_ratio")
+            if ratio is None or ratio < args.min_entry_ratio:
+                continue
+        if args.max_entry_ratio is not None:
+            ratio = row.get("_entry_ratio")
+            if ratio is None or ratio > args.max_entry_ratio:
+                continue
+        out.append(row)
+    return out
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    values = sorted(values)
+    return values[len(values) // 2]
+
+
 def _print_summary(rows: list[dict[str, Any]]) -> None:
     matched = [row for row in rows if row.get("shadow_entry") is not None and row.get("qsim_entry") is not None]
     shadow_only = [row for row in rows if row.get("shadow_entry") is not None and row.get("qsim_entry") is None]
@@ -263,11 +293,19 @@ def _print_summary(rows: list[dict[str, Any]]) -> None:
     shadow_sum = sum(row["_shadow_return"] for row in rows)
     qsim_sum = sum(row["_qsim_return"] for row in rows)
     entry_ratios = [row["_entry_ratio"] for row in matched if row["_entry_ratio"] is not None]
+    entry_delays = [_f(row.get("entry_delay_sec")) for row in matched if row.get("entry_delay_sec") is not None]
     print("\nSummary")
     print(f"rows={len(rows)} matched={len(matched)} shadow_only={len(shadow_only)} qsim_only={len(qsim_only)}")
     print(f"shadow_sum={shadow_sum:+.2f} qsim_sum={qsim_sum:+.2f} edge={shadow_sum - qsim_sum:+.2f}")
     if entry_ratios:
         print(f"avg_qsim/shadow_entry={sum(entry_ratios) / len(entry_ratios):.2f}x")
+    if entry_delays:
+        print(
+            "entry_delay_sec="
+            f"avg:{sum(entry_delays) / len(entry_delays):.1f} "
+            f"med:{_median(entry_delays):.1f} "
+            f"min:{min(entry_delays):.1f} max:{max(entry_delays):.1f}"
+        )
 
 
 def _print_buckets(rows: list[dict[str, Any]]) -> None:
@@ -299,7 +337,7 @@ def _print_buckets(rows: list[dict[str, Any]]) -> None:
 def _print_details(rows: list[dict[str, Any]], limit: int) -> None:
     print("\nLargest Absolute Gaps")
     hdr = (
-        f"{'call':>7} {'symbol':<12} {'bucket':<24} {'ent':>6} "
+        f"{'call':>7} {'symbol':<12} {'bucket':<24} {'ent':>6} {'delay':>7} "
         f"{'s_ex':>6} {'q_ex':>6} {'s_pk':>6} {'q_pk':>6} {'qmax':>6} "
         f"{'s_ret':>8} {'q_ret':>8} {'edge':>8} {'s_reason/q_reason':<28}"
     )
@@ -312,6 +350,7 @@ def _print_details(rows: list[dict[str, Any]], limit: int) -> None:
             f"{(row.get('symbol') or '?')[:12]:<12} "
             f"{row['_bucket'][:24]:<24} "
             f"{_fmt(row.get('_entry_ratio'), 6, 2)} "
+            f"{_fmt(row.get('entry_delay_sec'), 7, 1)} "
             f"{_fmt(row.get('_shadow_exit_mult'), 6, 2)} "
             f"{_fmt(row.get('_qsim_exit_mult'), 6, 2)} "
             f"{_fmt(row.get('shadow_peak'), 6, 2)} "
@@ -356,6 +395,10 @@ def main() -> None:
     parser.add_argument("--lane", default="any")
     parser.add_argument("--variant", default="early")
     parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument("--closed-only", action="store_true", help="only include closed qsim + closed shadow matches")
+    parser.add_argument("--require-qobs", action="store_true", help="only include rows with qsim quote observations")
+    parser.add_argument("--min-entry-ratio", type=float, default=None)
+    parser.add_argument("--max-entry-ratio", type=float, default=None)
     parser.add_argument("--raw", action="store_true")
     parser.add_argument("--max-qmax", type=float, default=MAX_QOBS_MULT)
     args = parser.parse_args()
@@ -371,12 +414,15 @@ def main() -> None:
         "min_pnl": MIN_SANE_PNL_PCT,
         "max_qmax": args.max_qmax,
     }
-    rows = _annotate(_rows(params))
+    rows = _filtered(_annotate(_rows(params)), args)
     print(
         f"\nQSIM/SHADOW TRADE RECONCILE — days={args.days} channel={args.channel} "
         f"lane={args.lane} variant={args.variant} max_qmax={args.max_qmax}"
     )
-    print("PnL is normalized per 1 SOL deployed. entry ratio = qsim_entry / shadow_entry.")
+    print(
+        "PnL is normalized per 1 SOL deployed. entry ratio = qsim_entry / shadow_entry. "
+        "delay = qsim_entry_time - shadow_entry_time seconds."
+    )
     if not rows:
         print("No rows matched.")
         return
