@@ -10,6 +10,10 @@ Historical mode uses ws_market_observations/feed after qsim exit through the
 matching shadow exit. Forward mode also reads qsim post-exit quote probes
 written by qsim.py when QSIM_POST_EXIT_OBS_ENABLED=true.
 
+Important: historical ws/feed observations may be sparse after qsim closes.
+For pre-probe history, the report also uses shadow_peak_at to identify cases
+where shadow's larger peak happened after qsim had already exited.
+
 Examples:
     python3 qsim_after_exit_move_report.py --days 7 --channel solwhaletrending --lane low_score --variant early
     python3 qsim_after_exit_move_report.py --days 7 --variant early --shadow-variant ride_vol
@@ -51,6 +55,7 @@ WITH matched AS (
         sp.exit_variant AS shadow_variant,
         sp.entry_time AS shadow_entry_time,
         sp.exit_time AS shadow_exit_time,
+        sp.peak_at AS shadow_peak_at,
         sp.entry_price AS shadow_entry,
         sp.exit_price AS shadow_exit,
         sp.peak_multiplier AS shadow_peak,
@@ -111,7 +116,12 @@ SELECT
     ws.max_ws_after_at,
     CASE WHEN m.qsim_entry > 0 THEN ws.max_ws_after_mcap / m.qsim_entry ELSE NULL END AS max_ws_after_qsim_mult,
     CASE WHEN m.shadow_entry > 0 THEN ws.max_ws_after_mcap / m.shadow_entry ELSE NULL END AS max_ws_after_shadow_mult,
+    CASE
+        WHEN m.shadow_peak_at > m.qsim_exit_time THEN m.shadow_peak
+        ELSE NULL
+    END AS shadow_peak_after_qsim,
     EXTRACT(EPOCH FROM (m.shadow_exit_time - m.qsim_exit_time)) / 60.0 AS shadow_held_after_qsim_min,
+    EXTRACT(EPOCH FROM (m.shadow_peak_at - m.qsim_exit_time)) / 60.0 AS shadow_peak_after_qsim_min,
     EXTRACT(EPOCH FROM (ws.max_ws_after_at - m.qsim_exit_time)) / 60.0 AS ws_peak_after_qsim_min,
     EXTRACT(EPOCH FROM (qpost.max_post_qobs_at - m.qsim_exit_time)) / 60.0 AS qobs_peak_after_qsim_min
 FROM matched m
@@ -193,6 +203,7 @@ def _bucket(row: dict[str, Any]) -> str:
     q_exit = _ratio(row.get("qsim_exit"), row.get("qsim_entry")) or 0.0
     q_peak = _f(row.get("qsim_peak"))
     shadow_peak = _f(row.get("shadow_peak"))
+    shadow_after = _f(row.get("shadow_peak_after_qsim"))
     ws_after = _f(row.get("max_ws_after_qsim_mult"))
     qpost = _f(row.get("max_post_qobs_mult"))
     held_min = _f(row.get("shadow_held_after_qsim_min"))
@@ -203,6 +214,8 @@ def _bucket(row: dict[str, Any]) -> str:
         return "quote_confirmed_after_exit"
     if ws_after >= max(q_exit + 0.5, q_peak * 1.25, 2.0):
         return "feed_after_exit_runner"
+    if shadow_after >= max(q_exit + 0.5, q_peak * 1.25, 2.0):
+        return "shadow_peak_after_qsim"
     if shadow_peak >= q_peak * 1.5 and ws_after < q_peak * 1.1:
         return "shadow_peak_not_ws_after_exit"
     if ws_after > q_exit + 0.25:
@@ -229,6 +242,7 @@ def main() -> None:
     parser.add_argument("--min-entry-ratio", type=float, default=None)
     parser.add_argument("--max-entry-ratio", type=float, default=None)
     parser.add_argument("--limit", type=int, default=40)
+    parser.add_argument("--held-longer-only", action="store_true")
     parser.add_argument("--detail", action="store_true")
     parser.add_argument("--raw", action="store_true")
     args = parser.parse_args()
@@ -250,6 +264,8 @@ def main() -> None:
         "min_pnl": MIN_SANE_PNL_PCT,
     }
     rows = _rows(params)
+    if args.held_longer_only:
+        rows = [row for row in rows if _f(row.get("shadow_held_after_qsim_min")) > 0]
 
     print(
         f"\nQSIM AFTER-EXIT MOVE REPORT — days={args.days} channel={args.channel} "
@@ -264,31 +280,40 @@ def main() -> None:
         buckets[_bucket(row)].append(row)
 
     print("\nBuckets")
-    print(f"{'bucket':<32} {'n':>5} {'qsim':>9} {'shadow':>9} {'avg_qpk':>8} {'avg_ws_after':>12} {'avg_qpost':>10}")
-    print("-" * 92)
+    print(f"{'bucket':<32} {'n':>5} {'qsim':>9} {'shadow':>9} {'avg_qpk':>8} {'avg_sh_after':>12} {'avg_ws_after':>12} {'avg_qpost':>10}")
+    print("-" * 106)
     for bucket, group in sorted(buckets.items(), key=lambda item: sum(_ret(r, "shadow") - _ret(r, "qsim") for r in item[1]), reverse=True):
         qsim_sum = sum(_ret(r, "qsim") for r in group)
         shadow_sum = sum(_ret(r, "shadow") for r in group)
         qpeaks = [_f(r.get("qsim_peak")) for r in group if r.get("qsim_peak") is not None]
+        sh_after = [_f(r.get("shadow_peak_after_qsim")) for r in group if r.get("shadow_peak_after_qsim") is not None]
         ws_after = [_f(r.get("max_ws_after_qsim_mult")) for r in group if r.get("max_ws_after_qsim_mult") is not None]
         qpost = [_f(r.get("max_post_qobs_mult")) for r in group if r.get("max_post_qobs_mult") is not None]
         print(
             f"{bucket:<32} {len(group):>5} {qsim_sum:>+9.2f} {shadow_sum:>+9.2f} "
             f"{(sum(qpeaks)/len(qpeaks) if qpeaks else 0):>8.2f} "
+            f"{(sum(sh_after)/len(sh_after) if sh_after else 0):>12.2f} "
             f"{(sum(ws_after)/len(ws_after) if ws_after else 0):>12.2f} "
             f"{(sum(qpost)/len(qpost) if qpost else 0):>10.2f}"
         )
 
-    print("\nLargest After-Exit Feed Moves")
+    print("\nLargest After-Exit Moves")
     print(
         f"{'call':>7} {'symbol':<12} {'bucket':<28} {'ch':<15} {'lane':<10} "
-        f"{'q_ex':>6} {'q_pk':>6} {'ws_a':>6} {'qpost':>6} {'hold+':>7} {'peak+':>7} "
+        f"{'q_ex':>6} {'q_pk':>6} {'sh_a':>6} {'ws_a':>6} {'qpost':>6} {'hold+':>7} {'shpk+':>7} "
         f"{'q_ret':>8} {'s_ret':>8} {'reason':<23}"
     )
-    print("-" * 145)
+    print("-" * 153)
     ranked = sorted(
         rows,
-        key=lambda r: (_f(r.get("max_ws_after_qsim_mult")) - (_ratio(r.get("qsim_exit"), r.get("qsim_entry")) or 0.0)),
+        key=lambda r: (
+            max(
+                _f(r.get("shadow_peak_after_qsim")),
+                _f(r.get("max_ws_after_qsim_mult")),
+                _f(r.get("max_post_qobs_mult")),
+            )
+            - (_ratio(r.get("qsim_exit"), r.get("qsim_entry")) or 0.0)
+        ),
         reverse=True,
     )
     for row in ranked[: args.limit]:
@@ -300,8 +325,9 @@ def main() -> None:
             f"{int(row['call_id']):>7} {str(row.get('symbol') or '?')[:12]:<12} {_bucket(row)[:28]:<28} "
             f"{str(row.get('channel') or '?')[:15]:<15} {str(row.get('lane') or '?')[:10]:<10} "
             f"{_fmt(q_exit_mult, 6, 2)} {_fmt(row.get('qsim_peak'), 6, 2)} "
-            f"{_fmt(row.get('max_ws_after_qsim_mult'), 6, 2)} {_fmt(row.get('max_post_qobs_mult'), 6, 2)} "
-            f"{_fmt(row.get('shadow_held_after_qsim_min'), 7, 1)} {_fmt(row.get('ws_peak_after_qsim_min'), 7, 1)} "
+            f"{_fmt(row.get('shadow_peak_after_qsim'), 6, 2)} {_fmt(row.get('max_ws_after_qsim_mult'), 6, 2)} "
+            f"{_fmt(row.get('max_post_qobs_mult'), 6, 2)} {_fmt(row.get('shadow_held_after_qsim_min'), 7, 1)} "
+            f"{_fmt(row.get('shadow_peak_after_qsim_min'), 7, 1)} "
             f"{q_ret:>+8.2f} {s_ret:>+8.2f} {reason[:23]:<23}"
         )
 
