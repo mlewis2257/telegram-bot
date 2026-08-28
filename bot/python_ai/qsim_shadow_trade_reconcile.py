@@ -44,6 +44,8 @@ WITH shadow_base AS (
         sp.exit_time,
         sp.peak_at,
         sp.entry_price,
+        sp.entry_source,
+        sp.entry_ref_mcap,
         sp.exit_price,
         sp.peak_multiplier,
         sp.sol_in,
@@ -98,6 +100,8 @@ matched AS (
         s.exit_time AS shadow_exit_time,
         s.peak_at AS shadow_peak_at,
         s.entry_price AS shadow_entry,
+        s.entry_source AS shadow_entry_source,
+        s.entry_ref_mcap AS shadow_entry_ref_mcap,
         s.exit_price AS shadow_exit,
         s.peak_multiplier AS shadow_peak,
         s.sol_in AS shadow_sol_in,
@@ -456,7 +460,8 @@ def _print_entry_debug(rows: list[dict[str, Any]], limit: int) -> None:
     hdr = (
         f"{'call':>7} {'symbol':<12} {'bucket':<20} {'ent':>6} {'delay':>6} "
         f"{'shadow_k':>9} {'qsim_k':>9} {'feed_k':>9} "
-        f"{'q_tok_m':>9} {'exp_tok_m':>10} {'fill%':>7} {'sol$':>7} {'dec':>4} {'supply_b':>9}"
+        f"{'q_tok_m':>9} {'exp_tok_m':>10} {'fill%':>7} {'sh/feed':>7} {'q/feed':>7} "
+        f"{'sol$':>7} {'dec':>4} {'supply_b':>9} {'sh_src':<18}"
     )
     print(hdr)
     print("-" * len(hdr))
@@ -481,9 +486,12 @@ def _print_entry_debug(rows: list[dict[str, Any]], limit: int) -> None:
             f"{((diag['q_tokens'] or 0.0) / 1_000_000):>9.2f} "
             f"{((diag['expected_tokens'] or 0.0) / 1_000_000):>10.2f} "
             f"{((fill_ratio or 0.0) * 100):>6.1f}% "
+            f"{_fmt(_ratio(row.get('shadow_entry'), row.get('feed_entry')), 7, 2)} "
+            f"{_fmt(_ratio(row.get('qsim_entry'), row.get('feed_entry')), 7, 2)} "
             f"{_fmt(diag.get('implied_sol_usd'), 7, 0)} "
             f"{_decimals(row):>4} "
-            f"{((supply or 0.0) / 1_000_000_000):>9.2f}"
+            f"{((supply or 0.0) / 1_000_000_000):>9.2f} "
+            f"{(row.get('shadow_entry_source') or '?')[:18]:<18}"
         )
 
 

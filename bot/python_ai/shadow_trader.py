@@ -82,16 +82,22 @@ async def maybe_open_shadow(score_result: dict, token_data: dict) -> None:
         # Real entry on the SAME feed used for monitoring/exit (consistent ruler).
         entry = None
         entry_vol = None
+        entry_source = None
+        entry_market = None
+        msg_mcap = float(token_data.get("mcap_at_call") or 0)
         try:
             market = data_fetcher.fetch_token_price_fast(mint)
+            entry_market = market
             if market and market.get("mcap"):
                 entry = float(market["mcap"])
+                entry_source = market.get("source") or market.get("price_source") or "fetch_token_price_fast"
             if market and market.get("volume_h1"):
                 entry_vol = float(market["volume_h1"])
         except Exception as e:
             print(f"[shadow] entry price fetch failed for {symbol}: {e}")
         if not entry or entry <= 0:
-            entry = float(token_data.get("mcap_at_call") or 0)
+            entry = msg_mcap
+            entry_source = "mcap_at_call"
         if entry <= 0:
             return
 
@@ -101,10 +107,12 @@ async def maybe_open_shadow(score_result: dict, token_data: dict) -> None:
         opened = []
         for variant in SHADOW_VARIANTS:
             if db.open_shadow_position(call_id, entry, SHADOW_SOL_IN, vip_tier,
-                                       exit_variant=variant, entry_volume=entry_vol):
+                                       exit_variant=variant, entry_volume=entry_vol,
+                                       entry_source=entry_source, entry_ref_mcap=msg_mcap,
+                                       entry_market=entry_market):
                 opened.append(variant)
         if opened:
             print(f"[shadow] opened {symbol} call_id={call_id} tier={vip_tier} "
-                  f"variants={','.join(opened)} @ ${entry/1000:.1f}k")
+                  f"variants={','.join(opened)} @ ${entry/1000:.1f}k source={entry_source}")
     except Exception as e:
         print(f"[shadow] maybe_open_shadow error: {e}")

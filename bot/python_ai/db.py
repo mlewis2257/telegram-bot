@@ -1320,6 +1320,9 @@ def ensure_shadow_positions_table() -> None:
                 vip_tier        text,
                 status          text NOT NULL DEFAULT 'open',
                 entry_price     numeric NOT NULL,
+                entry_source    text,
+                entry_ref_mcap  numeric,
+                entry_market_json jsonb,
                 sol_in          numeric NOT NULL,
                 entry_time      timestamptz NOT NULL DEFAULT now(),
                 peak_mcap       numeric,
@@ -1341,6 +1344,9 @@ def ensure_shadow_positions_table() -> None:
         # Migrate older tables (call_id-only unique → composite) idempotently.
         cur.execute("ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS exit_variant text NOT NULL DEFAULT 'early'")
         cur.execute("ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS entry_volume numeric")
+        cur.execute("ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS entry_source text")
+        cur.execute("ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS entry_ref_mcap numeric")
+        cur.execute("ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS entry_market_json jsonb")
         cur.execute("ALTER TABLE shadow_positions DROP CONSTRAINT IF EXISTS shadow_positions_call_id_key")
         cur.execute(
             """
@@ -1366,6 +1372,9 @@ def open_shadow_position(
     exit_variant: str = "early",
     entry_volume: float | None = None,
     entry_time: datetime | None = None,
+    entry_source: str | None = None,
+    entry_ref_mcap: float | None = None,
+    entry_market: dict | None = None,
 ) -> bool:
     """Open a shadow position for a normally-skipped call under one exit variant.
     No-ops if a position for this (call_id, exit_variant) already exists."""
@@ -1375,14 +1384,18 @@ def open_shadow_position(
         cur.execute(
             """
             INSERT INTO shadow_positions
-                (call_id, exit_variant, token_id, vip_tier, entry_price, sol_in, entry_volume, entry_time, status)
-            SELECT %s, %s, c.token_id, %s, %s, %s, %s, %s, 'open'
+                (call_id, exit_variant, token_id, vip_tier, entry_price, entry_source,
+                 entry_ref_mcap, entry_market_json, sol_in, entry_volume, entry_time, status)
+            SELECT %s, %s, c.token_id, %s, %s, %s, %s, %s, %s, %s, %s, 'open'
             FROM calls c
             WHERE c.id = %s
             ON CONFLICT (call_id, exit_variant) DO NOTHING
             """,
-            (call_id, exit_variant, vip_tier, entry_price, sol_in, entry_volume,
-             entry_time or datetime.now(timezone.utc), call_id),
+            (
+                call_id, exit_variant, vip_tier, entry_price, entry_source,
+                entry_ref_mcap, Json(entry_market) if entry_market is not None else None,
+                sol_in, entry_volume, entry_time or datetime.now(timezone.utc), call_id,
+            ),
         )
         affected = cur.rowcount
         conn.commit()
