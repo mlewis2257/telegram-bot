@@ -73,6 +73,8 @@ qsim_base AS (
         q.exit_price,
         q.peak_multiplier,
         q.sol_in,
+        q.entry_tokens,
+        q.entry_decimals,
         q.sol_out,
         q.pnl_sol,
         q.pnl_pct,
@@ -111,6 +113,8 @@ matched AS (
         q.exit_price AS qsim_exit,
         q.peak_multiplier AS qsim_peak,
         q.sol_in AS qsim_sol_in,
+        q.entry_tokens AS qsim_entry_tokens,
+        q.entry_decimals AS qsim_entry_decimals,
         q.sol_out AS qsim_sol_out,
         q.pnl_sol AS qsim_pnl,
         q.pnl_pct AS qsim_pnl_pct,
@@ -125,6 +129,8 @@ matched AS (
 SELECT
     m.*,
     tok.symbol,
+    tok.total_supply,
+    tok.decimals AS token_decimals,
     COALESCE(ch.handle, '?') AS channel,
     COALESCE(c.skip_reason, 'none') AS lane,
     c.message_type,
@@ -239,6 +245,59 @@ def _date(value: Any) -> str:
     if isinstance(value, datetime):
         return value.strftime("%m/%d %H:%M")
     return str(value)[:11]
+
+
+def _decimals(row: dict[str, Any]) -> int:
+    value = row.get("qsim_entry_decimals")
+    if value is None:
+        value = row.get("token_decimals")
+    try:
+        return int(value) if value is not None else 6
+    except (TypeError, ValueError):
+        return 6
+
+
+def _supply_whole(row: dict[str, Any]) -> float | None:
+    supply_raw = _f(row.get("total_supply"))
+    if supply_raw <= 0:
+        return None
+    decimals = _decimals(row)
+    supply_whole = supply_raw / (10 ** decimals)
+    return supply_whole if supply_whole > 0 else None
+
+
+def _qsim_tokens_whole(row: dict[str, Any]) -> float | None:
+    tokens_raw = _f(row.get("qsim_entry_tokens"))
+    if tokens_raw <= 0:
+        return None
+    tokens_whole = tokens_raw / (10 ** _decimals(row))
+    return tokens_whole if tokens_whole > 0 else None
+
+
+def _entry_diag(row: dict[str, Any]) -> dict[str, float | None]:
+    entry_ratio = row.get("_entry_ratio")
+    q_tokens = _qsim_tokens_whole(row)
+    supply = _supply_whole(row)
+    qsim_entry = _f(row.get("qsim_entry"))
+    qsim_sol = _f(row.get("qsim_sol_in"))
+
+    expected_tokens = None
+    token_fill_ratio = None
+    if q_tokens is not None and entry_ratio is not None and entry_ratio > 0:
+        expected_tokens = q_tokens * entry_ratio
+        token_fill_ratio = q_tokens / expected_tokens if expected_tokens > 0 else None
+
+    implied_sol_usd = None
+    if q_tokens is not None and supply and qsim_entry > 0 and qsim_sol > 0:
+        implied_sol_usd = qsim_entry * q_tokens / (qsim_sol * supply)
+
+    return {
+        "q_tokens": q_tokens,
+        "expected_tokens": expected_tokens,
+        "token_fill_ratio": token_fill_ratio,
+        "supply": supply,
+        "implied_sol_usd": implied_sol_usd,
+    }
 
 
 def _annotate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -388,6 +447,46 @@ def _print_timing(rows: list[dict[str, Any]], limit: int) -> None:
         )
 
 
+def _print_entry_debug(rows: list[dict[str, Any]], limit: int) -> None:
+    print("\nEntry Price Forensics")
+    print(
+        "expected_tok = tokens qsim would have received if qsim fill matched shadow entry "
+        "using the same supply/SOL assumptions."
+    )
+    hdr = (
+        f"{'call':>7} {'symbol':<12} {'bucket':<20} {'ent':>6} {'delay':>6} "
+        f"{'shadow_k':>9} {'qsim_k':>9} {'feed_k':>9} "
+        f"{'q_tok_m':>9} {'exp_tok_m':>10} {'fill%':>7} {'sol$':>7} {'dec':>4} {'supply_b':>9}"
+    )
+    print(hdr)
+    print("-" * len(hdr))
+    candidates = [
+        row for row in rows
+        if row.get("_entry_ratio") is not None and row.get("qsim_entry") and row.get("shadow_entry")
+    ]
+    candidates = sorted(candidates, key=lambda r: abs((_f(r.get("_entry_ratio")) or 1.0) - 1.0), reverse=True)
+    for row in candidates[:limit]:
+        diag = _entry_diag(row)
+        fill_ratio = diag["token_fill_ratio"]
+        supply = diag["supply"]
+        print(
+            f"{int(row['call_id']):>7} "
+            f"{(row.get('symbol') or '?')[:12]:<12} "
+            f"{row['_bucket'][:20]:<20} "
+            f"{_fmt(row.get('_entry_ratio'), 6, 2)} "
+            f"{_fmt(row.get('entry_delay_sec'), 6, 1)} "
+            f"{_f(row.get('shadow_entry')) / 1000:>9.1f} "
+            f"{_f(row.get('qsim_entry')) / 1000:>9.1f} "
+            f"{_f(row.get('feed_entry')) / 1000:>9.1f} "
+            f"{((diag['q_tokens'] or 0.0) / 1_000_000):>9.2f} "
+            f"{((diag['expected_tokens'] or 0.0) / 1_000_000):>10.2f} "
+            f"{((fill_ratio or 0.0) * 100):>6.1f}% "
+            f"{_fmt(diag.get('implied_sol_usd'), 7, 0)} "
+            f"{_decimals(row):>4} "
+            f"{((supply or 0.0) / 1_000_000_000):>9.2f}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Reconcile qsim vs shadow trade accounting.")
     parser.add_argument("--days", type=int, default=5)
@@ -401,6 +500,7 @@ def main() -> None:
     parser.add_argument("--max-entry-ratio", type=float, default=None)
     parser.add_argument("--raw", action="store_true")
     parser.add_argument("--max-qmax", type=float, default=MAX_QOBS_MULT)
+    parser.add_argument("--entry-debug", action="store_true", help="print qsim-vs-shadow entry token forensics")
     args = parser.parse_args()
 
     params = {
@@ -430,6 +530,8 @@ def main() -> None:
     _print_buckets(rows)
     _print_details(rows, args.limit)
     _print_timing(rows, min(args.limit, 30))
+    if args.entry_debug:
+        _print_entry_debug(rows, args.limit)
 
 
 if __name__ == "__main__":
