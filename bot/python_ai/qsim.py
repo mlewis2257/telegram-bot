@@ -98,6 +98,8 @@ QSIM_PEAK_PENDING_TTL_SECS = float(
 QSIM_NO_BOUNCE_STOP_ENABLED = os.getenv("QSIM_NO_BOUNCE_STOP_ENABLED", "true").lower() == "true"
 NO_BOUNCE_ARM_MULT          = float(os.getenv("NO_BOUNCE_ARM_MULT", "1.3"))
 NO_BOUNCE_STOP_MULT         = float(os.getenv("NO_BOUNCE_STOP_MULT", "0.9"))
+QSIM_BANK_EXIT_ENABLED      = os.getenv("QSIM_BANK_EXIT_ENABLED", "false").lower() == "true"
+QSIM_BANK_EXIT_MULT         = float(os.getenv("QSIM_BANK_EXIT_MULT", "1.3"))
 QSIM_POST_EXIT_OBS_ENABLED  = os.getenv("QSIM_POST_EXIT_OBS_ENABLED", "false").lower() == "true"
 QSIM_POST_EXIT_OBS_MINS     = float(os.getenv("QSIM_POST_EXIT_OBS_MINS", "90"))
 QSIM_POST_EXIT_OBS_CADENCE_SECS = float(os.getenv("QSIM_POST_EXIT_OBS_CADENCE_SECS", "60"))
@@ -130,6 +132,16 @@ def _no_bounce_stop_result(current_mult: float, peak_mult: float) -> ExitResult:
         and current_mult <= NO_BOUNCE_STOP_MULT
     ):
         return ExitResult(True, "no_bounce_stop")
+    return ExitResult(False)
+
+
+def _bank_exit_result(current_mult: float, current_mcap: float) -> ExitResult:
+    if (
+        QSIM_BANK_EXIT_ENABLED
+        and QSIM_BANK_EXIT_MULT > 0
+        and current_mult >= QSIM_BANK_EXIT_MULT
+    ):
+        return ExitResult(True, f"bank_{QSIM_BANK_EXIT_MULT:g}x", exit_mcap=current_mcap)
     return ExitResult(False)
 
 
@@ -345,6 +357,9 @@ async def _qsim_tick(pos: dict) -> None:
     )
     if no_bounce_result.should_exit and not result.should_exit:
         result = ExitResult(True, no_bounce_result.reason, exit_mcap=eff_cur)
+    bank_result = _bank_exit_result(eff_cur / entry, eff_cur)
+    if bank_result.should_exit:
+        result = bank_result
     result, runner_note = _apply_runner_window(
         call_id=call_id,
         current_mult=eff_cur / entry,
@@ -442,6 +457,7 @@ async def run_qsim_monitor() -> None:
     print(f"[qsim] post-exit probes enabled={QSIM_POST_EXIT_OBS_ENABLED} "
           f"mins={QSIM_POST_EXIT_OBS_MINS:g} cadence={QSIM_POST_EXIT_OBS_CADENCE_SECS:g}s "
           f"limit={QSIM_POST_EXIT_OBS_LIMIT} cap={QSIM_POST_EXIT_OBS_MAX_PER_MIN}/min")
+    print(f"[qsim] bank exit enabled={QSIM_BANK_EXIT_ENABLED} mult={QSIM_BANK_EXIT_MULT:g}x")
     while True:
         try:
             # Skip the whole quoting pass while in 429 backoff (the loop-end sleep still runs).
