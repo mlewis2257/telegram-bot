@@ -143,6 +143,8 @@ SELECT
     qobs.qobs_count,
     qobs.max_qobs_mult,
     qobs.max_qobs_at,
+    sh_any.shadow_any_count,
+    sh_any.shadow_variant_statuses,
     EXTRACT(EPOCH FROM (m.qsim_entry_time - m.shadow_entry_time)) AS entry_delay_sec,
     EXTRACT(EPOCH FROM (m.qsim_exit_time - m.shadow_exit_time)) AS exit_delay_sec,
     EXTRACT(EPOCH FROM (m.shadow_peak_at - m.shadow_entry_time)) / 60.0 AS shadow_peak_min,
@@ -164,6 +166,13 @@ LEFT JOIN LATERAL (
       AND qo.real_mult <= %(max_qmax)s
       AND qo.observed_at BETWEEN m.qsim_entry_time AND COALESCE(m.qsim_exit_time, now())
 ) qobs ON TRUE
+LEFT JOIN LATERAL (
+    SELECT
+        COUNT(*) AS shadow_any_count,
+        STRING_AGG(sp2.exit_variant || ':' || sp2.status, ', ' ORDER BY sp2.exit_variant, sp2.status) AS shadow_variant_statuses
+    FROM shadow_positions sp2
+    WHERE sp2.call_id = m.call_id
+) sh_any ON TRUE
 WHERE (%(channel)s = 'any' OR COALESCE(ch.handle, '?') = %(channel)s)
   AND (%(lane)s = 'any' OR COALESCE(c.skip_reason, 'none') = %(lane)s)
 ORDER BY COALESCE(m.shadow_entry_time, m.qsim_entry_time) DESC
@@ -371,6 +380,25 @@ def _print_summary(rows: list[dict[str, Any]]) -> None:
         )
 
 
+def _print_shadow_overlap(rows: list[dict[str, Any]]) -> None:
+    qsim_only = [row for row in rows if row.get("qsim_entry") is not None and row.get("shadow_entry") is None]
+    if not qsim_only:
+        return
+
+    counts: dict[str, int] = defaultdict(int)
+    for row in qsim_only:
+        variants = row.get("shadow_variant_statuses") or "no_shadow_row"
+        counts[str(variants)] += 1
+
+    print("\nQsim-Only Shadow Overlap")
+    print("Shows whether qsim-only rows have shadow rows under another variant/status.")
+    hdr = f"{'shadow_rows_for_call':<46} {'n':>6}"
+    print(hdr)
+    print("-" * len(hdr))
+    for label, count in sorted(counts.items(), key=lambda item: item[1], reverse=True):
+        print(f"{label[:46]:<46} {count:>6}")
+
+
 def _print_buckets(rows: list[dict[str, Any]]) -> None:
     print("\nDiscrepancy Buckets")
     hdr = (
@@ -535,6 +563,7 @@ def main() -> None:
         print("No rows matched.")
         return
     _print_summary(rows)
+    _print_shadow_overlap(rows)
     _print_buckets(rows)
     _print_details(rows, args.limit)
     _print_timing(rows, min(args.limit, 30))
