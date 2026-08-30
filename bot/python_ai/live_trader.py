@@ -24,6 +24,7 @@ import asyncio
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -191,15 +192,110 @@ NO_BOUNCE_ARM_MULT          = float(os.getenv("NO_BOUNCE_ARM_MULT", "1.3"))
 NO_BOUNCE_STOP_MULT         = float(os.getenv("NO_BOUNCE_STOP_MULT", "0.9"))
 LIVE_BANK_EXIT_ENABLED      = os.getenv("LIVE_BANK_EXIT_ENABLED", "false").lower() == "true"
 LIVE_BANK_EXIT_MULT         = float(os.getenv("LIVE_BANK_EXIT_MULT", "1.3"))
+LIVE_EXIT_OVERLAY_STRATEGY  = os.getenv("LIVE_EXIT_OVERLAY_STRATEGY", "").strip()
 LIVE_RUNNER_WINDOW_ENABLED  = os.getenv("LIVE_RUNNER_WINDOW_ENABLED", "false").lower() == "true"
 RUNNER_WINDOW_ARM_MULT      = float(os.getenv("RUNNER_WINDOW_ARM_MULT", "2.0"))
 RUNNER_WINDOW_RELEASE_MULT  = float(os.getenv("RUNNER_WINDOW_RELEASE_MULT", "5.0"))
 RUNNER_WINDOW_MINS          = float(os.getenv("RUNNER_WINDOW_MINS", "10"))
 RUNNER_WINDOW_FLOOR_MULT    = float(os.getenv("RUNNER_WINDOW_FLOOR_MULT", "1.0"))
 RUNNER_WINDOW_PROTECTED_REASONS = {"trail_stop", "profit_floor"}
-print(f"[live] bank exit enabled={LIVE_BANK_EXIT_ENABLED} mult={LIVE_BANK_EXIT_MULT:g}x")
 _sell_quote_cache: dict = {}  # mint -> (sol_out, monotonic_ts)
+_live_exit_state: dict[int, dict] = {}
 _runner_window_until: dict[int, float] = {}
+
+
+@dataclass(frozen=True)
+class LiveExitOverlay:
+    name: str
+    kind: str
+    bank_mult: float | None = None
+    confirm_ticks: int = 1
+    lock_trigger_mult: float | None = None
+    lock_floor_mult: float | None = None
+
+
+LIVE_EXIT_OVERLAYS: dict[str, LiveExitOverlay] = {
+    "bank_1p2x": LiveExitOverlay("bank_1p2x", "bank", bank_mult=1.2),
+    "bank_1p3x": LiveExitOverlay("bank_1p3x", "bank", bank_mult=1.3),
+    "bank_1p4x": LiveExitOverlay("bank_1p4x", "bank", bank_mult=1.4),
+    "bank_1p5x": LiveExitOverlay("bank_1p5x", "bank", bank_mult=1.5),
+    "bank_1p75x": LiveExitOverlay("bank_1p75x", "bank", bank_mult=1.75),
+    "bank_2x": LiveExitOverlay("bank_2x", "bank", bank_mult=2.0),
+    "confirm_bank_1p2x": LiveExitOverlay("confirm_bank_1p2x", "bank", bank_mult=1.2, confirm_ticks=2),
+    "confirm_bank_1p3x": LiveExitOverlay("confirm_bank_1p3x", "bank", bank_mult=1.3, confirm_ticks=2),
+    "confirm_bank_1p4x": LiveExitOverlay("confirm_bank_1p4x", "bank", bank_mult=1.4, confirm_ticks=2),
+    "confirm_bank_1p5x": LiveExitOverlay("confirm_bank_1p5x", "bank", bank_mult=1.5, confirm_ticks=2),
+    "confirm_bank_1p75x": LiveExitOverlay("confirm_bank_1p75x", "bank", bank_mult=1.75, confirm_ticks=2),
+    "confirm_bank_2x": LiveExitOverlay("confirm_bank_2x", "bank", bank_mult=2.0, confirm_ticks=2),
+    "lock_or_bank_1p3x_1p1x": LiveExitOverlay("lock_or_bank_1p3x_1p1x", "lock_or_bank", bank_mult=1.3, lock_trigger_mult=1.3, lock_floor_mult=1.1),
+    "lock_or_bank_1p4x_1p15x": LiveExitOverlay("lock_or_bank_1p4x_1p15x", "lock_or_bank", bank_mult=1.4, lock_trigger_mult=1.4, lock_floor_mult=1.15),
+    "lock_or_bank_1p5x_1p2x": LiveExitOverlay("lock_or_bank_1p5x_1p2x", "lock_or_bank", bank_mult=1.5, lock_trigger_mult=1.5, lock_floor_mult=1.2),
+    "lock_or_bank_1p75x_1p35x": LiveExitOverlay("lock_or_bank_1p75x_1p35x", "lock_or_bank", bank_mult=1.75, lock_trigger_mult=1.75, lock_floor_mult=1.35),
+    "lock_or_bank_2x_1p55x": LiveExitOverlay("lock_or_bank_2x_1p55x", "lock_or_bank", bank_mult=2.0, lock_trigger_mult=2.0, lock_floor_mult=1.55),
+}
+
+
+def _resolve_live_exit_overlay() -> LiveExitOverlay | None:
+    if LIVE_EXIT_OVERLAY_STRATEGY:
+        overlay = LIVE_EXIT_OVERLAYS.get(LIVE_EXIT_OVERLAY_STRATEGY)
+        if not overlay:
+            print(f"[live] WARNING: unknown LIVE_EXIT_OVERLAY_STRATEGY={LIVE_EXIT_OVERLAY_STRATEGY!r}; overlay disabled")
+        return overlay
+    if LIVE_BANK_EXIT_ENABLED and LIVE_BANK_EXIT_MULT > 0:
+        return LiveExitOverlay(
+            name=f"bank_{LIVE_BANK_EXIT_MULT:g}x",
+            kind="bank",
+            bank_mult=LIVE_BANK_EXIT_MULT,
+        )
+    return None
+
+
+_LIVE_EXIT_OVERLAY = _resolve_live_exit_overlay()
+print(f"[live] exit overlay: {_LIVE_EXIT_OVERLAY.name if _LIVE_EXIT_OVERLAY else 'none'}")
+
+
+def _apply_live_exit_overlay(
+    call_id: int,
+    current_mult: float,
+    current_mcap: float,
+    overlay: LiveExitOverlay | None = None,
+) -> tuple[ExitResult, bool]:
+    overlay = overlay if overlay is not None else _LIVE_EXIT_OVERLAY
+    if overlay is None:
+        return ExitResult(False), False
+
+    state = _live_exit_state.setdefault(call_id, {})
+    if overlay.kind == "bank":
+        threshold = overlay.bank_mult or 0.0
+        if threshold <= 0:
+            return ExitResult(False), False
+        streak_key = f"{overlay.name}:streak"
+        streak = int(state.get(streak_key, 0))
+        if current_mult >= threshold:
+            streak += 1
+            state[streak_key] = streak
+            if streak >= max(1, overlay.confirm_ticks):
+                return ExitResult(True, overlay.name, exit_mcap=current_mcap), False
+        else:
+            state[streak_key] = 0
+        return ExitResult(False), False
+
+    if overlay.kind == "lock_or_bank":
+        trigger = overlay.lock_trigger_mult or overlay.bank_mult or 0.0
+        floor = overlay.lock_floor_mult or 0.0
+        if trigger <= 0 or floor <= 0:
+            return ExitResult(False), False
+        armed_key = f"{overlay.name}:armed"
+        if current_mult >= trigger:
+            state[armed_key] = True
+            return ExitResult(False), True
+        if state.get(armed_key) and current_mult <= floor:
+            return ExitResult(True, overlay.name, exit_mcap=current_mcap), True
+        return ExitResult(False), bool(state.get(armed_key))
+
+    return ExitResult(False), False
+
+
 # Exit quotes are the highest-value quote we make (real money on the line), so a
 # transient Jupiter 429 is retried briefly before we surrender to the feed basis —
 # the feed is exactly the liar the quote path exists to bypass (measured: ~2/3 of live
@@ -868,6 +964,7 @@ async def close_live_position(
             f"  pnl={pnl:+.4f}  sig={sig[:16]}..."
         )
         _runner_window_until.pop(call_id, None)
+        _live_exit_state.pop(call_id, None)
         try:
             await alert_bot.send_live_sell_alert(
                 symbol=symbol,
@@ -943,8 +1040,21 @@ def check_live_exits(
     ):
         return ExitResult(True, "no_bounce_stop", exit_mcap=current_mcap)
 
-    if LIVE_BANK_EXIT_ENABLED and LIVE_BANK_EXIT_MULT > 0 and current_mult >= LIVE_BANK_EXIT_MULT:
-        return ExitResult(True, f"bank_{LIVE_BANK_EXIT_MULT:g}x", exit_mcap=current_mcap)
+    overlay_result, overlay_suppresses_base = _apply_live_exit_overlay(
+        call_id, current_mult, current_mcap
+    )
+    if overlay_result.should_exit:
+        return overlay_result
+    if overlay_suppresses_base:
+        if entry_time is not None:
+            if entry_time.tzinfo is None:
+                entry_time = entry_time.replace(tzinfo=timezone.utc)
+            age_hours = (
+                datetime.now(timezone.utc) - entry_time
+            ).total_seconds() / 3600.0
+            if age_hours > cfg.max_hours:
+                return ExitResult(True, "time_stop", exit_mcap=current_mcap)
+        return ExitResult(False)
 
     result = apply_exit_config(
         cfg,
