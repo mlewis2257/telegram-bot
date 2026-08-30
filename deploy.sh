@@ -34,7 +34,7 @@ sleep 5   # let processes boot + flush their startup banner to the logs
 ENVF="$REPO/bot/python_ai/.env"
 if [[ -f "$ENVF" ]]; then
   echo "→ .env flags:"
-  grep -E '^(LIVE_TRADING_ENABLED|LIVE_LANE_STRATEGY|EXIT_STRATEGY|LIVE_EXIT_USE_QUOTE|QSIM_ENABLED|LIVE_POSITION_SIZE_SOL)=' "$ENVF" | sed 's/^/    /' || echo "    (expected flags not found)"
+  grep -E '^(LIVE_TRADING_ENABLED|LIVE_LANE_STRATEGY|EXIT_STRATEGY|LIVE_EXIT_USE_QUOTE|LIVE_POSITION_SIZE_SOL|QSIM_ENABLED|QSIM_EXIT_OVERLAY_STRATEGY)=' "$ENVF" | sed 's/^/    /' || echo "    (expected flags not found)"
   if grep -qE '^LIVE_TRADING_ENABLED=true$' "$ENVF"; then
     echo "    ✅ live trading ENABLED"
   else

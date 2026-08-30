@@ -31,6 +31,7 @@ import asyncio
 import json
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import db
@@ -149,6 +150,7 @@ NO_BOUNCE_ARM_MULT          = float(os.getenv("NO_BOUNCE_ARM_MULT", "1.3"))
 NO_BOUNCE_STOP_MULT         = float(os.getenv("NO_BOUNCE_STOP_MULT", "0.9"))
 QSIM_BANK_EXIT_ENABLED      = os.getenv("QSIM_BANK_EXIT_ENABLED", "false").lower() == "true"
 QSIM_BANK_EXIT_MULT         = float(os.getenv("QSIM_BANK_EXIT_MULT", "1.3"))
+QSIM_EXIT_OVERLAY_STRATEGY  = os.getenv("QSIM_EXIT_OVERLAY_STRATEGY", "").strip()
 QSIM_POST_EXIT_OBS_ENABLED  = os.getenv("QSIM_POST_EXIT_OBS_ENABLED", "false").lower() == "true"
 QSIM_POST_EXIT_OBS_MINS     = float(os.getenv("QSIM_POST_EXIT_OBS_MINS", "90"))
 QSIM_POST_EXIT_OBS_CADENCE_SECS = float(os.getenv("QSIM_POST_EXIT_OBS_CADENCE_SECS", "60"))
@@ -166,6 +168,7 @@ _ensured = False
 _last_quote_ts: dict[int, float] = {}     # call_id -> monotonic time of last sell-quote
 _last_post_exit_quote_ts: dict[int, float] = {}  # call_id -> monotonic time of last post-exit quote
 _runner_window_until: dict[int, float] = {}  # call_id -> monotonic expiry for temporary loose-runner mode
+_qsim_exit_state: dict[int, dict] = {}       # call_id -> named overlay state
 _noroute_streak: dict[int, int] = {}      # call_id -> consecutive no-route sell quotes
 _quote_window: list[float] = []           # monotonic timestamps of recent quotes (budget window)
 _post_exit_quote_window: list[float] = [] # monotonic timestamps of recent post-exit quotes
@@ -192,6 +195,102 @@ def _bank_exit_result(current_mult: float, current_mcap: float) -> ExitResult:
     ):
         return ExitResult(True, f"bank_{QSIM_BANK_EXIT_MULT:g}x", exit_mcap=current_mcap)
     return ExitResult(False)
+
+
+@dataclass(frozen=True)
+class QsimExitOverlay:
+    name: str
+    kind: str
+    bank_mult: float | None = None
+    confirm_ticks: int = 1
+    lock_trigger_mult: float | None = None
+    lock_floor_mult: float | None = None
+
+
+QSIM_EXIT_OVERLAYS: dict[str, QsimExitOverlay] = {
+    "bank_1p2x": QsimExitOverlay("bank_1p2x", "bank", bank_mult=1.2),
+    "bank_1p3x": QsimExitOverlay("bank_1p3x", "bank", bank_mult=1.3),
+    "bank_1p4x": QsimExitOverlay("bank_1p4x", "bank", bank_mult=1.4),
+    "bank_1p5x": QsimExitOverlay("bank_1p5x", "bank", bank_mult=1.5),
+    "bank_1p75x": QsimExitOverlay("bank_1p75x", "bank", bank_mult=1.75),
+    "bank_2x": QsimExitOverlay("bank_2x", "bank", bank_mult=2.0),
+    "confirm_bank_1p2x": QsimExitOverlay("confirm_bank_1p2x", "bank", bank_mult=1.2, confirm_ticks=2),
+    "confirm_bank_1p3x": QsimExitOverlay("confirm_bank_1p3x", "bank", bank_mult=1.3, confirm_ticks=2),
+    "confirm_bank_1p4x": QsimExitOverlay("confirm_bank_1p4x", "bank", bank_mult=1.4, confirm_ticks=2),
+    "confirm_bank_1p5x": QsimExitOverlay("confirm_bank_1p5x", "bank", bank_mult=1.5, confirm_ticks=2),
+    "confirm_bank_1p75x": QsimExitOverlay("confirm_bank_1p75x", "bank", bank_mult=1.75, confirm_ticks=2),
+    "confirm_bank_2x": QsimExitOverlay("confirm_bank_2x", "bank", bank_mult=2.0, confirm_ticks=2),
+    "lock_or_bank_1p3x_1p1x": QsimExitOverlay("lock_or_bank_1p3x_1p1x", "lock_or_bank", bank_mult=1.3, lock_trigger_mult=1.3, lock_floor_mult=1.1),
+    "lock_or_bank_1p4x_1p15x": QsimExitOverlay("lock_or_bank_1p4x_1p15x", "lock_or_bank", bank_mult=1.4, lock_trigger_mult=1.4, lock_floor_mult=1.15),
+    "lock_or_bank_1p5x_1p2x": QsimExitOverlay("lock_or_bank_1p5x_1p2x", "lock_or_bank", bank_mult=1.5, lock_trigger_mult=1.5, lock_floor_mult=1.2),
+    "lock_or_bank_1p75x_1p35x": QsimExitOverlay("lock_or_bank_1p75x_1p35x", "lock_or_bank", bank_mult=1.75, lock_trigger_mult=1.75, lock_floor_mult=1.35),
+    "lock_or_bank_2x_1p55x": QsimExitOverlay("lock_or_bank_2x_1p55x", "lock_or_bank", bank_mult=2.0, lock_trigger_mult=2.0, lock_floor_mult=1.55),
+}
+
+
+def _resolve_qsim_exit_overlay() -> QsimExitOverlay | None:
+    if QSIM_EXIT_OVERLAY_STRATEGY:
+        overlay = QSIM_EXIT_OVERLAYS.get(QSIM_EXIT_OVERLAY_STRATEGY)
+        if not overlay:
+            print(f"[qsim] WARNING: unknown QSIM_EXIT_OVERLAY_STRATEGY={QSIM_EXIT_OVERLAY_STRATEGY!r}; overlay disabled")
+        return overlay
+    if QSIM_BANK_EXIT_ENABLED and QSIM_BANK_EXIT_MULT > 0:
+        return QsimExitOverlay(
+            name=f"bank_{QSIM_BANK_EXIT_MULT:g}x",
+            kind="bank",
+            bank_mult=QSIM_BANK_EXIT_MULT,
+        )
+    return None
+
+
+_QSIM_EXIT_OVERLAY = _resolve_qsim_exit_overlay()
+
+
+def _apply_qsim_exit_overlay(
+    call_id: int,
+    current_mult: float,
+    current_mcap: float,
+    overlay: QsimExitOverlay | None = None,
+) -> tuple[ExitResult, bool, str | None]:
+    overlay = overlay if overlay is not None else _QSIM_EXIT_OVERLAY
+    if overlay is None:
+        return ExitResult(False), False, None
+
+    state = _qsim_exit_state.setdefault(call_id, {})
+    if overlay.kind == "bank":
+        threshold = overlay.bank_mult or 0.0
+        if threshold <= 0:
+            return ExitResult(False), False, None
+        streak_key = f"{overlay.name}:streak"
+        streak = int(state.get(streak_key, 0))
+        if current_mult >= threshold:
+            streak += 1
+            state[streak_key] = streak
+            note = f"{overlay.name}:streak={streak}/{max(1, overlay.confirm_ticks)}"
+            if streak >= max(1, overlay.confirm_ticks):
+                return ExitResult(True, overlay.name, exit_mcap=current_mcap), False, note
+            return ExitResult(False), False, note
+        if streak:
+            state[streak_key] = 0
+            return ExitResult(False), False, f"{overlay.name}:streak_reset"
+        return ExitResult(False), False, None
+
+    if overlay.kind == "lock_or_bank":
+        trigger = overlay.lock_trigger_mult or overlay.bank_mult or 0.0
+        floor = overlay.lock_floor_mult or 0.0
+        if trigger <= 0 or floor <= 0:
+            return ExitResult(False), False, None
+        armed_key = f"{overlay.name}:armed"
+        if current_mult >= trigger:
+            state[armed_key] = True
+            return ExitResult(False), True, f"{overlay.name}:armed"
+        if state.get(armed_key) and current_mult <= floor:
+            return ExitResult(True, overlay.name, exit_mcap=current_mcap), True, f"{overlay.name}:floor"
+        if state.get(armed_key):
+            return ExitResult(False), True, f"{overlay.name}:hold"
+        return ExitResult(False), False, None
+
+    return ExitResult(False), False, None
 
 
 def _apply_runner_window(
@@ -406,7 +505,18 @@ async def _qsim_tick(pos: dict) -> None:
     )
     if no_bounce_result.should_exit and not result.should_exit:
         result = ExitResult(True, no_bounce_result.reason, exit_mcap=eff_cur)
-    bank_result = _bank_exit_result(eff_cur / entry, eff_cur)
+    overlay_result, overlay_suppresses_base, overlay_note = _apply_qsim_exit_overlay(
+        call_id=call_id,
+        current_mult=eff_cur / entry,
+        current_mcap=eff_cur,
+    )
+    if overlay_result.should_exit:
+        result = overlay_result
+    elif overlay_suppresses_base and result.should_exit and result.reason != "time_stop":
+        overlay_note = f"{overlay_note};hold:{result.reason}" if overlay_note else f"hold:{result.reason}"
+        result = ExitResult(False)
+
+    bank_result = _bank_exit_result(eff_cur / entry, eff_cur) if _QSIM_EXIT_OVERLAY is None else ExitResult(False)
     if bank_result.should_exit:
         result = bank_result
     result, runner_note = _apply_runner_window(
@@ -427,7 +537,7 @@ async def _qsim_tick(pos: dict) -> None:
         exit_reason=result.reason,
         should_exit=result.should_exit,
         noroute_streak=0,
-        note=runner_note,
+        note=";".join(note for note in (overlay_note, runner_note) if note),
     )
     if result.should_exit:
         db.close_qsim_position(call_id, exit_price=(result.exit_mcap or eff_cur),
@@ -495,6 +605,7 @@ def _cleanup(call_id: int) -> None:
     _last_quote_ts.pop(call_id, None)
     _noroute_streak.pop(call_id, None)
     _runner_window_until.pop(call_id, None)
+    _qsim_exit_state.pop(call_id, None)
 
 
 async def run_qsim_monitor() -> None:
@@ -507,6 +618,7 @@ async def run_qsim_monitor() -> None:
           f"mins={QSIM_POST_EXIT_OBS_MINS:g} cadence={QSIM_POST_EXIT_OBS_CADENCE_SECS:g}s "
           f"limit={QSIM_POST_EXIT_OBS_LIMIT} cap={QSIM_POST_EXIT_OBS_MAX_PER_MIN}/min")
     print(f"[qsim] bank exit enabled={QSIM_BANK_EXIT_ENABLED} mult={QSIM_BANK_EXIT_MULT:g}x")
+    print(f"[qsim] exit overlay: {_QSIM_EXIT_OVERLAY.name if _QSIM_EXIT_OVERLAY else 'none'}")
     while True:
         try:
             # Skip the whole quoting pass while in 429 backoff (the loop-end sleep still runs).
