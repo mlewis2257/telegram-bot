@@ -134,6 +134,7 @@ WITH base AS (
     ) qobs ON TRUE
     WHERE q.status = 'closed'
       AND q.entry_time >= now() - (%(days)s || ' days')::interval
+      AND (%(since)s IS NULL OR q.entry_time >= %(since)s::timestamptz)
       AND (%(channel)s = 'any' OR COALESCE(ch.handle, '?') = %(channel)s)
       AND (%(lane)s = 'any' OR COALESCE(c.skip_reason, 'none') = %(lane)s)
       AND (%(variant)s = 'any' OR q.variant = %(variant)s)
@@ -310,6 +311,7 @@ def main() -> None:
         description="Find qsim entry features separating quote runners from dead trades."
     )
     parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--since", default=None, help="only include qsim entries at/after this timestamp")
     parser.add_argument("--channel", default="any")
     parser.add_argument("--lane", default="any")
     parser.add_argument("--variant", default="early")
@@ -334,6 +336,7 @@ def main() -> None:
 
     params = {
         "days": args.days,
+        "since": args.since,
         "channel": args.channel,
         "lane": args.lane,
         "variant": args.variant,
@@ -364,7 +367,7 @@ def main() -> None:
     losers = [row for row in labeled if not row["_is_runner"]]
     total_return = sum(row["_return"] for row in labeled)
     print(
-        f"\nQSIM FEATURE EDGE — days={args.days} channel={args.channel} "
+        f"\nQSIM FEATURE EDGE — days={args.days} since={args.since} channel={args.channel} "
         f"lane={args.lane} variant={args.variant} max_qmax={args.max_qmax}"
     )
     print(

@@ -42,6 +42,7 @@ WITH closed AS (
     LEFT JOIN channels ch ON ch.id = c.channel_id
     WHERE sp.status = 'closed'
       AND (%(days)s = 0 OR sp.entry_time >= now() - (%(days)s || ' days')::interval)
+      AND (%(since)s IS NULL OR sp.entry_time >= %(since)s::timestamptz)
       AND (%(channel)s = 'any' OR COALESCE(ch.handle, '?') = %(channel)s)
       AND (%(lane)s = 'any' OR COALESCE(c.skip_reason, 'none') = %(lane)s)
       AND (%(variant)s = 'any' OR sp.exit_variant = %(variant)s)
@@ -198,7 +199,7 @@ def _candidate_json(rows: list[dict[str, Any]], args: argparse.Namespace) -> str
 
 def _print(rows: list[dict[str, Any]], args: argparse.Namespace) -> None:
     print(
-        f"\nQSIM CANDIDATE LANES — days={args.days} channel={args.channel} "
+        f"\nQSIM CANDIDATE LANES — days={args.days} since={args.since} channel={args.channel} "
         f"lane={args.lane} variant={args.variant} min_closed={args.min_closed} near_sol={args.near_sol}"
     )
     print("Shadow is only the screener. Promote candidates to qsim, then trust quote-backed qsim.")
@@ -239,6 +240,7 @@ def _print(rows: list[dict[str, Any]], args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Find shadow-positive lanes worth adding to qsim.")
     parser.add_argument("--days", type=int, default=14)
+    parser.add_argument("--since", default=None, help="only include shadow entries at/after this timestamp")
     parser.add_argument("--channel", default="any")
     parser.add_argument("--lane", default="any")
     parser.add_argument("--variant", default="any", help="shadow exit variant filter")
@@ -253,6 +255,7 @@ def main() -> None:
 
     params = {
         "days": args.days,
+        "since": args.since,
         "channel": args.channel,
         "lane": args.lane,
         "variant": args.variant,

@@ -20,6 +20,7 @@ when qmax coverage is high enough; otherwise it prints WAIT.
 Example:
     python3 qsim_forward_referee.py --days 7 --channel solwhaletrending --lane low_score --variant early
     python3 qsim_forward_referee.py --days 7 --channel solwhaletrending --lane low_score --variant early --include-post-exit
+    python3 qsim_forward_referee.py --days 30 --since '2026-08-28 00:00 UTC' --channel solwhaletrending --lane low_score --variant early
 """
 
 from __future__ import annotations
@@ -80,6 +81,7 @@ def _verdict(qsim_n: int, qmax_n: int, coverage: float, current: float,
 def main() -> None:
     parser = argparse.ArgumentParser(description="Daily qmax-covered referee table.")
     parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--since", default=None, help="only include qsim entries at/after this timestamp")
     parser.add_argument("--channel", default="solwhaletrending")
     parser.add_argument("--lane", default="low_score")
     parser.add_argument("--variant", default="early")
@@ -110,6 +112,7 @@ def main() -> None:
 
     params = {
         "days": args.days,
+        "since": args.since,
         "channel": args.channel,
         "lane": args.lane,
         "variant": args.variant,
@@ -130,7 +133,7 @@ def main() -> None:
 
     print(
         f"\nQSIM FORWARD REFEREE — days={args.days} channel={args.channel} "
-        f"lane={args.lane} variant={args.variant} max_qmax={args.max_qmax} "
+        f"lane={args.lane} variant={args.variant} since={args.since} max_qmax={args.max_qmax} "
         f"include_post_exit={args.include_post_exit} post_exit_mins={args.post_exit_mins:g}"
     )
     print(

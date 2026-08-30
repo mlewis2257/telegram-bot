@@ -72,6 +72,7 @@ WITH base AS (
      AND sp.status = 'closed'
     WHERE q.status = 'closed'
       AND q.entry_time >= now() - (%(days)s || ' days')::interval
+      AND (%(since)s IS NULL OR q.entry_time >= %(since)s::timestamptz)
       AND (%(channel)s = 'any' OR COALESCE(ch.handle, '?') = %(channel)s)
       AND (%(lane)s = 'any' OR COALESCE(c.skip_reason, 'none') = %(lane)s)
       AND (%(variant)s = 'any' OR q.variant = %(variant)s)
@@ -175,6 +176,7 @@ def _fmt(value: float) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Scan all qsim lanes by quote-path PnL.")
     parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--since", default=None, help="only include qsim entries at/after this timestamp")
     parser.add_argument("--channel", default="any")
     parser.add_argument("--lane", default="any")
     parser.add_argument("--variant", default="any")
@@ -194,6 +196,7 @@ def main() -> None:
 
     params = {
         "days": args.days,
+        "since": args.since,
         "channel": args.channel,
         "lane": args.lane,
         "variant": args.variant,
@@ -260,7 +263,7 @@ def main() -> None:
     summaries.sort(key=sort_key, reverse=True)
 
     print(
-        f"\nQSIM LANE SCAN — days={args.days} channel={args.channel} lane={args.lane} "
+        f"\nQSIM LANE SCAN — days={args.days} since={args.since} channel={args.channel} lane={args.lane} "
         f"variant={args.variant} min_n={args.min_n} max_qmax={args.max_qmax}"
     )
     print(

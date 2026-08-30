@@ -349,6 +349,7 @@ WITH base AS (
      AND sp.status = 'closed'
     WHERE q.status = 'closed'
       AND q.entry_time >= now() - (%(days)s || ' days')::interval
+      AND (%(since)s IS NULL OR q.entry_time >= %(since)s::timestamptz)
       AND (%(channel)s = 'any' OR COALESCE(ch.handle, '?') = %(channel)s)
       AND (%(lane)s = 'any' OR COALESCE(c.skip_reason, 'none') = %(lane)s)
       AND (%(variant)s = 'any' OR q.variant = %(variant)s)
@@ -1278,6 +1279,7 @@ def main() -> None:
         description="Replay qsim using raw Jupiter quote observations."
     )
     parser.add_argument("--days", type=int, default=1)
+    parser.add_argument("--since", default=None, help="only include qsim entries at/after this timestamp")
     parser.add_argument("--channel", default="any")
     parser.add_argument("--lane", default="any")
     parser.add_argument("--variant", default="early")
@@ -1317,6 +1319,7 @@ def main() -> None:
 
     params = {
         "days": args.days,
+        "since": args.since,
         "channel": args.channel,
         "lane": args.lane,
         "variant": args.variant,
@@ -1338,7 +1341,7 @@ def main() -> None:
         views = [view for view in views if int(view.row.get("qobs_count") or 0) > 0]
     print(
         f"filters: days={args.days} channel={args.channel} lane={args.lane} "
-        f"variant={args.variant} min_entry_ratio={args.min_entry_ratio} "
+        f"variant={args.variant} since={args.since} min_entry_ratio={args.min_entry_ratio} "
         f"max_entry_ratio={args.max_entry_ratio} require_qobs={args.require_qobs} "
         f"max_qmax={args.max_qmax} include_post_exit={args.include_post_exit} "
         f"post_exit_mins={args.post_exit_mins:g} where={args.where or 'none'}"

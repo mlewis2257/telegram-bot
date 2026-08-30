@@ -57,6 +57,7 @@ WITH shadow_base AS (
         sp.vip_tier
     FROM shadow_positions sp
     WHERE (%(days)s = 0 OR sp.entry_time >= now() - (%(days)s || ' days')::interval)
+      AND (%(since)s IS NULL OR sp.entry_time >= %(since)s::timestamptz)
       AND (%(variant)s = 'any' OR sp.exit_variant = %(variant)s)
       AND (%(raw)s OR NOT (
           COALESCE(sp.peak_multiplier, 0) > %(max_peak)s
@@ -85,6 +86,7 @@ qsim_base AS (
         q.vip_tier
     FROM qsim_positions q
     WHERE (%(days)s = 0 OR q.entry_time >= now() - (%(days)s || ' days')::interval)
+      AND (%(since)s IS NULL OR q.entry_time >= %(since)s::timestamptz)
       AND (%(variant)s = 'any' OR q.variant = %(variant)s)
       AND (%(raw)s OR NOT (
           COALESCE(q.peak_multiplier, 0) > %(max_peak)s
@@ -526,6 +528,7 @@ def _print_entry_debug(rows: list[dict[str, Any]], limit: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Reconcile qsim vs shadow trade accounting.")
     parser.add_argument("--days", type=int, default=5)
+    parser.add_argument("--since", default=None, help="only include entries at/after this timestamp")
     parser.add_argument("--channel", default="any")
     parser.add_argument("--lane", default="any")
     parser.add_argument("--variant", default="early")
@@ -541,6 +544,7 @@ def main() -> None:
 
     params = {
         "days": args.days,
+        "since": args.since,
         "channel": args.channel,
         "lane": args.lane,
         "variant": args.variant,
@@ -553,7 +557,7 @@ def main() -> None:
     rows = _filtered(_annotate(_rows(params)), args)
     print(
         f"\nQSIM/SHADOW TRADE RECONCILE — days={args.days} channel={args.channel} "
-        f"lane={args.lane} variant={args.variant} max_qmax={args.max_qmax}"
+        f"lane={args.lane} variant={args.variant} since={args.since} max_qmax={args.max_qmax}"
     )
     print(
         "PnL is normalized per 1 SOL deployed. entry ratio = qsim_entry / shadow_entry. "
