@@ -28,6 +28,7 @@ loop (run as its own process) sell-quotes open positions and applies the real ex
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from datetime import datetime, timezone
@@ -76,8 +77,56 @@ QSIM_LANES: dict[tuple[str, str, str], dict] = {
     ("solwhaletrending", "none", "low_score"): {"days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}, "size": 0.05, "exit": "early"},
 }
 
+
+def _normalize_days(raw) -> set[str]:
+    if raw in (None, "", "all"):
+        return {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
+    if isinstance(raw, str):
+        parts = raw.split(",")
+    else:
+        parts = list(raw)
+    days = {str(day).strip()[:3].title() for day in parts if str(day).strip()}
+    valid = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
+    bad = days - valid
+    if bad:
+        raise ValueError(f"invalid day(s): {sorted(bad)}")
+    return days or valid
+
+
+def _load_extra_qsim_lanes() -> None:
+    raw = os.getenv("QSIM_EXTRA_LANES_JSON", "").strip()
+    if not raw:
+        return
+    try:
+        entries = json.loads(raw)
+        if not isinstance(entries, list):
+            raise ValueError("expected a JSON list")
+        loaded = 0
+        for item in entries:
+            if not isinstance(item, dict):
+                raise ValueError("each lane must be a JSON object")
+            channel = str(item.get("channel") or "").lstrip("@").strip()
+            tier = str(item.get("vip_tier") or "none").strip()
+            lane = str(item.get("lane") or item.get("skip_reason") or "none").strip()
+            variant = str(item.get("variant") or item.get("exit") or "early").strip()
+            size = float(item.get("size", 0.05))
+            if not channel or not lane or size <= 0:
+                raise ValueError(f"bad lane entry: {item}")
+            if variant not in _VARIANT_CONFIGS:
+                raise ValueError(f"unsupported variant {variant!r}; use early, ride, or ride_vol")
+            QSIM_LANES[(channel, tier, lane)] = {
+                "days": _normalize_days(item.get("days")),
+                "size": size,
+                "exit": variant,
+            }
+            loaded += 1
+        print(f"[qsim] loaded {loaded} extra lane(s) from QSIM_EXTRA_LANES_JSON")
+    except Exception as e:
+        print(f"[qsim] WARNING: invalid QSIM_EXTRA_LANES_JSON ignored: {e}")
+
 # variant string -> the SAME ExitConfig shadow/paper use (keep in sync with shadow_monitor).
 _VARIANT_CONFIGS = {"early": EXIT_A_PAPER, "ride": EXIT_RIDE, "ride_vol": EXIT_RIDE}
+_load_extra_qsim_lanes()
 
 # Defaults are DELIBERATELY conservative: the Jupiter /order endpoint qsim quotes off has
 # its OWN rate limit (separate from the DexScreener api_rate_budget) and is SHARED with live
