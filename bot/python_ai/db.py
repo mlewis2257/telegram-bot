@@ -1,8 +1,10 @@
 import os
 import time
+import json
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -10,6 +12,14 @@ load_dotenv()
 # ── Connection ────────────────────────────────────────────────────────────────
 
 _conn = None
+
+
+def _json_default(value):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def get_conn():
@@ -1393,7 +1403,9 @@ def open_shadow_position(
             """,
             (
                 call_id, exit_variant, vip_tier, entry_price, entry_source,
-                entry_ref_mcap, Json(entry_market) if entry_market is not None else None,
+                entry_ref_mcap,
+                Json(entry_market, dumps=lambda obj: json.dumps(obj, default=_json_default))
+                if entry_market is not None else None,
                 sol_in, entry_volume, entry_time or datetime.now(timezone.utc), call_id,
             ),
         )
