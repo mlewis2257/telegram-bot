@@ -189,12 +189,15 @@ LIVE_QUOTE_PEAK_PENDING_TTL_SECS = float(
 LIVE_NO_BOUNCE_STOP_ENABLED = os.getenv("LIVE_NO_BOUNCE_STOP_ENABLED", "false").lower() == "true"
 NO_BOUNCE_ARM_MULT          = float(os.getenv("NO_BOUNCE_ARM_MULT", "1.3"))
 NO_BOUNCE_STOP_MULT         = float(os.getenv("NO_BOUNCE_STOP_MULT", "0.9"))
+LIVE_BANK_EXIT_ENABLED      = os.getenv("LIVE_BANK_EXIT_ENABLED", "false").lower() == "true"
+LIVE_BANK_EXIT_MULT         = float(os.getenv("LIVE_BANK_EXIT_MULT", "1.3"))
 LIVE_RUNNER_WINDOW_ENABLED  = os.getenv("LIVE_RUNNER_WINDOW_ENABLED", "false").lower() == "true"
 RUNNER_WINDOW_ARM_MULT      = float(os.getenv("RUNNER_WINDOW_ARM_MULT", "2.0"))
 RUNNER_WINDOW_RELEASE_MULT  = float(os.getenv("RUNNER_WINDOW_RELEASE_MULT", "5.0"))
 RUNNER_WINDOW_MINS          = float(os.getenv("RUNNER_WINDOW_MINS", "10"))
 RUNNER_WINDOW_FLOOR_MULT    = float(os.getenv("RUNNER_WINDOW_FLOOR_MULT", "1.0"))
 RUNNER_WINDOW_PROTECTED_REASONS = {"trail_stop", "profit_floor"}
+print(f"[live] bank exit enabled={LIVE_BANK_EXIT_ENABLED} mult={LIVE_BANK_EXIT_MULT:g}x")
 _sell_quote_cache: dict = {}  # mint -> (sol_out, monotonic_ts)
 _runner_window_until: dict[int, float] = {}
 # Exit quotes are the highest-value quote we make (real money on the line), so a
@@ -939,6 +942,9 @@ def check_live_exits(
         and current_mult <= NO_BOUNCE_STOP_MULT
     ):
         return ExitResult(True, "no_bounce_stop", exit_mcap=current_mcap)
+
+    if LIVE_BANK_EXIT_ENABLED and LIVE_BANK_EXIT_MULT > 0 and current_mult >= LIVE_BANK_EXIT_MULT:
+        return ExitResult(True, f"bank_{LIVE_BANK_EXIT_MULT:g}x", exit_mcap=current_mcap)
 
     result = apply_exit_config(
         cfg,
