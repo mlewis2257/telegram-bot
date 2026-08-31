@@ -1053,14 +1053,14 @@ def _print_summary(views: list[ReplayRow]) -> None:
     print(f"rows with qobs:     {len(with_qobs)}/{n}")
     print(f"rows with shadow:   {len(with_shadow)}/{n}")
     print(f"current qsim sum:   {current:+.2f} win%={current_wins / n:>5.1%} avg={current / n:+.3f}")
-    print("strategy win columns: all_win% = wins over all rows; hit_win% = wins among strategy-triggered rows")
+    print("strategy win columns: all_win% = wins over all rows; hit% = rows where the strategy triggered")
     if with_shadow:
         shadow_sum = sum(view.shadow_return or 0.0 for view in with_shadow)
         print(f"shadow compare sum: {shadow_sum:+.2f} ({len(with_shadow)} matched)")
 
     print("\nReplay Totals")
-    print(f"{'policy':<14} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hits':>7} {'hit_win%':>9} {'avg_hit':>9}")
-    print("-" * 85)
+    print(f"{'policy':<14} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 83)
     policies = [
         "best_raw", "raw_config",
         "floor_2x", "obs_2x", "confirm_2x",
@@ -1071,16 +1071,16 @@ def _print_summary(views: list[ReplayRow]) -> None:
         _print_policy_row(policy, views, current)
 
     print("\nEarly Bank Totals")
-    print(f"{'policy':<18} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hits':>7} {'hit_win%':>9} {'avg_hit':>9}")
-    print("-" * 89)
+    print(f"{'policy':<18} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 87)
     for level in BANK_LEVELS:
         suffix = _level_suffix(level)
         _print_policy_row(f"bank_{suffix}", views, current, width=18)
         _print_policy_row(f"confirm_bank_{suffix}", views, current, width=18)
 
     print("\nPartial Bank Totals")
-    print(f"{'policy':<24} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hits':>7} {'hit_win%':>9} {'avg_hit':>9}")
-    print("-" * 95)
+    print(f"{'policy':<24} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 93)
     for level in BANK_LEVELS:
         suffix = _level_suffix(level)
         for fraction in BANK_FRACTIONS:
@@ -1091,8 +1091,8 @@ def _print_summary(views: list[ReplayRow]) -> None:
             )
 
     print("\nPartial Bank + Remainder Stop Totals")
-    print(f"{'policy':<32} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hits':>7} {'hit_win%':>9} {'avg_hit':>9}")
-    print("-" * 103)
+    print(f"{'policy':<32} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 101)
     for level in (1.30, 1.40, 1.50):
         suffix = _level_suffix(level)
         for fraction in BANK_FRACTIONS:
@@ -1107,8 +1107,8 @@ def _print_summary(views: list[ReplayRow]) -> None:
                 )
 
     print("\nNo-Bounce Stop Totals")
-    print(f"{'policy':<24} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hits':>7} {'hit_win%':>9} {'avg_hit':>9}")
-    print("-" * 95)
+    print(f"{'policy':<24} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 93)
     for bounce in NO_BOUNCE_THRESHOLDS:
         bounce_suffix = _level_suffix(bounce)
         for stop in NO_BOUNCE_STOPS:
@@ -1121,28 +1121,28 @@ def _print_summary(views: list[ReplayRow]) -> None:
             )
 
     print("\nPeak Lock Totals")
-    print(f"{'policy':<22} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hits':>7} {'hit_win%':>9} {'avg_hit':>9}")
-    print("-" * 93)
+    print(f"{'policy':<22} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 91)
     for trigger, floor in LOCK_FLOORS:
         suffix = f"{_level_suffix(trigger)}_{_level_suffix(floor)}"
         _print_policy_row(f"lock_{suffix}", views, current, width=22)
         _print_policy_row(f"lock_or_bank_{suffix}", views, current, width=22)
 
     print("\nDynamic Exit Totals")
-    print(f"{'policy':<32} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hits':>7} {'hit_win%':>9} {'avg_hit':>9}")
-    print("-" * 103)
+    print(f"{'policy':<32} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 101)
     for policy in DYNAMIC_EXIT_POLICIES:
         _print_policy_row(policy["name"], views, current, width=32)
 
     print("\nWinner-Only Exit Totals")
-    print(f"{'policy':<22} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hits':>7} {'hit_win%':>9} {'avg_hit':>9}")
-    print("-" * 93)
+    print(f"{'policy':<22} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 91)
     for policy in WINNER_ONLY_POLICIES:
         _print_policy_row(policy["name"], views, current, width=22)
 
     print("\nRunner Window Totals")
-    print(f"{'policy':<28} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hits':>7} {'hit_win%':>9} {'avg_hit':>9}")
-    print("-" * 99)
+    print(f"{'policy':<28} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 97)
     for policy in RUNNER_WINDOW_POLICIES:
         _print_policy_row(policy["name"], views, current, width=28)
 
@@ -1227,11 +1227,10 @@ def _print_policy_row(
     avg = total / len(views) if views else 0.0
     hit_values = _policy_hit_mults(policy, views)
     avg_hit = sum(hit_values) / len(hit_values) if hit_values else None
-    hit_wins = sum(1 for value in hit_values if value > 1.0)
-    hit_win = f"{hit_wins / len(hit_values):>8.1%}" if hit_values else "     n/a "
+    hit_rate = len(hit_values) / len(views) if views else 0.0
     print(
         f"{policy:<{width}} {total:>+10.2f} {total - current:>+10.2f} "
-        f"{wins / len(views):>8.1%} {avg:>+8.3f} {len(hit_values):>7} {hit_win:>9} {_mult(avg_hit):>9}"
+        f"{wins / len(views):>8.1%} {avg:>+8.3f} {hit_rate:>6.1%} {len(hit_values):>7} {_mult(avg_hit):>9}"
     )
 
 
