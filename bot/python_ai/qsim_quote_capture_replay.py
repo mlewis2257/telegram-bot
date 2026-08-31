@@ -810,6 +810,130 @@ def _winner_only_return(
     return current_return
 
 
+def _no_bounce_hit_mult(mults: list[float], bounce: float, stop: float) -> float | None:
+    for mult in mults:
+        if mult >= bounce:
+            return None
+        if mult <= stop:
+            return mult
+    return None
+
+
+def _lock_levels_from_policy(policy: str) -> tuple[float, float]:
+    suffix = (
+        policy.removeprefix("lock_or_bank_")
+        if policy.startswith("lock_or_bank_")
+        else policy.removeprefix("lock_")
+    )
+    trigger_token, floor_token = suffix.split("_", 1)
+    return (
+        float(trigger_token.removesuffix("x").replace("p", ".")),
+        float(floor_token.removesuffix("x").replace("p", ".")),
+    )
+
+
+def _lock_hit_mult(mults: list[float], trigger: float, floor: float, *, or_bank: bool) -> float | None:
+    armed = False
+    last_mult = None
+    for mult in mults:
+        last_mult = mult
+        if not armed and mult >= trigger:
+            armed = True
+            continue
+        if armed and mult <= floor:
+            return mult
+    if or_bank and armed and last_mult is not None:
+        return last_mult
+    return None
+
+
+def _dynamic_hit_mult(
+    mults: list[float],
+    *,
+    arm: float,
+    floor: float,
+    stall_ticks: int,
+    confirm_ticks: int,
+    bounce: float,
+    dead_stop: float,
+) -> float | None:
+    bounced = False
+    armed = False
+    arm_streak = 0
+    armed_peak = 0.0
+    ticks_since_high = 0
+
+    for mult in mults:
+        if mult >= bounce:
+            bounced = True
+        elif not bounced and mult <= dead_stop:
+            return mult
+
+        if not armed:
+            if mult >= arm:
+                arm_streak += 1
+                if arm_streak >= confirm_ticks:
+                    armed = True
+                    armed_peak = mult
+                    ticks_since_high = 0
+            else:
+                arm_streak = 0
+            continue
+
+        if mult > armed_peak:
+            armed_peak = mult
+            ticks_since_high = 0
+            continue
+
+        ticks_since_high += 1
+        if mult <= floor:
+            return mult
+        if ticks_since_high >= stall_ticks:
+            return mult
+    return None
+
+
+def _winner_only_hit_mult(
+    mults: list[float],
+    *,
+    arm: float,
+    mode: str,
+    confirm_ticks: int,
+    floor: float | None = None,
+    stall_ticks: int | None = None,
+) -> float | None:
+    armed = False
+    arm_streak = 0
+    armed_peak = 0.0
+    ticks_since_high = 0
+
+    for mult in mults:
+        if not armed:
+            if mult >= arm:
+                arm_streak += 1
+                if arm_streak >= confirm_ticks:
+                    if mode == "bank":
+                        return mult
+                    armed = True
+                    armed_peak = mult
+                    ticks_since_high = 0
+            else:
+                arm_streak = 0
+            continue
+
+        if mult > armed_peak:
+            armed_peak = mult
+            ticks_since_high = 0
+            continue
+
+        ticks_since_high += 1
+        if mode == "floor" and floor is not None and mult <= floor:
+            return mult
+        if mode == "stall" and stall_ticks is not None and ticks_since_high >= stall_ticks:
+            return mult
+    return None
+
+
 def _config_for_variant(variant: str | None):
     if variant in {"ride", "ride_vol"}:
         return EXIT_RIDE
@@ -1188,28 +1312,54 @@ def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
             if (value := _confirmed_cross(_quote_mults(view.row), level)) is not None
         ]
     if policy.startswith("lock_") or policy.startswith("lock_or_bank_"):
+        trigger, floor = _lock_levels_from_policy(policy)
+        or_bank = policy.startswith("lock_or_bank_")
         return [
-            view.returns[policy] + 1.0
+            value
             for view in views
-            if view.returns[policy] != view.returns["current"]
+            if (value := _lock_hit_mult(_quote_mults(view.row), trigger, floor, or_bank=or_bank)) is not None
         ]
     if policy.startswith("dyn_"):
+        spec = next(item for item in DYNAMIC_EXIT_POLICIES if item["name"] == policy)
         return [
-            view.returns[policy] + 1.0
+            value
             for view in views
-            if view.returns[policy] != view.returns["current"]
+            if (
+                value := _dynamic_hit_mult(
+                    _quote_mults(view.row),
+                    arm=spec["arm"],
+                    floor=spec["floor"],
+                    stall_ticks=spec["stall_ticks"],
+                    confirm_ticks=spec["confirm_ticks"],
+                    bounce=spec["bounce"],
+                    dead_stop=spec["dead_stop"],
+                )
+            ) is not None
         ]
     if policy.startswith("win_"):
+        spec = next(item for item in WINNER_ONLY_POLICIES if item["name"] == policy)
         return [
-            view.returns[policy] + 1.0
+            value
             for view in views
-            if view.returns[policy] != view.returns["current"]
+            if (
+                value := _winner_only_hit_mult(
+                    _quote_mults(view.row),
+                    arm=spec["arm"],
+                    mode=spec["mode"],
+                    confirm_ticks=spec["confirm_ticks"],
+                    floor=spec.get("floor"),
+                    stall_ticks=spec.get("stall_ticks"),
+                )
+            ) is not None
         ]
     if policy.startswith("no_"):
+        parts = policy.split("_")
+        bounce = float(parts[1].removesuffix("x").replace("p", "."))
+        stop = float(parts[3].removesuffix("x").replace("p", "."))
         return [
-            view.returns[policy] + 1.0
+            value
             for view in views
-            if view.returns[policy] != view.returns["current"]
+            if (value := _no_bounce_hit_mult(_quote_mults(view.row), bounce, stop)) is not None
         ]
     if (
         policy.startswith("bank_")
