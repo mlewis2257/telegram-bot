@@ -47,6 +47,7 @@ comparison column. The replay variants are intentionally simple:
 Examples:
     python3 qsim_quote_capture_replay.py --days 1 --channel solwhaletrending --lane low_score --variant early --detail
     python3 qsim_quote_capture_replay.py --days 7 --channel solwhaletrending --lane low_score --variant early --max-entry-ratio 2
+    python3 qsim_quote_capture_replay.py --days 30 --since '2026-08-28 00:00 UTC' --include-post-exit --fallback last_quote
 """
 
 from __future__ import annotations
@@ -113,6 +114,7 @@ RUNNER_WINDOW_POLICIES = (
         "release": 5.0,
     },
 )
+FALLBACK_CHOICES = ("current", "raw_config", "last_quote", "hard_stop_35")
 DYNAMIC_EXIT_POLICIES = (
     {
         "name": "dyn_a1p3_f1p05_s3_nb1p2_0p9",
@@ -847,6 +849,24 @@ def _raw_config_exit(row: dict[str, Any], mults: list[float]) -> tuple[float, st
     return (_ratio(row.get("qsim_pnl"), row.get("qsim_sol_in")) or 0.0, "held_to_current")
 
 
+def _fallback_return(
+    row: dict[str, Any],
+    mults: list[float],
+    qsim_return: float,
+    raw_config_return: float,
+    mode: str,
+) -> float:
+    if mode == "current":
+        return qsim_return
+    if mode == "raw_config":
+        return raw_config_return
+    if mode == "last_quote":
+        return mults[-1] - 1.0 if mults else qsim_return
+    if mode == "hard_stop_35":
+        return -0.35
+    raise ValueError(f"unknown fallback mode: {mode}")
+
+
 def _runner_window_return(
     row: dict[str, Any],
     points: list[tuple[datetime | None, float]],
@@ -906,7 +926,7 @@ def _runner_window_return(
     return last_mult - 1.0
 
 
-def _view(row: dict[str, Any]) -> ReplayRow:
+def _view(row: dict[str, Any], fallback_mode: str = "current") -> ReplayRow:
     qsim_return = _ratio(row.get("qsim_pnl"), row.get("qsim_sol_in")) or 0.0
     shadow_return = _ratio(row.get("shadow_pnl"), row.get("shadow_sol_in"))
     mults = _quote_mults(row)
@@ -923,32 +943,36 @@ def _view(row: dict[str, Any]) -> ReplayRow:
     raw_config_return, raw_config_reason = _raw_config_exit(row, mults)
     returns["raw_config"] = raw_config_return
     row["raw_config_reason"] = raw_config_reason
+    fallback_return = _fallback_return(
+        row, mults, qsim_return, raw_config_return, fallback_mode
+    )
+    returns[f"fallback_{fallback_mode}"] = fallback_return
 
     for level in BANK_LEVELS:
         suffix = _level_suffix(level)
-        returns[f"bank_{suffix}"] = _bank_return(mults, level, qsim_return)
-        returns[f"confirm_bank_{suffix}"] = _confirm_bank_return(mults, level, qsim_return)
+        returns[f"bank_{suffix}"] = _bank_return(mults, level, fallback_return)
+        returns[f"confirm_bank_{suffix}"] = _confirm_bank_return(mults, level, fallback_return)
         for fraction in BANK_FRACTIONS:
             frac_suffix = _fraction_suffix(fraction)
             returns[f"{frac_suffix}_bank_{suffix}"] = _partial_bank_return(
-                mults, level, fraction, qsim_return
+                mults, level, fraction, fallback_return
             )
             returns[f"confirm_{frac_suffix}_bank_{suffix}"] = _confirm_partial_bank_return(
-                mults, level, fraction, qsim_return
+                mults, level, fraction, fallback_return
             )
             for stop in BANK_REMAINDER_STOPS:
                 stop_suffix = _level_suffix(stop)
                 returns[f"{frac_suffix}_bank_{suffix}_stop_{stop_suffix}"] = (
                     _partial_bank_with_stop_return(
-                        mults, level, fraction, stop, qsim_return
+                        mults, level, fraction, stop, fallback_return
                     )
                 )
 
     for trigger, floor in LOCK_FLOORS:
         suffix = f"{_level_suffix(trigger)}_{_level_suffix(floor)}"
-        returns[f"lock_{suffix}"] = _lock_floor_return(mults, trigger, floor, qsim_return)
+        returns[f"lock_{suffix}"] = _lock_floor_return(mults, trigger, floor, fallback_return)
         returns[f"lock_or_bank_{suffix}"] = _lock_floor_or_bank_return(
-            mults, trigger, floor, qsim_return
+            mults, trigger, floor, fallback_return
         )
 
     for policy in DYNAMIC_EXIT_POLICIES:
@@ -960,7 +984,7 @@ def _view(row: dict[str, Any]) -> ReplayRow:
             confirm_ticks=policy["confirm_ticks"],
             bounce=policy["bounce"],
             dead_stop=policy["dead_stop"],
-            current_return=qsim_return,
+            current_return=fallback_return,
         )
 
     for policy in WINNER_ONLY_POLICIES:
@@ -969,7 +993,7 @@ def _view(row: dict[str, Any]) -> ReplayRow:
             arm=policy["arm"],
             mode=policy["mode"],
             confirm_ticks=policy["confirm_ticks"],
-            current_return=qsim_return,
+            current_return=fallback_return,
             floor=policy.get("floor"),
             stall_ticks=policy.get("stall_ticks"),
         )
@@ -982,7 +1006,7 @@ def _view(row: dict[str, Any]) -> ReplayRow:
             window_mins=policy["window_mins"],
             floor=policy["floor"],
             release=policy["release"],
-            current_return=qsim_return,
+            current_return=fallback_return,
         )
 
     for bounce in NO_BOUNCE_THRESHOLDS:
@@ -990,7 +1014,7 @@ def _view(row: dict[str, Any]) -> ReplayRow:
         for stop in NO_BOUNCE_STOPS:
             stop_suffix = _level_suffix(stop)
             returns[f"no_{bounce_suffix}_stop_{stop_suffix}"] = _no_bounce_stop_return(
-                mults, bounce, stop, qsim_return
+                mults, bounce, stop, fallback_return
             )
 
     for threshold in THRESHOLDS:
@@ -998,9 +1022,9 @@ def _view(row: dict[str, Any]) -> ReplayRow:
         first = _first_cross(mults, threshold)
         confirmed = _confirmed_cross(mults, threshold)
         first_hits[suffix] = first
-        returns[f"floor_{suffix}"] = threshold - 1.0 if first is not None else qsim_return
-        returns[f"obs_{suffix}"] = first - 1.0 if first is not None else qsim_return
-        returns[f"confirm_{suffix}"] = confirmed - 1.0 if confirmed is not None else qsim_return
+        returns[f"floor_{suffix}"] = threshold - 1.0 if first is not None else fallback_return
+        returns[f"obs_{suffix}"] = first - 1.0 if first is not None else fallback_return
+        returns[f"confirm_{suffix}"] = confirmed - 1.0 if confirmed is not None else fallback_return
 
     return ReplayRow(
         row=row,
@@ -1317,6 +1341,16 @@ def main() -> None:
         default=90.0,
         help="minutes of post-exit qsim quote probes to include with --include-post-exit",
     )
+    parser.add_argument(
+        "--fallback",
+        choices=FALLBACK_CHOICES,
+        default="current",
+        help=(
+            "return used when a replay policy does not trigger: current keeps old behavior; "
+            "raw_config replays the base exit config; last_quote holds to the last observed quote; "
+            "hard_stop_35 uses a fixed -35%% fallback"
+        ),
+    )
     parser.add_argument("--detail", action="store_true", help="print per-trade rows")
     args = parser.parse_args()
     MAX_QOBS_MULT = args.max_qmax
@@ -1341,7 +1375,7 @@ def main() -> None:
 
     rows = _rows(params)
     rows = [row for row in rows if _passes_where(row, where_clauses)]
-    views = [_view(row) for row in rows]
+    views = [_view(row, fallback_mode=args.fallback) for row in rows]
     if args.require_qobs:
         views = [view for view in views if int(view.row.get("qobs_count") or 0) > 0]
     print(
@@ -1349,7 +1383,8 @@ def main() -> None:
         f"variant={args.variant} since={args.since} min_entry_ratio={args.min_entry_ratio} "
         f"max_entry_ratio={args.max_entry_ratio} require_qobs={args.require_qobs} "
         f"max_qmax={args.max_qmax} include_post_exit={args.include_post_exit} "
-        f"post_exit_mins={args.post_exit_mins:g} where={args.where or 'none'}"
+        f"post_exit_mins={args.post_exit_mins:g} fallback={args.fallback} "
+        f"where={args.where or 'none'}"
     )
     _print_summary(views)
     if views and args.detail:
