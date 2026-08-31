@@ -507,8 +507,8 @@ async def _qsim_tick(pos: dict) -> None:
         result = ExitResult(True, no_bounce_result.reason, exit_mcap=eff_cur)
     overlay_result, overlay_suppresses_base, overlay_note = _apply_qsim_exit_overlay(
         call_id=call_id,
-        current_mult=eff_cur / entry,
-        current_mcap=eff_cur,
+        current_mult=real_mult,
+        current_mcap=synth_cur,
     )
     if overlay_result.should_exit:
         result = overlay_result
@@ -516,7 +516,7 @@ async def _qsim_tick(pos: dict) -> None:
         overlay_note = f"{overlay_note};hold:{result.reason}" if overlay_note else f"hold:{result.reason}"
         result = ExitResult(False)
 
-    bank_result = _bank_exit_result(eff_cur / entry, eff_cur) if _QSIM_EXIT_OVERLAY is None else ExitResult(False)
+    bank_result = _bank_exit_result(real_mult, synth_cur) if _QSIM_EXIT_OVERLAY is None else ExitResult(False)
     if bank_result.should_exit:
         result = bank_result
     result, runner_note = _apply_runner_window(
