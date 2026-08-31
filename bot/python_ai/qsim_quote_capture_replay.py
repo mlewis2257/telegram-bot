@@ -114,7 +114,7 @@ RUNNER_WINDOW_POLICIES = (
         "release": 5.0,
     },
 )
-FALLBACK_CHOICES = ("current", "raw_config", "last_quote", "hard_stop_35")
+FALLBACK_CHOICES = ("current", "raw_config", "last_quote", "hard_stop", "hard_stop_35")
 DYNAMIC_EXIT_POLICIES = (
     {
         "name": "dyn_a1p3_f1p05_s3_nb1p2_0p9",
@@ -979,6 +979,7 @@ def _fallback_return(
     qsim_return: float,
     raw_config_return: float,
     mode: str,
+    hard_stop_pct: float = 0.35,
 ) -> float:
     if mode == "current":
         return qsim_return
@@ -986,6 +987,8 @@ def _fallback_return(
         return raw_config_return
     if mode == "last_quote":
         return mults[-1] - 1.0 if mults else qsim_return
+    if mode == "hard_stop":
+        return -abs(hard_stop_pct)
     if mode == "hard_stop_35":
         return -0.35
     raise ValueError(f"unknown fallback mode: {mode}")
@@ -1050,7 +1053,11 @@ def _runner_window_return(
     return last_mult - 1.0
 
 
-def _view(row: dict[str, Any], fallback_mode: str = "current") -> ReplayRow:
+def _view(
+    row: dict[str, Any],
+    fallback_mode: str = "current",
+    fallback_hard_stop_pct: float = 0.35,
+) -> ReplayRow:
     qsim_return = _ratio(row.get("qsim_pnl"), row.get("qsim_sol_in")) or 0.0
     shadow_return = _ratio(row.get("shadow_pnl"), row.get("shadow_sol_in"))
     mults = _quote_mults(row)
@@ -1068,7 +1075,7 @@ def _view(row: dict[str, Any], fallback_mode: str = "current") -> ReplayRow:
     returns["raw_config"] = raw_config_return
     row["raw_config_reason"] = raw_config_reason
     fallback_return = _fallback_return(
-        row, mults, qsim_return, raw_config_return, fallback_mode
+        row, mults, qsim_return, raw_config_return, fallback_mode, fallback_hard_stop_pct
     )
     returns[f"fallback_{fallback_mode}"] = fallback_return
 
@@ -1498,8 +1505,14 @@ def main() -> None:
         help=(
             "return used when a replay policy does not trigger: current keeps old behavior; "
             "raw_config replays the base exit config; last_quote holds to the last observed quote; "
-            "hard_stop_35 uses a fixed -35%% fallback"
+            "hard_stop uses --fallback-hard-stop-pct; hard_stop_35 is legacy fixed -35%%"
         ),
+    )
+    parser.add_argument(
+        "--fallback-hard-stop-pct",
+        type=float,
+        default=0.35,
+        help="loss fraction for --fallback hard_stop, e.g. 0.30 means -30%%",
     )
     parser.add_argument("--detail", action="store_true", help="print per-trade rows")
     args = parser.parse_args()
@@ -1525,7 +1538,14 @@ def main() -> None:
 
     rows = _rows(params)
     rows = [row for row in rows if _passes_where(row, where_clauses)]
-    views = [_view(row, fallback_mode=args.fallback) for row in rows]
+    views = [
+        _view(
+            row,
+            fallback_mode=args.fallback,
+            fallback_hard_stop_pct=args.fallback_hard_stop_pct,
+        )
+        for row in rows
+    ]
     if args.require_qobs:
         views = [view for view in views if int(view.row.get("qobs_count") or 0) > 0]
     print(
@@ -1534,6 +1554,7 @@ def main() -> None:
         f"max_entry_ratio={args.max_entry_ratio} require_qobs={args.require_qobs} "
         f"max_qmax={args.max_qmax} include_post_exit={args.include_post_exit} "
         f"post_exit_mins={args.post_exit_mins:g} fallback={args.fallback} "
+        f"fallback_hard_stop_pct={args.fallback_hard_stop_pct:g} "
         f"where={args.where or 'none'}"
     )
     _print_summary(views)
