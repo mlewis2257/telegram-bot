@@ -399,10 +399,15 @@ async def qsim_open(score_result: dict, token_data: dict) -> None:
         if not entry_mcap or entry_mcap <= 0:
             print(f"[qsim] {symbol} skipped — entry mcap calc failed call_id={call_id}")
             return
+        gate_token_data = dict(token_data or {})
+        if not gate_token_data.get("mcap_at_call"):
+            stored_mcap = db.get_call_mcap_at_call(call_id)
+            if stored_mcap:
+                gate_token_data["mcap_at_call"] = stored_mcap
         gate = entry_quality.check_entry_exec_ratio(
             max_ratio=QSIM_MAX_ENTRY_EXEC_RATIO,
             executable_mcap=entry_mcap,
-            token_data=token_data,
+            token_data=gate_token_data,
         )
         if gate.enabled and not gate.allowed:
             print(

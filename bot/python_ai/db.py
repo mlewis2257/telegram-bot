@@ -3157,6 +3157,28 @@ def get_call_skip_reason(call_id: int) -> str | None:
         return row[0] if row else None
 
 
+def get_call_mcap_at_call(call_id: int) -> float | None:
+    """Return the stored reference mcap for an existing call."""
+    if not call_id:
+        return None
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT mcap_at_call
+            FROM calls
+            WHERE id = %s
+            """,
+            (call_id,),
+        )
+        row = cur.fetchone()
+    try:
+        return float(row[0]) if row and row[0] else None
+    except (TypeError, ValueError):
+        return None
+
+
 def has_paper_position_for_call(call_id: int, is_strategy_b: bool = False) -> bool:
     """Return True if any paper position row exists for this call/strategy."""
     if not call_id:
