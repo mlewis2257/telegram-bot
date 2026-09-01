@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import db
+import entry_quality
 import jupiter
 import peak_guard
 import lane_policy
@@ -151,6 +152,7 @@ NO_BOUNCE_STOP_MULT         = float(os.getenv("NO_BOUNCE_STOP_MULT", "0.9"))
 QSIM_BANK_EXIT_ENABLED      = os.getenv("QSIM_BANK_EXIT_ENABLED", "false").lower() == "true"
 QSIM_BANK_EXIT_MULT         = float(os.getenv("QSIM_BANK_EXIT_MULT", "1.3"))
 QSIM_EXIT_OVERLAY_STRATEGY  = os.getenv("QSIM_EXIT_OVERLAY_STRATEGY", "").strip()
+QSIM_MAX_ENTRY_EXEC_RATIO   = entry_quality.env_float(os.getenv("QSIM_MAX_ENTRY_EXEC_RATIO"), 0.0)
 QSIM_POST_EXIT_OBS_ENABLED  = os.getenv("QSIM_POST_EXIT_OBS_ENABLED", "false").lower() == "true"
 QSIM_POST_EXIT_OBS_MINS     = float(os.getenv("QSIM_POST_EXIT_OBS_MINS", "90"))
 QSIM_POST_EXIT_OBS_CADENCE_SECS = float(os.getenv("QSIM_POST_EXIT_OBS_CADENCE_SECS", "60"))
@@ -397,6 +399,20 @@ async def qsim_open(score_result: dict, token_data: dict) -> None:
         if not entry_mcap or entry_mcap <= 0:
             print(f"[qsim] {symbol} skipped — entry mcap calc failed call_id={call_id}")
             return
+        gate = entry_quality.check_entry_exec_ratio(
+            max_ratio=QSIM_MAX_ENTRY_EXEC_RATIO,
+            executable_mcap=entry_mcap,
+            token_data=token_data,
+        )
+        if gate.enabled and not gate.allowed:
+            print(
+                f"[qsim] {symbol} skipped — entry exec/ref ratio "
+                f"{(gate.ratio or 0):.2f}x > {gate.max_ratio:.2f}x "
+                f"exec=${entry_mcap/1000:.1f}k "
+                f"ref=${(gate.reference_mcap or 0)/1000:.1f}k "
+                f"source={gate.reference_source or '?'} call_id={call_id}"
+            )
+            return
 
         opened = db.open_qsim_position(
             call_id=call_id, entry_price=entry_mcap, entry_tokens=tokens_raw,
@@ -619,6 +635,8 @@ async def run_qsim_monitor() -> None:
           f"limit={QSIM_POST_EXIT_OBS_LIMIT} cap={QSIM_POST_EXIT_OBS_MAX_PER_MIN}/min")
     print(f"[qsim] bank exit enabled={QSIM_BANK_EXIT_ENABLED} mult={QSIM_BANK_EXIT_MULT:g}x")
     print(f"[qsim] exit overlay: {_QSIM_EXIT_OVERLAY.name if _QSIM_EXIT_OVERLAY else 'none'}")
+    print(f"[qsim] max entry exec/ref ratio: {QSIM_MAX_ENTRY_EXEC_RATIO:g}x"
+          if QSIM_MAX_ENTRY_EXEC_RATIO > 0 else "[qsim] max entry exec/ref ratio: disabled")
     while True:
         try:
             # Skip the whole quoting pass while in 429 backoff (the loop-end sleep still runs).

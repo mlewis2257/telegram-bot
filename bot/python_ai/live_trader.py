@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, os.path.dirname(__file__))
 
 import db
+import entry_quality
 import jupiter
 import alert_bot
 import data_fetcher
@@ -105,6 +106,10 @@ _startup_allowed_hours = [
     int(h) for h in os.getenv("LIVE_ALLOWED_HOURS_UTC", "").split(",") if h.strip()
 ]
 print(f"[live] allowed hours UTC: {_startup_allowed_hours if _startup_allowed_hours else 'all (no restriction)'}")
+
+LIVE_MAX_ENTRY_EXEC_RATIO = entry_quality.env_float(os.getenv("LIVE_MAX_ENTRY_EXEC_RATIO"), 0.0)
+print(f"[live] max entry exec/ref ratio: {LIVE_MAX_ENTRY_EXEC_RATIO:g}x"
+      if LIVE_MAX_ENTRY_EXEC_RATIO > 0 else "[live] max entry exec/ref ratio: disabled")
 
 
 # ── Per-channel mcap entry limits ──────────────────────────────────────────────
@@ -591,6 +596,36 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             print(f"[live] {symbol} skipped — mcap ${actual_entry/1000:.0f}k too high for {channel_handle or 'unknown'} (max ${max_mcap/1000:.0f}k)")
             db.set_call_skip_reason(call_id, "mcap_too_high")
             return False
+
+        if LIVE_MAX_ENTRY_EXEC_RATIO > 0 and mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
+            try:
+                quote_tokens = await jupiter.get_buy_quote(mint, size, raise_on_ratelimit=True)
+            except jupiter.RateLimitError:
+                print(f"[live] {symbol} skipped — pre-entry buy quote 429 call_id={call_id}")
+                db.set_call_skip_reason(call_id, "entry_quote_429")
+                return False
+            if not quote_tokens or quote_tokens <= 0:
+                print(f"[live] {symbol} skipped — pre-entry buy quote no-route call_id={call_id}")
+                db.set_call_skip_reason(call_id, "entry_quote_no_route")
+                return False
+            _s, quote_decimals = db.get_token_supply_and_decimals(mint)
+            quote_entry = _effective_fill_mcap(mint, size, quote_tokens, quote_decimals, market=market)
+            gate = entry_quality.check_entry_exec_ratio(
+                max_ratio=LIVE_MAX_ENTRY_EXEC_RATIO,
+                executable_mcap=quote_entry,
+                token_data=token_data,
+                market=market,
+            )
+            if not gate.allowed:
+                print(
+                    f"[live] {symbol} skipped — entry exec/ref ratio "
+                    f"{(gate.ratio or 0):.2f}x > {gate.max_ratio:.2f}x "
+                    f"exec=${(gate.executable_mcap or 0)/1000:.1f}k "
+                    f"ref=${(gate.reference_mcap or 0)/1000:.1f}k "
+                    f"source={gate.reference_source or '?'} call_id={call_id}"
+                )
+                db.set_call_skip_reason(call_id, gate.reason)
+                return False
 
         # ── Execute buy ────────────────────────────────────────────────────────
         print(
