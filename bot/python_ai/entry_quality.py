@@ -16,6 +16,17 @@ class EntryRatioDecision:
     max_ratio: float | None = None
 
 
+@dataclass(frozen=True)
+class RoundtripDecision:
+    allowed: bool
+    enabled: bool
+    reason: str
+    sol_in: float | None = None
+    sol_out: float | None = None
+    mult: float | None = None
+    min_mult: float | None = None
+
+
 def env_float(raw: str | None, default: float = 0.0) -> float:
     try:
         return float((raw or "").strip() or default)
@@ -76,6 +87,41 @@ def check_entry_exec_ratio(
         reference_source=ref_source,
         ratio=ratio,
         max_ratio=max_ratio,
+    )
+
+
+def check_roundtrip(
+    *,
+    min_mult: float,
+    sol_in: float | None,
+    sol_out: float | None,
+) -> RoundtripDecision:
+    if min_mult <= 0:
+        return RoundtripDecision(True, False, "disabled", min_mult=min_mult)
+
+    in_sol = _positive_float(sol_in)
+    if not in_sol:
+        return RoundtripDecision(False, True, "missing_roundtrip_input", min_mult=min_mult)
+
+    out_sol = _positive_float(sol_out)
+    if not out_sol:
+        return RoundtripDecision(
+            False,
+            True,
+            "entry_roundtrip_no_route",
+            sol_in=in_sol,
+            min_mult=min_mult,
+        )
+
+    mult = out_sol / in_sol
+    return RoundtripDecision(
+        allowed=mult >= min_mult,
+        enabled=True,
+        reason="ok" if mult >= min_mult else "entry_roundtrip",
+        sol_in=in_sol,
+        sol_out=out_sol,
+        mult=mult,
+        min_mult=min_mult,
     )
 
 

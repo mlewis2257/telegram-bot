@@ -110,6 +110,9 @@ print(f"[live] allowed hours UTC: {_startup_allowed_hours if _startup_allowed_ho
 LIVE_MAX_ENTRY_EXEC_RATIO = entry_quality.env_float(os.getenv("LIVE_MAX_ENTRY_EXEC_RATIO"), 0.0)
 print(f"[live] max entry exec/ref ratio: {LIVE_MAX_ENTRY_EXEC_RATIO:g}x"
       if LIVE_MAX_ENTRY_EXEC_RATIO > 0 else "[live] max entry exec/ref ratio: disabled")
+LIVE_ENTRY_ROUNDTRIP_MIN_MULT = entry_quality.env_float(os.getenv("LIVE_ENTRY_ROUNDTRIP_MIN_MULT"), 0.0)
+print(f"[live] entry roundtrip min: {LIVE_ENTRY_ROUNDTRIP_MIN_MULT:g}x"
+      if LIVE_ENTRY_ROUNDTRIP_MIN_MULT > 0 else "[live] entry roundtrip min: disabled")
 
 
 # ── Per-channel mcap entry limits ──────────────────────────────────────────────
@@ -597,7 +600,11 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             db.set_call_skip_reason(call_id, "mcap_too_high")
             return False
 
-        if LIVE_MAX_ENTRY_EXEC_RATIO > 0 and mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
+        if (
+            (LIVE_MAX_ENTRY_EXEC_RATIO > 0 or LIVE_ENTRY_ROUNDTRIP_MIN_MULT > 0)
+            and mint
+            and not mint.startswith(("INFERRED:", "UNKNOWN:"))
+        ):
             try:
                 quote_tokens = await jupiter.get_buy_quote(mint, size, raise_on_ratelimit=True)
             except jupiter.RateLimitError:
@@ -626,6 +633,27 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
                 )
                 db.set_call_skip_reason(call_id, gate.reason)
                 return False
+            if LIVE_ENTRY_ROUNDTRIP_MIN_MULT > 0:
+                try:
+                    roundtrip_sol = await jupiter.get_sell_quote(mint, quote_tokens, raise_on_ratelimit=True)
+                except jupiter.RateLimitError:
+                    print(f"[live] {symbol} skipped — pre-entry roundtrip sell quote 429 call_id={call_id}")
+                    db.set_call_skip_reason(call_id, "entry_roundtrip_429")
+                    return False
+                roundtrip = entry_quality.check_roundtrip(
+                    min_mult=LIVE_ENTRY_ROUNDTRIP_MIN_MULT,
+                    sol_in=size,
+                    sol_out=roundtrip_sol,
+                )
+                if not roundtrip.allowed:
+                    print(
+                        f"[live] {symbol} skipped — entry roundtrip "
+                        f"{(roundtrip.mult or 0):.2f}x < {roundtrip.min_mult:.2f}x "
+                        f"sol_in={size:.4f} sol_out={(roundtrip.sol_out or 0):.4f} "
+                        f"reason={roundtrip.reason} call_id={call_id}"
+                    )
+                    db.set_call_skip_reason(call_id, roundtrip.reason)
+                    return False
 
         # ── Execute buy ────────────────────────────────────────────────────────
         print(

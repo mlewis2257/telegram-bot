@@ -153,6 +153,7 @@ QSIM_BANK_EXIT_ENABLED      = os.getenv("QSIM_BANK_EXIT_ENABLED", "false").lower
 QSIM_BANK_EXIT_MULT         = float(os.getenv("QSIM_BANK_EXIT_MULT", "1.3"))
 QSIM_EXIT_OVERLAY_STRATEGY  = os.getenv("QSIM_EXIT_OVERLAY_STRATEGY", "").strip()
 QSIM_MAX_ENTRY_EXEC_RATIO   = entry_quality.env_float(os.getenv("QSIM_MAX_ENTRY_EXEC_RATIO"), 0.0)
+QSIM_ENTRY_ROUNDTRIP_MIN_MULT = entry_quality.env_float(os.getenv("QSIM_ENTRY_ROUNDTRIP_MIN_MULT"), 0.0)
 QSIM_POST_EXIT_OBS_ENABLED  = os.getenv("QSIM_POST_EXIT_OBS_ENABLED", "false").lower() == "true"
 QSIM_POST_EXIT_OBS_MINS     = float(os.getenv("QSIM_POST_EXIT_OBS_MINS", "90"))
 QSIM_POST_EXIT_OBS_CADENCE_SECS = float(os.getenv("QSIM_POST_EXIT_OBS_CADENCE_SECS", "60"))
@@ -418,6 +419,25 @@ async def qsim_open(score_result: dict, token_data: dict) -> None:
                 f"source={gate.reference_source or '?'} call_id={call_id}"
             )
             return
+        if QSIM_ENTRY_ROUNDTRIP_MIN_MULT > 0:
+            try:
+                roundtrip_sol = await jupiter.get_sell_quote(mint, tokens_raw, raise_on_ratelimit=True)
+            except jupiter.RateLimitError:
+                print(f"[qsim] {symbol} open skipped — roundtrip sell quote 429 call_id={call_id}")
+                return
+            roundtrip = entry_quality.check_roundtrip(
+                min_mult=QSIM_ENTRY_ROUNDTRIP_MIN_MULT,
+                sol_in=size,
+                sol_out=roundtrip_sol,
+            )
+            if not roundtrip.allowed:
+                print(
+                    f"[qsim] {symbol} skipped — entry roundtrip "
+                    f"{(roundtrip.mult or 0):.2f}x < {roundtrip.min_mult:.2f}x "
+                    f"sol_in={size:.4f} sol_out={(roundtrip.sol_out or 0):.4f} "
+                    f"reason={roundtrip.reason} call_id={call_id}"
+                )
+                return
 
         opened = db.open_qsim_position(
             call_id=call_id, entry_price=entry_mcap, entry_tokens=tokens_raw,
@@ -642,6 +662,8 @@ async def run_qsim_monitor() -> None:
     print(f"[qsim] exit overlay: {_QSIM_EXIT_OVERLAY.name if _QSIM_EXIT_OVERLAY else 'none'}")
     print(f"[qsim] max entry exec/ref ratio: {QSIM_MAX_ENTRY_EXEC_RATIO:g}x"
           if QSIM_MAX_ENTRY_EXEC_RATIO > 0 else "[qsim] max entry exec/ref ratio: disabled")
+    print(f"[qsim] entry roundtrip min: {QSIM_ENTRY_ROUNDTRIP_MIN_MULT:g}x"
+          if QSIM_ENTRY_ROUNDTRIP_MIN_MULT > 0 else "[qsim] entry roundtrip min: disabled")
     while True:
         try:
             # Skip the whole quoting pass while in 429 backoff (the loop-end sleep still runs).
