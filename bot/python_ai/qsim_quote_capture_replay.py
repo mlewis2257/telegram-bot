@@ -49,6 +49,13 @@ comparison column. The replay variants are intentionally simple:
         bank quote is already a fast 1.7x+ strength print, hold up to 10 minutes
         for 3x while protecting with a 1.25x floor and 3 stalled ticks.
 
+    cdelay_b1p4_hs25_band0p5to0p7_life0p9_age5_w3_floor0p4_rec1x
+        "Conditional delay": bank normal 1.4x winners immediately. If a hard
+        stop triggers quickly inside a recoverable-looking 0.5x-0.7x band after
+        prior quote life near 0.9x, delay briefly for a bounce while protecting
+        with a disaster floor. This tests the COGE/XCAT/PUMP recovery shape
+        without forgiving slow bleeds or near-zero rugs.
+
 Examples:
     python3 qsim_quote_capture_replay.py --days 1 --channel solwhaletrending --lane low_score --variant early --detail
     python3 qsim_quote_capture_replay.py --days 7 --channel solwhaletrending --lane low_score --variant early --max-entry-ratio 2
@@ -236,6 +243,80 @@ BANK_SOFT_STOP_POLICIES = (
         "window_mins": 5.0,
         "disaster_floor": 0.55,
         "recover": 1.20,
+    },
+)
+CONDITIONAL_STOP_DELAY_POLICIES = (
+    {
+        "name": "cdelay_b1p4_hs25_band0p5to0p7_life0p9_age5_w2_floor0p4_rec1x",
+        "bank": 1.40,
+        "hard_stop": 0.75,
+        "delay_min": 0.50,
+        "delay_max": 0.70,
+        "life": 0.90,
+        "max_age_mins": 5.0,
+        "window_mins": 2.0,
+        "disaster_floor": 0.40,
+        "recover": 1.0,
+    },
+    {
+        "name": "cdelay_b1p4_hs25_band0p5to0p7_life0p9_age5_w3_floor0p4_rec1x",
+        "bank": 1.40,
+        "hard_stop": 0.75,
+        "delay_min": 0.50,
+        "delay_max": 0.70,
+        "life": 0.90,
+        "max_age_mins": 5.0,
+        "window_mins": 3.0,
+        "disaster_floor": 0.40,
+        "recover": 1.0,
+    },
+    {
+        "name": "cdelay_b1p4_hs25_band0p5to0p7_life0p9_age5_w5_floor0p4_rec1x",
+        "bank": 1.40,
+        "hard_stop": 0.75,
+        "delay_min": 0.50,
+        "delay_max": 0.70,
+        "life": 0.90,
+        "max_age_mins": 5.0,
+        "window_mins": 5.0,
+        "disaster_floor": 0.40,
+        "recover": 1.0,
+    },
+    {
+        "name": "cdelay_b1p4_hs25_band0p55to0p7_life0p9_age5_w3_floor0p45_rec1x",
+        "bank": 1.40,
+        "hard_stop": 0.75,
+        "delay_min": 0.55,
+        "delay_max": 0.70,
+        "life": 0.90,
+        "max_age_mins": 5.0,
+        "window_mins": 3.0,
+        "disaster_floor": 0.45,
+        "recover": 1.0,
+    },
+    {
+        "name": "cdelay_b1p4_hs25_band0p5to0p7_life1x_age5_w3_floor0p4_rec1p2",
+        "bank": 1.40,
+        "hard_stop": 0.75,
+        "delay_min": 0.50,
+        "delay_max": 0.70,
+        "life": 1.0,
+        "max_age_mins": 5.0,
+        "window_mins": 3.0,
+        "disaster_floor": 0.40,
+        "recover": 1.20,
+    },
+    {
+        "name": "cdelay_b1p3_hs25_band0p5to0p7_life0p9_age5_w3_floor0p4_rec1x",
+        "bank": 1.30,
+        "hard_stop": 0.75,
+        "delay_min": 0.50,
+        "delay_max": 0.70,
+        "life": 0.90,
+        "max_age_mins": 5.0,
+        "window_mins": 3.0,
+        "disaster_floor": 0.40,
+        "recover": 1.0,
     },
 )
 FALLBACK_CHOICES = ("current", "raw_config", "last_quote", "hard_stop", "hard_stop_35")
@@ -1526,6 +1607,142 @@ def _bank_soft_stop_hit_mult(
     return last_mult if in_recovery else None
 
 
+def _conditional_stop_delay_return(
+    row: dict[str, Any],
+    points: list[tuple[datetime | None, float]],
+    *,
+    bank: float,
+    hard_stop: float,
+    delay_min: float,
+    delay_max: float,
+    life: float,
+    max_age_mins: float,
+    window_mins: float,
+    disaster_floor: float,
+    recover: float,
+    current_return: float,
+) -> float:
+    """
+    Bank normal winners; delay only fast hard stops that look recoverable.
+
+    A delayed stop is allowed only when the hard-stop print is not a near-zero
+    nuke, happened quickly after entry, and the trade had already shown enough
+    quote life. Otherwise the replay exits immediately at the hard-stop quote.
+    """
+    if not points:
+        return current_return
+
+    entry_time = _parse_dt(row.get("entry_time"))
+    peak = 0.0
+    in_delay = False
+    delay_started_at: float | None = None
+    last_mult = points[-1][1]
+
+    for observed_at, mult in points:
+        last_mult = mult
+
+        if not in_delay and mult >= bank:
+            return mult - 1.0
+
+        peak = max(peak, mult)
+
+        if not in_delay:
+            if mult > hard_stop:
+                continue
+
+            age_mins = None
+            if entry_time is not None and observed_at is not None:
+                age_mins = (observed_at - entry_time).total_seconds() / 60.0
+            can_delay = (
+                delay_min <= mult <= delay_max
+                and peak >= life
+                and (age_mins is None or age_mins <= max_age_mins)
+            )
+            if not can_delay:
+                return mult - 1.0
+
+            in_delay = True
+            delay_started_at = observed_at.timestamp() if observed_at is not None else None
+            continue
+
+        if mult >= recover:
+            return mult - 1.0
+        if mult <= disaster_floor:
+            return mult - 1.0
+        if (
+            delay_started_at is not None
+            and observed_at is not None
+            and observed_at.timestamp() >= delay_started_at + window_mins * 60.0
+        ):
+            return mult - 1.0
+
+    return last_mult - 1.0 if in_delay else current_return
+
+
+def _conditional_stop_delay_hit_mult(
+    row: dict[str, Any],
+    points: list[tuple[datetime | None, float]],
+    *,
+    bank: float,
+    hard_stop: float,
+    delay_min: float,
+    delay_max: float,
+    life: float,
+    max_age_mins: float,
+    window_mins: float,
+    disaster_floor: float,
+    recover: float,
+) -> float | None:
+    if not points:
+        return None
+
+    entry_time = _parse_dt(row.get("entry_time"))
+    peak = 0.0
+    in_delay = False
+    delay_started_at: float | None = None
+    last_mult = points[-1][1]
+
+    for observed_at, mult in points:
+        last_mult = mult
+
+        if not in_delay and mult >= bank:
+            return mult
+
+        peak = max(peak, mult)
+
+        if not in_delay:
+            if mult > hard_stop:
+                continue
+
+            age_mins = None
+            if entry_time is not None and observed_at is not None:
+                age_mins = (observed_at - entry_time).total_seconds() / 60.0
+            can_delay = (
+                delay_min <= mult <= delay_max
+                and peak >= life
+                and (age_mins is None or age_mins <= max_age_mins)
+            )
+            if not can_delay:
+                return None
+
+            in_delay = True
+            delay_started_at = observed_at.timestamp() if observed_at is not None else None
+            continue
+
+        if mult >= recover:
+            return mult
+        if mult <= disaster_floor:
+            return mult
+        if (
+            delay_started_at is not None
+            and observed_at is not None
+            and observed_at.timestamp() >= delay_started_at + window_mins * 60.0
+        ):
+            return mult
+
+    return last_mult if in_delay else None
+
+
 def _view(
     row: dict[str, Any],
     fallback_mode: str = "current",
@@ -1642,6 +1859,22 @@ def _view(
             bank=policy["bank"],
             hard_stop=policy["hard_stop"],
             life=policy["life"],
+            window_mins=policy["window_mins"],
+            disaster_floor=policy["disaster_floor"],
+            recover=policy["recover"],
+            current_return=fallback_return,
+        )
+
+    for policy in CONDITIONAL_STOP_DELAY_POLICIES:
+        returns[policy["name"]] = _conditional_stop_delay_return(
+            row,
+            points,
+            bank=policy["bank"],
+            hard_stop=policy["hard_stop"],
+            delay_min=policy["delay_min"],
+            delay_max=policy["delay_max"],
+            life=policy["life"],
+            max_age_mins=policy["max_age_mins"],
             window_mins=policy["window_mins"],
             disaster_floor=policy["disaster_floor"],
             recover=policy["recover"],
@@ -1815,6 +2048,12 @@ def _print_summary(views: list[ReplayRow]) -> None:
     for policy in BANK_SOFT_STOP_POLICIES:
         _print_policy_row(policy["name"], views, current, width=48)
 
+    print("\nConditional Stop Delay Totals")
+    print(f"{'policy':<58} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 127)
+    for policy in CONDITIONAL_STOP_DELAY_POLICIES:
+        _print_policy_row(policy["name"], views, current, width=58)
+
     print("\nWinner-Only Exit Totals")
     print(f"{'policy':<22} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
     print("-" * 91)
@@ -1919,6 +2158,27 @@ def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
                 )
             ) is not None
         ]
+    if policy.startswith("cdelay_"):
+        spec = next(item for item in CONDITIONAL_STOP_DELAY_POLICIES if item["name"] == policy)
+        return [
+            value
+            for view in views
+            if (
+                value := _conditional_stop_delay_hit_mult(
+                    view.row,
+                    _quote_points(view.row),
+                    bank=spec["bank"],
+                    hard_stop=spec["hard_stop"],
+                    delay_min=spec["delay_min"],
+                    delay_max=spec["delay_max"],
+                    life=spec["life"],
+                    max_age_mins=spec["max_age_mins"],
+                    window_mins=spec["window_mins"],
+                    disaster_floor=spec["disaster_floor"],
+                    recover=spec["recover"],
+                )
+            ) is not None
+        ]
     if policy.startswith("win_"):
         spec = next(item for item in WINNER_ONLY_POLICIES if item["name"] == policy)
         return [
@@ -2002,6 +2262,7 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
             view.returns["bor_b1p4_a1p7_t3x_f1p25_w10m_s3"],
             view.returns["soft_hs25_life1p15_w5m_floor0p55_rec1p2"],
             view.returns["bank1p4_soft_hs25_life1p15_w5m_floor0p55_rec1p2"],
+            view.returns["cdelay_b1p4_hs25_band0p5to0p7_life0p9_age5_w3_floor0p4_rec1x"],
             view.returns["win_a1p4_stall3"],
             view.returns["obs_2x"],
         ) - view.returns["current"],
