@@ -157,6 +157,40 @@ BANK_OR_RUN_POLICIES = (
         "stall_ticks": 3,
     },
 )
+SOFT_STOP_POLICIES = (
+    {
+        "name": "soft_hs25_life1p1_w3m_floor0p55_rec1x",
+        "hard_stop": 0.75,
+        "life": 1.10,
+        "window_mins": 3.0,
+        "disaster_floor": 0.55,
+        "recover": 1.0,
+    },
+    {
+        "name": "soft_hs25_life1p15_w5m_floor0p55_rec1p2",
+        "hard_stop": 0.75,
+        "life": 1.15,
+        "window_mins": 5.0,
+        "disaster_floor": 0.55,
+        "recover": 1.20,
+    },
+    {
+        "name": "soft_hs25_life1p2_w5m_floor0p5_rec1p3",
+        "hard_stop": 0.75,
+        "life": 1.20,
+        "window_mins": 5.0,
+        "disaster_floor": 0.50,
+        "recover": 1.30,
+    },
+    {
+        "name": "soft_hs30_life1p15_w5m_floor0p5_rec1p2",
+        "hard_stop": 0.70,
+        "life": 1.15,
+        "window_mins": 5.0,
+        "disaster_floor": 0.50,
+        "recover": 1.20,
+    },
+)
 FALLBACK_CHOICES = ("current", "raw_config", "last_quote", "hard_stop", "hard_stop_35")
 DYNAMIC_EXIT_POLICIES = (
     {
@@ -1226,6 +1260,111 @@ def _bank_or_run_hit_mult(
     return last_mult if runner_started_at is not None else None
 
 
+def _soft_stop_recovery_return(
+    points: list[tuple[datetime | None, float]],
+    *,
+    hard_stop: float,
+    life: float,
+    window_mins: float,
+    disaster_floor: float,
+    recover: float,
+    current_return: float,
+) -> float:
+    """
+    Delay only selected hard stops that showed enough prior life to deserve grace.
+
+    If a trade falls through hard_stop without ever printing life, this exits at
+    that observed hard-stop quote. If it did print life first, it gets a short
+    recovery window. The recovery window exits on:
+      * recover target hit
+      * disaster floor breach
+      * timeout at the latest observed quote
+
+    This models "temporary flush rescue" without forgiving true dead rugs.
+    """
+    if not points:
+        return current_return
+
+    saw_life = False
+    in_recovery = False
+    recovery_started_at: float | None = None
+    last_mult = points[-1][1]
+
+    for observed_at, mult in points:
+        last_mult = mult
+        if mult >= life:
+            saw_life = True
+
+        if not in_recovery:
+            if mult <= hard_stop:
+                if not saw_life:
+                    return mult - 1.0
+                in_recovery = True
+                recovery_started_at = (
+                    observed_at.timestamp() if observed_at is not None else None
+                )
+            continue
+
+        if mult >= recover:
+            return mult - 1.0
+        if mult <= disaster_floor:
+            return mult - 1.0
+        if (
+            recovery_started_at is not None
+            and observed_at is not None
+            and observed_at.timestamp() >= recovery_started_at + window_mins * 60.0
+        ):
+            return mult - 1.0
+
+    return last_mult - 1.0 if in_recovery else current_return
+
+
+def _soft_stop_hit_mult(
+    points: list[tuple[datetime | None, float]],
+    *,
+    hard_stop: float,
+    life: float,
+    window_mins: float,
+    disaster_floor: float,
+    recover: float,
+) -> float | None:
+    if not points:
+        return None
+
+    saw_life = False
+    in_recovery = False
+    recovery_started_at: float | None = None
+    last_mult = points[-1][1]
+
+    for observed_at, mult in points:
+        last_mult = mult
+        if mult >= life:
+            saw_life = True
+
+        if not in_recovery:
+            if mult <= hard_stop:
+                if not saw_life:
+                    return mult
+                in_recovery = True
+                recovery_started_at = (
+                    observed_at.timestamp() if observed_at is not None else None
+                )
+            continue
+
+        if mult >= recover:
+            return mult
+        if mult <= disaster_floor:
+            return mult
+        if (
+            recovery_started_at is not None
+            and observed_at is not None
+            and observed_at.timestamp() >= recovery_started_at + window_mins * 60.0
+        ):
+            return mult
+
+    return last_mult if in_recovery else None
+
+
 def _view(
     row: dict[str, Any],
     fallback_mode: str = "current",
@@ -1322,6 +1461,17 @@ def _view(
             floor=policy["floor"],
             window_mins=policy["window_mins"],
             stall_ticks=policy["stall_ticks"],
+            current_return=fallback_return,
+        )
+
+    for policy in SOFT_STOP_POLICIES:
+        returns[policy["name"]] = _soft_stop_recovery_return(
+            points,
+            hard_stop=policy["hard_stop"],
+            life=policy["life"],
+            window_mins=policy["window_mins"],
+            disaster_floor=policy["disaster_floor"],
+            recover=policy["recover"],
             current_return=fallback_return,
         )
 
@@ -1480,6 +1630,12 @@ def _print_summary(views: list[ReplayRow]) -> None:
     for policy in BANK_OR_RUN_POLICIES:
         _print_policy_row(policy["name"], views, current, width=32)
 
+    print("\nSoft Stop Recovery Totals")
+    print(f"{'policy':<36} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 105)
+    for policy in SOFT_STOP_POLICIES:
+        _print_policy_row(policy["name"], views, current, width=36)
+
     print("\nWinner-Only Exit Totals")
     print(f"{'policy':<22} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
     print("-" * 91)
@@ -1548,6 +1704,22 @@ def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
                     floor=spec["floor"],
                     window_mins=spec["window_mins"],
                     stall_ticks=spec["stall_ticks"],
+                )
+            ) is not None
+        ]
+    if policy.startswith("soft_"):
+        spec = next(item for item in SOFT_STOP_POLICIES if item["name"] == policy)
+        return [
+            value
+            for view in views
+            if (
+                value := _soft_stop_hit_mult(
+                    _quote_points(view.row),
+                    hard_stop=spec["hard_stop"],
+                    life=spec["life"],
+                    window_mins=spec["window_mins"],
+                    disaster_floor=spec["disaster_floor"],
+                    recover=spec["recover"],
                 )
             ) is not None
         ]
@@ -1632,6 +1804,7 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
             view.returns["lock_or_bank_1p5x_1p2x"],
             view.returns["dyn_a1p4_f1p1_s3_nb1p2_0p9"],
             view.returns["bor_b1p4_a1p7_t3x_f1p25_w10m_s3"],
+            view.returns["soft_hs25_life1p15_w5m_floor0p55_rec1p2"],
             view.returns["win_a1p4_stall3"],
             view.returns["obs_2x"],
         ) - view.returns["current"],
@@ -1641,7 +1814,7 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
     print("\nDetail — biggest bank/lock improvement first")
     hdr = (
         f"{'call':>7} {'symbol':<12} {'ent':>5} {'qpk':>5} {'qmax':>5} {'spk':>5} "
-        f"{'cur':>8} {'bank14':>8} {'bor14':>8} {'bank15':>8} {'obs2':>8} {'shadow':>8} "
+        f"{'cur':>8} {'bank14':>8} {'bor14':>8} {'soft':>8} {'obs2':>8} {'shadow':>8} "
         f"{'raw_reason':<12} {'q_reason/shadow_reason':<28}"
     )
     print(hdr)
@@ -1659,7 +1832,7 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
             f"{_pct(view.returns['current']):>8} "
             f"{_pct(view.returns['bank_1p4x']):>8} "
             f"{_pct(view.returns['bor_b1p4_a1p7_t3x_f1p25_w10m_s3']):>8} "
-            f"{_pct(view.returns['bank_1p5x']):>8} "
+            f"{_pct(view.returns['soft_hs25_life1p15_w5m_floor0p55_rec1p2']):>8} "
             f"{_pct(view.returns['obs_2x']):>8} "
             f"{_pct(view.shadow_return):>8} "
             f"{(row.get('raw_config_reason') or '?')[:12]:<12} "
