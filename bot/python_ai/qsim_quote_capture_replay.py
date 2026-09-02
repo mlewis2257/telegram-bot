@@ -44,6 +44,11 @@ comparison column. The replay variants are intentionally simple:
         the final observed quote. This tests "never let an armed winner become a
         full loser" and is intentionally less conservative.
 
+    bor_b1p4_a1p7_t3x_f1p25_w10m_s3
+        "Bank-or-run": bank normal 1.4x winners immediately, but if the first
+        bank quote is already a fast 1.7x+ strength print, hold up to 10 minutes
+        for 3x while protecting with a 1.25x floor and 3 stalled ticks.
+
 Examples:
     python3 qsim_quote_capture_replay.py --days 1 --channel solwhaletrending --lane low_score --variant early --detail
     python3 qsim_quote_capture_replay.py --days 7 --channel solwhaletrending --lane low_score --variant early --max-entry-ratio 2
@@ -112,6 +117,44 @@ RUNNER_WINDOW_POLICIES = (
         "window_mins": 10.0,
         "floor": 1.2,
         "release": 5.0,
+    },
+)
+BANK_OR_RUN_POLICIES = (
+    {
+        "name": "bor_b1p3_a1p7_t3x_f1p2_w10m_s3",
+        "bank": 1.30,
+        "runner_arm": 1.70,
+        "target": 3.0,
+        "floor": 1.20,
+        "window_mins": 10.0,
+        "stall_ticks": 3,
+    },
+    {
+        "name": "bor_b1p4_a1p7_t3x_f1p25_w10m_s3",
+        "bank": 1.40,
+        "runner_arm": 1.70,
+        "target": 3.0,
+        "floor": 1.25,
+        "window_mins": 10.0,
+        "stall_ticks": 3,
+    },
+    {
+        "name": "bor_b1p4_a1p7_t5x_f1p35_w10m_s3",
+        "bank": 1.40,
+        "runner_arm": 1.70,
+        "target": 5.0,
+        "floor": 1.35,
+        "window_mins": 10.0,
+        "stall_ticks": 3,
+    },
+    {
+        "name": "bor_b1p4_a2x_t5x_f1p55_w10m_s3",
+        "bank": 1.40,
+        "runner_arm": 2.0,
+        "target": 5.0,
+        "floor": 1.55,
+        "window_mins": 10.0,
+        "stall_ticks": 3,
     },
 )
 FALLBACK_CHOICES = ("current", "raw_config", "last_quote", "hard_stop", "hard_stop_35")
@@ -1053,6 +1096,136 @@ def _runner_window_return(
     return last_mult - 1.0
 
 
+def _bank_or_run_return(
+    points: list[tuple[datetime | None, float]],
+    *,
+    bank: float,
+    runner_arm: float,
+    target: float,
+    floor: float,
+    window_mins: float,
+    stall_ticks: int,
+    current_return: float,
+) -> float:
+    """
+    Bank ordinary winners, but hold fast strength briefly for a bigger target.
+
+    The policy stays deliberately executable:
+      * first quote >= bank is the safe bank point
+      * only if that same quote already reaches runner_arm does it enter runner mode
+      * runner mode exits on target, floor, stall, or window expiry
+
+    This avoids pretending the bot can pause at 1.4x, watch for a later 2x, and
+    still magically sell the old 1.4x if momentum vanishes.
+    """
+    if not points:
+        return current_return
+
+    runner_started_at: float | None = None
+    runner_peak = 0.0
+    ticks_since_high = 0
+    last_mult = points[-1][1]
+
+    for observed_at, mult in points:
+        last_mult = mult
+
+        if runner_started_at is None:
+            if mult < bank:
+                continue
+            if mult < runner_arm:
+                return mult - 1.0
+            runner_started_at = (
+                observed_at.timestamp() if observed_at is not None else None
+            )
+            runner_peak = mult
+            ticks_since_high = 0
+            if mult >= target:
+                return mult - 1.0
+            continue
+
+        if mult >= target:
+            return mult - 1.0
+        if mult <= floor:
+            return mult - 1.0
+
+        if mult > runner_peak:
+            runner_peak = mult
+            ticks_since_high = 0
+        else:
+            ticks_since_high += 1
+            if ticks_since_high >= stall_ticks:
+                return mult - 1.0
+
+        if (
+            runner_started_at is not None
+            and observed_at is not None
+            and observed_at.timestamp() >= runner_started_at + window_mins * 60.0
+        ):
+            return mult - 1.0
+
+    if runner_started_at is not None:
+        return last_mult - 1.0
+    return current_return
+
+
+def _bank_or_run_hit_mult(
+    points: list[tuple[datetime | None, float]],
+    *,
+    bank: float,
+    runner_arm: float,
+    target: float,
+    floor: float,
+    window_mins: float,
+    stall_ticks: int,
+) -> float | None:
+    if not points:
+        return None
+
+    runner_started_at: float | None = None
+    runner_peak = 0.0
+    ticks_since_high = 0
+    last_mult = points[-1][1]
+
+    for observed_at, mult in points:
+        last_mult = mult
+
+        if runner_started_at is None:
+            if mult < bank:
+                continue
+            if mult < runner_arm:
+                return mult
+            runner_started_at = (
+                observed_at.timestamp() if observed_at is not None else None
+            )
+            runner_peak = mult
+            ticks_since_high = 0
+            if mult >= target:
+                return mult
+            continue
+
+        if mult >= target:
+            return mult
+        if mult <= floor:
+            return mult
+
+        if mult > runner_peak:
+            runner_peak = mult
+            ticks_since_high = 0
+        else:
+            ticks_since_high += 1
+            if ticks_since_high >= stall_ticks:
+                return mult
+
+        if (
+            runner_started_at is not None
+            and observed_at is not None
+            and observed_at.timestamp() >= runner_started_at + window_mins * 60.0
+        ):
+            return mult
+
+    return last_mult if runner_started_at is not None else None
+
+
 def _view(
     row: dict[str, Any],
     fallback_mode: str = "current",
@@ -1137,6 +1310,18 @@ def _view(
             window_mins=policy["window_mins"],
             floor=policy["floor"],
             release=policy["release"],
+            current_return=fallback_return,
+        )
+
+    for policy in BANK_OR_RUN_POLICIES:
+        returns[policy["name"]] = _bank_or_run_return(
+            points,
+            bank=policy["bank"],
+            runner_arm=policy["runner_arm"],
+            target=policy["target"],
+            floor=policy["floor"],
+            window_mins=policy["window_mins"],
+            stall_ticks=policy["stall_ticks"],
             current_return=fallback_return,
         )
 
@@ -1289,6 +1474,12 @@ def _print_summary(views: list[ReplayRow]) -> None:
     for policy in DYNAMIC_EXIT_POLICIES:
         _print_policy_row(policy["name"], views, current, width=32)
 
+    print("\nBank-Or-Run Totals")
+    print(f"{'policy':<32} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 101)
+    for policy in BANK_OR_RUN_POLICIES:
+        _print_policy_row(policy["name"], views, current, width=32)
+
     print("\nWinner-Only Exit Totals")
     print(f"{'policy':<22} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
     print("-" * 91)
@@ -1340,6 +1531,23 @@ def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
                     confirm_ticks=spec["confirm_ticks"],
                     bounce=spec["bounce"],
                     dead_stop=spec["dead_stop"],
+                )
+            ) is not None
+        ]
+    if policy.startswith("bor_"):
+        spec = next(item for item in BANK_OR_RUN_POLICIES if item["name"] == policy)
+        return [
+            value
+            for view in views
+            if (
+                value := _bank_or_run_hit_mult(
+                    _quote_points(view.row),
+                    bank=spec["bank"],
+                    runner_arm=spec["runner_arm"],
+                    target=spec["target"],
+                    floor=spec["floor"],
+                    window_mins=spec["window_mins"],
+                    stall_ticks=spec["stall_ticks"],
                 )
             ) is not None
         ]
@@ -1423,6 +1631,7 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
             view.returns["p50_bank_1p3x"],
             view.returns["lock_or_bank_1p5x_1p2x"],
             view.returns["dyn_a1p4_f1p1_s3_nb1p2_0p9"],
+            view.returns["bor_b1p4_a1p7_t3x_f1p25_w10m_s3"],
             view.returns["win_a1p4_stall3"],
             view.returns["obs_2x"],
         ) - view.returns["current"],
@@ -1432,7 +1641,7 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
     print("\nDetail — biggest bank/lock improvement first")
     hdr = (
         f"{'call':>7} {'symbol':<12} {'ent':>5} {'qpk':>5} {'qmax':>5} {'spk':>5} "
-        f"{'cur':>8} {'bank13':>8} {'win14s':>8} {'bank15':>8} {'obs2':>8} {'shadow':>8} "
+        f"{'cur':>8} {'bank14':>8} {'bor14':>8} {'bank15':>8} {'obs2':>8} {'shadow':>8} "
         f"{'raw_reason':<12} {'q_reason/shadow_reason':<28}"
     )
     print(hdr)
@@ -1448,8 +1657,8 @@ def _print_detail(views: list[ReplayRow], limit: int) -> None:
             f"{_mult(view.max_quote_mult):>5} "
             f"{_mult(_f(row.get('shadow_peak'))):>5} "
             f"{_pct(view.returns['current']):>8} "
-            f"{_pct(view.returns['bank_1p3x']):>8} "
-            f"{_pct(view.returns['win_a1p4_stall3']):>8} "
+            f"{_pct(view.returns['bank_1p4x']):>8} "
+            f"{_pct(view.returns['bor_b1p4_a1p7_t3x_f1p25_w10m_s3']):>8} "
             f"{_pct(view.returns['bank_1p5x']):>8} "
             f"{_pct(view.returns['obs_2x']):>8} "
             f"{_pct(view.shadow_return):>8} "
