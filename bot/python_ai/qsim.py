@@ -31,7 +31,7 @@ import asyncio
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 import db
@@ -154,6 +154,7 @@ QSIM_BANK_EXIT_MULT         = float(os.getenv("QSIM_BANK_EXIT_MULT", "1.3"))
 QSIM_EXIT_OVERLAY_STRATEGY  = os.getenv("QSIM_EXIT_OVERLAY_STRATEGY", "").strip()
 QSIM_MAX_ENTRY_EXEC_RATIO   = entry_quality.env_float(os.getenv("QSIM_MAX_ENTRY_EXEC_RATIO"), 0.0)
 QSIM_ENTRY_ROUNDTRIP_MIN_MULT = entry_quality.env_float(os.getenv("QSIM_ENTRY_ROUNDTRIP_MIN_MULT"), 0.0)
+QSIM_HARD_STOP_PCT          = entry_quality.env_float(os.getenv("QSIM_HARD_STOP_PCT"), 0.0)
 QSIM_POST_EXIT_OBS_ENABLED  = os.getenv("QSIM_POST_EXIT_OBS_ENABLED", "false").lower() == "true"
 QSIM_POST_EXIT_OBS_MINS     = float(os.getenv("QSIM_POST_EXIT_OBS_MINS", "90"))
 QSIM_POST_EXIT_OBS_CADENCE_SECS = float(os.getenv("QSIM_POST_EXIT_OBS_CADENCE_SECS", "60"))
@@ -176,6 +177,13 @@ _noroute_streak: dict[int, int] = {}      # call_id -> consecutive no-route sell
 _quote_window: list[float] = []           # monotonic timestamps of recent quotes (budget window)
 _post_exit_quote_window: list[float] = [] # monotonic timestamps of recent post-exit quotes
 _backoff_until: float = 0.0               # monotonic time until which quoting is paused (429 backoff)
+
+
+def _qsim_exit_config(variant: str | None):
+    cfg = _VARIANT_CONFIGS.get(variant or "early", EXIT_A_PAPER)
+    if QSIM_HARD_STOP_PCT > 0:
+        return replace(cfg, hard_stop_pct=QSIM_HARD_STOP_PCT)
+    return cfg
 
 
 def _no_bounce_stop_result(current_mult: float, peak_mult: float) -> ExitResult:
@@ -532,7 +540,7 @@ async def _qsim_tick(pos: dict) -> None:
     if eff_cur <= 0:
         return
 
-    cfg = _VARIANT_CONFIGS.get(pos.get("variant") or "early", EXIT_A_PAPER)
+    cfg = _qsim_exit_config(pos.get("variant") or "early")
     is_vip_gamble = (pos.get("vip_tier") in ("gamble", "gamble_risk"))
     channel_handle = (pos.get("channel_handle") or "").lstrip("@")
     result = apply_exit_config(
@@ -664,6 +672,11 @@ async def run_qsim_monitor() -> None:
           if QSIM_MAX_ENTRY_EXEC_RATIO > 0 else "[qsim] max entry exec/ref ratio: disabled")
     print(f"[qsim] entry roundtrip min: {QSIM_ENTRY_ROUNDTRIP_MIN_MULT:g}x"
           if QSIM_ENTRY_ROUNDTRIP_MIN_MULT > 0 else "[qsim] entry roundtrip min: disabled")
+    base_cfg = _VARIANT_CONFIGS.get("early", EXIT_A_PAPER)
+    print(f"[qsim] hard_stop override: -{QSIM_HARD_STOP_PCT * 100:.0f}% "
+          f"(was -{base_cfg.hard_stop_pct * 100:.0f}%)"
+          if QSIM_HARD_STOP_PCT > 0 else
+          f"[qsim] hard_stop override: disabled (using -{base_cfg.hard_stop_pct * 100:.0f}%)")
     while True:
         try:
             # Skip the whole quoting pass while in 429 backoff (the loop-end sleep still runs).
