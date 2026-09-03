@@ -1599,7 +1599,7 @@ def get_open_qsim_positions() -> list[dict]:
             FROM qsim_positions qp
             JOIN tokens t ON t.id = qp.token_id
             WHERE qp.status = 'open'
-            ORDER BY qp.entry_time DESC
+            ORDER BY qp.entry_time ASC
             """,
         )
         cols = [d.name for d in cur.description]

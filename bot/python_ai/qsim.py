@@ -186,6 +186,11 @@ def _qsim_exit_config(variant: str | None):
     return cfg
 
 
+def _qsim_hard_stop_pct(pos: dict, cfg) -> float:
+    is_vip_gamble = (pos.get("vip_tier") in ("gamble", "gamble_risk"))
+    return cfg.vip_gamble_hard_stop_pct if is_vip_gamble else cfg.hard_stop_pct
+
+
 def _no_bounce_stop_result(current_mult: float, peak_mult: float) -> ExitResult:
     if (
         QSIM_NO_BOUNCE_STOP_ENABLED
@@ -526,6 +531,29 @@ async def _qsim_tick(pos: dict) -> None:
 
     real_mult   = sol_out / sol_in
     synth_cur   = entry * real_mult
+    cfg = _qsim_exit_config(pos.get("variant") or "early")
+    raw_hard_stop_pct = _qsim_hard_stop_pct(pos, cfg)
+    raw_hard_stop = raw_hard_stop_pct > 0 and real_mult <= (1.0 - raw_hard_stop_pct)
+    if raw_hard_stop:
+        db.insert_qsim_quote_observation(
+            call_id=call_id,
+            sol_out=sol_out,
+            real_mult=real_mult,
+            synth_mcap=synth_cur,
+            eff_mcap=synth_cur,
+            exit_reason="hard_stop",
+            should_exit=True,
+            noroute_streak=0,
+            note="raw_exec_hard_stop",
+        )
+        db.close_qsim_position(call_id, exit_price=synth_cur, sol_out=sol_out, exit_reason="hard_stop")
+        peak_guard.clear(f"qsim:{call_id}")
+        peak_guard.clear(f"qsimT:{call_id}")
+        _cleanup(call_id)
+        print(f"[qsim] CLOSE {symbol} call_id={call_id} hard_stop "
+              f"pnl={sol_out - sol_in:+.4f} ({real_mult:.2f}x)")
+        return
+
     prior_peak  = float(pos.get("peak_mcap") or 0.0)
     real_peak   = peak_guard.guard_peak(
         f"qsim:{call_id}",
@@ -540,7 +568,6 @@ async def _qsim_tick(pos: dict) -> None:
     if eff_cur <= 0:
         return
 
-    cfg = _qsim_exit_config(pos.get("variant") or "early")
     is_vip_gamble = (pos.get("vip_tier") in ("gamble", "gamble_risk"))
     channel_handle = (pos.get("channel_handle") or "").lstrip("@")
     result = apply_exit_config(
@@ -682,7 +709,18 @@ async def run_qsim_monitor() -> None:
             # Skip the whole quoting pass while in 429 backoff (the loop-end sleep still runs).
             if QSIM_ENABLED and time.monotonic() >= _backoff_until:
                 now = time.monotonic()
-                if QSIM_POST_EXIT_OBS_ENABLED:
+                positions = db.get_open_qsim_positions()
+                for pos in positions:
+                    cid = pos["call_id"]
+                    # per-position cadence
+                    if now - _last_quote_ts.get(cid, 0.0) < QSIM_TICK_SECS:
+                        continue
+                    if not _budget_ok():
+                        break   # over budget this minute — the rest wait for the next pass
+                    await _qsim_tick(pos)
+                    if time.monotonic() < _backoff_until:
+                        break   # a 429 mid-pass tripped backoff — stop quoting immediately
+                if QSIM_POST_EXIT_OBS_ENABLED and time.monotonic() >= _backoff_until:
                     closed_positions = db.get_recent_closed_qsim_positions_for_post_exit(
                         QSIM_POST_EXIT_OBS_MINS,
                         QSIM_POST_EXIT_OBS_LIMIT,
@@ -696,17 +734,6 @@ async def run_qsim_monitor() -> None:
                         await _qsim_post_exit_tick(pos)
                         if time.monotonic() < _backoff_until:
                             break
-                positions = db.get_open_qsim_positions()
-                for pos in positions:
-                    cid = pos["call_id"]
-                    # per-position cadence
-                    if now - _last_quote_ts.get(cid, 0.0) < QSIM_TICK_SECS:
-                        continue
-                    if not _budget_ok():
-                        break   # over budget this minute — the rest wait for the next pass
-                    await _qsim_tick(pos)
-                    if time.monotonic() < _backoff_until:
-                        break   # a 429 mid-pass tripped backoff — stop quoting immediately
         except Exception as e:
             db.safe_rollback()
             print(f"[qsim] monitor pass error: {e}")
