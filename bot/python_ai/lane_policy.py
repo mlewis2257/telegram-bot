@@ -392,12 +392,11 @@ LIVE_LANES: dict[tuple[str, str, str], dict] = {
     # candle qsim's sampling missed and booked -99.7%; ALING peaked 4.32x then rugged to -98.7%.
     # On those coins, exit SPEED is the whole difference between +0.15 and a near-total loss.)
     #
-    # ONE lane, ALL 7 DAYS, no day-gate. Day-of-week is NOISE — proven repeatedly: the "good day"
-    # reshuffles every window (shadow-28d says Mon is best +39.7; qsim-14d says Mon is worst -0.99;
-    # Fridays are green here 3/4, not "bad"). Gating days would just re-import that mirage and, on
-    # a short budget, let one cherry-picked day decide the whole result. So we trade every day and
-    # let monster arrival fall where it falls. "Sun" is listed explicitly to opt past the global
-    # Sunday skip. solwhaletrending/none left OUT for now — thinner; add once low_score proves out.
+    # LIVE 2026-09-04: keep this narrow and cut Friday. The qsim research lanes still observe
+    # Fridays, but live should not keep donating to the one weekday that repeatedly shows weak
+    # realized/shadow behavior. "Sun" stays listed explicitly to opt past the global Sunday skip
+    # until qsim proves that day is also unsafe. solwhaletrending/none left OUT for now — thinner;
+    # add once low_score proves out.
     #
     # Guardrails live in .env (NOT here): LIVE_LANE_STRATEGY=LIVE (use this allowlist, not the wide
     # A bench), MAX_TOTAL_LOSS_SOL=0.35 net since LIVE_PNL_SINCE, MAX_DAILY_LOSS_SOL=0 (no daily
@@ -405,7 +404,7 @@ LIVE_LANES: dict[tuple[str, str, str], dict] = {
     # now enabled for solwhaletrending). "exit"/"size" below are the lane defaults; process-wide
     # EXIT_STRATEGY is the real exit — keep any exit_live_v2 out of .env.
     ("solwhaletrending", "none", "low_score"): {
-        "days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"},
+        "days": {"Mon", "Tue", "Wed", "Thu", "Sat", "Sun"},
         "exit": EXIT_EARLY, "size": 0.05,
     },
 }
