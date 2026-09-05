@@ -157,6 +157,12 @@ QSIM_POST_EXIT_OBS_MINS     = float(os.getenv("QSIM_POST_EXIT_OBS_MINS", "90"))
 QSIM_POST_EXIT_OBS_CADENCE_SECS = float(os.getenv("QSIM_POST_EXIT_OBS_CADENCE_SECS", "60"))
 QSIM_POST_EXIT_OBS_LIMIT    = int(os.getenv("QSIM_POST_EXIT_OBS_LIMIT", "50"))
 QSIM_POST_EXIT_OBS_MAX_PER_MIN = int(os.getenv("QSIM_POST_EXIT_OBS_MAX_PER_MIN", "3"))
+# A close is STALE when the position went unobserved longer than this right before the quote
+# that closed it. Such a row is not the exit the strategy would have taken — the thresholds were
+# never evaluated during the gap — so it gets a 'stale_' exit_reason prefix and is excluded from
+# honest PnL by construction. Default 6x the tick: normal jitter/backoff stays clean, a genuinely
+# unwatched position does not. 0 disables the labelling (NOT recommended).
+QSIM_STALE_DECISION_SECS = float(os.getenv("QSIM_STALE_DECISION_SECS", str(QSIM_TICK_SECS * 6)))
 QSIM_RUNNER_WINDOW_ENABLED  = os.getenv("QSIM_RUNNER_WINDOW_ENABLED", "true").lower() == "true"
 RUNNER_WINDOW_ARM_MULT      = float(os.getenv("RUNNER_WINDOW_ARM_MULT", "2.0"))
 RUNNER_WINDOW_RELEASE_MULT  = float(os.getenv("RUNNER_WINDOW_RELEASE_MULT", "5.0"))
@@ -167,6 +173,7 @@ RUNNER_WINDOW_PROTECTED_REASONS = {"trail_stop", "profit_floor"}
 _ensured = False
 # monitor-process in-memory state
 _last_quote_ts: dict[int, float] = {}     # call_id -> monotonic time of last sell-quote
+_last_quote_wall: dict[int, datetime] = {}  # call_id -> WALL time of last sell-quote (staleness)
 _last_post_exit_quote_ts: dict[int, float] = {}  # call_id -> monotonic time of last post-exit quote
 _runner_window_until: dict[int, float] = {}  # call_id -> monotonic expiry for temporary loose-runner mode
 _qsim_exit_state: dict[int, dict] = {}       # call_id -> named overlay state
@@ -345,6 +352,42 @@ def _apply_runner_window(
     return result, "runner_window_active"
 
 
+def _decision_gap_secs(pos: dict, prior_quote_at: datetime | None) -> float | None:
+    """Seconds this position went UNOBSERVED before the quote now closing it.
+
+    Measured from the previous sell-quote, or from entry_time when this is the first quote
+    (a position quoted once after four hours was blind for four hours, not for one tick).
+    Returns None only when neither timestamp is usable — never fabricate a clean gap.
+    """
+    ref = prior_quote_at or pos.get("entry_time")
+    if ref is None:
+        return None
+    try:
+        if ref.tzinfo is None:
+            ref = ref.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - ref).total_seconds())
+    except Exception:
+        return None
+
+
+def _stale_reason(reason: str, gap_secs: float | None) -> str:
+    """Prefix an exit_reason with 'stale_' when the decision was made on a stale quote.
+
+    The prefix (not just the numeric column) is deliberate: every report that does
+    GROUP BY exit_reason separates these automatically, including ad-hoc SQL that knows
+    nothing about decision_gap_secs. A column alone can be silently ignored; a different
+    label cannot be.
+    """
+    if (
+        QSIM_STALE_DECISION_SECS > 0
+        and gap_secs is not None
+        and gap_secs > QSIM_STALE_DECISION_SECS
+        and not reason.startswith("stale_")
+    ):
+        return f"stale_{reason}"
+    return reason
+
+
 def _ensure_table() -> None:
     global _ensured
     if not _ensured:
@@ -491,6 +534,9 @@ async def _qsim_tick(pos: dict) -> None:
     if sol_in <= 0 or entry <= 0 or tokens <= 0:
         return
 
+    # Captured BEFORE this tick stamps its own time: how long the position has been blind.
+    prior_quote_at = _last_quote_wall.get(call_id)
+
     try:
         sol_out = await jupiter.get_sell_quote(mint, tokens, raise_on_ratelimit=True)
     except jupiter.RateLimitError:
@@ -508,6 +554,8 @@ async def _qsim_tick(pos: dict) -> None:
         return
     _quote_window.append(time.monotonic())
     _last_quote_ts[call_id] = time.monotonic()
+    _last_quote_wall[call_id] = datetime.now(timezone.utc)
+    gap_secs = _decision_gap_secs(pos, prior_quote_at)
 
     if sol_out is None or sol_out <= 0:
         # No sell route = the bag isn't sellable (rug/illiquid). After a streak, realize it at 0.
@@ -519,10 +567,13 @@ async def _qsim_tick(pos: dict) -> None:
             note="sell quote no-route",
         )
         if _noroute_streak[call_id] >= QSIM_RUG_FAILS:
-            db.close_qsim_position(call_id, exit_price=0.0, sol_out=0.0, exit_reason="rug")
+            reason = _stale_reason("rug", gap_secs)
+            db.close_qsim_position(call_id, exit_price=0.0, sol_out=0.0, exit_reason=reason,
+                                   decision_gap_secs=gap_secs)
             peak_guard.clear(f"qsim:{call_id}")
             _cleanup(call_id)
-            print(f"[qsim] CLOSE {symbol} call_id={call_id} rug (no sell route x{QSIM_RUG_FAILS}) pnl={-sol_in:+.4f}")
+            print(f"[qsim] CLOSE {symbol} call_id={call_id} {reason} "
+                  f"(no sell route x{QSIM_RUG_FAILS}) pnl={-sol_in:+.4f} gap={gap_secs or 0:.0f}s")
         return
     _noroute_streak.pop(call_id, None)
 
@@ -543,12 +594,14 @@ async def _qsim_tick(pos: dict) -> None:
             noroute_streak=0,
             note="raw_exec_hard_stop",
         )
-        db.close_qsim_position(call_id, exit_price=synth_cur, sol_out=sol_out, exit_reason="hard_stop")
+        reason = _stale_reason("hard_stop", gap_secs)
+        db.close_qsim_position(call_id, exit_price=synth_cur, sol_out=sol_out,
+                               exit_reason=reason, decision_gap_secs=gap_secs)
         peak_guard.clear(f"qsim:{call_id}")
         peak_guard.clear(f"qsimT:{call_id}")
         _cleanup(call_id)
-        print(f"[qsim] CLOSE {symbol} call_id={call_id} hard_stop "
-              f"pnl={sol_out - sol_in:+.4f} ({real_mult:.2f}x)")
+        print(f"[qsim] CLOSE {symbol} call_id={call_id} {reason} "
+              f"pnl={sol_out - sol_in:+.4f} ({real_mult:.2f}x) gap={gap_secs or 0:.0f}s")
         return
 
     prior_peak  = float(pos.get("peak_mcap") or 0.0)
@@ -613,13 +666,15 @@ async def _qsim_tick(pos: dict) -> None:
         note=";".join(note for note in (overlay_note, runner_note) if note),
     )
     if result.should_exit:
+        reason = _stale_reason(result.reason, gap_secs)
         db.close_qsim_position(call_id, exit_price=(result.exit_mcap or eff_cur),
-                               sol_out=sol_out, exit_reason=result.reason)
+                               sol_out=sol_out, exit_reason=reason,
+                               decision_gap_secs=gap_secs)
         peak_guard.clear(f"qsim:{call_id}")
         peak_guard.clear(f"qsimT:{call_id}")
         _cleanup(call_id)
-        print(f"[qsim] CLOSE {symbol} call_id={call_id} {result.reason} "
-              f"pnl={sol_out - sol_in:+.4f} ({real_mult:.2f}x)")
+        print(f"[qsim] CLOSE {symbol} call_id={call_id} {reason} "
+              f"pnl={sol_out - sol_in:+.4f} ({real_mult:.2f}x) gap={gap_secs or 0:.0f}s")
 
 
 async def _qsim_post_exit_tick(pos: dict) -> None:
@@ -676,6 +731,7 @@ async def _qsim_post_exit_tick(pos: dict) -> None:
 
 def _cleanup(call_id: int) -> None:
     _last_quote_ts.pop(call_id, None)
+    _last_quote_wall.pop(call_id, None)
     _noroute_streak.pop(call_id, None)
     _runner_window_until.pop(call_id, None)
     _qsim_exit_state.pop(call_id, None)
@@ -692,6 +748,10 @@ async def run_qsim_monitor() -> None:
           f"limit={QSIM_POST_EXIT_OBS_LIMIT} cap={QSIM_POST_EXIT_OBS_MAX_PER_MIN}/min")
     print(f"[qsim] bank exit enabled={QSIM_BANK_EXIT_ENABLED} mult={QSIM_BANK_EXIT_MULT:g}x")
     print(f"[qsim] exit overlay: {_QSIM_EXIT_OVERLAY.name if _QSIM_EXIT_OVERLAY else 'none'}")
+    print(f"[qsim] stale-decision threshold: {QSIM_STALE_DECISION_SECS:g}s "
+          f"(closes decided on an older quote are labelled stale_*)"
+          if QSIM_STALE_DECISION_SECS > 0 else
+          "[qsim] stale-decision labelling: DISABLED")
     print(f"[qsim] max entry exec/ref ratio: {QSIM_MAX_ENTRY_EXEC_RATIO:g}x"
           if QSIM_MAX_ENTRY_EXEC_RATIO > 0 else "[qsim] max entry exec/ref ratio: disabled")
     print(f"[qsim] entry roundtrip min: {QSIM_ENTRY_ROUNDTRIP_MIN_MULT:g}x"

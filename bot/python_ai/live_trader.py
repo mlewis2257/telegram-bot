@@ -500,10 +500,18 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             return False
 
         # ── Quiet hours (PST) — mirrors paper Strategy A ───────────────────────
+        # QUIET HOURS BYPASS 2026-09-05: when LIVE_USE_LANE_POLICY is on, lane_policy IS
+        # the entry decision (the same reasoning that already bypasses the legacy
+        # strategy_engine gate below) — so this hour gate is a SECOND, unmirrored filter.
+        # It came from Strategy A research on solhousesignal and solwhaletrending was never
+        # exempted, so live silently dropped 04/09/14 PST on its ONLY allowlisted lane while
+        # qsim took those calls with no such gate — which invalidates every qsim-vs-live
+        # comparison. Revert = set LIVE_USE_LANE_POLICY=false (or drop the clause) + restart.
         free_uses_custom_filters = (channel_handle == "solhousesignal")
         vip_uses_lane_allowlist  = (channel_handle == "solhousesignal_vip")
         if (
             local_hour in QUIET_HOURS_PST
+            and not LIVE_USE_LANE_POLICY
             and not free_uses_custom_filters
             and not vip_uses_lane_allowlist
         ):
@@ -826,7 +834,7 @@ async def live_exit_basis(
     feed_current: float,
     feed_peak: float,
     feed_entry: float,
-) -> tuple[float, float, float, str]:
+) -> tuple[float, float, float, str, float | None]:
     """
     Return the (current, peak, entry) triple to hand check_live_exits, plus a basis tag.
 
@@ -838,20 +846,25 @@ async def live_exit_basis(
     so every exit ratio (drawdown-from-peak, multiple-from-entry) reflects what the bag
     is really worth, not the laggy feed. On ANY failure (quote unavailable, no recorded
     fill, flag off) it returns the FEED triple unchanged — a bad quote must never force
-    or block a sell. Returns (current, peak, entry, "real"|"feed").
+    or block a sell. Returns (current, peak, entry, "real"|"feed", raw_mult).
+
+    `raw_mult` is the UNGUARDED executable multiple (quote_sol_out / sol_in) — the same
+    number qsim calls `real_mult`. It is None on the feed basis. check_live_exits uses it
+    for the bank overlay and the hard stop so live evaluates those off the RAW quote exactly
+    like qsim after 6da293d / e81d4d7; every other exit rule stays on the guarded triple.
     """
     if not LIVE_EXIT_USE_QUOTE:
-        return feed_current, feed_peak, feed_entry, "feed"
+        return feed_current, feed_peak, feed_entry, "feed", None
     try:
         real_entry = float(pos.get("entry_price_fill") or 0)
         if real_entry <= 0:
-            return feed_current, feed_peak, feed_entry, "feed"  # pre-instrumentation position
+            return feed_current, feed_peak, feed_entry, "feed", None  # pre-instrumentation position
         eff = await live_effective_current(pos)
         if not eff:
-            return feed_current, feed_peak, feed_entry, "feed"  # quote failed → feed fallback
-        synth_current, _real_mult = eff
+            return feed_current, feed_peak, feed_entry, "feed", None  # quote failed → feed fallback
+        synth_current, real_mult = eff
         if synth_current <= 0:
-            return feed_current, feed_peak, feed_entry, "feed"
+            return feed_current, feed_peak, feed_entry, "feed", None
         # Ratchet the real peak off observed sell-quote value. Seed from the DB row so the
         # peak is shared across sol-monitor + sol-ws-monitor and survives restarts; the
         # guard adds the same single-tick corroboration used on the feed side.
@@ -869,10 +882,10 @@ async def live_exit_basis(
         if real_peak > prior_peak:
             db.update_live_real_peak(call_id, real_peak)
         eff_current = min(synth_current, real_peak) if real_peak > 0 else synth_current
-        return eff_current, real_peak, real_entry, "real"
+        return eff_current, real_peak, real_entry, "real", real_mult
     except Exception as e:
         print(f"[live] exit-basis calc failed, using feed: {e}")
-        return feed_current, feed_peak, feed_entry, "feed"
+        return feed_current, feed_peak, feed_entry, "feed", None
 
 
 async def close_live_position(
@@ -1055,6 +1068,7 @@ def check_live_exits(
     peak_mcap: float,
     entry_mcap: float,
     exit_config: ExitConfig = None,
+    raw_mult: float | None = None,
 ) -> ExitResult:
     """
     Check whether the open live position for call_id should be exited.
@@ -1064,6 +1078,13 @@ def check_live_exits(
 
     exit_config defaults to the module-level _LIVE_EXIT_CONFIG which is
     loaded from the EXIT_STRATEGY env var at startup.
+
+    `raw_mult` (from live_exit_basis, None on the feed basis) is the UNGUARDED executable
+    multiple. When present, the hard stop and the bank overlay read it instead of the
+    guarded/peak-capped mcap — mirroring qsim, whose two most important fixes were exactly
+    this: 6da293d (bank overlay off the raw quote, not guarded peak data) and e81d4d7 (close
+    a raw sell quote below the hard stop before guard_trough can hold the position open).
+    Without it live cannot reproduce qsim's exits even in principle. None -> old behavior.
     """
     position = db.get_open_live_position(call_id)
     if not position:
@@ -1080,17 +1101,27 @@ def check_live_exits(
     if current_mcap <= 0:
         return ExitResult(False)
 
+    cfg = exit_config if exit_config is not None else _LIVE_EXIT_CONFIG
+    is_vip_gamble = position.get("vip_tier") in ("gamble_risk", "gamble")
+    channel_handle = (position.get("channel_handle") or "").lstrip("@")
+    entry_time = position.get("entry_time")
+
+    # ── RAW executable hard stop (mirrors qsim e81d4d7) ──────────────────────────
+    # A real sell quote already below the stop is not a phantom — it is the price the bag
+    # would actually fetch. guard_trough exists to survive a bad FEED tick, but on the quote
+    # basis it only delays a stop we know is real (in qsim it kept positions open for hours
+    # far below the stop). So on the raw basis the stop fires here, before the guard.
+    if raw_mult is not None and raw_mult > 0:
+        raw_stop_pct = cfg.vip_gamble_hard_stop_pct if is_vip_gamble else cfg.hard_stop_pct
+        if raw_stop_pct > 0 and raw_mult <= (1.0 - raw_stop_pct):
+            return ExitResult(True, "hard_stop", exit_mcap=entry_mcap * raw_mult)
+
     # Low-side corroboration: hold a single uncorroborated crater for one reading so one
     # phantom low tick can't trigger a real stop-sell (mirror of guard_peak on the high
     # side; the high side is already guarded in ws_monitor).
     current_mcap = peak_guard.guard_trough(f"tL:{call_id}", current_mcap)
     if current_mcap <= 0:
         return ExitResult(False)
-
-    cfg = exit_config if exit_config is not None else _LIVE_EXIT_CONFIG
-    is_vip_gamble = position.get("vip_tier") in ("gamble_risk", "gamble")
-    channel_handle = (position.get("channel_handle") or "").lstrip("@")
-    entry_time = position.get("entry_time")
 
     current_mult = current_mcap / entry_mcap
     peak_mult = (peak_mcap / entry_mcap) if peak_mcap > 0 else current_mult
@@ -1103,8 +1134,14 @@ def check_live_exits(
     ):
         return ExitResult(True, "no_bounce_stop", exit_mcap=current_mcap)
 
+    # Bank overlay on the RAW executable multiple when we have one (qsim 6da293d): the
+    # guarded value is capped at min(synth, real_peak), and guard_peak withholds a >50%
+    # single-tick jump for one reading — so on exactly the violent spikes bank_1p3x exists
+    # to catch, the guarded mult reads below the threshold and the bank does not fire.
+    overlay_mult = raw_mult if (raw_mult is not None and raw_mult > 0) else current_mult
+    overlay_mcap = (entry_mcap * raw_mult) if (raw_mult is not None and raw_mult > 0) else current_mcap
     overlay_result, overlay_suppresses_base = _apply_live_exit_overlay(
-        call_id, current_mult, current_mcap
+        call_id, overlay_mult, overlay_mcap
     )
     if overlay_result.should_exit:
         return overlay_result

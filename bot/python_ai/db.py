@@ -1516,6 +1516,15 @@ def ensure_qsim_positions_table() -> None:
             )
             """
         )
+        # decision_gap_secs: seconds the position went UNOBSERVED immediately before the
+        # quote that closed it (measured from the prior quote, or from entry if this was the
+        # first). A close decided on a stale quote is not the exit the strategy would have
+        # taken — see the 2026-09-05 starvation incident, where positions went 1-4 HOURS
+        # between quotes and booked -95% rows labelled 'hard_stop' that the -20% stop never
+        # actually got to evaluate. Written at close time so no consumer can miss it.
+        cur.execute(
+            "ALTER TABLE qsim_positions ADD COLUMN IF NOT EXISTS decision_gap_secs numeric"
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_qsim_status ON qsim_positions (status)")
         cur.execute(
             """
@@ -1648,7 +1657,12 @@ def update_qsim_peak(call_id: int, peak_mcap: float, peak_mult: float) -> bool:
         return cur.rowcount > 0
 
 
-def close_qsim_position(call_id: int, exit_price: float, sol_out: float, exit_reason: str) -> None:
+def close_qsim_position(call_id: int, exit_price: float, sol_out: float, exit_reason: str,
+                        decision_gap_secs: float | None = None) -> None:
+    """Close a qsim position. `decision_gap_secs` is how long the position went unobserved
+    before the quote that triggered this close — callers pass qsim._decision_gap_secs(), which
+    also prefixes `exit_reason` with 'stale_' past the threshold so a starved decision can
+    never be grouped as a real one."""
     conn = get_conn()
     safe_rollback()
     with conn.cursor() as cur:
@@ -1656,10 +1670,11 @@ def close_qsim_position(call_id: int, exit_price: float, sol_out: float, exit_re
             """
             UPDATE qsim_positions SET
                 exit_price = %s, sol_out = %s, exit_time = NOW(),
-                exit_reason = %s, status = 'closed', updated_at = NOW()
+                exit_reason = %s, decision_gap_secs = %s,
+                status = 'closed', updated_at = NOW()
             WHERE call_id = %s AND status = 'open'
             """,
-            (exit_price, sol_out, exit_reason, call_id),
+            (exit_price, sol_out, exit_reason, decision_gap_secs, call_id),
         )
         conn.commit()
 

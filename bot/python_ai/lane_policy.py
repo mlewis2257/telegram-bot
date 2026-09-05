@@ -400,7 +400,7 @@ LIVE_LANES: dict[tuple[str, str, str], dict] = {
     #
     # Guardrails live in .env (NOT here): LIVE_LANE_STRATEGY=LIVE (use this allowlist, not the wide
     # A bench), MAX_TOTAL_LOSS_SOL=0.35 net since LIVE_PNL_SINCE, MAX_DAILY_LOSS_SOL=0 (no daily
-    # stop), MAX_OPEN_LIVE_POSITIONS=3, EXIT_STRATEGY=paper_a (EXIT_A_PAPER: early + profit_floor,
+    # stop), MAX_OPEN_LIVE_POSITIONS=5 (raised from 3; 5 x 0.05 = 0.25 SOL max exposure), EXIT_STRATEGY=paper_a (EXIT_A_PAPER: early + profit_floor,
     # now enabled for solwhaletrending). "exit"/"size" below are the lane defaults; process-wide
     # EXIT_STRATEGY is the real exit — keep any exit_live_v2 out of .env.
     ("solwhaletrending", "none", "low_score"): {

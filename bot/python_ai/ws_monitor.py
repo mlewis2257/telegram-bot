@@ -508,11 +508,12 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
             # close a real position at a price that never existed.
             eff_mcap_live = min(current_mcap, peak_mcap_live) if peak_mcap_live > 0 else current_mcap
             # Phase 2: real (sell-quote) basis when armed, else the feed triple unchanged.
-            exit_cur, exit_peak, exit_entry, _basis = await live_trader.live_exit_basis(
+            exit_cur, exit_peak, exit_entry, _basis, _raw_mult = await live_trader.live_exit_basis(
                 call_id, position_live, eff_mcap_live, peak_mcap_live, entry_price)
             result_live = live_trader.check_live_exits(
                 call_id, exit_cur, exit_peak, exit_entry,
                 exit_config=_EXIT_LIVE,
+                raw_mult=_raw_mult,
             )
             if result_live.should_exit:
                 # Decision on real basis; record keeps feed exit mcap (exit_price col)
