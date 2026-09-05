@@ -163,6 +163,23 @@ QSIM_POST_EXIT_OBS_MAX_PER_MIN = int(os.getenv("QSIM_POST_EXIT_OBS_MAX_PER_MIN",
 # honest PnL by construction. Default 6x the tick: normal jitter/backoff stays clean, a genuinely
 # unwatched position does not. 0 disables the labelling (NOT recommended).
 QSIM_STALE_DECISION_SECS = float(os.getenv("QSIM_STALE_DECISION_SECS", str(QSIM_TICK_SECS * 6)))
+# ── Adaptive cadence ─────────────────────────────────────────────────────────
+# A quote is only worth spending when it could change a decision. A position sitting at 0.99x
+# is 19 points from its stop and 31 from the bank: quoting it every 30s buys nothing, while a
+# position at 0.85x is 5 points from the stop and needs every tick. On 2026-09-05 three flat
+# drifters took 89.4% of the day's quotes at full cadence (KEYCAT alone 40%, 1,162 quotes at
+# 0.996x) while 19 positions held >20min got 21 quotes BETWEEN them. Cadence now scales with
+# distance to the nearest actionable threshold. Set false to restore the flat tick.
+QSIM_ADAPTIVE_CADENCE   = os.getenv("QSIM_ADAPTIVE_CADENCE", "true").lower() == "true"
+# Cadence multipliers by distance-to-threshold (as a fraction of entry). The far tier is
+# capped so a stretched position can never itself trip the stale-decision label — see
+# _target_cadence_secs, which clamps to half of QSIM_STALE_DECISION_SECS.
+QSIM_CADENCE_NEAR_MULT  = float(os.getenv("QSIM_CADENCE_NEAR_MULT", "0.5"))   # <=5 pts away
+QSIM_CADENCE_MID_MULT   = float(os.getenv("QSIM_CADENCE_MID_MULT", "2.0"))    # <=30 pts away
+QSIM_CADENCE_FAR_MULT   = float(os.getenv("QSIM_CADENCE_FAR_MULT", "3.0"))    # further out
+# Post-exit research probes yield the budget when any open position is this far past its own
+# target cadence (they were 21% of all quotes during the starvation incident).
+QSIM_POST_EXIT_YIELD_OVERDUE = float(os.getenv("QSIM_POST_EXIT_YIELD_OVERDUE", "2.0"))
 QSIM_RUNNER_WINDOW_ENABLED  = os.getenv("QSIM_RUNNER_WINDOW_ENABLED", "true").lower() == "true"
 RUNNER_WINDOW_ARM_MULT      = float(os.getenv("RUNNER_WINDOW_ARM_MULT", "2.0"))
 RUNNER_WINDOW_RELEASE_MULT  = float(os.getenv("RUNNER_WINDOW_RELEASE_MULT", "5.0"))
@@ -173,6 +190,7 @@ RUNNER_WINDOW_PROTECTED_REASONS = {"trail_stop", "profit_floor"}
 _ensured = False
 # monitor-process in-memory state
 _last_quote_ts: dict[int, float] = {}     # call_id -> monotonic time of last sell-quote
+_last_mult: dict[int, float] = {}         # call_id -> last observed real_mult (drives cadence)
 _last_post_exit_quote_ts: dict[int, float] = {}  # call_id -> monotonic time of last post-exit quote
 _runner_window_until: dict[int, float] = {}  # call_id -> monotonic expiry for temporary loose-runner mode
 _qsim_exit_state: dict[int, dict] = {}       # call_id -> named overlay state
@@ -349,6 +367,68 @@ def _apply_runner_window(
         return ExitResult(False), f"runner_window_hold:{result.reason}"
 
     return result, "runner_window_active"
+
+
+def _actionable_thresholds(pos: dict) -> tuple[float, float | None]:
+    """(stop_mult, bank_mult) — the multiples at which a quote would actually DO something.
+
+    stop_mult is the hard stop this position is subject to (vip gamble gets its own). bank_mult
+    is the active overlay's trigger, or None when no overlay is armed. Fixed take-profits and
+    the trail sit far above the bank, so the bank is the binding upper threshold whenever an
+    overlay is on; with no overlay we fall back to the trail arm.
+    """
+    cfg = _qsim_exit_config(pos.get("variant") or "early")
+    stop_mult = max(0.0, 1.0 - _qsim_hard_stop_pct(pos, cfg))
+    bank_mult: float | None = None
+    if _QSIM_EXIT_OVERLAY is not None:
+        bank_mult = _QSIM_EXIT_OVERLAY.bank_mult or _QSIM_EXIT_OVERLAY.lock_trigger_mult
+    elif QSIM_BANK_EXIT_ENABLED and QSIM_BANK_EXIT_MULT > 0:
+        bank_mult = QSIM_BANK_EXIT_MULT
+    else:
+        bank_mult = cfg.trail_peak_min or None
+    return stop_mult, bank_mult
+
+
+def _target_cadence_secs(pos: dict) -> float:
+    """How often THIS position deserves a quote, from its distance to the nearest threshold.
+
+    Never quoted yet -> fastest tier (an unpriced position is pure unknown). The result is
+    clamped to half of QSIM_STALE_DECISION_SECS so a deliberately stretched cadence can never
+    be the reason a close gets labelled stale — the label must only ever mean starvation.
+    """
+    if not QSIM_ADAPTIVE_CADENCE:
+        return QSIM_TICK_SECS
+
+    ceiling = QSIM_TICK_SECS * QSIM_CADENCE_FAR_MULT
+    if QSIM_STALE_DECISION_SECS > 0:
+        ceiling = min(ceiling, QSIM_STALE_DECISION_SECS * 0.5)
+
+    mult = _last_mult.get(pos["call_id"])
+    if mult is None:
+        return min(QSIM_TICK_SECS * QSIM_CADENCE_NEAR_MULT, ceiling)
+
+    stop_mult, bank_mult = _actionable_thresholds(pos)
+    distances = []
+    if stop_mult > 0:
+        distances.append(mult - stop_mult)        # how far ABOVE the stop
+    if bank_mult and bank_mult > 0:
+        distances.append(bank_mult - mult)        # how far BELOW the bank
+    if not distances:
+        return min(QSIM_TICK_SECS, ceiling)
+
+    # Rounded before comparison: 1.3 - 1.15 is 0.15000000000000002 in binary float, which
+    # would drop a position sitting exactly on a tier edge (e.g. 1.25x, five points from the
+    # bank) into the SLOWER tier — the opposite of what the tiers are for.
+    nearest = round(min(distances), 6)
+    if nearest <= 0.05:                            # about to trigger, or already past
+        factor = QSIM_CADENCE_NEAR_MULT
+    elif nearest <= 0.15:
+        factor = 1.0
+    elif nearest <= 0.30:
+        factor = QSIM_CADENCE_MID_MULT
+    else:
+        factor = QSIM_CADENCE_FAR_MULT
+    return min(QSIM_TICK_SECS * factor, ceiling)
 
 
 def _quote_quality(pos: dict) -> dict:
@@ -571,6 +651,7 @@ async def _qsim_tick(pos: dict) -> None:
     _noroute_streak.pop(call_id, None)
 
     real_mult   = sol_out / sol_in
+    _last_mult[call_id] = real_mult      # drives this position's next cadence
     synth_cur   = entry * real_mult
     cfg = _qsim_exit_config(pos.get("variant") or "early")
     raw_hard_stop_pct = _qsim_hard_stop_pct(pos, cfg)
@@ -730,6 +811,7 @@ async def _qsim_post_exit_tick(pos: dict) -> None:
 
 def _cleanup(call_id: int) -> None:
     _last_quote_ts.pop(call_id, None)
+    _last_mult.pop(call_id, None)
     _noroute_streak.pop(call_id, None)
     _runner_window_until.pop(call_id, None)
     _qsim_exit_state.pop(call_id, None)
@@ -746,6 +828,12 @@ async def run_qsim_monitor() -> None:
           f"limit={QSIM_POST_EXIT_OBS_LIMIT} cap={QSIM_POST_EXIT_OBS_MAX_PER_MIN}/min")
     print(f"[qsim] bank exit enabled={QSIM_BANK_EXIT_ENABLED} mult={QSIM_BANK_EXIT_MULT:g}x")
     print(f"[qsim] exit overlay: {_QSIM_EXIT_OVERLAY.name if _QSIM_EXIT_OVERLAY else 'none'}")
+    print(f"[qsim] adaptive cadence: ON — base {QSIM_TICK_SECS:g}s, "
+          f"near {QSIM_TICK_SECS * QSIM_CADENCE_NEAR_MULT:g}s / far "
+          f"{min(QSIM_TICK_SECS * QSIM_CADENCE_FAR_MULT, QSIM_STALE_DECISION_SECS * 0.5):g}s, "
+          f"most-overdue-first"
+          if QSIM_ADAPTIVE_CADENCE else
+          f"[qsim] adaptive cadence: OFF — flat {QSIM_TICK_SECS:g}s, most-overdue-first")
     print(f"[qsim] stale-decision threshold: {QSIM_STALE_DECISION_SECS:g}s "
           f"(closes decided on an older quote are labelled stale_*)"
           if QSIM_STALE_DECISION_SECS > 0 else
@@ -765,17 +853,40 @@ async def run_qsim_monitor() -> None:
             if QSIM_ENABLED and time.monotonic() >= _backoff_until:
                 now = time.monotonic()
                 positions = db.get_open_qsim_positions()
+                # MOST-OVERDUE FIRST. The old loop iterated oldest-entry-first and `break`ed on
+                # budget exhaustion, so scarcity fell entirely on the TAIL — the newest
+                # positions, which are the ones actually near their thresholds. That turned a
+                # ~3x shortage into a total blackout for 19 positions on 2026-09-05 while three
+                # old drifters were served every 33s. Ranking by how far past its OWN target
+                # cadence each position is spreads the shortage proportionally: everyone
+                # degrades a little instead of a few going blind. Never-quoted positions sort
+                # first (inf) — an unpriced position is pure unknown. This also strictly
+                # supersedes e81d4d7's oldest-first zombie fix: a zombie is, by definition,
+                # the most overdue thing in the queue.
+                due: list[tuple[float, int, dict]] = []
                 for pos in positions:
                     cid = pos["call_id"]
-                    # per-position cadence
-                    if now - _last_quote_ts.get(cid, 0.0) < QSIM_TICK_SECS:
-                        continue
+                    target = _target_cadence_secs(pos)
+                    last = _last_quote_ts.get(cid)
+                    overdue = float("inf") if last is None else (now - last) / max(target, 1e-6)
+                    if overdue >= 1.0:
+                        due.append((overdue, cid, pos))
+                due.sort(key=lambda item: (-item[0], item[1]))
+                worst_overdue = due[0][0] if due else 0.0
+                for _overdue, _cid, pos in due:
                     if not _budget_ok():
                         break   # over budget this minute — the rest wait for the next pass
                     await _qsim_tick(pos)
                     if time.monotonic() < _backoff_until:
                         break   # a 429 mid-pass tripped backoff — stop quoting immediately
-                if QSIM_POST_EXIT_OBS_ENABLED and time.monotonic() >= _backoff_until:
+                # Post-exit probes are RESEARCH. They share the main budget, so they must yield
+                # while any live position is badly overdue — otherwise opportunity-mapping data
+                # is bought with the quotes that decide real exits.
+                _probes_yield = worst_overdue >= QSIM_POST_EXIT_YIELD_OVERDUE
+                if _probes_yield and QSIM_POST_EXIT_OBS_ENABLED:
+                    print(f"[qsim] post-exit probes yielding — an open position is "
+                          f"{worst_overdue:.1f}x past its target cadence")
+                if QSIM_POST_EXIT_OBS_ENABLED and not _probes_yield and time.monotonic() >= _backoff_until:
                     closed_positions = db.get_recent_closed_qsim_positions_for_post_exit(
                         QSIM_POST_EXIT_OBS_MINS,
                         QSIM_POST_EXIT_OBS_LIMIT,

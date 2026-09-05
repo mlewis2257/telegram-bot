@@ -587,12 +587,58 @@ rows carry no measure of how stale the quote driving the exit was. Live is curre
 its cadence is driven by the watchlist rather than a fixed tick, but this is the same class of
 gap and should be closed before live restarts.
 
-STILL TO DO — #3, the cause rather than the symptom: serve most-overdue-first instead of
-oldest-first so scarcity spreads evenly, and scale cadence by distance-to-threshold instead of
-uniformly (a position at 0.99x is 19 points from its stop and does not need 30s quoting; one at
-0.85x does). That cuts demand enough to drop the cap back toward 20. #4 (admission control:
-refuse to open a position the monitor cannot service, mirroring MAX_OPEN_LIVE_POSITIONS) is the
-permanent structural guarantee.
+### #3 SHIPPED 2026-09-05 — adaptive cadence + most-overdue-first scheduling
+
+Two defects caused the blackout, both in the monitor loop:
+
+1. **Uniform cadence.** Every position got 30s regardless of whether a quote could change
+   anything. Cadence now scales with distance to the nearest ACTIONABLE threshold (the hard
+   stop below, the bank overlay above):
+
+   | distance to nearest threshold | cadence |
+   |---|---|
+   | <= 5 pts (about to trigger) | 15s |
+   | <= 15 pts | 30s |
+   | <= 30 pts | 60s |
+   | further / flat drifter | 90s |
+   | never quoted yet | 15s |
+
+   Clamped to half of `QSIM_STALE_DECISION_SECS`, so a deliberately stretched cadence can
+   never itself trip a stale label — that label must only ever mean starvation. Tier bounds
+   are rounded before comparison because `1.3 - 1.15` is `0.15000000000000002` in float, which
+   would drop a position sitting exactly on an edge into the slower tier.
+
+2. **Priority inversion.** The loop iterated oldest-entry-first and `break`ed when the budget
+   ran out, so scarcity fell entirely on the tail — the newest positions, which are the ones
+   near their thresholds. It now ranks by how far past its OWN target cadence each position is
+   and serves the most overdue first. Never-quoted positions sort first. This strictly
+   supersedes `e81d4d7`'s oldest-first zombie fix: a zombie is by definition the most overdue
+   thing in the queue.
+
+Post-exit probes now yield the shared budget entirely when any open position is
+`QSIM_POST_EXIT_YIELD_OVERDUE` (2x) past its target — research must not be bought with the
+quotes that decide real exits.
+
+Simulated against the incident's exact conditions (21 concurrent, the real multiples):
+
+| budget | scheduler | never quoted | worst gap | drifter's share |
+|---|---|---|---|---|
+| 10/min | old | **11 / 21** | **60.0 min** | 10% |
+| 10/min | new | 0 / 21 | 5.2 min | 3% |
+| 50/min | old | 0 / 21 | 0.6 min | 5% |
+| 50/min | new | 0 / 21 | 1.1 min | 2% |
+
+At the starved budget the old loop blacked out half the book; the new one keeps everyone
+observed and degrades visibly (and any close still decided across a >180s gap gets labelled).
+At the current 50/min both are healthy, but the new one reallocates: the flat drifter drops
+from 5% to 2% of spend while positions near a threshold get 15s instead of 30s. New worst gap
+is 1.1 min rather than 0.6 because far positions sit at 90s deliberately — still well inside
+the 180s stale bound by construction.
+
+STILL TO DO — #4, admission control: refuse to open a position the monitor cannot service at
+target cadence (record `skipped_budget`), mirroring `MAX_OPEN_LIVE_POSITIONS`. That is the only
+fix that holds regardless of volume, and it closes the qsim/live position-cap divergence at the
+same time. Once #3 has a day of data, the cap can likely come back down to 20.
 
 ### qsim has no position cap; live has 5
 
