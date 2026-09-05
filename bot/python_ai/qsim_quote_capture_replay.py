@@ -560,6 +560,15 @@ WITH base AS (
       AND (%(channel)s = 'any' OR COALESCE(ch.handle, '?') = %(channel)s)
       AND (%(lane)s = 'any' OR COALESCE(c.skip_reason, 'none') = %(lane)s)
       AND (%(variant)s = 'any' OR q.variant = %(variant)s)
+      -- DATA QUALITY. A starved row is not a strategy observation: the 2026-09-05 incident
+      -- left positions quoted ONCE in four hours, whose single quote is simultaneously their
+      -- "peak" and their "exit". Replaying a policy over that path measures the outage, not
+      -- the policy. Stale rows are excluded by default (--include-stale to override); NULL
+      -- quality columns mean "not yet backfilled", and are kept so an un-backfilled window
+      -- still returns rows rather than silently reading as empty.
+      AND (%(include_stale)s OR left(COALESCE(q.exit_reason, ''), 6) <> 'stale_')
+      AND (%(min_obs)s <= 0 OR COALESCE(q.obs_count, %(min_obs)s) >= %(min_obs)s)
+      AND (%(max_gap_secs)s <= 0 OR COALESCE(q.max_gap_secs, 0) <= %(max_gap_secs)s)
       AND (%(min_entry_ratio)s IS NULL OR q.entry_price / NULLIF(sp.entry_price, 0) >= %(min_entry_ratio)s)
       AND (%(max_entry_ratio)s IS NULL OR q.entry_price / NULLIF(sp.entry_price, 0) <= %(max_entry_ratio)s)
       AND (%(raw)s OR NOT (
@@ -2323,6 +2332,17 @@ def main() -> None:
         default=[],
         help="pre-filter rows with a numeric condition; repeat for combos",
     )
+    parser.add_argument("--include-stale", action="store_true",
+                        help="include rows whose close was decided on a stale quote "
+                             "(exit_reason stale_*). Off by default — those paths measure the "
+                             "quote outage, not the strategy.")
+    parser.add_argument("--min-obs", type=int, default=0,
+                        help="minimum priced quote observations over the position's life "
+                             "(qsim_positions.obs_count). 0 = off. Try 5+ for policy work.")
+    parser.add_argument("--max-gap-secs", type=float, default=0.0,
+                        help="reject rows with a blind hole longer than this anywhere in the "
+                             "position's life (qsim_positions.max_gap_secs). 0 = off. A hole "
+                             "can hide a 1.3x touch that fell back before the next quote.")
     parser.add_argument("--require-qobs", action="store_true",
                         help="only include rows with quote observations")
     parser.add_argument("--limit", type=int, default=50)
@@ -2380,6 +2400,9 @@ def main() -> None:
         "max_qmax": args.max_qmax,
         "include_post_exit": args.include_post_exit,
         "post_exit_mins": args.post_exit_mins,
+        "include_stale": args.include_stale,
+        "min_obs": args.min_obs,
+        "max_gap_secs": args.max_gap_secs,
     }
 
     rows = _rows(params)
@@ -2398,6 +2421,8 @@ def main() -> None:
         f"filters: days={args.days} channel={args.channel} lane={args.lane} "
         f"variant={args.variant} since={args.since} min_entry_ratio={args.min_entry_ratio} "
         f"max_entry_ratio={args.max_entry_ratio} require_qobs={args.require_qobs} "
+        f"include_stale={args.include_stale} min_obs={args.min_obs} "
+        f"max_gap_secs={args.max_gap_secs:g} "
         f"max_qmax={args.max_qmax} include_post_exit={args.include_post_exit} "
         f"post_exit_mins={args.post_exit_mins:g} fallback={args.fallback} "
         f"fallback_hard_stop_pct={args.fallback_hard_stop_pct:g} "

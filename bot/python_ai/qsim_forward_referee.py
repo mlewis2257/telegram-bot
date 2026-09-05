@@ -80,6 +80,12 @@ def _verdict(qsim_n: int, qmax_n: int, coverage: float, current: float,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Daily qmax-covered referee table.")
+    parser.add_argument("--include-stale", action="store_true",
+                        help="include rows closed on a stale quote (exit_reason stale_*)")
+    parser.add_argument("--min-obs", type=int, default=0,
+                        help="minimum priced observations over the position's life (0 = off)")
+    parser.add_argument("--max-gap-secs", type=float, default=0.0,
+                        help="reject rows with a blind hole longer than this (0 = off)")
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--since", default=None, help="only include qsim entries at/after this timestamp")
     parser.add_argument("--channel", default="solwhaletrending")
@@ -125,6 +131,9 @@ def main() -> None:
         "max_qmax": args.max_qmax,
         "include_post_exit": args.include_post_exit,
         "post_exit_mins": args.post_exit_mins,
+        "include_stale": args.include_stale,
+        "min_obs": args.min_obs,
+        "max_gap_secs": args.max_gap_secs,
     }
     rows = replay._rows(params)
     by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)

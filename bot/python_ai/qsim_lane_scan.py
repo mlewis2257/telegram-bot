@@ -76,6 +76,11 @@ WITH base AS (
       AND (%(channel)s = 'any' OR COALESCE(ch.handle, '?') = %(channel)s)
       AND (%(lane)s = 'any' OR COALESCE(c.skip_reason, 'none') = %(lane)s)
       AND (%(variant)s = 'any' OR q.variant = %(variant)s)
+      -- DATA QUALITY — see qsim_quote_capture_replay.py. Starved rows measure the quote
+      -- outage, not the strategy; excluded by default.
+      AND (%(include_stale)s OR left(COALESCE(q.exit_reason, ''), 6) <> 'stale_')
+      AND (%(min_obs)s <= 0 OR COALESCE(q.obs_count, %(min_obs)s) >= %(min_obs)s)
+      AND (%(max_gap_secs)s <= 0 OR COALESCE(q.max_gap_secs, 0) <= %(max_gap_secs)s)
       AND (%(min_entry_ratio)s IS NULL OR q.entry_price / NULLIF(sp.entry_price, 0) >= %(min_entry_ratio)s)
       AND (%(max_entry_ratio)s IS NULL OR q.entry_price / NULLIF(sp.entry_price, 0) <= %(max_entry_ratio)s)
       AND (%(raw)s OR NOT (
@@ -186,6 +191,12 @@ def main() -> None:
     parser.add_argument("--channel", default="any")
     parser.add_argument("--lane", default="any")
     parser.add_argument("--variant", default="any")
+    parser.add_argument("--include-stale", action="store_true",
+                        help="include rows closed on a stale quote (exit_reason stale_*)")
+    parser.add_argument("--min-obs", type=int, default=0,
+                        help="minimum priced observations over the position's life (0 = off)")
+    parser.add_argument("--max-gap-secs", type=float, default=0.0,
+                        help="reject rows with a blind hole longer than this (0 = off)")
     parser.add_argument("--min-n", type=int, default=15)
     parser.add_argument("--min-entry-ratio", type=float, default=None)
     parser.add_argument("--max-entry-ratio", type=float, default=None)
@@ -212,6 +223,9 @@ def main() -> None:
         "max_peak": MAX_SANE_PEAK,
         "max_pnl": MAX_SANE_PNL_PCT,
         "min_pnl": MIN_SANE_PNL_PCT,
+        "include_stale": args.include_stale,
+        "min_obs": args.min_obs,
+        "max_gap_secs": args.max_gap_secs,
     }
 
     groups: dict[tuple[str, str, str], list[replay.ReplayRow]] = defaultdict(list)
