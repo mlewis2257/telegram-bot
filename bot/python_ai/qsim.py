@@ -173,7 +173,6 @@ RUNNER_WINDOW_PROTECTED_REASONS = {"trail_stop", "profit_floor"}
 _ensured = False
 # monitor-process in-memory state
 _last_quote_ts: dict[int, float] = {}     # call_id -> monotonic time of last sell-quote
-_last_quote_wall: dict[int, datetime] = {}  # call_id -> WALL time of last sell-quote (staleness)
 _last_post_exit_quote_ts: dict[int, float] = {}  # call_id -> monotonic time of last post-exit quote
 _runner_window_until: dict[int, float] = {}  # call_id -> monotonic expiry for temporary loose-runner mode
 _qsim_exit_state: dict[int, dict] = {}       # call_id -> named overlay state
@@ -352,22 +351,18 @@ def _apply_runner_window(
     return result, "runner_window_active"
 
 
-def _decision_gap_secs(pos: dict, prior_quote_at: datetime | None) -> float | None:
-    """Seconds this position went UNOBSERVED before the quote now closing it.
+def _quote_quality(pos: dict) -> dict:
+    """Observation quality for the position being closed, read from qsim_quote_observations.
 
-    Measured from the previous sell-quote, or from entry_time when this is the first quote
-    (a position quoted once after four hours was blind for four hours, not for one tick).
-    Returns None only when neither timestamp is usable — never fabricate a clean gap.
+    Deliberately DB-derived rather than in-memory: process state dies on `pm2 restart`, which
+    would make a well-quoted position look blind since entry and mislabel a perfectly good
+    close as stale. This also guarantees the monitor and qsim_backfill_decision_gap.py apply
+    one identical rule (db.get_qsim_quote_quality) instead of two that can drift.
+
+    Call AFTER the closing observation is inserted, so last_gap_secs is the real gap the exit
+    decision was made across.
     """
-    ref = prior_quote_at or pos.get("entry_time")
-    if ref is None:
-        return None
-    try:
-        if ref.tzinfo is None:
-            ref = ref.replace(tzinfo=timezone.utc)
-        return max(0.0, (datetime.now(timezone.utc) - ref).total_seconds())
-    except Exception:
-        return None
+    return db.get_qsim_quote_quality(pos["call_id"], pos.get("entry_time"))
 
 
 def _stale_reason(reason: str, gap_secs: float | None) -> str:
@@ -534,9 +529,6 @@ async def _qsim_tick(pos: dict) -> None:
     if sol_in <= 0 or entry <= 0 or tokens <= 0:
         return
 
-    # Captured BEFORE this tick stamps its own time: how long the position has been blind.
-    prior_quote_at = _last_quote_wall.get(call_id)
-
     try:
         sol_out = await jupiter.get_sell_quote(mint, tokens, raise_on_ratelimit=True)
     except jupiter.RateLimitError:
@@ -554,8 +546,6 @@ async def _qsim_tick(pos: dict) -> None:
         return
     _quote_window.append(time.monotonic())
     _last_quote_ts[call_id] = time.monotonic()
-    _last_quote_wall[call_id] = datetime.now(timezone.utc)
-    gap_secs = _decision_gap_secs(pos, prior_quote_at)
 
     if sol_out is None or sol_out <= 0:
         # No sell route = the bag isn't sellable (rug/illiquid). After a streak, realize it at 0.
@@ -567,9 +557,12 @@ async def _qsim_tick(pos: dict) -> None:
             note="sell quote no-route",
         )
         if _noroute_streak[call_id] >= QSIM_RUG_FAILS:
+            q = _quote_quality(pos)
+            gap_secs = q["last_gap_secs"]
             reason = _stale_reason("rug", gap_secs)
             db.close_qsim_position(call_id, exit_price=0.0, sol_out=0.0, exit_reason=reason,
-                                   decision_gap_secs=gap_secs)
+                                   decision_gap_secs=gap_secs,
+                                   max_gap_secs=q["max_gap_secs"], obs_count=q["obs_count"])
             peak_guard.clear(f"qsim:{call_id}")
             _cleanup(call_id)
             print(f"[qsim] CLOSE {symbol} call_id={call_id} {reason} "
@@ -594,9 +587,12 @@ async def _qsim_tick(pos: dict) -> None:
             noroute_streak=0,
             note="raw_exec_hard_stop",
         )
+        q = _quote_quality(pos)
+        gap_secs = q["last_gap_secs"]
         reason = _stale_reason("hard_stop", gap_secs)
         db.close_qsim_position(call_id, exit_price=synth_cur, sol_out=sol_out,
-                               exit_reason=reason, decision_gap_secs=gap_secs)
+                               exit_reason=reason, decision_gap_secs=gap_secs,
+                               max_gap_secs=q["max_gap_secs"], obs_count=q["obs_count"])
         peak_guard.clear(f"qsim:{call_id}")
         peak_guard.clear(f"qsimT:{call_id}")
         _cleanup(call_id)
@@ -666,10 +662,13 @@ async def _qsim_tick(pos: dict) -> None:
         note=";".join(note for note in (overlay_note, runner_note) if note),
     )
     if result.should_exit:
+        q = _quote_quality(pos)
+        gap_secs = q["last_gap_secs"]
         reason = _stale_reason(result.reason, gap_secs)
         db.close_qsim_position(call_id, exit_price=(result.exit_mcap or eff_cur),
                                sol_out=sol_out, exit_reason=reason,
-                               decision_gap_secs=gap_secs)
+                               decision_gap_secs=gap_secs,
+                               max_gap_secs=q["max_gap_secs"], obs_count=q["obs_count"])
         peak_guard.clear(f"qsim:{call_id}")
         peak_guard.clear(f"qsimT:{call_id}")
         _cleanup(call_id)
@@ -731,7 +730,6 @@ async def _qsim_post_exit_tick(pos: dict) -> None:
 
 def _cleanup(call_id: int) -> None:
     _last_quote_ts.pop(call_id, None)
-    _last_quote_wall.pop(call_id, None)
     _noroute_streak.pop(call_id, None)
     _runner_window_until.pop(call_id, None)
     _qsim_exit_state.pop(call_id, None)

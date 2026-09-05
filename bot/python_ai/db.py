@@ -1525,6 +1525,18 @@ def ensure_qsim_positions_table() -> None:
         cur.execute(
             "ALTER TABLE qsim_positions ADD COLUMN IF NOT EXISTS decision_gap_secs numeric"
         )
+        # max_gap_secs / obs_count describe the WHOLE life, not just the close. decision_gap
+        # only proves the EXIT was honest; a position can end on a fresh quote yet have been
+        # blind for 10 minutes mid-life, crossing 1.3x and falling back unseen. That trade is
+        # wrong even though its exit is clean, and the bias is one-way (missed banks, never
+        # missed losses). peak_multiplier is also derived only from observations, so it is
+        # only meaningful when obs_count is high.
+        cur.execute(
+            "ALTER TABLE qsim_positions ADD COLUMN IF NOT EXISTS max_gap_secs numeric"
+        )
+        cur.execute(
+            "ALTER TABLE qsim_positions ADD COLUMN IF NOT EXISTS obs_count integer"
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_qsim_status ON qsim_positions (status)")
         cur.execute(
             """
@@ -1657,8 +1669,70 @@ def update_qsim_peak(call_id: int, peak_mcap: float, peak_mult: float) -> bool:
         return cur.rowcount > 0
 
 
+_QSIM_QUALITY_SQL = """
+WITH obs AS (
+    SELECT qo.observed_at
+    FROM qsim_quote_observations qo
+    WHERE qo.call_id = %(call_id)s
+      AND qo.rate_limited = false
+      AND qo.note IS DISTINCT FROM 'post_exit_probe'
+      -- +5s grace, see qsim_backfill_decision_gap.py; the live monitor passes
+      -- until=NULL (no bound) since it closes before exit_time exists.
+      AND (%(until)s::timestamptz IS NULL
+           OR qo.observed_at <= %(until)s::timestamptz + interval '5 seconds')
+),
+seq AS (
+    SELECT observed_at,
+           COALESCE(lag(observed_at) OVER (ORDER BY observed_at),
+                    %(entry_time)s::timestamptz) AS prev_at
+    FROM obs
+)
+SELECT
+    (SELECT count(*) FROM obs)                                              AS obs_count,
+    MAX(EXTRACT(epoch FROM (observed_at - prev_at)))                        AS max_gap_secs,
+    (SELECT EXTRACT(epoch FROM (observed_at - prev_at))
+       FROM seq ORDER BY observed_at DESC LIMIT 1)                          AS last_gap_secs
+FROM seq
+"""
+
+
+def get_qsim_quote_quality(call_id: int, entry_time, until=None) -> dict:
+    """Observation-quality stats for one qsim position, computed from the observations table.
+
+    THE single definition of qsim data quality — the monitor calls it at close time and
+    qsim_backfill_decision_gap.py calls it for historical rows, so live labelling and
+    backfilled labelling can never drift apart. Deliberately NOT in-memory: process state is
+    lost on restart, which would make a well-quoted position look blind since entry.
+
+    Rate-limited rows are not observations (a 429 saw no price). No-route rows ARE — we looked
+    and the answer was "unsellable". The first gap is measured from entry_time, so a position
+    quoted once four hours in reads as four hours blind, not one tick.
+
+    Returns {obs_count, max_gap_secs, last_gap_secs}; gaps are None when undeterminable.
+    """
+    try:
+        conn = get_conn()
+        safe_rollback()
+        with conn.cursor() as cur:
+            cur.execute(_QSIM_QUALITY_SQL,
+                        {"call_id": call_id, "entry_time": entry_time, "until": until})
+            row = cur.fetchone()
+        if not row:
+            return {"obs_count": 0, "max_gap_secs": None, "last_gap_secs": None}
+        return {
+            "obs_count": int(row[0] or 0),
+            "max_gap_secs": float(row[1]) if row[1] is not None else None,
+            "last_gap_secs": float(row[2]) if row[2] is not None else None,
+        }
+    except Exception as e:
+        print(f"[db] qsim quote quality failed call_id={call_id}: {e}")
+        return {"obs_count": 0, "max_gap_secs": None, "last_gap_secs": None}
+
+
 def close_qsim_position(call_id: int, exit_price: float, sol_out: float, exit_reason: str,
-                        decision_gap_secs: float | None = None) -> None:
+                        decision_gap_secs: float | None = None,
+                        max_gap_secs: float | None = None,
+                        obs_count: int | None = None) -> None:
     """Close a qsim position. `decision_gap_secs` is how long the position went unobserved
     before the quote that triggered this close — callers pass qsim._decision_gap_secs(), which
     also prefixes `exit_reason` with 'stale_' past the threshold so a starved decision can
@@ -1671,10 +1745,12 @@ def close_qsim_position(call_id: int, exit_price: float, sol_out: float, exit_re
             UPDATE qsim_positions SET
                 exit_price = %s, sol_out = %s, exit_time = NOW(),
                 exit_reason = %s, decision_gap_secs = %s,
+                max_gap_secs = %s, obs_count = %s,
                 status = 'closed', updated_at = NOW()
             WHERE call_id = %s AND status = 'open'
             """,
-            (exit_price, sol_out, exit_reason, decision_gap_secs, call_id),
+            (exit_price, sol_out, exit_reason, decision_gap_secs,
+             max_gap_secs, obs_count, call_id),
         )
         conn.commit()
 

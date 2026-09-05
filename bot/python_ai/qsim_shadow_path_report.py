@@ -132,7 +132,13 @@ LEFT JOIN LATERAL (
 ) obs ON TRUE
 LEFT JOIN LATERAL (
     SELECT
-        COUNT(*) AS qobs_count,
+        -- Only PRICED observations count as coverage. qobs_count is used solely as a
+        -- `> 0` gate (replay --require-qobs, lane_scan join, forward_referee's
+        -- referee-grade test), and counting 429/no-route rows made a row with zero
+        -- usable quotes read as covered — which is how the 2026-09-05 starved window
+        -- passed the referee. (qsim_positions.obs_count is a different question —
+        -- 'did we look' — so it does count no-route.)
+        COUNT(*) FILTER (WHERE qo.real_mult IS NOT NULL) AS qobs_count,
         COUNT(*) FILTER (WHERE qo.should_exit) AS qobs_exit_signals,
         COUNT(*) FILTER (WHERE qo.no_route) AS qobs_no_routes,
         MAX(qo.real_mult) AS max_qobs_mult,
@@ -191,14 +197,28 @@ def _ratio(num, den) -> float | None:
     return _f(num) / den
 
 
+def _strip_stale(reason: str | None) -> str | None:
+    """`stale_hard_stop` -> `hard_stop`. Comparison-only; the raw value stays visible."""
+    if reason and reason.startswith("stale_"):
+        return reason[len("stale_"):]
+    return reason
+
+
 def _reason_is_bank(reason: str | None) -> bool:
     return reason in {"profit_floor", "trail_stop", "5x_tp", "10x_tp", "50x_tp"}
 
 
 def _bucket(row: dict, edge: float, entry_ratio: float | None,
             peak_gap: float | None, reason_pair: str) -> str:
-    q_reason = row.get("qsim_reason")
+    # qsim now writes `stale_<reason>` when a close was decided on a stale quote (see
+    # qsim._stale_reason). Strip the prefix for COMPARISON so the reason logic below still
+    # matches, but surface staleness as its own verdict first — a qsim/shadow disagreement on
+    # a starved row is explained by the starvation, not by any real path difference.
+    q_reason_raw = row.get("qsim_reason") or ""
+    q_reason = _strip_stale(q_reason_raw)
     s_reason = row.get("shadow_reason")
+    if q_reason_raw.startswith("stale_"):
+        return "qsim_starved_decision"
     obs_count = int(row.get("obs_count") or 0)
     max_after = _f(row.get("max_ws_after_qsim_mult"))
     max_ws = _f(row.get("max_ws_mult"))

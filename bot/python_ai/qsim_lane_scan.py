@@ -95,7 +95,13 @@ SELECT
 FROM base b
 JOIN LATERAL (
     SELECT
-        COUNT(*) AS qobs_count,
+        -- Only PRICED observations count as coverage. qobs_count is used solely as a
+        -- `> 0` gate (replay --require-qobs, lane_scan join, forward_referee's
+        -- referee-grade test), and counting 429/no-route rows made a row with zero
+        -- usable quotes read as covered — which is how the 2026-09-05 starved window
+        -- passed the referee. (qsim_positions.obs_count is a different question —
+        -- 'did we look' — so it does count no-route.)
+        COUNT(*) FILTER (WHERE qo.real_mult IS NOT NULL) AS qobs_count,
         MAX(qo.real_mult) AS max_qobs_mult,
         COALESCE(
             jsonb_agg(

@@ -543,8 +543,24 @@ automatically, including ad-hoc SQL that has never heard of `decision_gap_secs`.
 can be ignored; a different label cannot. PnL columns are untouched — the data is preserved,
 only the label is made honest.
 
+`decision_gap_secs` only proves the EXIT was honest. Two more columns describe the whole life:
+
+- `max_gap_secs` — worst hole ANYWHERE in the position (first gap measured from entry). A row
+  can end on a fresh quote yet have been blind for 10 minutes mid-life, crossing 1.3x and
+  falling back unseen. That trade is wrong even though its exit is clean, and the bias is
+  one-way: missed banks, never missed losses.
+- `obs_count` — real quotes over the whole life. Also the only thing that makes
+  `peak_multiplier` meaningful, since the peak is ratcheted purely from observations (a
+  1-observation row reports peak == exit, i.e. "never went up", which is usually false).
+
+All three are computed by ONE function, `db.get_qsim_quote_quality()`, called by the monitor at
+close and by the backfill for history — so live and backfilled labelling cannot drift apart.
+Deliberately DB-derived, not in-memory: process state dies on `pm2 restart`, which would make a
+well-quoted position look blind since entry and mislabel a good close as stale.
+
 Retroactive: `qsim_backfill_decision_gap.py` applies the identical rule to already-collected
-rows, so a starved window is salvaged rather than discarded. Dry-run by default.
+rows, so a starved window is salvaged rather than discarded. Dry-run by default; `--include-open`
+also stamps still-open rows (quality columns only — an open row has no exit to relabel).
 
 ```bash
 python3 qsim_backfill_decision_gap.py --since '2026-09-03 23:00 UTC'          # inspect
@@ -553,6 +569,23 @@ python3 qsim_backfill_decision_gap.py --since '2026-09-03 23:00 UTC' --apply  # 
 
 Reverting is a prefix strip (the script prints the SQL). After backfilling, every honest-PnL
 query should read `WHERE exit_reason NOT LIKE 'stale\_%'`.
+
+Related gaps closed in the same pass (2026-09-05 audit):
+
+- `qobs_count` in `qsim_quote_capture_replay.py` / `qsim_lane_scan.py` /
+  `qsim_shadow_path_report.py` counted rate-limited and no-route rows, so a position with ZERO
+  usable quotes read as "covered". It is used only as a `> 0` gate — including by
+  `qsim_forward_referee`'s referee-grade test, which is how the starved window passed. Now
+  `COUNT(*) FILTER (WHERE real_mult IS NOT NULL)`.
+- `qsim_shadow_path_report.py` compared `q_reason == "hard_stop"`, which a `stale_hard_stop`
+  silently fails. It now strips the prefix for comparison and returns a `qsim_starved_decision`
+  verdict first, so a starved row is explained by starvation rather than by a fake path
+  difference.
+
+KNOWN, NOT YET CLOSED: the live path has no equivalent staleness record. `trading_positions`
+rows carry no measure of how stale the quote driving the exit was. Live is currently OFF, and
+its cadence is driven by the watchlist rather than a fixed tick, but this is the same class of
+gap and should be closed before live restarts.
 
 STILL TO DO — #3, the cause rather than the symptom: serve most-overdue-first instead of
 oldest-first so scarcity spreads evenly, and scale cadence by distance-to-threshold instead of
