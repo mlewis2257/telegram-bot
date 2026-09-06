@@ -126,6 +126,42 @@ RUNNER_WINDOW_POLICIES = (
         "release": 5.0,
     },
 )
+# PARTIAL BANK + RUNNER. Unlike bor_* (which only enters runner mode if the FIRST bank quote
+# already shows strength, and so almost never fired), this always keeps a runner slice back.
+# Motivated by the 2026-09-05 post-exit measurement: of 40 banked trades, 16 (40%) went on to
+# reach 2x AFTER bank_1p3x sold, 6 reached 3x, 3 reached 5x (IBRL 2.19 -> 6.09, CAT 1.88 ->
+# 5.47, CLIFFORD 1.55 -> 5.32). bank_1p3x is systematically selling the front of a real move.
+#
+# WARNING ON MEASUREMENT: the runner leg exits LATER than qsim did, so replaying it needs quote
+# data past the real exit — i.e. --include-post-exit. That is the case the handoff flags as
+# opportunity mapping rather than live-capturable PnL. It is only trustworthy to the extent the
+# post-exit sampling is dense enough to see both the peak and the drawdown through it; at the
+# 60s cadence in use before 2026-09-05 it was not (median ~2.3 min between quotes), which is
+# why the probe cadence was tightened to 30s. Read these rows as an upper bound until the
+# denser data lands.
+PARTIAL_BANK_RUNNER_POLICIES = (
+    {   # the concrete shape proposed 2026-09-05: sell 70% at 1.3x, run 30%
+        "name": "pbr_b1p3_s70_t2x_f1p1_tr30_w10m",
+        "bank": 1.30, "fraction": 0.70, "runner_arm": 0.0,
+        "target": 2.0, "floor": 1.10, "trail_pct": 0.30, "window_mins": 10.0,
+    },
+    {   # keep a bigger runner
+        "name": "pbr_b1p3_s50_t2x_f1p1_tr30_w10m",
+        "bank": 1.30, "fraction": 0.50, "runner_arm": 0.0,
+        "target": 2.0, "floor": 1.10, "trail_pct": 0.30, "window_mins": 10.0,
+    },
+    {   # let the runner reach for 3x instead of banking it at 2x
+        "name": "pbr_b1p3_s70_t3x_f1p1_tr30_w10m",
+        "bank": 1.30, "fraction": 0.70, "runner_arm": 0.0,
+        "target": 3.0, "floor": 1.10, "trail_pct": 0.30, "window_mins": 10.0,
+    },
+    {   # tighter trail — gives back less of the peak, exits sooner
+        "name": "pbr_b1p3_s70_t2x_f1p1_tr25_w10m",
+        "bank": 1.30, "fraction": 0.70, "runner_arm": 0.0,
+        "target": 2.0, "floor": 1.10, "trail_pct": 0.25, "window_mins": 10.0,
+    },
+)
+
 BANK_OR_RUN_POLICIES = (
     {
         "name": "bor_b1p3_a1p7_t3x_f1p2_w10m_s3",
@@ -1345,6 +1381,97 @@ def _bank_or_run_return(
     return current_return
 
 
+def _partial_bank_runner_return(
+    points: list[tuple[datetime | None, float]],
+    *,
+    bank: float,
+    fraction: float,
+    runner_arm: float,
+    target: float,
+    floor: float,
+    trail_pct: float,
+    window_mins: float,
+    current_return: float,
+) -> float:
+    """
+    Sell `fraction` at the first quote >= bank, then ride the remainder.
+
+    The banked leg is realised at the observed crossing quote — the same executable number
+    every other bank policy uses. The runner leg then exits at whichever comes first:
+        target      quote reaches the target multiple
+        floor       quote falls to the floor (do not let a banked winner round-trip)
+        trail       quote falls trail_pct below the runner's own peak
+        stall       window_mins elapse with no new high (clock resets on each new high)
+    and otherwise at the last observed quote.
+
+    `runner_arm` > 0 additionally requires the bank quote itself to show that much strength
+    before a runner is kept at all; 0 means always keep one, which is the proposed shape.
+    """
+    if not points:
+        return current_return
+
+    banked_mult: float | None = None
+    runner_peak = 0.0
+    last_high_at: float | None = None
+    last_mult = points[-1][1]
+
+    for observed_at, mult in points:
+        last_mult = mult
+        ts = observed_at.timestamp() if observed_at is not None else None
+
+        if banked_mult is None:
+            if mult < bank:
+                continue
+            banked_mult = mult
+            if runner_arm > 0 and mult < runner_arm:
+                return mult - 1.0          # not strong enough — sell the whole position
+            runner_peak = mult
+            last_high_at = ts
+            if mult >= target:             # already at target on the bank quote
+                return mult - 1.0
+            continue
+
+        # ── runner leg ────────────────────────────────────────────────────────
+        banked_return = banked_mult - 1.0
+
+        def blended(exit_mult: float) -> float:
+            return fraction * banked_return + (1.0 - fraction) * (exit_mult - 1.0)
+
+        if mult >= target:
+            return blended(mult)
+        if mult <= floor:
+            return blended(mult)
+        if runner_peak > 0 and mult <= runner_peak * (1.0 - trail_pct):
+            return blended(mult)
+
+        if mult > runner_peak:
+            runner_peak = mult
+            last_high_at = ts
+        elif (
+            last_high_at is not None
+            and ts is not None
+            and ts >= last_high_at + window_mins * 60.0
+        ):
+            return blended(mult)
+
+    if banked_mult is None:
+        return current_return
+    return fraction * (banked_mult - 1.0) + (1.0 - fraction) * (last_mult - 1.0)
+
+
+def _partial_bank_runner_hit_mult(
+    points: list[tuple[datetime | None, float]],
+    *,
+    bank: float,
+    **_ignored,
+) -> float | None:
+    """The bank crossing is the trigger — a row 'hits' when the bank leg fired."""
+    for _observed_at, mult in points:
+        if mult >= bank:
+            return mult
+    return None
+
+
 def _bank_or_run_hit_mult(
     points: list[tuple[datetime | None, float]],
     *,
@@ -1845,6 +1972,19 @@ def _view(
             current_return=fallback_return,
         )
 
+    for policy in PARTIAL_BANK_RUNNER_POLICIES:
+        returns[policy["name"]] = _partial_bank_runner_return(
+            points,
+            bank=policy["bank"],
+            fraction=policy["fraction"],
+            runner_arm=policy["runner_arm"],
+            target=policy["target"],
+            floor=policy["floor"],
+            trail_pct=policy["trail_pct"],
+            window_mins=policy["window_mins"],
+            current_return=fallback_return,
+        )
+
     for policy in BANK_OR_RUN_POLICIES:
         returns[policy["name"]] = _bank_or_run_return(
             points,
@@ -2045,6 +2185,14 @@ def _print_summary(views: list[ReplayRow]) -> None:
     for policy in DYNAMIC_EXIT_POLICIES:
         _print_policy_row(policy["name"], views, current, width=32)
 
+    print("\nPartial Bank + Runner Totals")
+    print("  (runner exits LATER than qsim did — needs --include-post-exit to be meaningful,")
+    print("   and is an UPPER BOUND until post-exit sampling is dense enough to trail on)")
+    print(f"{'policy':<36} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 105)
+    for policy in PARTIAL_BANK_RUNNER_POLICIES:
+        _print_policy_row(policy["name"], views, current, width=36)
+
     print("\nBank-Or-Run Totals")
     print(f"{'policy':<32} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
     print("-" * 101)
@@ -2120,6 +2268,17 @@ def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
                     confirm_ticks=spec["confirm_ticks"],
                     bounce=spec["bounce"],
                     dead_stop=spec["dead_stop"],
+                )
+            ) is not None
+        ]
+    if policy.startswith("pbr_"):
+        spec = next(item for item in PARTIAL_BANK_RUNNER_POLICIES if item["name"] == policy)
+        return [
+            value
+            for view in views
+            if (
+                value := _partial_bank_runner_hit_mult(
+                    _quote_points(view.row), bank=spec["bank"]
                 )
             ) is not None
         ]

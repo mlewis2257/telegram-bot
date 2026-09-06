@@ -265,6 +265,45 @@ Potential future strategy shape:
 - Partial bank could sell 50-75% at 1.3x, then trail or target higher with the rest.
 - But this must be tested live-forward or qsim-forward because replay can over-credit if post-exit data is used incorrectly.
 
+## THE RUNNER FINDING (2026-09-05, measured on real post-exit quotes)
+
+`bank_1p3x` is systematically selling the front of real moves. Of 40 banked trades in the
+09-04/09-05 window, measured on qsim's OWN executable post-exit quotes (not shadow, so the
+shadow entry-inflation problem does not touch this):
+
+| post-exit peak | banks (n=40) | hard stops (n=72) |
+|---|---|---|
+| >= 1.5x | 27 (67.5%) | 5 (6.9%) |
+| >= 2.0x | **16 (40.0%)** | 5 (6.9%) |
+| >= 3.0x | 6 (15.0%) | 0 |
+| >= 5.0x | 3 (7.5%) | 0 |
+
+IBRL banked 2.186 -> 6.086. CAT 1.877 -> 5.473. CLIFFORD 1.546 -> 5.323.
+
+Rough EV of keeping a 30% runner (cost = giving up 30% of the bank on every bank that did not
+run, exiting the runner at a 1.1x floor): **+1.24%/trade at 40% capture of the observed run,
++1.94% at 50%, +3.35% at 70%.** Top 3 runners are 41% of the gain — fat-tailed, but 16 events,
+not one outlier.
+
+WHAT IS AND IS NOT UNCERTAIN: the frequency is solid (16/40, 95% CI roughly [25%, 55%]). The
+CAPTURE FRACTION is not — how much of a run a trailing stop actually gets. That is what the
+post-exit cadence change (60s -> 30s, banks probed first) exists to measure. Post-exit sampling
+was a median of 39 quotes over 90 min, ~2.3 min apart; you cannot simulate a 25-35% trail on
+that (you miss the peak, or miss the trigger on the way down) and the three biggest runners had
+the thinnest coverage (CAT's 5.473x rests on 6 quotes).
+
+Under-sampling MISSES peaks, so 40% is a floor, not a ceiling.
+
+NOT accessible to a runner leg: the 5 hard stops that later recovered past 2x. You already sold
+at the stop. Capturing those means not stopping out — a different and much riskier change.
+
+`pbr_*` policies in the replay implement the shape (sell 70% at 1.3x, runner exits on target /
+1.1x floor / 30% trail from its own peak / 10 min with no new high). Verified against the spec
+on synthetic paths. NOTE from that test: a 2x target DEFEATS the runner on the biggest movers —
+IBRL's bank quote was already 2.186, past the target, so the whole position exits there. The
+`t3x` variant is the one that rides those. Read `pbr_*` rows as an UPPER BOUND until the denser
+post-exit data lands, since the runner exits later than qsim did and needs `--include-post-exit`.
+
 ## THE CLEAN WINDOW PROTOCOL (2026-09-06 onward)
 
 Everything before `2026-09-06 00:00:00 UTC` is research scrap, not evidence. Not only the 19

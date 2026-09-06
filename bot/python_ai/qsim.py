@@ -180,6 +180,12 @@ QSIM_CADENCE_FAR_MULT   = float(os.getenv("QSIM_CADENCE_FAR_MULT", "3.0"))    # 
 # Post-exit research probes yield the budget when any open position is this far past its own
 # target cadence (they were 21% of all quotes during the starvation incident).
 QSIM_POST_EXIT_YIELD_OVERDUE = float(os.getenv("QSIM_POST_EXIT_YIELD_OVERDUE", "2.0"))
+# Post-exit probes on a BANKED exit are the runner counterfactual — the price path a partial
+# position would have ridden after bank_1p3x fired. Probes on a hard stop are recovery
+# research (qsim_recovery_classifier). Both are worth having, but only the banked ones can
+# answer "how much of the run would a trailing stop have captured", so they are served first
+# and never starve. Measured 2026-09-05: 40% of banked trades reached 2x AFTER the bank.
+QSIM_POST_EXIT_BANKS_FIRST = os.getenv("QSIM_POST_EXIT_BANKS_FIRST", "true").lower() == "true"
 QSIM_RUNNER_WINDOW_ENABLED  = os.getenv("QSIM_RUNNER_WINDOW_ENABLED", "true").lower() == "true"
 RUNNER_WINDOW_ARM_MULT      = float(os.getenv("RUNNER_WINDOW_ARM_MULT", "2.0"))
 RUNNER_WINDOW_RELEASE_MULT  = float(os.getenv("RUNNER_WINDOW_RELEASE_MULT", "5.0"))
@@ -825,7 +831,8 @@ async def run_qsim_monitor() -> None:
           f"cap={QSIM_MAX_QUOTES_PER_MIN}/min cadence={QSIM_TICK_SECS}s enabled={QSIM_ENABLED}")
     print(f"[qsim] post-exit probes enabled={QSIM_POST_EXIT_OBS_ENABLED} "
           f"mins={QSIM_POST_EXIT_OBS_MINS:g} cadence={QSIM_POST_EXIT_OBS_CADENCE_SECS:g}s "
-          f"limit={QSIM_POST_EXIT_OBS_LIMIT} cap={QSIM_POST_EXIT_OBS_MAX_PER_MIN}/min")
+          f"limit={QSIM_POST_EXIT_OBS_LIMIT} cap={QSIM_POST_EXIT_OBS_MAX_PER_MIN}/min "
+          f"banks_first={QSIM_POST_EXIT_BANKS_FIRST}")
     print(f"[qsim] bank exit enabled={QSIM_BANK_EXIT_ENABLED} mult={QSIM_BANK_EXIT_MULT:g}x")
     print(f"[qsim] exit overlay: {_QSIM_EXIT_OVERLAY.name if _QSIM_EXIT_OVERLAY else 'none'}")
     print(f"[qsim] adaptive cadence: ON — base {QSIM_TICK_SECS:g}s, "
@@ -891,6 +898,14 @@ async def run_qsim_monitor() -> None:
                         QSIM_POST_EXIT_OBS_MINS,
                         QSIM_POST_EXIT_OBS_LIMIT,
                     )
+                    if QSIM_POST_EXIT_BANKS_FIRST:
+                        # Banked exits first: they are the only rows that can measure the
+                        # runner's capture fraction, and a trail simulated on gappy samples
+                        # is guesswork (you miss the peak, or miss the trigger on the way down).
+                        closed_positions = sorted(
+                            closed_positions,
+                            key=lambda p: 0 if "bank" in (p.get("exit_reason") or "") else 1,
+                        )
                     for pos in closed_positions:
                         cid = pos["call_id"]
                         if now - _last_post_exit_quote_ts.get(cid, 0.0) < QSIM_POST_EXIT_OBS_CADENCE_SECS:
