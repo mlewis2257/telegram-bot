@@ -265,6 +265,45 @@ Potential future strategy shape:
 - Partial bank could sell 50-75% at 1.3x, then trail or target higher with the rest.
 - But this must be tested live-forward or qsim-forward because replay can over-credit if post-exit data is used incorrectly.
 
+## THE CLEAN WINDOW PROTOCOL (2026-09-06 onward)
+
+Everything before `2026-09-06 00:00:00 UTC` is research scrap, not evidence. Not only the 19
+starved rows — the whole window ran with the quote budget pinned at ~100%, so cadence was ~60s
+and hard stops realized -30% against a configured -20%. Removing the fabricated rows leaves
+degraded rows.
+
+`qsim_clean_window.py` is the ONE report for this window. It asks two pre-registered questions
+and refuses to answer either until the sample supports it:
+
+```bash
+python3 qsim_clean_window.py --since '2026-09-06 00:00:00 UTC' --fee-pct 0.02
+```
+
+WHY ONLY TWO QUESTIONS: `qsim_quote_capture_replay.py` sweeps ~150 policies. Picking the best
+on a small sample finds noise nearly every time — that is exactly how a 28-trade window produced
+a "best policy" (`no_1p3x_stop_0p85x`, +1.25%/trade) that was inside round-trip fee cost. Do not
+run the sweep for decisions in this window. Run it to generate hypotheses, then test ONE.
+
+SAMPLE SIZE IS THE BINDING CONSTRAINT. Per-trade volatility is ~37-47%, so:
+
+| effect | trades needed | at ~14 SWT/day |
+|---|---|---|
+| +10%/trade | ~53 | 4 days |
+| +5%/trade | ~211 | 15 days |
+| +2%/trade | ~1315 | 3+ months |
+
+Anything too small to confirm inside two weeks is also too small to be worth trading at 0.05
+SOL after fees — the detectability bar and the profitability bar are the same bar. Corollary:
+tuning between `bank_1p2x` and `bank_1p3x` (a ~1% difference) is unmeasurable here. Only look
+for large effects.
+
+The paired A/B (Q2) is far cheaper than absolute profitability (Q1) because both policies run
+over the SAME rows and the per-row difference cancels most of the volatility. Expect Q2 to
+resolve in days while Q1 stays INCONCLUSIVE for weeks. That asymmetry is not a bug.
+
+The report also prints DATA QUALITY. If dropped rows exceed 15% it warns — that means the
+scheduler fixes have regressed and every number below it is suspect.
+
 ## Reports / Commands To Run
 
 Set clean window:
