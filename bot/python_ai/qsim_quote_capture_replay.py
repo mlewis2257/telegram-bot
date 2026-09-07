@@ -160,6 +160,34 @@ PARTIAL_BANK_RUNNER_POLICIES = (
         "bank": 1.30, "fraction": 0.70, "runner_arm": 0.0,
         "target": 2.0, "floor": 1.10, "trail_pct": 0.25, "window_mins": 10.0,
     },
+    # ── LEASH LENGTH, one variable at a time off the s70/f1.1/tr30/t2x base ──
+    # Measured 2026-09-06: runners peaking >=4x arrive at 60-90 MINUTES (UBER 29.4x at 84min,
+    # GPT 10.7x at 83, ULCAT 5.5x at 64, BILL 5.4x at 70), while the 0-10min bucket averages
+    # only 2.76x. A 10-minute stall window is set for the small runners and sells the big ones
+    # long before the top. These isolate the window; everything else is held constant.
+    {
+        "name": "pbr_b1p3_s70_t2x_f1p1_tr30_w30m",
+        "bank": 1.30, "fraction": 0.70, "runner_arm": 0.0,
+        "target": 2.0, "floor": 1.10, "trail_pct": 0.30, "window_mins": 30.0,
+    },
+    {
+        "name": "pbr_b1p3_s70_t2x_f1p1_tr30_w60m",
+        "bank": 1.30, "fraction": 0.70, "runner_arm": 0.0,
+        "target": 2.0, "floor": 1.10, "trail_pct": 0.30, "window_mins": 60.0,
+    },
+    # ── TARGET, with the leash long enough to reach it ──────────────────────
+    # A 2x target caps the runner at 2x on a coin that went to 29x. 5 of 40 banks reached 5x
+    # after exit, so the cap is binding on exactly the trades the runner exists for.
+    {
+        "name": "pbr_b1p3_s70_t5x_f1p1_tr30_w60m",
+        "bank": 1.30, "fraction": 0.70, "runner_arm": 0.0,
+        "target": 5.0, "floor": 1.10, "trail_pct": 0.30, "window_mins": 60.0,
+    },
+    {   # no target at all — floor, trail and stall govern. The fat-tail shape.
+        "name": "pbr_b1p3_s70_tNONE_f1p1_tr30_w60m",
+        "bank": 1.30, "fraction": 0.70, "runner_arm": 0.0,
+        "target": 0.0, "floor": 1.10, "trail_pct": 0.30, "window_mins": 60.0,
+    },
 )
 
 BANK_OR_RUN_POLICIES = (
@@ -1405,6 +1433,10 @@ def _partial_bank_runner_return(
         stall       window_mins elapse with no new high (clock resets on each new high)
     and otherwise at the last observed quote.
 
+    `target` <= 0 means NO target: the runner rides until the floor, the trail, or the stall
+    window ends it. That is the shape a fat tail needs — a 2x target caps you at 2x on a coin
+    that went to 29x, while a 30% trail on the same path exits near 20x.
+
     `runner_arm` > 0 additionally requires the bank quote itself to show that much strength
     before a runner is kept at all; 0 means always keep one, which is the proposed shape.
 
@@ -1442,7 +1474,7 @@ def _partial_bank_runner_return(
                 return mult - 1.0          # not strong enough — sell the whole position
             runner_peak = mult
             last_high_at = ts
-            if mult >= target:             # already at target on the bank quote
+            if target > 0 and mult >= target:   # already at target on the bank quote
                 return mult - 1.0
             continue
 
@@ -1452,7 +1484,7 @@ def _partial_bank_runner_return(
         def blended(exit_mult: float) -> float:
             return fraction * banked_return + (1.0 - fraction) * (exit_mult - 1.0)
 
-        if mult >= target:
+        if target > 0 and mult >= target:
             return blended(mult)
         if mult <= floor:
             return blended(mult)
