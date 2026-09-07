@@ -304,6 +304,54 @@ STILL OPEN: whether to keep solhousesignal in QSIM_LANES at all. With the ceilin
 rather than losing, so it costs nothing to keep and it is the adversarial referee. Cutting it
 would free the whole quote budget for solwhaletrending, the only live lane. One-line change.
 
+## PARTIAL BANK + RUNNER — SHIPPED FORWARD 2026-09-06
+
+THE CASE. Replaying the clean day's real post-exit quotes, with the mcap ceiling applied
+(76 trades, base -0.127 SOL / -3.34%/trade), keeping a runner flips it positive at EVERY
+capture level tested:
+
+| keep | capture 40% | 50% | 60% | 70% |
+|---|---|---|---|---|
+| 20% | +0.115 | +0.176 | +0.236 | +0.297 |
+| **30%** | +0.236 | **+0.327 (+8.6%/trade)** | +0.418 | +0.509 |
+| 50% | +0.478 | +0.630 | +0.781 | +0.932 |
+
+FRAGILITY (keep 30%, capture 50%): all 76 trades +8.61%/trade; minus UBER (29.4x) +3.04%;
+minus UBER and GPT +1.31%; minus the top 5 runners -0.97%. Tail-weighted but NOT a one-coin
+artifact — delete the single best coin and it is still positive.
+
+NO TARGET IS LOAD-BEARING. A 2x target sells UBER at 2.16x and discards ~90% of its value.
+Tested on UBER's shape: runner exit 2.16x at t2x, 3.15x at t3x, 5.14x at t5x, 20.00x with no
+target. The trail is what lets a 29x run. Note this also corrected an earlier belief that the
+10-minute stall window was what sold the monsters early — on a steady climber the stall never
+fires; the TARGET binds first.
+
+IMPLEMENTATION (forward, not replay). qsim can now hold a position past the bank:
+
+* `QSIM_PARTIAL_BANK_ENABLED` — when bank_1p3x fires, sell `QSIM_PARTIAL_BANK_FRACTION`
+  (0.70) and keep the position OPEN with the remaining tokens instead of closing.
+* Runner exits on `runner_target` / `runner_floor` (1.10x) / `runner_trail` (30% off its own
+  peak) / `runner_stall` (60 min with no new high; the clock resets on every new high).
+* The runner is priced on the money still at risk (`sol_in * (1 - sold_frac)`), so
+  runner_mult reads in the same units as the pre-bank multiple.
+* Final `sol_out` = `partial_sol_out` + the runner's own sell quote, so the generated
+  `pnl_sol` stays correct with no change to its definition.
+* All runner state is PERSISTED (`partial_*`, `runner_tokens`, `runner_peak_mult`,
+  `runner_high_at`) — a pm2 restart mid-runner would otherwise lose the trail reference and
+  the stall clock and silently change the exit.
+* A rug in runner mode keeps whatever was banked: a total runner loss is ~breakeven
+  (-0.0027 on 0.05) rather than -0.05.
+
+THE BASELINE IS NOT LOST. Bank-everything PnL is recoverable on any runner row as
+`(partial_sol_out / partial_fraction) - sol_in`, so enabling this costs no comparability.
+
+The runner sells a SMALLER bag than the full position, so it takes less slippage than the
+replay assumed — a rare error in the conservative direction here.
+
+Verified end-to-end against a scratch postgres driving the real `_qsim_tick`: UBER's shape
+banks 70% at 1.49x then trails out at 20.00x for +0.3022 vs +0.0246 banking everything; the
+floor case costs 0.0045 against banking all; a runner rug lands at -0.0027.
+
 ## REPLAY RESULTS ON THE CLEAN WINDOW (2026-09-06, n=65 both channels)
 
 **Nothing beats `bank_1p3x`.** On the uncontaminated run (`--fallback current`, post-exit OFF)

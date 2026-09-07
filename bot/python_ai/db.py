@@ -1537,6 +1537,23 @@ def ensure_qsim_positions_table() -> None:
         cur.execute(
             "ALTER TABLE qsim_positions ADD COLUMN IF NOT EXISTS obs_count integer"
         )
+        # ── Partial bank + runner ────────────────────────────────────────────
+        # A position can now sell part of the bag at the bank and keep riding the rest.
+        # partial_fraction is the fraction SOLD; the runner holds the remainder. All of it
+        # is persisted because a pm2 restart mid-runner would otherwise lose the trail
+        # reference and the stall clock, silently changing the exit.
+        # sol_out on the final close is partial_sol_out + the runner's own sell quote, so
+        # the generated pnl_sol stays correct without touching its definition.
+        for col, typ in (
+            ("partial_fraction",   "numeric"),
+            ("partial_sol_out",    "numeric"),
+            ("partial_exit_price", "numeric"),
+            ("partial_exit_time",  "timestamptz"),
+            ("runner_tokens",      "numeric"),
+            ("runner_peak_mult",   "numeric"),
+            ("runner_high_at",     "timestamptz"),
+        ):
+            cur.execute(f"ALTER TABLE qsim_positions ADD COLUMN IF NOT EXISTS {col} {typ}")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_qsim_status ON qsim_positions (status)")
         cur.execute(
             """
@@ -1616,6 +1633,8 @@ def get_open_qsim_positions() -> list[dict]:
             SELECT qp.call_id, qp.lane, qp.variant, qp.vip_tier, qp.channel_handle,
                    qp.entry_price, qp.entry_tokens, qp.entry_decimals, qp.sol_in,
                    qp.entry_time, qp.peak_mcap, qp.peak_multiplier,
+                   qp.partial_fraction, qp.partial_sol_out, qp.partial_exit_price,
+                   qp.runner_tokens, qp.runner_peak_mult, qp.runner_high_at,
                    t.symbol, t.mint_address
             FROM qsim_positions qp
             JOIN tokens t ON t.id = qp.token_id
@@ -1650,6 +1669,45 @@ def get_recent_closed_qsim_positions_for_post_exit(minutes: float, limit: int = 
         )
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def partial_bank_qsim_position(call_id: int, fraction: float, partial_sol_out: float,
+                               partial_exit_price: float, runner_tokens: int,
+                               runner_peak_mult: float) -> bool:
+    """Sell `fraction` of the bag at the bank and keep the position OPEN as a runner.
+
+    Returns False if the row already banked (so a duplicate tick cannot double-sell).
+    """
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE qsim_positions SET
+                partial_fraction = %s, partial_sol_out = %s, partial_exit_price = %s,
+                partial_exit_time = NOW(), runner_tokens = %s,
+                runner_peak_mult = %s, runner_high_at = NOW(), updated_at = NOW()
+            WHERE call_id = %s AND status = 'open' AND partial_fraction IS NULL
+            """,
+            (fraction, partial_sol_out, partial_exit_price, runner_tokens,
+             runner_peak_mult, call_id),
+        )
+        affected = cur.rowcount
+        conn.commit()
+        return affected > 0
+
+
+def update_qsim_runner_peak(call_id: int, peak_mult: float) -> None:
+    """Ratchet the runner's own peak and reset the stall clock (a new high restarts it)."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE qsim_positions SET runner_peak_mult = %s, runner_high_at = NOW(), "
+            "updated_at = NOW() WHERE call_id = %s AND status = 'open'",
+            (peak_mult, call_id),
+        )
+        conn.commit()
 
 
 def update_qsim_peak(call_id: int, peak_mcap: float, peak_mult: float) -> bool:

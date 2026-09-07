@@ -186,6 +186,26 @@ QSIM_POST_EXIT_YIELD_OVERDUE = float(os.getenv("QSIM_POST_EXIT_YIELD_OVERDUE", "
 # answer "how much of the run would a trailing stop have captured", so they are served first
 # and never starve. Measured 2026-09-05: 40% of banked trades reached 2x AFTER the bank.
 QSIM_POST_EXIT_BANKS_FIRST = os.getenv("QSIM_POST_EXIT_BANKS_FIRST", "true").lower() == "true"
+
+# ── PARTIAL BANK + RUNNER ────────────────────────────────────────────────────
+# Sell most of the bag when the bank overlay fires, then KEEP RIDING the rest. Measured on
+# the 2026-09-06 clean day: of 40 banked trades, 19 (47.5%) went on to reach 2x AFTER
+# bank_1p3x sold, 7 reached 3x, 5 reached 5x (UBER 1.49 -> 29.4x at 84min, GPT 1.94 -> 10.7x
+# at 83min). Replayed over those real post-exit quotes, keeping 30% and capturing half the
+# move turns the day from -0.127 to +0.327 SOL — and it stays positive with the single best
+# coin removed (+3.0%/trade) and with the best two removed (+1.3%/trade).
+#
+# NO TARGET BY DEFAULT. A 2x target sells UBER at 2.16x and discards ~90% of its value; the
+# trail is what lets a 29x run. QSIM_RUNNER_TARGET_MULT=0 means "no target".
+#
+# The runner sells a SMALLER bag than the full position would, so it takes less slippage —
+# the replay, which assumes the same multiple, slightly understates this.
+QSIM_PARTIAL_BANK_ENABLED  = os.getenv("QSIM_PARTIAL_BANK_ENABLED", "false").lower() == "true"
+QSIM_PARTIAL_BANK_FRACTION = float(os.getenv("QSIM_PARTIAL_BANK_FRACTION", "0.70"))  # fraction SOLD
+QSIM_RUNNER_TARGET_MULT    = float(os.getenv("QSIM_RUNNER_TARGET_MULT", "0"))        # 0 = none
+QSIM_RUNNER_FLOOR_MULT     = float(os.getenv("QSIM_RUNNER_FLOOR_MULT", "1.10"))
+QSIM_RUNNER_TRAIL_PCT      = float(os.getenv("QSIM_RUNNER_TRAIL_PCT", "0.30"))
+QSIM_RUNNER_STALL_MINS     = float(os.getenv("QSIM_RUNNER_STALL_MINS", "60"))
 QSIM_RUNNER_WINDOW_ENABLED  = os.getenv("QSIM_RUNNER_WINDOW_ENABLED", "true").lower() == "true"
 RUNNER_WINDOW_ARM_MULT      = float(os.getenv("RUNNER_WINDOW_ARM_MULT", "2.0"))
 RUNNER_WINDOW_RELEASE_MULT  = float(os.getenv("RUNNER_WINDOW_RELEASE_MULT", "5.0"))
@@ -373,6 +393,34 @@ def _apply_runner_window(
         return ExitResult(False), f"runner_window_hold:{result.reason}"
 
     return result, "runner_window_active"
+
+
+def _runner_exit(runner_mult: float, peak_mult: float, high_at) -> ExitResult:
+    """Exit rules for the runner leg, evaluated on the RAW quote multiple.
+
+    Order matters: target (if any), then floor, then trail from the runner's own peak, then
+    the stall window. All are checked against the unguarded quote for the same reason the
+    bank overlay is (6da293d) — the guard exists to survive a bad FEED tick, and there is no
+    feed here.
+    """
+    if QSIM_RUNNER_TARGET_MULT > 0 and runner_mult >= QSIM_RUNNER_TARGET_MULT:
+        return ExitResult(True, "runner_target")
+    if QSIM_RUNNER_FLOOR_MULT > 0 and runner_mult <= QSIM_RUNNER_FLOOR_MULT:
+        return ExitResult(True, "runner_floor")
+    if (
+        QSIM_RUNNER_TRAIL_PCT > 0
+        and peak_mult > 0
+        and runner_mult <= peak_mult * (1.0 - QSIM_RUNNER_TRAIL_PCT)
+    ):
+        return ExitResult(True, "runner_trail")
+    if QSIM_RUNNER_STALL_MINS > 0 and high_at is not None:
+        try:
+            ref = high_at if high_at.tzinfo else high_at.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - ref).total_seconds() >= QSIM_RUNNER_STALL_MINS * 60:
+                return ExitResult(True, "runner_stall")
+        except Exception:
+            pass
+    return ExitResult(False)
 
 
 def _actionable_thresholds(pos: dict) -> tuple[float, float | None]:
@@ -635,8 +683,18 @@ async def _qsim_tick(pos: dict) -> None:
     if sol_in <= 0 or entry <= 0 or tokens <= 0:
         return
 
+    # Runner mode: a partial has already been banked, so the bag we still hold — and
+    # therefore the bag we must quote — is smaller than entry_tokens.
+    sold_frac      = float(pos.get("partial_fraction") or 0.0)
+    in_runner      = sold_frac > 0
+    partial_sol    = float(pos.get("partial_sol_out") or 0.0)
+    quote_tokens   = int(float(pos.get("runner_tokens") or tokens)) if in_runner else tokens
+    runner_basis   = sol_in * (1.0 - sold_frac) if in_runner else sol_in
+    if quote_tokens <= 0 or runner_basis <= 0:
+        return
+
     try:
-        sol_out = await jupiter.get_sell_quote(mint, tokens, raise_on_ratelimit=True)
+        sol_out = await jupiter.get_sell_quote(mint, quote_tokens, raise_on_ratelimit=True)
     except jupiter.RateLimitError:
         # 429 = throttle, NOT a rug. Back off ALL quoting for a bit and skip this tick; leave
         # the rug streak untouched so a rate-limit can never be booked as a fake -100% close.
@@ -665,16 +723,58 @@ async def _qsim_tick(pos: dict) -> None:
         if _noroute_streak[call_id] >= QSIM_RUG_FAILS:
             q = _quote_quality(pos)
             gap_secs = q["last_gap_secs"]
-            reason = _stale_reason("rug", gap_secs)
-            db.close_qsim_position(call_id, exit_price=0.0, sol_out=0.0, exit_reason=reason,
-                                   decision_gap_secs=gap_secs,
+            reason = _stale_reason("runner_rug" if in_runner else "rug", gap_secs)
+            # A rug in runner mode still keeps whatever was banked at the partial.
+            db.close_qsim_position(call_id, exit_price=0.0, sol_out=partial_sol,
+                                   exit_reason=reason, decision_gap_secs=gap_secs,
                                    max_gap_secs=q["max_gap_secs"], obs_count=q["obs_count"])
             peak_guard.clear(f"qsim:{call_id}")
             _cleanup(call_id)
+            # pnl is NOT -sol_in in runner mode: whatever was banked at the partial is kept.
             print(f"[qsim] CLOSE {symbol} call_id={call_id} {reason} "
-                  f"(no sell route x{QSIM_RUG_FAILS}) pnl={-sol_in:+.4f} gap={gap_secs or 0:.0f}s")
+                  f"(no sell route x{QSIM_RUG_FAILS}) banked={partial_sol:.4f} "
+                  f"pnl={partial_sol - sol_in:+.4f} gap={gap_secs or 0:.0f}s")
         return
     _noroute_streak.pop(call_id, None)
+
+    # ── RUNNER LEG ───────────────────────────────────────────────────────────
+    # Priced on the money still at risk: sol_in * (1 - sold_frac). That makes runner_mult
+    # directly comparable to the pre-bank multiple, so floor/trail read in the same units.
+    if in_runner:
+        runner_mult = sol_out / runner_basis
+        _last_mult[call_id] = runner_mult
+        prior_peak_mult = float(pos.get("runner_peak_mult") or 0.0)
+        if runner_mult > prior_peak_mult:
+            prior_peak_mult = runner_mult
+            db.update_qsim_runner_peak(call_id, runner_mult)   # also resets the stall clock
+            high_at = datetime.now(timezone.utc)
+        else:
+            high_at = pos.get("runner_high_at")
+        result = _runner_exit(runner_mult, prior_peak_mult, high_at)
+        db.insert_qsim_quote_observation(
+            call_id=call_id, sol_out=sol_out, real_mult=runner_mult,
+            synth_mcap=entry * runner_mult, eff_mcap=entry * runner_mult,
+            peak_mult=prior_peak_mult, exit_reason=result.reason,
+            should_exit=result.should_exit, noroute_streak=0,
+            note=f"runner;sold={sold_frac:.2f};banked={partial_sol:.4f}",
+        )
+        if result.should_exit:
+            q = _quote_quality(pos)
+            gap_secs = q["last_gap_secs"]
+            reason = _stale_reason(result.reason, gap_secs)
+            total_out = partial_sol + sol_out
+            db.close_qsim_position(call_id, exit_price=entry * runner_mult,
+                                   sol_out=total_out, exit_reason=reason,
+                                   decision_gap_secs=gap_secs,
+                                   max_gap_secs=q["max_gap_secs"], obs_count=q["obs_count"])
+            peak_guard.clear(f"qsim:{call_id}")
+            peak_guard.clear(f"qsimT:{call_id}")
+            _cleanup(call_id)
+            print(f"[qsim] CLOSE {symbol} call_id={call_id} {reason} "
+                  f"runner={runner_mult:.2f}x peak={prior_peak_mult:.2f}x "
+                  f"banked={partial_sol:.4f} total={total_out:.4f} "
+                  f"pnl={total_out - sol_in:+.4f}")
+        return
 
     real_mult   = sol_out / sol_in
     _last_mult[call_id] = real_mult      # drives this position's next cadence
@@ -768,6 +868,26 @@ async def _qsim_tick(pos: dict) -> None:
         noroute_streak=0,
         note=";".join(note for note in (overlay_note, runner_note) if note),
     )
+    # PARTIAL BANK: when the bank overlay fires and partial mode is on, sell the configured
+    # fraction and keep the rest running instead of closing the whole position.
+    if (
+        result.should_exit
+        and QSIM_PARTIAL_BANK_ENABLED
+        and 0.0 < QSIM_PARTIAL_BANK_FRACTION < 1.0
+        and _QSIM_EXIT_OVERLAY is not None
+        and result.reason == _QSIM_EXIT_OVERLAY.name
+    ):
+        keep_tokens = int(tokens * (1.0 - QSIM_PARTIAL_BANK_FRACTION))
+        banked_sol  = sol_out * QSIM_PARTIAL_BANK_FRACTION
+        if keep_tokens > 0 and db.partial_bank_qsim_position(
+            call_id, QSIM_PARTIAL_BANK_FRACTION, banked_sol, synth_cur,
+            keep_tokens, real_mult,
+        ):
+            print(f"[qsim] PARTIAL {symbol} call_id={call_id} {result.reason} "
+                  f"sold={QSIM_PARTIAL_BANK_FRACTION:.0%} at {real_mult:.2f}x "
+                  f"banked={banked_sol:.4f} runner={keep_tokens} tokens")
+            return
+
     if result.should_exit:
         q = _quote_quality(pos)
         gap_secs = q["last_gap_secs"]
@@ -861,6 +981,14 @@ async def run_qsim_monitor() -> None:
           f"most-overdue-first"
           if QSIM_ADAPTIVE_CADENCE else
           f"[qsim] adaptive cadence: OFF — flat {QSIM_TICK_SECS:g}s, most-overdue-first")
+    if QSIM_PARTIAL_BANK_ENABLED:
+        _tgt = f"{QSIM_RUNNER_TARGET_MULT:g}x" if QSIM_RUNNER_TARGET_MULT > 0 else "none"
+        print(f"[qsim] partial bank: sell {QSIM_PARTIAL_BANK_FRACTION:.0%} at the overlay, "
+              f"runner keeps {1 - QSIM_PARTIAL_BANK_FRACTION:.0%} — target={_tgt} "
+              f"floor={QSIM_RUNNER_FLOOR_MULT:g}x trail={QSIM_RUNNER_TRAIL_PCT:.0%} "
+              f"stall={QSIM_RUNNER_STALL_MINS:g}m")
+    else:
+        print("[qsim] partial bank: disabled (overlay closes the whole position)")
     print(f"[qsim] stale-decision threshold: {QSIM_STALE_DECISION_SECS:g}s "
           f"(closes decided on an older quote are labelled stale_*)"
           if QSIM_STALE_DECISION_SECS > 0 else
