@@ -304,6 +304,44 @@ STILL OPEN: whether to keep solhousesignal in QSIM_LANES at all. With the ceilin
 rather than losing, so it costs nothing to keep and it is the adversarial referee. Cutting it
 would free the whole quote budget for solwhaletrending, the only live lane. One-line change.
 
+## REPLAY RESULTS ON THE CLEAN WINDOW (2026-09-06, n=65 both channels)
+
+**Nothing beats `bank_1p3x`.** On the uncontaminated run (`--fallback current`, post-exit OFF)
+every alternative that actually fires is worse:
+
+| policy | delta vs current |
+|---|---|
+| `bank_1p2x` | -1.52 |
+| `no_1p3x_stop_0p9x` | -1.50 |
+| `no_1p3x_stop_0p85x` | -0.24 |
+| `dyn_*` (all) | -1.50 |
+
+That KILLS the no-bounce candidate. The 2026-09-05 lane scan ranked `no_1p3x_stop_0p85x` best
+(+0.35 on n=28); on 65 clean rows it is -0.24. Textbook small-sample noise from a ~150-policy
+sweep — the exact failure the clean-window protocol exists to prevent. Do not resurrect it
+without a fresh, larger sample.
+
+**The data is CENSORED above 1.3x.** `bank_1p4x` fires on 5 of 65 rows, `bank_2x` on 1, because
+qsim exits at 1.3x so the observed path rarely goes higher. Every row reading exactly `current`
+with delta `+0.00` is "policy never fired". You CANNOT compare bank thresholds above the one
+you are running — that question is unanswerable from this data by construction, and needs a
+forward run at the higher threshold.
+
+**TWO WAYS `--include-post-exit` LIES, and both bit here.**
+
+1. It extends the path for EVERY policy, not just the runner ones. Tell: `raw_config` is the
+   same config qsim actually ran, so it should equal `current`; with post-exit on it read
+   -18.72 against current -5.37. Any "positive" policy in a post-exit run (`bank_1p4x +0.01`,
+   `floor_2x +0.07`) is trading quotes from after the position was sold. Compare policies ONLY
+   with post-exit off.
+
+2. FIXED 2026-09-06: `pbr_*` let the BANK leg fire on a post-exit quote, crediting a 1.3x bank
+   on a position qsim had already hard-stopped out of. Tell: hit count went 27 (clean) -> 32
+   (post-exit). On a synthetic case it booked +0.6950 where the real result was -0.2200. The
+   bank leg is now bounded by qsim's real `exit_time` (`held_until`); the runner leg still
+   reads post-exit quotes, which is the whole point. Every `pbr_` number produced before this
+   fix was inflated.
+
 ## THE RUNNER FINDING (2026-09-05, measured on real post-exit quotes)
 
 `bank_1p3x` is systematically selling the front of real moves. Of 40 banked trades in the

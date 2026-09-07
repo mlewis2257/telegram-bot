@@ -1392,6 +1392,7 @@ def _partial_bank_runner_return(
     trail_pct: float,
     window_mins: float,
     current_return: float,
+    held_until: datetime | None = None,
 ) -> float:
     """
     Sell `fraction` at the first quote >= bank, then ride the remainder.
@@ -1406,6 +1407,13 @@ def _partial_bank_runner_return(
 
     `runner_arm` > 0 additionally requires the bank quote itself to show that much strength
     before a runner is kept at all; 0 means always keep one, which is the proposed shape.
+
+    `held_until` is qsim's real exit time and it is LOAD-BEARING under --include-post-exit.
+    The runner leg legitimately reads quotes from after the exit — that is the whole point —
+    but the BANK leg must not. Without this bound the policy fires a 1.3x bank on a position
+    qsim had already hard-stopped out of, crediting a trade you did not own: on 2026-09-06 that
+    turned 27 real banks into 32, and inflated the runner's apparent edge. A bank that only
+    becomes reachable after you sold is not a bank.
     """
     if not points:
         return current_return
@@ -1420,6 +1428,13 @@ def _partial_bank_runner_return(
         ts = observed_at.timestamp() if observed_at is not None else None
 
         if banked_mult is None:
+            # Bank leg: only while the position was actually held.
+            if (
+                held_until is not None
+                and observed_at is not None
+                and observed_at > held_until
+            ):
+                return current_return
             if mult < bank:
                 continue
             banked_mult = mult
@@ -1463,10 +1478,17 @@ def _partial_bank_runner_hit_mult(
     points: list[tuple[datetime | None, float]],
     *,
     bank: float,
+    held_until: datetime | None = None,
     **_ignored,
 ) -> float | None:
-    """The bank crossing is the trigger — a row 'hits' when the bank leg fired."""
-    for _observed_at, mult in points:
+    """The bank crossing is the trigger — a row 'hits' when the bank leg fired.
+
+    Bounded by `held_until` for the same reason as the return fn: a crossing that only
+    happens after qsim exited is not a bank this strategy could have taken.
+    """
+    for observed_at, mult in points:
+        if held_until is not None and observed_at is not None and observed_at > held_until:
+            return None
         if mult >= bank:
             return mult
     return None
@@ -1983,6 +2005,7 @@ def _view(
             trail_pct=policy["trail_pct"],
             window_mins=policy["window_mins"],
             current_return=fallback_return,
+            held_until=_parse_dt(row.get("exit_time")),
         )
 
     for policy in BANK_OR_RUN_POLICIES:
@@ -2278,7 +2301,8 @@ def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
             for view in views
             if (
                 value := _partial_bank_runner_hit_mult(
-                    _quote_points(view.row), bank=spec["bank"]
+                    _quote_points(view.row), bank=spec["bank"],
+                    held_until=_parse_dt(view.row.get("exit_time")),
                 )
             ) is not None
         ]
