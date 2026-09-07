@@ -117,11 +117,25 @@ print(f"[live] entry roundtrip min: {LIVE_ENTRY_ROUNDTRIP_MIN_MULT:g}x"
 
 # ── Per-channel mcap entry limits ──────────────────────────────────────────────
 
+# Per-channel ENTRY ceiling: reject a call whose market cap is already above this, because
+# the multiple you are buying has to come from somewhere — a $150k coin reaching 3x needs
+# $450k, a $20M coin needs $60M. 0 disables the ceiling for that channel.
 MCAP_LIMITS = {
     'solhousesignal_vip': 200_000,
-    'solwhaletrending':   100_000,
+    # 0 = NO CEILING (2026-09-06). The trending channel's calls skew larger by nature and
+    # the 100k cap was rejecting the better half: on the first clean qsim day SWT entries
+    # ABOVE 100k ran +1.6%/trade (n=28, incl. BEBE 2.14x and TOA 1.77x) while entries below
+    # it ran -15.5% (n=18). Loosening improved monotonically (100k -15.5%, 175k -11.3%,
+    # 280k -6.8%, uncapped -5.1%). CIs overlap, so revisit on more data — but the cap was
+    # pointed the wrong way. NOTE: solhousesignal is the opposite; its ceiling is doing the
+    # heavy lifting there.
+    'solwhaletrending':   0,
     'solearlytrending':    75_000,
-    'solhousesignal':     175_000,  # matches paper A upper bound; strategy engine enforces 20k min
+    # 280k (was 175k) 2026-09-06. The ceiling is load-bearing: on the first clean qsim day
+    # solhousesignal ENTRIES ABOVE it lost -33.0%/trade (n=30, CI [-52.3%,-13.7%]) while
+    # entries at/below it were -0.7% (n=30) — the lane's whole loss was oversized coins,
+    # incl. a rug series (WOTF x4, WOAF, IOAF, VOF, GOAF at $19-33M, all exiting 0.000).
+    'solhousesignal':     280_000,  # strategy engine enforces 20k min
 }
 DEFAULT_MCAP_LIMIT = 75_000  # fallback for unknown channels
 
@@ -603,7 +617,7 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
 
         # ── Channel mcap ceiling (outer safety net) ────────────────────────────
         max_mcap = MCAP_LIMITS.get(channel_handle, DEFAULT_MCAP_LIMIT)
-        if actual_entry and actual_entry > max_mcap:
+        if max_mcap and actual_entry and actual_entry > max_mcap:
             print(f"[live] {symbol} skipped — mcap ${actual_entry/1000:.0f}k too high for {channel_handle or 'unknown'} (max ${max_mcap/1000:.0f}k)")
             db.set_call_skip_reason(call_id, "mcap_too_high")
             return False

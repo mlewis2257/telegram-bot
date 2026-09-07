@@ -519,6 +519,31 @@ async def qsim_open(score_result: dict, token_data: dict) -> None:
             return
 
         _ensure_table()
+
+        # ── Channel mcap ceiling — MIRROR of live's outer safety net ──────────────
+        # qsim had NO mcap ceiling while live has always had one, so qsim was pricing a
+        # strategy live cannot run. On the first clean day (2026-09-06) that gap was 73% of
+        # the day's entire loss: 13 solhousesignal entries at $5M-$39M against live's ceiling,
+        # 10 of them exiting at ~0.000, including an obvious rug series (WOTF x4, WOAF, IOAF,
+        # VOF, GOAF — all $19-33M, all exactly 0.000).
+        #
+        # Checked against the FEED/reference mcap the way live does, NOT qsim's executable
+        # entry_price: that value is demonstrably wrong on some tokens (URANUS read 283 vs a
+        # real 260k, AOC 213 vs 230k), which does not affect PnL — exit_mult is sol_out/sol_in
+        # — but would make an executable-mcap ceiling leak exactly the coins it must catch.
+        ref_token_data = dict(token_data or {})
+        if not ref_token_data.get("mcap_at_call"):
+            stored_mcap = db.get_call_mcap_at_call(call_id)
+            if stored_mcap:
+                ref_token_data["mcap_at_call"] = stored_mcap
+        ref_mcap, ref_source = entry_quality.trusted_reference_mcap(ref_token_data)
+        max_mcap = live_trader.MCAP_LIMITS.get(channel, live_trader.DEFAULT_MCAP_LIMIT)
+        if max_mcap and ref_mcap and ref_mcap > max_mcap:
+            print(f"[qsim] {symbol} skipped — mcap ${ref_mcap/1000:.0f}k too high for "
+                  f"{channel or 'unknown'} (max ${max_mcap/1000:.0f}k, source={ref_source}) "
+                  f"call_id={call_id}")
+            return
+
         size = float(spec["size"])
         try:
             tokens_raw = await jupiter.get_buy_quote(mint, size, raise_on_ratelimit=True)
@@ -534,15 +559,10 @@ async def qsim_open(score_result: dict, token_data: dict) -> None:
         if not entry_mcap or entry_mcap <= 0:
             print(f"[qsim] {symbol} skipped — entry mcap calc failed call_id={call_id}")
             return
-        gate_token_data = dict(token_data or {})
-        if not gate_token_data.get("mcap_at_call"):
-            stored_mcap = db.get_call_mcap_at_call(call_id)
-            if stored_mcap:
-                gate_token_data["mcap_at_call"] = stored_mcap
         gate = entry_quality.check_entry_exec_ratio(
             max_ratio=QSIM_MAX_ENTRY_EXEC_RATIO,
             executable_mcap=entry_mcap,
-            token_data=gate_token_data,
+            token_data=ref_token_data,
         )
         if gate.enabled and not gate.allowed:
             print(
@@ -849,6 +869,10 @@ async def run_qsim_monitor() -> None:
           if QSIM_MAX_ENTRY_EXEC_RATIO > 0 else "[qsim] max entry exec/ref ratio: disabled")
     print(f"[qsim] entry roundtrip min: {QSIM_ENTRY_ROUNDTRIP_MIN_MULT:g}x"
           if QSIM_ENTRY_ROUNDTRIP_MIN_MULT > 0 else "[qsim] entry roundtrip min: disabled")
+    print("[qsim] mcap ceilings (mirrored from live): "
+          + ", ".join(f"{ch}=" + (f"${lim/1000:.0f}k" if lim else "none")
+                      for ch, lim in sorted(live_trader.MCAP_LIMITS.items()))
+          + f", default=${live_trader.DEFAULT_MCAP_LIMIT/1000:.0f}k")
     base_cfg = _VARIANT_CONFIGS.get("early", EXIT_A_PAPER)
     print(f"[qsim] hard_stop override: -{QSIM_HARD_STOP_PCT * 100:.0f}% "
           f"(was -{base_cfg.hard_stop_pct * 100:.0f}%)"

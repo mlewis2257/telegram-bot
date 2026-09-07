@@ -265,6 +265,45 @@ Potential future strategy shape:
 - Partial bank could sell 50-75% at 1.3x, then trail or target higher with the rest.
 - But this must be tested live-forward or qsim-forward because replay can over-credit if post-exit data is used incorrectly.
 
+## FIRST CLEAN DAY — 2026-09-06 (106 trades)
+
+The plumbing held: **0 stale rows**, max_gap p50 67s / worst 136s (nothing near the 180s
+threshold), post-exit probes median 154 per bank (was 39). This data is trustworthy.
+
+The strategy is a confirmed loser — but 73% of it was one bucket qsim should never have traded:
+
+| | n | pnl | mean/trade | 95% CI | |
+|---|---|---|---|---|---|
+| All closed | 106 | -0.6220 | -11.74% | [-21.9%, -1.6%] | **NEGATIVE** |
+| solhousesignal > $5M | 13 | **-0.4536** | -69.78% | [-100.8%, -38.8%] | **NEGATIVE** |
+| Everything else | 93 | -0.1684 | -3.62% | [-13.3%, +6.1%] | inconclusive |
+
+Ten of those 13 exited at ~0.000, including an obvious rug series cycled through
+solhousesignal: **WOTF x4, WOAF, IOAF, VOF, GOAF — all $19-33M, all exactly 0.000.**
+
+ROOT CAUSE: qsim had NO mcap ceiling while live has always had one (`MCAP_LIMITS`). Same family
+as the quiet-hours gate and the position cap — a live guard qsim did not mirror, so qsim was
+pricing a strategy live cannot run. FIXED 2026-09-06: `qsim_open` now enforces `MCAP_LIMITS`,
+checked against the FEED/reference mcap the way live does (NOT qsim's executable `entry_price`,
+which is demonstrably wrong on some tokens — URANUS read 283 against a real 260k, AOC 213 vs
+230k; harmless for PnL since exit_mult is sol_out/sol_in, but it would make the ceiling leak).
+
+CEILINGS RETUNED, and they point in OPPOSITE directions per channel:
+
+| lane | above ceiling | at/below | decision |
+|---|---|---|---|
+| solhousesignal | -33.0%/trade (n=30) | -0.68% (n=30) | ceiling **$280k** (was 175k) |
+| solwhaletrending | +1.60% (n=28) | -15.47% (n=18) | **ceiling REMOVED** (0 = off) |
+
+solhousesignal's whole loss is oversized entries; the ceiling rescues the lane from -16.8% to
+-0.68%. solwhaletrending is the reverse — its 100k cap was rejecting the better half (BEBE
+2.14x, TOA 1.77x), and loosening improved monotonically (100k -15.5%, 175k -11.3%, 280k -6.8%,
+uncapped -5.1%). CIs overlap on SWT, so revisit with more data.
+
+STILL OPEN: whether to keep solhousesignal in QSIM_LANES at all. With the ceiling it is flat
+rather than losing, so it costs nothing to keep and it is the adversarial referee. Cutting it
+would free the whole quote budget for solwhaletrending, the only live lane. One-line change.
+
 ## THE RUNNER FINDING (2026-09-05, measured on real post-exit quotes)
 
 `bank_1p3x` is systematically selling the front of real moves. Of 40 banked trades in the
