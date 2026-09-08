@@ -21,6 +21,13 @@ Every number is reported with the smallest effect the current sample could detec
 observed effect is inside that band the verdict is INCONCLUSIVE — not a weak signal, not a
 hint, not something to act on. That distinction is the whole point of this file.
 
+A FILTER THAT SELECTS ON THE OUTCOME IS WORSE THAN NO FILTER. `--min-obs` looks like a data
+quality control and is actually an outcome control: coins that die fast produce few quotes, so
+requiring N observations preferentially keeps the coins that lived, i.e. the winners. Measured
+2026-09-06..08: --min-obs 5 dropped 112 of 220 trades holding -1.0550 of the -1.0933 total loss
+and reported -0.71%/SOL for a book that was really -9.94%/SOL. It now defaults to 0. Use it only
+for paired A/B on well-observed coins, and remember the answer then applies only to that half.
+
 DATA QUALITY is reported alongside, because a clean window is a claim that has to be checked:
 starved rows are excluded (see qsim._stale_reason / decision_gap_secs) and the report shows how
 many were dropped and why. If that count is not ~0 after the 2026-09-05 scheduler fixes, the
@@ -122,7 +129,8 @@ def main() -> None:
                          "return. qsim quotes already include slippage but NOT network + "
                          "priority fees; ~0.02 is a reasonable guess at 0.05 SOL sizing. "
                          "Left at 0 it is NOT modelled and the report says so.")
-    ap.add_argument("--min-obs", type=int, default=5)
+    ap.add_argument("--min-obs", type=int, default=0,
+                    help="minimum real quotes a row must have. DEFAULT 0 ON PURPOSE: this\n                         filter SELECTS ON THE OUTCOME. Coins that die fast produce few\n                         quotes, so on 2026-09-06..08 --min-obs 5 dropped 112 of 220 trades\n                         carrying -1.0550 of the -1.0933 total loss, turning a -9.94%%/SOL\n                         book into a -0.71%%/SOL one. Raise it only to ask 'does policy A\n                         beat B on well-observed coins', never to ask 'am I profitable'.")
     ap.add_argument("--max-gap-secs", type=float, default=180.0)
     ap.add_argument("--max-qmax", type=float, default=50.0)
     args = ap.parse_args()
