@@ -175,6 +175,7 @@ QSIM_ADAPTIVE_CADENCE   = os.getenv("QSIM_ADAPTIVE_CADENCE", "true").lower() == 
 # capped so a stretched position can never itself trip the stale-decision label — see
 # _target_cadence_secs, which clamps to half of QSIM_STALE_DECISION_SECS.
 QSIM_CADENCE_NEAR_MULT  = float(os.getenv("QSIM_CADENCE_NEAR_MULT", "0.5"))   # <=5 pts away
+QSIM_CADENCE_CLOSE_MULT = float(os.getenv("QSIM_CADENCE_CLOSE_MULT", "1.0"))  # <=15 pts away
 QSIM_CADENCE_MID_MULT   = float(os.getenv("QSIM_CADENCE_MID_MULT", "2.0"))    # <=30 pts away
 QSIM_CADENCE_FAR_MULT   = float(os.getenv("QSIM_CADENCE_FAR_MULT", "3.0"))    # further out
 # Post-exit research probes yield the budget when any open position is this far past its own
@@ -474,14 +475,23 @@ def _target_cadence_secs(pos: dict) -> float:
     # would drop a position sitting exactly on a tier edge (e.g. 1.25x, five points from the
     # bank) into the SLOWER tier — the opposite of what the tiers are for.
     nearest = round(min(distances), 6)
+    # Monotonic by construction: a position CLOSER to a threshold must never be quoted less
+    # often than one further away. The 0.05-0.15 band used to be a hardcoded 1.0, so lowering
+    # MID_MULT below it silently inverted the ladder — coins 12 points from the stop were
+    # quoted every 30s while coins 20 points away got 10s. That band is where a stop actually
+    # breaches, so it was also the one band no cadence setting could reach (2026-09-10).
+    near  = QSIM_CADENCE_NEAR_MULT
+    close = max(QSIM_CADENCE_CLOSE_MULT, near)
+    mid   = max(QSIM_CADENCE_MID_MULT,   close)
+    far   = max(QSIM_CADENCE_FAR_MULT,   mid)
     if nearest <= 0.05:                            # about to trigger, or already past
-        factor = QSIM_CADENCE_NEAR_MULT
+        factor = near
     elif nearest <= 0.15:
-        factor = 1.0
+        factor = close
     elif nearest <= 0.30:
-        factor = QSIM_CADENCE_MID_MULT
+        factor = mid
     else:
-        factor = QSIM_CADENCE_FAR_MULT
+        factor = far
     return min(QSIM_TICK_SECS * factor, ceiling)
 
 
