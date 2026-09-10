@@ -70,7 +70,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -783,6 +783,35 @@ def _quote_points(row: dict[str, Any]) -> list[tuple[datetime | None, float]]:
         if 0 < mult <= MAX_QOBS_MULT:
             points.append((_parse_dt(obs.get("observed_at")), mult))
     return points
+
+
+def _held_mults(
+    points: list[tuple[datetime | None, float]], held_until: datetime | None
+) -> list[float]:
+    """Multiples from the window the position was ACTUALLY HELD.
+
+    LOAD-BEARING under --include-post-exit. Every policy that consumes a bare `mults` list
+    can only exit EARLIER than qsim did or at the same moment — banking at 1.4x instead of
+    1.3x never makes you hold longer. Feeding those policies post-exit quotes lets them fire
+    on a position qsim had already sold, which is not a counterfactual, it is look-ahead.
+
+    Measured 2026-09-09 on the same 92 rows, with and without post-exit quotes:
+        bank_1p3x  -9.97 -> -1.93     bank_2x  -8.30 -> +5.43
+        floor_2x   -9.42 -> +2.32     best_raw +20.94 -> +60.16
+    qsim RUNS bank_1p3x as its live overlay, so a replayed bank_1p3x that beats `current` by
+    +8 is impossible on honest data — that gap was the bug, and it is the standing sanity
+    check for this file.
+
+    Policies that legitimately EXTEND the hold (soft stop, cdelay, runner, pbr_, bank_or_run)
+    take timestamped `points` instead and bound themselves, so they are unaffected.
+
+    The 5s grace matches db.get_qsim_quote_quality: the closing observation is inserted just
+    before exit_time is stamped and clock slop can invert them by milliseconds.
+    """
+    if held_until is None:
+        return [mult for _, mult in points]
+    bound = held_until + timedelta(seconds=5)
+    return [mult for observed_at, mult in points if observed_at is None or observed_at <= bound]
 
 
 def _parse_where(where_values: list[str] | None) -> list[tuple[str, str, float]]:
@@ -1946,8 +1975,10 @@ def _view(
 ) -> ReplayRow:
     qsim_return = _ratio(row.get("qsim_pnl"), row.get("qsim_sol_in")) or 0.0
     shadow_return = _ratio(row.get("shadow_pnl"), row.get("shadow_sol_in"))
-    mults = _quote_mults(row)
     points = _quote_points(row)
+    # `mults` is HELD-ONLY on purpose — see _held_mults. `points` keeps the full sequence for
+    # the hold-extending families, which bound themselves with held_until.
+    mults = _held_mults(points, _parse_dt(row.get("exit_time")))
     max_quote_mult = max(mults) if mults else None
     returns = {"current": qsim_return}
     first_hits: dict[str, float | None] = {}
