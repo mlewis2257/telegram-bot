@@ -1070,6 +1070,16 @@ async def run_qsim_monitor() -> None:
                         )
                     for pos in closed_positions:
                         cid = pos["call_id"]
+                        # Cadence comes from the DB (`last_probe_at`), not memory, so it
+                        # survives a pm2 restart — see db.get_recent_closed_qsim_positions_
+                        # for_post_exit. The in-memory map is still consulted because the
+                        # selection query is issued once per pass and goes stale within it.
+                        last_at = pos.get("last_probe_at")
+                        if last_at is not None:
+                            ref = last_at if last_at.tzinfo else last_at.replace(tzinfo=timezone.utc)
+                            age = (datetime.now(timezone.utc) - ref).total_seconds()
+                            if age < QSIM_POST_EXIT_OBS_CADENCE_SECS:
+                                continue
                         if now - _last_post_exit_quote_ts.get(cid, 0.0) < QSIM_POST_EXIT_OBS_CADENCE_SECS:
                             continue
                         if not _post_exit_budget_ok():

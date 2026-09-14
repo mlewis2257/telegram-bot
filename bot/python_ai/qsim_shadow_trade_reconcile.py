@@ -29,10 +29,13 @@ sys.path.insert(0, os.path.dirname(__file__))
 import db
 
 
-MAX_SANE_PEAK = 50.0
-MAX_SANE_PNL_PCT = 5000.0
+# Raised from 50 on 2026-09-14 for the 48h tail hunt: a cap of 50 SILENTLY DISCARDS
+# the exact events a tail strategy exists to catch. Some cap is still wanted (thin
+# liquidity produces absurd quotes — we saw a bogus 247x uplift), just not at 50x.
+MAX_SANE_PEAK = float(os.getenv("QSIM_MAX_SANE_PEAK", "1000"))
+MAX_SANE_PNL_PCT = float(os.getenv("QSIM_MAX_SANE_PNL_PCT", "100000"))   # +1000x
 MIN_SANE_PNL_PCT = -100.5
-MAX_QOBS_MULT = 50.0
+MAX_QOBS_MULT = float(os.getenv("QSIM_REPLAY_MAX_QOBS_MULT", "1000"))
 
 
 SQL = """

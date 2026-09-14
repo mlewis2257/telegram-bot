@@ -32,8 +32,11 @@ import db
 # Sane memecoin bounds. Real runners reach ~45x ($willo2 +4412%), so 50x leaves
 # headroom; anything past it — or a loss worse than -100% (impossible) — is a
 # cross-source/stale-supply pricing artifact, not a trade.
-MAX_SANE_PEAK = 50.0
-MAX_SANE_PNL_PCT = 5000.0   # +5000% == 51x
+# Raised from 50 on 2026-09-14 for the 48h tail hunt: a cap of 50 SILENTLY DISCARDS
+# the exact events a tail strategy exists to catch. Some cap is still wanted (thin
+# liquidity produces absurd quotes — we saw a bogus 247x uplift), just not at 50x.
+MAX_SANE_PEAK = float(os.getenv("QSIM_MAX_SANE_PEAK", "1000"))
+MAX_SANE_PNL_PCT = float(os.getenv("QSIM_MAX_SANE_PNL_PCT", "100000"))   # +1000x
 MIN_SANE_PNL_PCT = -100.5   # can't lose more than the position
 
 # Reused by both the aggregate (negated) and the EXCLUDED listing.

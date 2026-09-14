@@ -1647,7 +1647,24 @@ def get_open_qsim_positions() -> list[dict]:
 
 
 def get_recent_closed_qsim_positions_for_post_exit(minutes: float, limit: int = 50) -> list[dict]:
-    """Closed qsim positions still inside the research-only post-exit quote window."""
+    """Closed qsim positions still inside the research-only post-exit quote window.
+
+    Returns `last_probe_at` and orders MOST-OVERDUE-FIRST (never-probed first, then the
+    longest since its last probe). Two reasons, both learned the hard way:
+
+    1. `ORDER BY exit_time DESC LIMIT n` takes the NEWEST closures. Under any budget
+       scarcity that starves the OLDEST coins first — and on a 48h window those are
+       precisely the ones the experiment exists to observe. The failure is silent: you
+       get a full-looking dataset that stops at whatever horizon the budget reached.
+    2. qsim.py used to track probe cadence in memory (`_last_post_exit_quote_ts`, keyed
+       on time.monotonic()). A pm2 restart wiped it AND reset the clock, so every
+       position looked infinitely overdue and got re-quoted at once. Over a 48h window
+       spanning restarts the cadence went lumpy. Same bug class as `_last_quote_wall`;
+       same fix — the database is the durable record of when we last looked.
+
+    The rate-limited probe path writes note='post_exit_probe rate-limited', so match on
+    the prefix: a 429 means we DID spend an attempt and should wait before retrying.
+    """
     conn = get_conn()
     safe_rollback()
     with conn.cursor() as cur:
@@ -1656,13 +1673,17 @@ def get_recent_closed_qsim_positions_for_post_exit(minutes: float, limit: int = 
             SELECT qp.call_id, qp.lane, qp.variant, qp.vip_tier, qp.channel_handle,
                    qp.entry_price, qp.entry_tokens, qp.entry_decimals, qp.sol_in,
                    qp.entry_time, qp.exit_time, qp.exit_reason,
-                   t.symbol, t.mint_address
+                   t.symbol, t.mint_address,
+                   (SELECT max(qo.observed_at)
+                      FROM qsim_quote_observations qo
+                     WHERE qo.call_id = qp.call_id
+                       AND qo.note LIKE 'post_exit_probe%%') AS last_probe_at
             FROM qsim_positions qp
             JOIN tokens t ON t.id = qp.token_id
             WHERE qp.status = 'closed'
               AND qp.exit_time IS NOT NULL
               AND qp.exit_time >= now() - (%s || ' minutes')::interval
-            ORDER BY qp.exit_time DESC
+            ORDER BY last_probe_at ASC NULLS FIRST, qp.exit_time DESC
             LIMIT %s
             """,
             (minutes, limit),

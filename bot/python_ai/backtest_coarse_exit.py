@@ -46,8 +46,11 @@ import lane_policy
 from exit_config import EXIT_A_PAPER, EXIT_RIDE, apply_exit_config
 
 # Phantom guard — identical bounds to compare_shadow / shadow_report.
-MAX_SANE_PEAK = 50.0
-MAX_SANE_PNL_PCT = 5000.0
+# Raised from 50 on 2026-09-14 for the 48h tail hunt: a cap of 50 SILENTLY DISCARDS
+# the exact events a tail strategy exists to catch. Some cap is still wanted (thin
+# liquidity produces absurd quotes — we saw a bogus 247x uplift), just not at 50x.
+MAX_SANE_PEAK = float(os.getenv("QSIM_MAX_SANE_PEAK", "1000"))
+MAX_SANE_PNL_PCT = float(os.getenv("QSIM_MAX_SANE_PNL_PCT", "100000"))   # +1000x
 MIN_SANE_PNL_PCT = -100.5
 
 # variant -> exit config. ride_vol approximated as RIDE (its riding branch; no live RVOL here).
