@@ -207,6 +207,15 @@ QSIM_RUNNER_TARGET_MULT    = float(os.getenv("QSIM_RUNNER_TARGET_MULT", "0"))   
 QSIM_RUNNER_FLOOR_MULT     = float(os.getenv("QSIM_RUNNER_FLOOR_MULT", "1.10"))
 QSIM_RUNNER_TRAIL_PCT      = float(os.getenv("QSIM_RUNNER_TRAIL_PCT", "0.30"))
 QSIM_RUNNER_STALL_MINS     = float(os.getenv("QSIM_RUNNER_STALL_MINS", "60"))
+# Hard horizon on a runner, hours from the partial bank. 0 = none. REQUIRED whenever
+# STALL_MINS is 0: the runner branch of _qsim_tick returns before apply_exit_config,
+# so the stall was the ONLY rule that ever closed a runner going nowhere. Without one
+# of the two, a runner stays open forever.
+QSIM_RUNNER_MAX_HOURS      = float(os.getenv("QSIM_RUNNER_MAX_HOURS", "0"))
+# Cadence for a runner far from its own floor/trail. Runners can now live for days;
+# at the normal far tier (30s) a couple of dozen of them would eat the whole quote
+# budget and re-create the 2026-09-05 starvation spiral. Clamped by the stale ceiling.
+QSIM_RUNNER_FAR_SECS       = float(os.getenv("QSIM_RUNNER_FAR_SECS", "90"))
 QSIM_RUNNER_WINDOW_ENABLED  = os.getenv("QSIM_RUNNER_WINDOW_ENABLED", "true").lower() == "true"
 RUNNER_WINDOW_ARM_MULT      = float(os.getenv("RUNNER_WINDOW_ARM_MULT", "2.0"))
 RUNNER_WINDOW_RELEASE_MULT  = float(os.getenv("RUNNER_WINDOW_RELEASE_MULT", "5.0"))
@@ -396,7 +405,7 @@ def _apply_runner_window(
     return result, "runner_window_active"
 
 
-def _runner_exit(runner_mult: float, peak_mult: float, high_at) -> ExitResult:
+def _runner_exit(runner_mult: float, peak_mult: float, high_at, banked_at=None) -> ExitResult:
     """Exit rules for the runner leg, evaluated on the RAW quote multiple.
 
     Order matters: target (if any), then floor, then trail from the runner's own peak, then
@@ -421,6 +430,15 @@ def _runner_exit(runner_mult: float, peak_mult: float, high_at) -> ExitResult:
                 return ExitResult(True, "runner_stall")
         except Exception:
             pass
+    # Horizon LAST: it is the backstop, not a strategy. With STALL_MINS=0 it is the only
+    # thing that closes a runner that neither trails out nor hits its floor.
+    if QSIM_RUNNER_MAX_HOURS > 0 and banked_at is not None:
+        try:
+            ref = banked_at if banked_at.tzinfo else banked_at.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - ref).total_seconds() >= QSIM_RUNNER_MAX_HOURS * 3600:
+                return ExitResult(True, "runner_horizon")
+        except Exception:
+            pass
     return ExitResult(False)
 
 
@@ -432,6 +450,19 @@ def _actionable_thresholds(pos: dict) -> tuple[float, float | None]:
     the trail sit far above the bank, so the bank is the binding upper threshold whenever an
     overlay is on; with no overlay we fall back to the trail arm.
     """
+    # A runner is subject to NONE of these. Its live thresholds are its own floor, its
+    # trail measured off its own peak, and its target. Measuring a runner against the bank
+    # it already took put every runner above 1.3x in the "already past a threshold" tier —
+    # a 5s quote cadence for its entire life, which was survivable only because the 60min
+    # stall capped that life (2026-09-17).
+    if float(pos.get("partial_fraction") or 0.0) > 0:
+        peak  = float(pos.get("runner_peak_mult") or 0.0)
+        lower = QSIM_RUNNER_FLOOR_MULT if QSIM_RUNNER_FLOOR_MULT > 0 else 0.0
+        if QSIM_RUNNER_TRAIL_PCT > 0 and peak > 0:
+            lower = max(lower, peak * (1.0 - QSIM_RUNNER_TRAIL_PCT))
+        upper = QSIM_RUNNER_TARGET_MULT if QSIM_RUNNER_TARGET_MULT > 0 else None
+        return max(0.0, lower), upper
+
     cfg = _qsim_exit_config(pos.get("variant") or "early")
     stop_mult = max(0.0, 1.0 - _qsim_hard_stop_pct(pos, cfg))
     bank_mult: float | None = None
@@ -492,6 +523,10 @@ def _target_cadence_secs(pos: dict) -> float:
         factor = mid
     else:
         factor = far
+        if QSIM_RUNNER_FAR_SECS > 0 and float(pos.get("partial_fraction") or 0.0) > 0:
+            stale_ceiling = (QSIM_STALE_DECISION_SECS * 0.5
+                             if QSIM_STALE_DECISION_SECS > 0 else QSIM_RUNNER_FAR_SECS)
+            return min(QSIM_RUNNER_FAR_SECS, stale_ceiling)
     return min(QSIM_TICK_SECS * factor, ceiling)
 
 
@@ -760,7 +795,8 @@ async def _qsim_tick(pos: dict) -> None:
             high_at = datetime.now(timezone.utc)
         else:
             high_at = pos.get("runner_high_at")
-        result = _runner_exit(runner_mult, prior_peak_mult, high_at)
+        result = _runner_exit(runner_mult, prior_peak_mult, high_at,
+                              banked_at=pos.get("partial_exit_time"))
         db.insert_qsim_quote_observation(
             call_id=call_id, sol_out=sol_out, real_mult=runner_mult,
             synth_mcap=entry * runner_mult, eff_mcap=entry * runner_mult,

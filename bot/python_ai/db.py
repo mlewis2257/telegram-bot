@@ -1634,6 +1634,7 @@ def get_open_qsim_positions() -> list[dict]:
                    qp.entry_price, qp.entry_tokens, qp.entry_decimals, qp.sol_in,
                    qp.entry_time, qp.peak_mcap, qp.peak_multiplier,
                    qp.partial_fraction, qp.partial_sol_out, qp.partial_exit_price,
+                   qp.partial_exit_time,
                    qp.runner_tokens, qp.runner_peak_mult, qp.runner_high_at,
                    t.symbol, t.mint_address
             FROM qsim_positions qp
