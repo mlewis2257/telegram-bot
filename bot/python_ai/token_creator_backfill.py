@@ -30,9 +30,9 @@ than it is -- the same error class as --include-post-exit.
 
 THIS SCRIPT WRITES
 ------------------
-It adds two additive columns (tokens.creator_address, tokens.creator_source) and
-fills them. It never updates or deletes anything else. --report and --dry-run do
-not write at all.
+It creates ONE side table (token_creators) and fills it. It does not alter
+`tokens` -- the bot's DB role does not own that table -- and it never updates or
+deletes anything else. --report and --dry-run write nothing at all.
 
     python3 token_creator_backfill.py --report
     python3 token_creator_backfill.py --limit 200 --dry-run
@@ -132,14 +132,28 @@ def creator_via_first_tx(mint: str) -> tuple[str | None, str]:
     return None, ""
 
 
-def ensure_columns() -> None:
+def ensure_table() -> None:
+    """Side table, NOT a column on `tokens`.
+
+    The bot's DB role owns what it creates but is not the owner of `tokens`, so
+    ALTER TABLE there fails with InsufficientPrivilege. A side table needs no
+    ownership, touches no schema other processes read, and can be dropped
+    without consequence if this line of work dies.
+    """
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor() as cur:
-        cur.execute("ALTER TABLE tokens ADD COLUMN IF NOT EXISTS creator_address text")
-        cur.execute("ALTER TABLE tokens ADD COLUMN IF NOT EXISTS creator_source text")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_tokens_creator "
-                    "ON tokens (creator_address)")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS token_creators (
+                token_id        integer PRIMARY KEY,
+                mint_address    text,
+                creator_address text,
+                creator_source  text,
+                resolved_at     timestamptz NOT NULL DEFAULT now()
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_token_creators_creator "
+                    "ON token_creators (creator_address)")
     conn.commit()
 
 
@@ -150,7 +164,8 @@ def backfill(limit: int, rps: float, dry_run: bool) -> None:
         cur.execute("""
             SELECT t.id, t.mint_address, t.symbol
             FROM tokens t
-            WHERE t.creator_address IS NULL
+            LEFT JOIN token_creators tc ON tc.token_id = t.id
+            WHERE tc.token_id IS NULL
               AND t.mint_address IS NOT NULL
               AND t.mint_address NOT LIKE 'UNKNOWN:%%'
             ORDER BY t.id DESC
@@ -167,13 +182,23 @@ def backfill(limit: int, rps: float, dry_run: bool) -> None:
             addr, src = creator_via_first_tx(mint)
         if addr:
             ok += 1
-            if not dry_run:
-                with conn.cursor() as cur:
-                    cur.execute("UPDATE tokens SET creator_address=%s, creator_source=%s "
-                                "WHERE id=%s", (addr, src, tid))
-                conn.commit()
         else:
             miss += 1
+        if not dry_run:
+            # Unresolved mints are recorded too, so a re-run resumes instead of
+            # re-querying every failure. To retry them:
+            #   DELETE FROM token_creators WHERE creator_address IS NULL;
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO token_creators
+                        (token_id, mint_address, creator_address, creator_source)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (token_id) DO UPDATE
+                        SET creator_address = EXCLUDED.creator_address,
+                            creator_source  = EXCLUDED.creator_source,
+                            resolved_at     = now()
+                """, (tid, mint, addr, src or "unresolved"))
+            conn.commit()
         if i % 100 == 0:
             print(f"  {i}/{len(todo)}  resolved={ok} unresolved={miss}")
         if delay:
@@ -182,17 +207,18 @@ def backfill(limit: int, rps: float, dry_run: bool) -> None:
 
 
 REPORT_SQL = """
-SELECT t.id                      AS token_id,
-       t.creator_address         AS creator,
-       min(c.created_at)         AS first_call,
-       max(qp.pnl_pct)           AS best_pnl_pct,
+SELECT t.id                       AS token_id,
+       tc.creator_address         AS creator,
+       min(c.created_at)          AS first_call,
+       max(qp.pnl_pct)            AS best_pnl_pct,
        bool_or(qp.pnl_pct <= -80) AS rugged,
-       count(qp.call_id)         AS qsim_trades
+       count(qp.call_id)          AS qsim_trades
 FROM tokens t
+JOIN token_creators tc ON tc.token_id = t.id
 JOIN calls c ON c.token_id = t.id
 LEFT JOIN qsim_positions qp ON qp.call_id = c.id AND qp.status = 'closed'
-WHERE t.creator_address IS NOT NULL
-GROUP BY t.id, t.creator_address
+WHERE tc.creator_address IS NOT NULL
+GROUP BY t.id, tc.creator_address
 """
 
 
@@ -201,8 +227,13 @@ def report() -> None:
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor() as cur:
-        cur.execute("SELECT count(*), count(creator_address) FROM tokens "
-                    "WHERE mint_address NOT LIKE 'UNKNOWN:%%'")
+        cur.execute("""
+            SELECT count(*),
+                   count(tc.creator_address)
+            FROM tokens t
+            LEFT JOIN token_creators tc ON tc.token_id = t.id
+            WHERE t.mint_address NOT LIKE 'UNKNOWN:%%'
+        """)
         total, have = cur.fetchone()
     print(f"tokens {total}, creator resolved {have} ({100 * have / total if total else 0:.1f}%)")
     if not have:
@@ -275,7 +306,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    ensure_columns()
+    ensure_table()
     if args.report:
         report()
     else:
