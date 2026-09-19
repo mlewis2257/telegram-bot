@@ -192,7 +192,8 @@ def policies() -> list[Policy]:
 
 
 def simulate(row: dict[str, Any], pol: Policy, roundtrip: float,
-             enter_on: str) -> tuple[float, str] | None:
+             enter_on: str, max_mult: float = 50.0, max_gap_min: float = 5.0,
+             confirm_ticks: bool = True) -> tuple[float, str] | None:
     """Forward pass. Returns (pnl_sol, reason), or None if never confirmed."""
     series = _series(row.get("series"))
     if not series:
@@ -206,17 +207,34 @@ def simulate(row: dict[str, Any], pol: Policy, roundtrip: float,
     peak = 0.0
     armed = False
 
+    prev_t = None
+    prev_m = 0.0
     for i, (t, m) in enumerate(series):
+        if m > max_mult:
+            # Beyond the cap we do not believe the print. Do not trade on it and
+            # do not let it set a peak that a trail would then measure against.
+            prev_t, prev_m = t, m
+            continue
         if basis == 0.0:
             if not armed:
                 if m >= pol.confirm:
                     armed = True
                     if enter_on == "cross":
                         basis, entry_at, peak = m / roundtrip, t, m
+                prev_t, prev_m = t, m
                 continue
             # armed: fill on the NEXT observation, which is what live can do
             basis, entry_at, peak = m / roundtrip, t, m
             continue
+
+        # Coverage guard. In-life quotes are ~30s apart; post-exit probes are
+        # ~30 MINUTES. An exit priced off a 30-minute-stale series is fiction:
+        # the sim can take a spike no live bot could reach, and can sit through
+        # a drawdown it never saw. Past max_gap we simply do not know, so close
+        # at the last price we could actually have acted on and flag it.
+        if max_gap_min > 0 and prev_t is not None \
+                and (t - prev_t).total_seconds() > max_gap_min * 60:
+            return (size * (prev_m / basis - 1.0), "blind")
 
         peak = max(peak, m)
         r = m / basis
@@ -231,7 +249,15 @@ def simulate(row: dict[str, Any], pol: Policy, roundtrip: float,
                 and (t - entry_at).total_seconds() >= pol.horizon_h * 3600:
             reason = "horizon"
         if reason:
+            # A one-tick print is not a fill. Require the level to survive into
+            # the next observation, and settle at the WORSE of the two.
+            if reason in ("bank", "trail") and confirm_ticks:
+                nxt = series[i + 1][1] if i + 1 < len(series) else None
+                if nxt is None:
+                    return (size * (r - 1.0), reason + "_unconfirmed")
+                r = min(r, nxt / basis)
             return (size * (r - 1.0), reason)
+        prev_t, prev_m = t, m
 
     if basis > 0.0:
         # still holding when quotes ran out — mark to last, flagged as unresolved
@@ -252,6 +278,19 @@ def main() -> int:
     ap.add_argument("--min-obs", type=int, default=3,
                     help="positions with fewer quotes cannot be judged to have "
                          "missed a crossing; they are excluded and counted")
+    ap.add_argument("--max-mult", type=float, default=50.0,
+                    help="ignore quotes above this multiple. The replay default "
+                         "of 1000 let a single bad print book +34 SOL on one "
+                         "trade and drove an entire bogus result (default 50)")
+    ap.add_argument("--max-gap-min", type=float, default=5.0,
+                    help="if quotes go quiet longer than this while holding, the "
+                         "exit cannot be modelled honestly — in-life quotes are "
+                         "~30s apart but post-exit probes are ~30 MINUTES. Close "
+                         "at the last actionable price and flag it (default 5)")
+    ap.add_argument("--no-confirm-ticks", action="store_true",
+                    help="allow single-tick prints to fill an exit (unsafe)")
+    ap.add_argument("--detail", type=int, nargs="?", const=15, default=0,
+                    help="list the N biggest contributing trades of the best policy")
     ap.add_argument("--boot", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=20260918)
     ap.add_argument("--json", action="store_true")
@@ -288,10 +327,12 @@ def main() -> int:
     for pol in policies():
         per: list[float] = []      # policy pnl per position (0 when not taken)
         diffs: list[float] = []    # paired difference vs what qsim booked
-        taken = wins = unres = 0
+        taken = wins = unres = blind = 0
         h1 = h2 = 0.0
+        contrib: list[tuple[float, str, str]] = []
         for r in usable:
-            res = simulate(r, pol, roundtrip, args.enter_on)
+            res = simulate(r, pol, roundtrip, args.enter_on, args.max_mult,
+                           args.max_gap_min, not args.no_confirm_ticks)
             p = 0.0
             if res is not None:
                 p, reason = res
@@ -300,6 +341,9 @@ def main() -> int:
                     wins += 1
                 if reason == "unresolved":
                     unres += 1
+                if reason == "blind":
+                    blind += 1
+                contrib.append((p, r.get("symbol") or "?", reason))
             per.append(p)
             d = p - _f(r["pnl_sol"])
             diffs.append(d)
@@ -323,23 +367,30 @@ def main() -> int:
             "pnl": sum(per), "per_trade": sum(per) / taken if taken else 0.0,
             "vs_base": sum(diffs), "ci_lo": lo, "ci_hi": hi,
             "win": 100.0 * wins / taken if taken else 0.0,
-            "unres": unres, "h1": h1, "h2": h2,
+            "unres": unres, "blind": blind, "h1": h1, "h2": h2,
+            "contrib": sorted(contrib, key=lambda x: -x[0]),
         })
 
     if args.json:
         print(json.dumps(out, indent=2, default=str))
         return 0
 
+    def top5(r) -> float:
+        """Share of gross profit from the 5 best trades. Near 100 means the
+        'edge' IS those trades, not a strategy."""
+        pos = [c for c, _, _ in r["contrib"] if c > 0]
+        return 100.0 * sum(sorted(pos, reverse=True)[:5]) / sum(pos) if pos else 0.0
+
     hdr = (f"{'policy':<18}{'taken':>7}{'take%':>7}{'pnl_sol':>10}{'per_trade':>11}"
            f"{'vs_base':>10}{'ci_lo':>9}{'ci_hi':>9}{'win%':>7}{'unres':>7}"
-           f"{'h1':>9}{'h2':>9}")
+           f"{'blind':>7}{'top5%':>7}{'h1':>9}{'h2':>9}")
     print(hdr)
     print("-" * len(hdr))
     for r in sorted(out, key=lambda x: -x["vs_base"]):
         print(f"{r['policy']:<18}{r['taken']:>7}{r['rate']:>7.1f}{r['pnl']:>10.4f}"
               f"{r['per_trade']:>11.4f}{r['vs_base']:>10.4f}{r['ci_lo']:>9.3f}"
-              f"{r['ci_hi']:>9.3f}{r['win']:>7.1f}{r['unres']:>7}"
-              f"{r['h1']:>9.3f}{r['h2']:>9.3f}")
+              f"{r['ci_hi']:>9.3f}{r['win']:>7.1f}{r['unres']:>7}{r['blind']:>7}"
+              f"{top5(r):>7.0f}{r['h1']:>9.3f}{r['h2']:>9.3f}")
 
     print()
     print("  vs_base = this policy's PnL minus what qsim actually booked, position")
@@ -347,6 +398,16 @@ def main() -> int:
     print("  that avoided loss IS the edge, and it is already inside vs_base.")
     print("  ci_lo/ci_hi are a PAIRED bootstrap on that difference: if ci_lo is")
     print("  below zero the policy has not been shown to beat doing nothing.")
+    if args.detail:
+        best = max(out, key=lambda x: x["vs_base"])
+        print(f"\ntop {args.detail} contributing trades — policy '{best['policy']}'")
+        print(f"{'symbol':<14}{'pnl_sol':>10}  reason")
+        for c, sym, reason in best["contrib"][:args.detail]:
+            print(f"{sym[:13]:<14}{c:>10.4f}  {reason}")
+        print()
+    print("  top5% is the share of gross profit from the 5 best trades — near 100")
+    print("  means the 'edge' IS those trades. 'blind' closed because quote coverage")
+    print("  went stale and the exit could not be modelled honestly.")
     print(f"  {len(out)} policies against one sample — the top row flatters itself;")
     print("  h1/h2 must agree in sign before any of this is worth trading.")
     return 0
