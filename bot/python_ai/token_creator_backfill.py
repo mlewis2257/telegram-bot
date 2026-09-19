@@ -157,7 +157,7 @@ def ensure_table() -> None:
     conn.commit()
 
 
-def backfill(limit: int, rps: float, dry_run: bool) -> None:
+def backfill(limit: int, rps: float, dry_run: bool, order: str, called_only: bool) -> None:
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor() as cur:
@@ -168,9 +168,12 @@ def backfill(limit: int, rps: float, dry_run: bool) -> None:
             WHERE tc.token_id IS NULL
               AND t.mint_address IS NOT NULL
               AND t.mint_address NOT LIKE 'UNKNOWN:%%'
-            ORDER BY t.id DESC
+              {called}
+            ORDER BY t.id {order}
             LIMIT %s
-        """, (limit,))
+        """.format(order=('ASC' if order == 'asc' else 'DESC'),
+                   called=('AND EXISTS (SELECT 1 FROM calls c WHERE c.token_id = t.id)'
+                           if called_only else '')), (limit,))
         todo = cur.fetchall()
 
     print(f"{len(todo)} tokens need a creator" + (" (dry run)" if dry_run else ""))
@@ -250,6 +253,12 @@ def report() -> None:
     print(f"\ndistinct creators        {len(per)}")
     print(f"tokens per creator       p50 {statistics.median(sizes):.0f}  "
           f"p90 {sizes[int(0.9 * len(sizes)) - 1]}  max {max(sizes)}")
+    top = per.most_common(5)
+    print("\ntop creators by token count (a human dev does not deploy hundreds —")
+    print("  anything in the hundreds is a launchpad/factory and must be excluded):")
+    for addr, cnt in top:
+        print(f"   {addr}  {cnt}")
+    print()
     print(f"tokens by a REPEAT dev   {repeats} of {len(rows)} "
           f"({100 * repeats / len(rows):.1f}%)")
     print()
@@ -304,13 +313,20 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=500)
     ap.add_argument("--rps", type=float, default=10.0)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--order", choices=("asc", "desc"), default="asc",
+                    help="asc = OLDEST first (default). Prior history lives in "
+                         "earlier tokens, so a partial desc run leaves recent "
+                         "calls looking like first-time devs and hides the signal.")
+    ap.add_argument("--called-only", action="store_true",
+                    help="only tokens that actually produced a call — cuts the "
+                         "universe to what can ever carry an outcome")
     args = ap.parse_args()
 
     ensure_table()
     if args.report:
         report()
     else:
-        backfill(args.limit, args.rps, args.dry_run)
+        backfill(args.limit, args.rps, args.dry_run, args.order, args.called_only)
         report()
     return 0
 
