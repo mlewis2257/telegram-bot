@@ -85,8 +85,31 @@ obs AS (
     GROUP BY q.call_id
 )
 SELECT p.call_id, p.sol_in, p.pnl_sol, o.series, coalesce(o.n_obs, 0) AS n_obs
-FROM pos p JOIN obs o ON o.call_id = p.call_id
-WHERE o.n_obs >= %(minobs)s
+FROM pos p LEFT JOIN obs o ON o.call_id = p.call_id
+WHERE coalesce(o.n_obs, 0) >= %(minobs)s
+"""
+
+# What the sweep cannot model, so the omission is never silent.
+EXCLUDED_SQL = """
+WITH pos AS (
+    SELECT qp.call_id, qp.exit_time, qp.sol_in, qp.pnl_sol
+    FROM qsim_positions qp
+    WHERE qp.status = 'closed' AND qp.exit_time IS NOT NULL AND qp.sol_in > 0
+      AND qp.entry_time >= now() - (%(days)s || ' days')::interval
+),
+obs AS (
+    SELECT q.call_id, count(*) AS n_obs
+    FROM qsim_quote_observations q
+    JOIN pos p ON p.call_id = q.call_id
+    WHERE q.real_mult IS NOT NULL AND q.real_mult > 0
+      AND (q.note IS NULL OR q.note NOT LIKE 'post_exit_probe%%')
+      AND q.observed_at <= p.exit_time + interval '5 seconds'
+    GROUP BY q.call_id
+)
+SELECT count(*) AS n, coalesce(sum(p.pnl_sol), 0) AS pnl,
+       coalesce(sum(p.sol_in), 0) AS sol
+FROM pos p LEFT JOIN obs o ON o.call_id = p.call_id
+WHERE coalesce(o.n_obs, 0) < %(minobs)s
 """
 
 
@@ -98,7 +121,9 @@ def _rows(days: int, min_obs: int) -> list[dict[str, Any]]:
     db.safe_rollback()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(SQL, {"days": days, "maxmult": MAX_MULT, "minobs": min_obs})
-        return [dict(r) for r in cur.fetchall()]
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.execute(EXCLUDED_SQL, {"days": days, "minobs": min_obs})
+        return rows, dict(cur.fetchone())
 
 
 def _series(raw: Any) -> list[float]:
@@ -149,7 +174,13 @@ def main() -> int:
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--bank", type=float, action="append", default=None,
                     help="bank level(s) to pair each stop with (default 1.3)")
-    ap.add_argument("--min-obs", type=int, default=3)
+    ap.add_argument("--min-obs", type=int, default=1,
+                    help="DEFAULT 1 ON PURPOSE. A coin that dies before it can "
+                         "be quoted three times is not a data-quality problem, "
+                         "it is the worst trade in the book. Requiring 3 dropped "
+                         "828 of 3,768 positions carrying ~87%% of the loss and "
+                         "made the book look like -1.3%%/SOL instead of -13.3%%. "
+                         "Raise it only to test sensitivity, never to clean data.")
     ap.add_argument("--qsim-stop", type=float, default=0.80,
                     help="qsim's REAL stop. Levels below it are censored, since "
                          "the series ends there and a recovery cannot be seen.")
@@ -157,7 +188,7 @@ def main() -> int:
     args = ap.parse_args()
 
     banks = args.bank or [1.3]
-    rows = _rows(args.days, args.min_obs)
+    rows, excl = _rows(args.days, args.min_obs)
     if not rows:
         print("no usable positions")
         return 1
@@ -165,6 +196,13 @@ def main() -> int:
     firsts = [_series(r.get("series"))[0] for r in rows if _series(r.get("series"))]
     print(f"window     {args.days}d   {len(rows)} positions with >= {args.min_obs} "
           f"held-window quotes")
+    if int(excl.get("n") or 0):
+        e_n, e_pnl = int(excl["n"]), float(excl["pnl"])
+        e_sol = float(excl["sol"]) or 1.0
+        print(f"EXCLUDED   {e_n} positions had fewer, and qsim REALLY booked "
+              f"{e_pnl:+.4f} SOL on them ({100 * e_pnl / e_sol:+.1f}%/SOL).")
+        print(f"           They are not in any row below. If that number is large, "
+              f"every %/SOL here is optimistic by roughly that much.")
     print(f"entry      first observable quote is p50 {statistics.median(firsts):.4f} "
           f"of the call price — that is the round trip, and every stop below is "
           f"measured from the CALL, not from there")
