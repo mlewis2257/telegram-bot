@@ -211,9 +211,10 @@ def simulate(row: dict[str, Any], pol: Policy, roundtrip: float,
     prev_m = 0.0
     for i, (t, m) in enumerate(series):
         if m > max_mult:
-            # Beyond the cap we do not believe the print. Do not trade on it and
-            # do not let it set a peak that a trail would then measure against.
-            prev_t, prev_m = t, m
+            # Beyond the cap we do not believe the print. It must NOT become
+            # prev_m either: a rejected price is not a price we could have sold
+            # at, and using it as the blind-close fallback booked +121 SOL on a
+            # single position (WOFI) and drove an entire bogus result.
             continue
         if basis == 0.0:
             if not armed:
@@ -328,6 +329,7 @@ def main() -> int:
         per: list[float] = []      # policy pnl per position (0 when not taken)
         diffs: list[float] = []    # paired difference vs what qsim booked
         taken = wins = unres = blind = 0
+        pol_sol = xb_pol = xb_base = 0.0
         h1 = h2 = 0.0
         contrib: list[tuple[float, str, str]] = []
         for r in usable:
@@ -345,6 +347,11 @@ def main() -> int:
                     blind += 1
                 contrib.append((p, r.get("symbol") or "?", reason))
             per.append(p)
+            if res is not None:
+                pol_sol += _f(r["sol_in"])
+                if reason != "blind":
+                    xb_pol += p
+                    xb_base += _f(r["pnl_sol"])
             d = p - _f(r["pnl_sol"])
             diffs.append(d)
             if mid and _dt(r["entry_time"]) and _dt(r["entry_time"]) <= mid:
@@ -368,6 +375,8 @@ def main() -> int:
             "vs_base": sum(diffs), "ci_lo": lo, "ci_hi": hi,
             "win": 100.0 * wins / taken if taken else 0.0,
             "unres": unres, "blind": blind, "h1": h1, "h2": h2,
+            "per_sol": 100.0 * sum(per) / pol_sol if pol_sol else 0.0,
+            "vs_base_xb": xb_pol - xb_base,
             "contrib": sorted(contrib, key=lambda x: -x[0]),
         })
 
@@ -382,13 +391,13 @@ def main() -> int:
         return 100.0 * sum(sorted(pos, reverse=True)[:5]) / sum(pos) if pos else 0.0
 
     hdr = (f"{'policy':<18}{'taken':>7}{'take%':>7}{'pnl_sol':>10}{'per_trade':>11}"
-           f"{'vs_base':>10}{'ci_lo':>9}{'ci_hi':>9}{'win%':>7}{'unres':>7}"
+           f"{'%/SOL':>8}{'vs_base':>10}{'xblind':>9}{'ci_lo':>9}{'ci_hi':>9}{'win%':>7}{'unres':>7}"
            f"{'blind':>7}{'top5%':>7}{'h1':>9}{'h2':>9}")
     print(hdr)
     print("-" * len(hdr))
     for r in sorted(out, key=lambda x: -x["vs_base"]):
         print(f"{r['policy']:<18}{r['taken']:>7}{r['rate']:>7.1f}{r['pnl']:>10.4f}"
-              f"{r['per_trade']:>11.4f}{r['vs_base']:>10.4f}{r['ci_lo']:>9.3f}"
+              f"{r['per_trade']:>11.4f}{r['per_sol']:>8.2f}{r['vs_base']:>10.4f}{r['vs_base_xb']:>9.3f}{r['ci_lo']:>9.3f}"
               f"{r['ci_hi']:>9.3f}{r['win']:>7.1f}{r['unres']:>7}{r['blind']:>7}"
               f"{top5(r):>7.0f}{r['h1']:>9.3f}{r['h2']:>9.3f}")
 
@@ -405,6 +414,11 @@ def main() -> int:
         for c, sym, reason in best["contrib"][:args.detail]:
             print(f"{sym[:13]:<14}{c:>10.4f}  {reason}")
         print()
+    print(f"  %/SOL is THIS POLICY's return on the capital it actually deployed.")
+    print(f"  Compare it to the baseline %/SOL in the header: if they match, the")
+    print("  filter is not picking better trades, it is only taking FEWER of them —")
+    print("  which you could match by trading at random, and is not an edge.")
+    print("  xblind = vs_base with unmodellable 'blind' exits removed from both sides.")
     print("  top5% is the share of gross profit from the 5 best trades — near 100")
     print("  means the 'edge' IS those trades. 'blind' closed because quote coverage")
     print("  went stale and the exit could not be modelled honestly.")
