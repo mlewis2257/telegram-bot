@@ -193,7 +193,8 @@ def policies() -> list[Policy]:
 
 def simulate(row: dict[str, Any], pol: Policy, roundtrip: float,
              enter_on: str, max_mult: float = 50.0, max_gap_min: float = 5.0,
-             confirm_ticks: bool = True) -> tuple[float, str] | None:
+             confirm_ticks: bool = True, max_fill_slip: float = 0.5
+             ) -> tuple[float, str, float, float, float] | None:
     """Forward pass. Returns (pnl_sol, reason), or None if never confirmed."""
     series = _series(row.get("series"))
     if not series:
@@ -209,6 +210,9 @@ def simulate(row: dict[str, Any], pol: Policy, roundtrip: float,
 
     prev_t = None
     prev_m = 0.0
+    trig_t = None
+    trig_m = 0.0
+    entry_mult = 0.0
     for i, (t, m) in enumerate(series):
         if m > max_mult:
             # Beyond the cap we do not believe the print. It must NOT become
@@ -220,12 +224,32 @@ def simulate(row: dict[str, Any], pol: Policy, roundtrip: float,
             if not armed:
                 if m >= pol.confirm:
                     armed = True
+                    trig_t, trig_m = t, m
                     if enter_on == "cross":
                         basis, entry_at, peak = m / roundtrip, t, m
+                        entry_mult = m
                 prev_t, prev_m = t, m
                 continue
-            # armed: fill on the NEXT observation, which is what live can do
+            # armed: fill on the NEXT observation — but only if that fill could
+            # REALLY have happened. Two ways it could not, both of which
+            # manufactured enormous fake wins (WOFI booked +121 SOL alone):
+            #
+            #   * the next quote is 30 MINUTES later (post-exit probe cadence).
+            #     Nobody sends an order off half-hour-old data.
+            #   * the price has moved wildly from the trigger. A high confirm
+            #     level fires on a SPIKE and the next print is often the revert
+            #     or an outright collapse; filling there sets a microscopic
+            #     basis and every later quote becomes a vast multiple. That is
+            #     why %/SOL ROSE with the confirm level (c2.0 +382, c1.5 +203,
+            #     c1.2 +0.8) instead of falling, and why --enter-on cross, which
+            #     never fills post-spike, was clean.
+            if trig_t is not None and (t - trig_t).total_seconds() > max_gap_min * 60:
+                return None
+            if trig_m > 0 and not (1.0 - max_fill_slip <= m / trig_m <= 1.0 + max_fill_slip):
+                return None
             basis, entry_at, peak = m / roundtrip, t, m
+            entry_mult = m
+            prev_t, prev_m = t, m
             continue
 
         # Coverage guard. In-life quotes are ~30s apart; post-exit probes are
@@ -235,7 +259,7 @@ def simulate(row: dict[str, Any], pol: Policy, roundtrip: float,
         # at the last price we could actually have acted on and flag it.
         if max_gap_min > 0 and prev_t is not None \
                 and (t - prev_t).total_seconds() > max_gap_min * 60:
-            return (size * (prev_m / basis - 1.0), "blind")
+            return (size * (prev_m / basis - 1.0), "blind", entry_mult, basis, prev_m)
 
         peak = max(peak, m)
         r = m / basis
@@ -255,14 +279,14 @@ def simulate(row: dict[str, Any], pol: Policy, roundtrip: float,
             if reason in ("bank", "trail") and confirm_ticks:
                 nxt = series[i + 1][1] if i + 1 < len(series) else None
                 if nxt is None:
-                    return (size * (r - 1.0), reason + "_unconfirmed")
+                    return (size * (r - 1.0), reason + "_unconfirmed", entry_mult, basis, m)
                 r = min(r, nxt / basis)
-            return (size * (r - 1.0), reason)
+            return (size * (r - 1.0), reason, entry_mult, basis, m)
         prev_t, prev_m = t, m
 
     if basis > 0.0:
         # still holding when quotes ran out — mark to last, flagged as unresolved
-        return (size * (series[-1][1] / basis - 1.0), "unresolved")
+        return (size * (series[-1][1] / basis - 1.0), "unresolved", entry_mult, basis, series[-1][1])
     return None
 
 
@@ -288,6 +312,10 @@ def main() -> int:
                          "exit cannot be modelled honestly — in-life quotes are "
                          "~30s apart but post-exit probes are ~30 MINUTES. Close "
                          "at the last actionable price and flag it (default 5)")
+    ap.add_argument("--max-fill-slip", type=float, default=0.5,
+                    help="reject the trade if the fill quote differs from the "
+                         "trigger quote by more than this fraction — a spike "
+                         "that reverts before you fill is not a trade you took")
     ap.add_argument("--no-confirm-ticks", action="store_true",
                     help="allow single-tick prints to fill an exit (unsafe)")
     ap.add_argument("--detail", type=int, nargs="?", const=15, default=0,
@@ -334,10 +362,11 @@ def main() -> int:
         contrib: list[tuple[float, str, str]] = []
         for r in usable:
             res = simulate(r, pol, roundtrip, args.enter_on, args.max_mult,
-                           args.max_gap_min, not args.no_confirm_ticks)
+                           args.max_gap_min, not args.no_confirm_ticks,
+                           args.max_fill_slip)
             p = 0.0
             if res is not None:
-                p, reason = res
+                p, reason, e_m, bas, x_m = res
                 taken += 1
                 if p > 0:
                     wins += 1
@@ -345,7 +374,7 @@ def main() -> int:
                     unres += 1
                 if reason == "blind":
                     blind += 1
-                contrib.append((p, r.get("symbol") or "?", reason))
+                contrib.append((p, r.get("symbol") or "?", reason, e_m, bas, x_m))
             per.append(p)
             if res is not None:
                 pol_sol += _f(r["sol_in"])
@@ -387,7 +416,7 @@ def main() -> int:
     def top5(r) -> float:
         """Share of gross profit from the 5 best trades. Near 100 means the
         'edge' IS those trades, not a strategy."""
-        pos = [c for c, _, _ in r["contrib"] if c > 0]
+        pos = [c[0] for c in r["contrib"] if c[0] > 0]
         return 100.0 * sum(sorted(pos, reverse=True)[:5]) / sum(pos) if pos else 0.0
 
     hdr = (f"{'policy':<18}{'taken':>7}{'take%':>7}{'pnl_sol':>10}{'per_trade':>11}"
@@ -410,9 +439,11 @@ def main() -> int:
     if args.detail:
         best = max(out, key=lambda x: x["vs_base"])
         print(f"\ntop {args.detail} contributing trades — policy '{best['policy']}'")
-        print(f"{'symbol':<14}{'pnl_sol':>10}  reason")
-        for c, sym, reason in best["contrib"][:args.detail]:
-            print(f"{sym[:13]:<14}{c:>10.4f}  {reason}")
+        print(f"{'symbol':<14}{'pnl_sol':>10}{'entry@':>9}{'basis':>9}{'exit@':>10}"
+              f"{'ret':>9}  reason")
+        for c, sym, reason, e_m, bas, x_m in best["contrib"][:args.detail]:
+            print(f"{sym[:13]:<14}{c:>10.4f}{e_m:>9.3f}{bas:>9.3f}{x_m:>10.3f}"
+                  f"{(x_m / bas if bas else 0):>9.2f}  {reason}")
         print()
     print(f"  %/SOL is THIS POLICY's return on the capital it actually deployed.")
     print(f"  Compare it to the baseline %/SOL in the header: if they match, the")
