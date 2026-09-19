@@ -68,7 +68,20 @@ NOT_A_DEPLOYER = {
     "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",   # pump.fun fee
     "11111111111111111111111111111111",              # system program
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   # SPL token program
+    # Found by --report: these hold tens to hundreds of "their own" tokens, which
+    # no human deployer does. Left in, they alone drive the repeat-dev bucket.
+    "WLHv2UAZm6z4KyaaELi5pjdbJh6RESMva1Rnn8pJVVh",   # 829 tokens, BOTH authority+creator
+    "2tgUbS9UMoQD6GkDZBiqKYCURnGrSb6ocYwRABrSJUvY",  # 247, fee payer
+    "AgmLJBMDCqWynYnQiPCuj9ewsNNsBJXyzoUhD9LJzN51",  # 191, fee payer
+    "gasTzr94Pmp4Gf8vknQnqxeYxdgwFjbgdJa4msYRpnB",   # 68, gas relayer (vanity 'gas')
+    "BAGSB9TpGrZxQbEsrEznv5jXXdwyP6AXerN8aVRiAmcv",  # 62, Bags launchpad authority
 }
+
+# A launchpad pays the deploy fee for its users, so the first-tx fee payer is
+# NOT reliably the dev. Any address that "deploys" more than this many tokens in
+# our sample is infrastructure, and the report drops it rather than letting it
+# masquerade as an experienced deployer.
+FACTORY_MIN_TOKENS = int(os.getenv("CREATOR_FACTORY_MIN", "40"))
 
 
 def _rpc(payload: dict) -> dict | None:
@@ -160,23 +173,29 @@ def ensure_table() -> None:
 def backfill(limit: int, rps: float, dry_run: bool, order: str, called_only: bool) -> None:
     conn = db.get_conn()
     db.safe_rollback()
+    print("selecting work (this query can take a minute on 107k tokens)...",
+          flush=True)
+    # --called-only used a correlated EXISTS, which on 107k tokens with no index
+    # on calls.token_id is one scan per token and effectively hangs. A hash join
+    # against a materialised DISTINCT set does the same job in seconds.
     with conn.cursor() as cur:
         cur.execute("""
             SELECT t.id, t.mint_address, t.symbol
             FROM tokens t
+            {called}
             LEFT JOIN token_creators tc ON tc.token_id = t.id
             WHERE tc.token_id IS NULL
               AND t.mint_address IS NOT NULL
               AND t.mint_address NOT LIKE 'UNKNOWN:%%'
-              {called}
             ORDER BY t.id {order}
             LIMIT %s
         """.format(order=('ASC' if order == 'asc' else 'DESC'),
-                   called=('AND EXISTS (SELECT 1 FROM calls c WHERE c.token_id = t.id)'
-                           if called_only else '')), (limit,))
+                   called=('JOIN (SELECT DISTINCT token_id FROM calls) cc '
+                           'ON cc.token_id = t.id' if called_only else '')), (limit,))
         todo = cur.fetchall()
 
-    print(f"{len(todo)} tokens need a creator" + (" (dry run)" if dry_run else ""))
+    print(f"{len(todo)} tokens need a creator"
+          + (" (dry run)" if dry_run else ""), flush=True)
     ok = miss = 0
     delay = 1.0 / rps if rps > 0 else 0.0
     for i, (tid, mint, sym) in enumerate(todo, 1):
@@ -203,10 +222,10 @@ def backfill(limit: int, rps: float, dry_run: bool, order: str, called_only: boo
                 """, (tid, mint, addr, src or "unresolved"))
             conn.commit()
         if i % 100 == 0:
-            print(f"  {i}/{len(todo)}  resolved={ok} unresolved={miss}")
+            print(f"  {i}/{len(todo)}  resolved={ok} unresolved={miss}", flush=True)
         if delay:
             time.sleep(delay)
-    print(f"done: resolved {ok}, unresolved {miss}")
+    print(f"done: resolved {ok}, unresolved {miss}", flush=True)
 
 
 REPORT_SQL = """
@@ -247,6 +266,13 @@ def report() -> None:
         cur.execute(REPORT_SQL)
         rows = [dict(r) for r in cur.fetchall()]
 
+    per_all = Counter(r["creator"] for r in rows)
+    factories = {a for a, c in per_all.items() if c >= FACTORY_MIN_TOKENS}
+    if factories:
+        rows = [r for r in rows if r["creator"] not in factories]
+        print(f"\nexcluded {len(factories)} factory addresses "
+              f"(>= {FACTORY_MIN_TOKENS} tokens each) — launchpads pay deploy "
+              f"fees for their users, so their fee payer is not the dev")
     per = Counter(r["creator"] for r in rows)
     sizes = sorted(per.values())
     repeats = sum(v for v in per.values() if v > 1)
