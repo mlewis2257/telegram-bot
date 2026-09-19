@@ -84,30 +84,55 @@ NOT_A_DEPLOYER = {
 FACTORY_MIN_TOKENS = int(os.getenv("CREATOR_FACTORY_MIN", "40"))
 
 
-def _rpc(payload: dict) -> dict | None:
-    url = rpc_pool.http_url() or SOLANA_RPC_URL
-    if not url:
-        return None
-    try:
-        r = requests.post(url, json=payload, timeout=TIMEOUT)
-    except requests.RequestException:
-        return None
-    if r.status_code != 200:
-        if hasattr(rpc_pool, "is_quota_error") and rpc_pool.is_quota_error(
-                r.status_code, r.text[:300] if r.content else None):
-            rpc_pool.penalize(url)
-        return None
-    try:
-        return r.json()
-    except ValueError:
-        return None
+class RpcFail(Exception):
+    """The RPC could not answer — rate limit, timeout, 5xx, bad JSON.
+
+    LOAD-BEARING. Before this existed, a 429 was indistinguishable from "this
+    mint genuinely has no creator", so throttled lookups were WRITTEN to the
+    table as permanently unresolved and skipped on every later run. Raising
+    the rate from 10 to 20 rps dropped resolution from 98.4% to 38.7% and holed
+    4,108 rows that way. A transient failure must never be persisted.
+    """
+
+
+def _rpc(payload: dict, retries: int = 4) -> dict:
+    backoff = 1.0
+    last = "no endpoint"
+    for _ in range(retries):
+        url = rpc_pool.http_url() or SOLANA_RPC_URL
+        if not url:
+            raise RpcFail("no RPC endpoint configured")
+        try:
+            r = requests.post(url, json=payload, timeout=TIMEOUT)
+        except requests.RequestException as e:
+            last = f"transport {type(e).__name__}"
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+        if r.status_code == 429 or r.status_code >= 500:
+            if hasattr(rpc_pool, "is_quota_error") and rpc_pool.is_quota_error(
+                    r.status_code, r.text[:300] if r.content else None):
+                rpc_pool.penalize(url)
+            last = f"http {r.status_code}"
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+        if r.status_code != 200:
+            raise RpcFail(f"http {r.status_code}")
+        try:
+            return r.json()
+        except ValueError:
+            last = "bad json"
+            time.sleep(backoff)
+            backoff *= 2
+    raise RpcFail(last)
 
 
 def creator_via_das(mint: str) -> tuple[str | None, str]:
     """Helius DAS getAsset. For pump.fun mints the dev is normally creators[0]."""
     data = _rpc({"jsonrpc": "2.0", "id": 1, "method": "getAsset",
                  "params": {"id": mint}})
-    res = (data or {}).get("result") or {}
+    res = (data or {}).get("result") or {}   # valid reply, possibly empty
     for c in res.get("creators") or []:
         addr = c.get("address")
         if addr and addr not in NOT_A_DEPLOYER:
@@ -196,12 +221,23 @@ def backfill(limit: int, rps: float, dry_run: bool, order: str, called_only: boo
 
     print(f"{len(todo)} tokens need a creator"
           + (" (dry run)" if dry_run else ""), flush=True)
-    ok = miss = 0
+    ok = miss = transient = 0
     delay = 1.0 / rps if rps > 0 else 0.0
     for i, (tid, mint, sym) in enumerate(todo, 1):
-        addr, src = creator_via_das(mint)
-        if not addr:
-            addr, src = creator_via_first_tx(mint)
+        try:
+            addr, src = creator_via_das(mint)
+            if not addr:
+                addr, src = creator_via_first_tx(mint)
+        except RpcFail as e:
+            # The node could not answer. That says nothing about the mint, so
+            # write NOTHING and leave it for the next run.
+            transient += 1
+            if transient % 50 == 0:
+                print(f"  ...{transient} transient RPC failures "
+                      f"(last: {e}) — consider a lower --rps", flush=True)
+            if delay:
+                time.sleep(delay)
+            continue
         if addr:
             ok += 1
         else:
@@ -222,10 +258,13 @@ def backfill(limit: int, rps: float, dry_run: bool, order: str, called_only: boo
                 """, (tid, mint, addr, src or "unresolved"))
             conn.commit()
         if i % 100 == 0:
-            print(f"  {i}/{len(todo)}  resolved={ok} unresolved={miss}", flush=True)
+            print(f"  {i}/{len(todo)}  resolved={ok} unresolved={miss} "
+                  f"transient={transient}", flush=True)
         if delay:
             time.sleep(delay)
-    print(f"done: resolved {ok}, unresolved {miss}", flush=True)
+    print(f"done: resolved {ok}, genuinely unresolved {miss}, "
+          f"transient RPC failures {transient} (not written — rerun to retry)",
+          flush=True)
 
 
 REPORT_SQL = """
@@ -336,8 +375,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--report", action="store_true", help="stats only, no fetching, no writes")
+    ap.add_argument("--retry-unresolved", action="store_true",
+                    help="delete rows with no creator and try them again. Use "
+                         "this once after the rate-limit bug: those rows may be "
+                         "throttled lookups recorded as permanent failures.")
     ap.add_argument("--limit", type=int, default=500)
-    ap.add_argument("--rps", type=float, default=10.0)
+    ap.add_argument("--rps", type=float, default=8.0,
+                    help="20 rps throttled badly (98.4%% -> 38.7%% resolution)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--order", choices=("asc", "desc"), default="asc",
                     help="asc = OLDEST first (default). Prior history lives in "
@@ -349,6 +393,13 @@ def main() -> int:
     args = ap.parse_args()
 
     ensure_table()
+    if args.retry_unresolved:
+        conn = db.get_conn()
+        db.safe_rollback()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM token_creators WHERE creator_address IS NULL")
+            print(f"cleared {cur.rowcount} unresolved rows for retry", flush=True)
+        conn.commit()
     if args.report:
         report()
     else:
