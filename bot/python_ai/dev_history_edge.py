@@ -134,6 +134,32 @@ def boot_ci(pnl: list[float], sol: list[float], iters: int,
     return (vals[int(0.025 * len(vals))], vals[min(len(vals) - 1, int(0.975 * len(vals)))])
 
 
+PEAK_SQL = """
+-- Per TOKEN: the highest multiple ever observed (in-life quotes AND post-exit
+-- probes, so it measures what the coin DID), and separately the highest seen
+-- while we still held it (what we could have banked).
+SELECT qp.token_id,
+       max(q.real_mult)                                      AS ever_peak,
+       max(q.real_mult) FILTER (WHERE q.note IS NULL
+             OR q.note NOT LIKE 'post_exit_probe%%')         AS held_peak
+FROM qsim_quote_observations q
+JOIN qsim_positions qp ON qp.call_id = q.call_id
+WHERE q.real_mult IS NOT NULL AND q.real_mult > 0 AND q.real_mult <= 1000
+GROUP BY qp.token_id
+"""
+
+
+def _peaks() -> dict[int, tuple[float, float]]:
+    from psycopg2.extras import RealDictCursor
+    import db
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(PEAK_SQL)
+        return {int(r["token_id"]): (_f(r["ever_peak"]), _f(r["held_peak"]))
+                for r in cur.fetchall()}
+
+
 POS_SQL = """
 SELECT qp.call_id, qp.token_id, qp.sol_in, qp.pnl_sol, qp.pnl_pct,
        qp.entry_time,
@@ -300,6 +326,11 @@ def main() -> int:
                          "and are dropped (default 40)")
     ap.add_argument("--source", default=None,
                     help="restrict to one creator_source, e.g. das_creators")
+    ap.add_argument("--peaks", action="store_true",
+                    help="report the RUNNER side, not just the rug side: what "
+                         "share of each bucket ever reached 1.3x / 2x / 5x / 10x. "
+                         "Cutting rugs only stops losses; a real signal should "
+                         "also RAISE the runner rate.")
     ap.add_argument("--split", choices=("lane", "channel", "variant"), default=None,
                     help="break the buckets down within each lane/channel, to see "
                          "whether the dev edge is independent of the lane policy")
@@ -377,8 +408,11 @@ def main() -> int:
               f"time and are excluded here but counted by --mode loose")
     print()
 
+    peaks = _peaks() if args.peaks else {}
     hdr = (f"{'bucket':<20}{'tokens':>8}{'trades':>8}{'pnl_sol':>10}{'%/SOL':>9}"
            f"{'ci_lo':>9}{'ci_hi':>9}{'rug%':>8}{'top5%':>8}")
+    if args.peaks:
+        hdr += f"{'bank%':>8}{'2x%':>7}{'5x%':>7}{'10x%':>7}{'run:lose':>10}"
     print(hdr)
     print("-" * len(hdr))
     for name in sorted(buckets):
@@ -392,7 +426,21 @@ def main() -> int:
         top5 = 100.0 * sum(wins[:5]) / sum(wins) if wins else 0.0
         rug = 100.0 * sum(1 for r in rs if r["rugged"]) / len(rs)
         print(f"{name:<20}{len(rs):>8}{sum(int(r['trades']) for r in rs):>8}"
-              f"{sum(pnl):>10.4f}{pct:>9.2f}{lo:>9.2f}{hi:>9.2f}{rug:>8.1f}{top5:>8.1f}")
+              f"{sum(pnl):>10.4f}{pct:>9.2f}{lo:>9.2f}{hi:>9.2f}{rug:>8.1f}{top5:>8.1f}",
+              end="")
+        if args.peaks:
+            pk = [peaks.get(int(r["token_id"])) for r in rs]
+            pk = [x for x in pk if x]
+            n = len(pk) or 1
+            bank = 100.0 * sum(1 for e, h in pk if h >= 1.3) / n
+            x2 = 100.0 * sum(1 for e, h in pk if e >= 2) / n
+            x5 = 100.0 * sum(1 for e, h in pk if e >= 5) / n
+            x10 = 100.0 * sum(1 for e, h in pk if e >= 10) / n
+            n_rug = sum(1 for r in rs if r["rugged"]) or 0
+            n_run = sum(1 for e, h in pk if e >= 2)
+            ratio = (n_run / n_rug) if n_rug else float("inf")
+            print(f"{bank:>8.1f}{x2:>7.1f}{x5:>7.1f}{x10:>7.1f}{ratio:>10.2f}", end="")
+        print()
 
     print()
     print("  The claim is NOT that '3+ clean' is profitable — it is that it beats")
@@ -400,6 +448,16 @@ def main() -> int:
     print("  straddles zero is breakeven-or-unknown, not an edge.")
     print("  top5% is the share of GROSS WINS from the 5 best tokens; near 100")
     print("  would mean the bucket is a few lucky coins wearing a filter's clothes.")
+    if args.peaks:
+        print()
+        print("  bank% is the HELD-window rate of reaching 1.3x — what you would")
+        print("  actually bank. 2x/5x/10x use post-exit probes too, so they measure")
+        print("  what the COIN did, not what the leash caught.")
+        print("  run:lose is (reached 2x) / (rugged). If that ratio is flat across")
+        print("  buckets, the filter only removes losers and the ceiling is breakeven.")
+        print("  If it RISES with clean history, clean devs ship better coins and the")
+        print("  filter can pay rather than merely stop the bleeding.")
+        print("  Breakeven needs bank% near 50; the whole book runs about 30.")
     print()
     print("  Compare the three modes. loose reads the future; strict hides")
     print("  deployments a bot could already see; realistic is the live information")
