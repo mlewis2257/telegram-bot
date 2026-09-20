@@ -622,6 +622,25 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             db.set_call_skip_reason(call_id, "mcap_too_high")
             return False
 
+        # ── Clean-deployer gate ───────────────────────────────────────────────
+        # Same gate qsim runs. Deployers with 3+ prior tokens and no prior rug
+        # rug half as often AND ship coins that run ~4x more (run:lose 0.94 ->
+        # 3.65) — see dev_history_edge.py. Honours DEV_GATE_MODE, so it blocks
+        # nothing while that is 'shadow'. Fails OPEN on any error: a gate that is
+        # down must not quietly become a gate that rejects everything.
+        if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
+            try:
+                import dev_gate
+                _g = await dev_gate.check(call_id, mint, channel_handle)
+                if not _g.allowed:
+                    print(f"[live] {symbol} skipped — dev gate: {_g.reason} "
+                          f"(prior_n={_g.prior_n} rugs={_g.prior_rugs} "
+                          f"{_g.latency_ms:.0f}ms)")
+                    db.set_call_skip_reason(call_id, "dev_gate")
+                    return False
+            except Exception as e:
+                print(f"[live] dev gate error (allowing): {type(e).__name__} {e}")
+
         if (
             (LIVE_MAX_ENTRY_EXEC_RATIO > 0 or LIVE_ENTRY_ROUNDTRIP_MIN_MULT > 0)
             and mint
