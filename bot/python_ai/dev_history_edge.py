@@ -134,6 +134,110 @@ def boot_ci(pnl: list[float], sol: list[float], iters: int,
     return (vals[int(0.025 * len(vals))], vals[min(len(vals) - 1, int(0.975 * len(vals)))])
 
 
+POS_SQL = """
+SELECT qp.call_id, qp.token_id, qp.sol_in, qp.pnl_sol, qp.pnl_pct,
+       qp.entry_time,
+       coalesce(qp.channel_handle, '?') AS channel,
+       coalesce(qp.lane, 'none')        AS lane,
+       coalesce(qp.variant, '?')        AS variant
+FROM qsim_positions qp
+WHERE qp.status = 'closed' AND qp.sol_in > 0
+  AND qp.entry_time >= now() - (%(days)s || ' days')::interval
+"""
+
+
+def _positions(days: int) -> list[dict[str, Any]]:
+    from psycopg2.extras import RealDictCursor
+    import db
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(POS_SQL, {"days": days})
+        return [dict(r) for r in cur.fetchall()]
+
+
+def token_buckets(rows: list[dict[str, Any]], mode: str,
+                  factory_min: int) -> dict[int, str]:
+    """token_id -> prior-history bucket, on the live information set."""
+    per: dict[str, int] = defaultdict(int)
+    for r in rows:
+        per[r["creator"]] += 1
+    factories = {c for c, n in per.items() if n >= factory_min}
+    by_creator: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        if r["creator"] not in factories and _dt(r["first_call"]):
+            by_creator[r["creator"]].append(r)
+
+    out: dict[int, str] = {}
+    for toks in by_creator.values():
+        toks.sort(key=lambda r: _dt(r["first_call"]))
+        called: list[float] = []
+        resolved_rug: list[float] = []
+        order_n = order_rugs = 0
+        for r in toks:
+            ts = _dt(r["first_call"]).timestamp()
+            if mode == "loose":
+                p_n, p_rugs = order_n, order_rugs
+            else:
+                p_n = bisect.bisect_left(called, ts)
+                p_rugs = bisect.bisect_left(resolved_rug, ts)
+            out[int(r["token_id"])] = bucket_of(p_n, p_rugs)
+            order_n += 1
+            order_rugs += 1 if r["rugged"] else 0
+            bisect.insort(called, ts)
+            le = _dt(r["last_exit"])
+            if le and r["rugged"]:
+                bisect.insort(resolved_rug, le.timestamp())
+    return out
+
+
+def report_split(days: int, split: str, mode: str, factory_min: int,
+                 boot: int, rng: random.Random) -> None:
+    """Does the dev edge hold WITHIN each lane/channel?
+
+    If it does, the lane policy is not what is producing it — and that policy was
+    fitted on the old paper book whose entries the price feed inflated. Dropping
+    it would roughly triple tradeable volume at the same edge, which is the
+    cheapest multiplier available and needs no new infrastructure.
+    """
+    tb = token_buckets(_rows(), mode, factory_min)
+    pos = _positions(days)
+    groups: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for p in pos:
+        b = tb.get(int(p["token_id"]))
+        if b is None:
+            continue          # creator unresolved — cannot be bucketed
+        key = p.get(split) or "?"
+        groups[str(key)][b].append(p)
+
+    for key in sorted(groups):
+        rows_by_b = groups[key]
+        total = sum(len(v) for v in rows_by_b.values())
+        if total < 50:
+            continue
+        print(f"\n{split} = {key}   ({total} positions)")
+        print(f"  {'bucket':<20}{'n':>7}{'pnl_sol':>10}{'%/SOL':>9}"
+              f"{'ci_lo':>9}{'ci_hi':>9}{'rug%':>8}")
+        print("  " + "-" * 70)
+        for b in sorted(rows_by_b):
+            v = rows_by_b[b]
+            pnl = [_f(r["pnl_sol"]) for r in v]
+            sol = [_f(r["sol_in"]) for r in v]
+            ts = sum(sol)
+            pct = 100.0 * sum(pnl) / ts if ts else 0.0
+            lo, hi = boot_ci(pnl, sol, boot, rng)
+            rug = 100.0 * sum(1 for r in v if _f(r["pnl_pct"]) <= -80) / len(v)
+            print(f"  {b:<20}{len(v):>7}{sum(pnl):>10.4f}{pct:>9.2f}"
+                  f"{lo:>9.2f}{hi:>9.2f}{rug:>8.1f}")
+    print()
+    print("  The edge is lane-INDEPENDENT if '3+ clean' beats '0 prior' inside")
+    print("  every cell with enough positions to read. Then the lane policy is not")
+    print("  producing it, and dropping that policy is ~3x more tradeable volume")
+    print("  at the same edge — the cheapest multiplier available.")
+    print("  If it only appears in one lane, the two are entangled and the lane")
+    print("  policy stays.")
+
+
 def clean_token_ids(min_prior: int = 3, factory_min: int = 40,
                     mode: str = "realistic", source: str | None = None) -> set[int]:
     """token_ids whose deployer had >= min_prior prior tokens and NO prior rug,
@@ -196,6 +300,9 @@ def main() -> int:
                          "and are dropped (default 40)")
     ap.add_argument("--source", default=None,
                     help="restrict to one creator_source, e.g. das_creators")
+    ap.add_argument("--split", choices=("lane", "channel", "variant"), default=None,
+                    help="break the buckets down within each lane/channel, to see "
+                         "whether the dev edge is independent of the lane policy")
     ap.add_argument("--boot", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=20260919)
     args = ap.parse_args()
@@ -297,6 +404,9 @@ def main() -> int:
     print("  Compare the three modes. loose reads the future; strict hides")
     print("  deployments a bot could already see; realistic is the live information")
     print("  set and is the only one worth trading on.")
+
+    if args.split:
+        report_split(args.days, args.split, mode, args.factory_min, args.boot, rng)
     return 0
 
 
