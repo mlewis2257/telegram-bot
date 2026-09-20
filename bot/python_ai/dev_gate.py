@@ -74,6 +74,10 @@ CHANNELS = {c.strip().lstrip("@").lower()
             for c in os.getenv("DEV_GATE_CHANNELS", "").split(",") if c.strip()}
 
 
+_TABLE_READY = False
+_LOG_FAILED_ONCE = False
+
+
 @dataclass(frozen=True)
 class Decision:
     allowed: bool
@@ -185,8 +189,12 @@ async def check(call_id: int | None, mint: str, channel: str | None) -> Decision
         d = Decision(allowed, reason, creator, source, p_n, p_r, ms)
         try:
             _log(call_id, mint, channel, d)
-        except Exception:
-            pass
+        except Exception as e:
+            global _LOG_FAILED_ONCE
+            if not _LOG_FAILED_ONCE:
+                _LOG_FAILED_ONCE = True
+                print(f"[dev_gate] LOGGING FAILED — decisions are not being "
+                      f"recorded: {type(e).__name__} {e}", flush=True)
         return d
 
     if MODE == "off":
@@ -225,6 +233,10 @@ async def check(call_id: int | None, mint: str, channel: str | None) -> Decision
 
 
 def _log(call_id, mint, channel, d: Decision) -> None:
+    global _TABLE_READY
+    if not _TABLE_READY:
+        ensure_table()          # nothing else calls this — the gate is the only writer
+        _TABLE_READY = True
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor() as cur:
