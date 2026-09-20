@@ -1030,6 +1030,20 @@ async def run_qsim_monitor() -> None:
     """Monitor loop (own process). Sell-quotes open qsim positions on a budget-capped
     cadence and applies real exit logic. Never executes anything."""
     _ensure_table()
+    # Create the gate's log at BOOT, not on first write. Lazily creating it meant
+    # the table only appeared once a gated call arrived, so "no table" and "no
+    # calls yet" were indistinguishable — and the startup line below now reports
+    # the gate's config, so a misconfigured DEV_GATE_CHANNELS is visible at once
+    # instead of looking like the gate silently doing nothing.
+    try:
+        import dev_gate
+        dev_gate.ensure_table()
+        print(f"[qsim] dev gate: mode={dev_gate.MODE} min_prior={dev_gate.MIN_PRIOR} "
+              f"max_prior_rugs={dev_gate.MAX_PRIOR_RUGS} "
+              f"channels={sorted(dev_gate.CHANNELS) or 'ALL'} "
+              f"timeout={dev_gate.TIMEOUT_MS:g}ms")
+    except Exception as e:
+        print(f"[qsim] dev gate unavailable: {type(e).__name__} {e}")
     print(f"[qsim] monitor started — lanes={list(QSIM_LANES)} "
           f"cap={QSIM_MAX_QUOTES_PER_MIN}/min cadence={QSIM_TICK_SECS}s enabled={QSIM_ENABLED}")
     print(f"[qsim] post-exit probes enabled={QSIM_POST_EXIT_OBS_ENABLED} "
