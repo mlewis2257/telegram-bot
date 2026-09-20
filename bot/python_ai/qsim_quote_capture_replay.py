@@ -612,6 +612,7 @@ WITH base AS (
         t.sniper_pct_remaining AS sniper_pct,
         t.bundle_count,
         t.sniper_count,
+        q.token_id AS _token_id,
         q.entry_price / NULLIF(c.mcap_at_call, 0) AS feed_entry_ratio
     FROM qsim_positions q
     JOIN calls c ON c.id = q.call_id
@@ -2570,6 +2571,15 @@ def main() -> None:
     )
     parser.add_argument("--days", type=int, default=1)
     parser.add_argument("--since", default=None, help="only include qsim entries at/after this timestamp")
+    parser.add_argument("--clean-devs", type=int, default=0,
+                        help="restrict to tokens whose deployer had >= N prior "
+                             "tokens and NO prior rug. The exit comparison that "
+                             "matters is the one run on the population you will "
+                             "actually trade: the filter TRIPLES tail density "
+                             "(10x rate 0.7%% -> 2.3%%), which is exactly the term "
+                             "that made tail-chasing lose on the whole book.")
+    parser.add_argument("--clean-factory-min", type=int, default=40,
+                        help="creators holding this many tokens are infrastructure")
     parser.add_argument("--channel", default="any")
     parser.add_argument("--lane", default="any")
     parser.add_argument("--variant", default="early")
@@ -2655,6 +2665,13 @@ def main() -> None:
     }
 
     rows = _rows(params)
+    if getattr(args, "clean_devs", 0):
+        from dev_history_edge import clean_token_ids
+        allowed = clean_token_ids(args.clean_devs, args.clean_factory_min)
+        before = len(rows)
+        rows = [r for r in rows if int(r.get("_token_id") or -1) in allowed]
+        print(f"clean-dev filter: {len(rows)} of {before} positions kept "
+              f"(deployer had >= {args.clean_devs} prior tokens, none rugged)")
     rows = [row for row in rows if _passes_where(row, where_clauses)]
     views = [
         _view(
