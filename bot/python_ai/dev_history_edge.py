@@ -134,6 +134,48 @@ def boot_ci(pnl: list[float], sol: list[float], iters: int,
     return (vals[int(0.025 * len(vals))], vals[min(len(vals) - 1, int(0.975 * len(vals)))])
 
 
+def clean_token_ids(min_prior: int = 3, factory_min: int = 40,
+                    mode: str = "realistic", source: str | None = None) -> set[int]:
+    """token_ids whose deployer had >= min_prior prior tokens and NO prior rug,
+    judged on the live information set. Shared with qsim_stop_sweep so the two
+    analyses cannot drift apart."""
+    rows = _rows()
+    if source:
+        rows = [r for r in rows if (r.get("source") or "") == source]
+    per: dict[str, int] = defaultdict(int)
+    for r in rows:
+        per[r["creator"]] += 1
+    factories = {c for c, n in per.items() if n >= factory_min}
+
+    by_creator: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        if r["creator"] not in factories and _dt(r["first_call"]):
+            by_creator[r["creator"]].append(r)
+
+    out: set[int] = set()
+    for toks in by_creator.values():
+        toks.sort(key=lambda r: _dt(r["first_call"]))
+        called: list[float] = []
+        resolved_rug: list[float] = []
+        order_n = order_rugs = 0
+        for r in toks:
+            call_ts = _dt(r["first_call"]).timestamp()
+            if mode == "loose":
+                p_n, p_rugs = order_n, order_rugs
+            else:
+                p_n = bisect.bisect_left(called, call_ts)
+                p_rugs = bisect.bisect_left(resolved_rug, call_ts)
+            if p_rugs == 0 and p_n >= min_prior:
+                out.add(int(r["token_id"]))
+            order_n += 1
+            order_rugs += 1 if r["rugged"] else 0
+            bisect.insort(called, call_ts)
+            le = _dt(r["last_exit"])
+            if le and r["rugged"]:
+                bisect.insort(resolved_rug, le.timestamp())
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)

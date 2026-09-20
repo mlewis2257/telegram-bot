@@ -65,7 +65,7 @@ MAX_MULT = float(os.getenv("QSIM_STOP_SWEEP_MAX_MULT", "50"))
 
 SQL = """
 WITH pos AS (
-    SELECT qp.call_id, qp.entry_time, qp.exit_time, qp.sol_in, qp.pnl_sol
+    SELECT qp.call_id, qp.token_id, qp.entry_time, qp.exit_time, qp.sol_in, qp.pnl_sol
     FROM qsim_positions qp
     WHERE qp.status = 'closed' AND qp.exit_time IS NOT NULL AND qp.sol_in > 0
       AND qp.entry_time >= now() - (%(days)s || ' days')::interval
@@ -84,7 +84,7 @@ obs AS (
       AND q.observed_at <= p.exit_time + interval '5 seconds'
     GROUP BY q.call_id
 )
-SELECT p.call_id, p.sol_in, p.pnl_sol, o.series, coalesce(o.n_obs, 0) AS n_obs
+SELECT p.call_id, p.token_id, p.sol_in, p.pnl_sol, o.series, coalesce(o.n_obs, 0) AS n_obs
 FROM pos p LEFT JOIN obs o ON o.call_id = p.call_id
 WHERE coalesce(o.n_obs, 0) >= %(minobs)s
 """
@@ -184,11 +184,25 @@ def main() -> int:
     ap.add_argument("--qsim-stop", type=float, default=0.80,
                     help="qsim's REAL stop. Levels below it are censored, since "
                          "the series ends there and a recovery cannot be seen.")
+    ap.add_argument("--clean-devs", type=int, default=0,
+                    help="restrict to tokens whose deployer had >= N prior tokens "
+                         "and NO prior rug. The stop's benefit was measured on the "
+                         "WHOLE book, most of which is rugs; on a population that "
+                         "already rugs at 8%% instead of 17%% it may buy far less, "
+                         "so the two effects must be measured together, not added.")
+    ap.add_argument("--factory-min", type=int, default=40)
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     banks = args.bank or [1.3]
     rows, excl = _rows(args.days, args.min_obs)
+    if args.clean_devs:
+        from dev_history_edge import clean_token_ids
+        allowed = clean_token_ids(args.clean_devs, args.factory_min)
+        before = len(rows)
+        rows = [r for r in rows if int(r.get("token_id") or -1) in allowed]
+        print(f"clean-dev filter: {len(rows)} of {before} positions kept "
+              f"(deployer had >= {args.clean_devs} prior tokens, none rugged)")
     if not rows:
         print("no usable positions")
         return 1
