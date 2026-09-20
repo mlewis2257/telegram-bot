@@ -138,9 +138,17 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--days", type=int, default=30)
+    ap.add_argument("--mode", choices=("realistic", "strict", "loose"),
+                    default="realistic",
+                    help="realistic (default): prior_n by CALL time, which a bot "
+                         "reads off-chain instantly, and prior_rugs by RUG time, "
+                         "which it can only learn once the rug happens. strict: "
+                         "both delayed until the prior position closed — an "
+                         "OVER-correction, it hides deployments already visible "
+                         "on chain. loose: call order only, which reads the "
+                         "future and is shown for comparison.")
     ap.add_argument("--loose", action="store_true",
-                    help="count prior tokens by call ORDER only, ignoring whether "
-                         "their outcome was known yet — the old, look-ahead version")
+                    help="alias for --mode loose")
     ap.add_argument("--factory-min", type=int, default=40,
                     help="creators holding this many tokens are infrastructure "
                          "and are dropped (default 40)")
@@ -150,6 +158,7 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=20260919)
     args = ap.parse_args()
 
+    mode = "loose" if args.loose else args.mode
     rows = _rows()
     if args.source:
         rows = [r for r in rows if (r.get("source") or "") == args.source]
@@ -174,22 +183,30 @@ def main() -> int:
 
     for toks in by_creator.values():
         toks.sort(key=lambda r: _dt(r["first_call"]))
-        resolved: list[float] = []        # last_exit timestamps of prior tokens
-        resolved_rug: list[float] = []    # ...of prior tokens that rugged
+        resolved: list[float] = []        # last_exit ts of prior tokens (strict)
+        resolved_rug: list[float] = []    # last_exit ts of prior tokens that RUGGED
+        called: list[float] = []          # first_call ts of prior tokens
         order_n = order_rugs = 0
         for r in toks:
             call_ts = _dt(r["first_call"]).timestamp()
-            if args.loose:
+            if mode == "loose":
                 p_n, p_rugs = order_n, order_rugs
-            else:
-                # STRICT: only priors whose outcome was already settled.
+            elif mode == "strict":
                 p_n = bisect.bisect_left(resolved, call_ts)
                 p_rugs = bisect.bisect_left(resolved_rug, call_ts)
                 unknown_at_call += order_n - p_n
+            else:
+                # REALISTIC. A deployment is visible on chain the moment it
+                # happens, so prior_n needs no delay. A rug verdict is not, so
+                # prior_rugs counts only rugs that had already occurred.
+                p_n = bisect.bisect_left(called, call_ts)
+                p_rugs = bisect.bisect_left(resolved_rug, call_ts)
+                unknown_at_call += order_rugs - p_rugs
             if int(r["trades"] or 0) > 0 and call_ts >= cutoff:
                 buckets[bucket_of(p_n, p_rugs)].append(r)
             order_n += 1
             order_rugs += 1 if r["rugged"] else 0
+            bisect.insort(called, call_ts)
             le = _dt(r["last_exit"])
             if le:
                 bisect.insort(resolved, le.timestamp())
@@ -197,14 +214,18 @@ def main() -> int:
                     bisect.insort(resolved_rug, le.timestamp())
 
     rng = random.Random(args.seed)
-    mode = "LOOSE (call order only — look-ahead)" if args.loose \
-        else "STRICT (prior outcome must have settled before the call)"
-    print(f"window        last {args.days}d   prior-history mode: {mode}")
+    labels = {
+        "realistic": "REALISTIC (deployments known at once, rugs only once they rug)",
+        "strict":    "STRICT (prior position must have CLOSED — over-corrects)",
+        "loose":     "LOOSE (call order only — reads the future)",
+    }
+    print(f"window        last {args.days}d   prior-history mode: {labels[mode]}")
     print(f"factories     {len(factories)} creators dropped at >= {args.factory_min} tokens"
           + (f"   source={args.source}" if args.source else ""))
-    if not args.loose:
-        print(f"look-ahead    {unknown_at_call} prior-token outcomes were NOT yet known "
-              f"at call time and are excluded here but counted by --loose")
+    if mode != "loose":
+        what = "rug verdicts" if mode == "realistic" else "prior-token outcomes"
+        print(f"look-ahead    {unknown_at_call} {what} were NOT yet known at call "
+              f"time and are excluded here but counted by --mode loose")
     print()
 
     hdr = (f"{'bucket':<20}{'tokens':>8}{'trades':>8}{'pnl_sol':>10}{'%/SOL':>9}"
@@ -231,9 +252,9 @@ def main() -> int:
     print("  top5% is the share of GROSS WINS from the 5 best tokens; near 100")
     print("  would mean the bucket is a few lucky coins wearing a filter's clothes.")
     print()
-    print("  Then run --loose. If the edge is much larger there, the difference is")
-    print("  exactly the rug verdicts that had not happened yet at call time, and")
-    print("  only the STRICT number is tradeable.")
+    print("  Compare the three modes. loose reads the future; strict hides")
+    print("  deployments a bot could already see; realistic is the live information")
+    print("  set and is the only one worth trading on.")
     return 0
 
 
