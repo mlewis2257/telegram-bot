@@ -637,6 +637,23 @@ async def qsim_open(score_result: dict, token_data: dict) -> None:
                   f"call_id={call_id}")
             return
 
+        # ── Clean-deployer gate ──────────────────────────────────────────────
+        # Deployers with 3+ prior tokens and no prior rug rug half as often AND
+        # run ~4x more (run:lose 0.94 -> 3.65); see dev_history_edge.py. Default
+        # mode is SHADOW: it evaluates, records, and allows, so the real latency
+        # and block rate get measured before anything depends on them. It never
+        # raises and every failure path allows the trade.
+        try:
+            import dev_gate
+            _g = await dev_gate.check(call_id, mint, channel)
+            if not _g.allowed:
+                print(f"[qsim] {symbol} skipped — dev gate: {_g.reason} "
+                      f"(prior_n={_g.prior_n} rugs={_g.prior_rugs} "
+                      f"{_g.latency_ms:.0f}ms) call_id={call_id}")
+                return
+        except Exception as e:
+            print(f"[qsim] dev gate error (allowing): {type(e).__name__} {e}")
+
         size = float(spec["size"])
         try:
             tokens_raw = await jupiter.get_buy_quote(mint, size, raise_on_ratelimit=True)
