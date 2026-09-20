@@ -63,7 +63,18 @@ from datetime import datetime, timezone
 
 import db
 
+# One mode cannot serve both callers. qsim needs SHADOW to keep trading the
+# blocked group — that is the control arm of the forward test, and without it a
+# filtered book can only be compared to a different month, which is the confound
+# that made September look 10 points better than August on the mcap ceiling
+# alone. Live needs ENFORCE, because there the point is to not take the trade.
 MODE = os.getenv("DEV_GATE_MODE", "shadow").strip().lower()
+MODE_QSIM = (os.getenv("DEV_GATE_MODE_QSIM", "").strip().lower() or MODE)
+MODE_LIVE = (os.getenv("DEV_GATE_MODE_LIVE", "").strip().lower() or MODE)
+
+
+def mode_for(context: str) -> str:
+    return MODE_LIVE if context == "live" else MODE_QSIM
 MIN_PRIOR = int(os.getenv("DEV_GATE_MIN_PRIOR", "3"))
 MAX_PRIOR_RUGS = int(os.getenv("DEV_GATE_MAX_PRIOR_RUGS", "0"))
 TIMEOUT_MS = float(os.getenv("DEV_GATE_TIMEOUT_MS", "1200"))
@@ -107,9 +118,13 @@ def ensure_table() -> None:
                 prior_n     integer,
                 prior_rugs  integer,
                 latency_ms  numeric,
+                context     text,
                 decided_at  timestamptz NOT NULL DEFAULT now()
             )
         """)
+        # Added after the table shipped, so existing installs get it too.
+        cur.execute("ALTER TABLE dev_gate_decisions "
+                    "ADD COLUMN IF NOT EXISTS context text")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_dev_gate_call "
                     "ON dev_gate_decisions (call_id)")
     conn.commit()
@@ -180,15 +195,21 @@ def _remember(mint: str, creator: str, source: str) -> None:
     conn.commit()
 
 
-async def check(call_id: int | None, mint: str, channel: str | None) -> Decision:
-    """Never raises. Any failure allows the trade — see FAIL-OPEN above."""
+async def check(call_id: int | None, mint: str, channel: str | None,
+                context: str = "qsim") -> Decision:
+    """Never raises. Any failure allows the trade — see FAIL-OPEN above.
+
+    `context` selects the mode, so qsim can stay in shadow (keeping both arms of
+    the forward test) while live enforces.
+    """
     t0 = time.monotonic()
+    mode = mode_for(context)
 
     def done(allowed, reason, creator=None, source=None, p_n=0, p_r=0) -> Decision:
         ms = (time.monotonic() - t0) * 1000.0
         d = Decision(allowed, reason, creator, source, p_n, p_r, ms)
         try:
-            _log(call_id, mint, channel, d)
+            _log(call_id, mint, channel, d, context, mode)
         except Exception as e:
             global _LOG_FAILED_ONCE
             if not _LOG_FAILED_ONCE:
@@ -197,7 +218,7 @@ async def check(call_id: int | None, mint: str, channel: str | None) -> Decision
                       f"recorded: {type(e).__name__} {e}", flush=True)
         return d
 
-    if MODE == "off":
+    if mode == "off":
         return done(True, "gate_off")
     ch = (channel or "").lstrip("@").lower()
     if CHANNELS and ch not in CHANNELS:
@@ -225,14 +246,14 @@ async def check(call_id: int | None, mint: str, channel: str | None) -> Decision
     ok = p_n >= MIN_PRIOR and p_r <= MAX_PRIOR_RUGS
     reason = "pass" if ok else (f"prior_rugs={p_r}" if p_r > MAX_PRIOR_RUGS
                                 else f"prior_n={p_n}<{MIN_PRIOR}")
-    if MODE == "shadow":
+    if mode == "shadow":
         # Evaluated and recorded, but the trade proceeds. The reason column
         # still says what enforce WOULD have done.
         return done(True, f"shadow:{reason}", creator, source, p_n, p_r)
     return done(ok, reason, creator, source, p_n, p_r)
 
 
-def _log(call_id, mint, channel, d: Decision) -> None:
+def _log(call_id, mint, channel, d: Decision, context: str, mode: str) -> None:
     global _TABLE_READY
     if not _TABLE_READY:
         ensure_table()          # nothing else calls this — the gate is the only writer
@@ -243,8 +264,8 @@ def _log(call_id, mint, channel, d: Decision) -> None:
         cur.execute("""
             INSERT INTO dev_gate_decisions
                 (call_id, mint_address, channel, mode, allowed, reason,
-                 creator, source, prior_n, prior_rugs, latency_ms)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (call_id, mint, channel, MODE, d.allowed, d.reason, d.creator,
-              d.source, d.prior_n, d.prior_rugs, round(d.latency_ms, 1)))
+                 creator, source, prior_n, prior_rugs, latency_ms, context)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (call_id, mint, channel, mode, d.allowed, d.reason, d.creator,
+              d.source, d.prior_n, d.prior_rugs, round(d.latency_ms, 1), context))
     conn.commit()

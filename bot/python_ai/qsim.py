@@ -645,7 +645,7 @@ async def qsim_open(score_result: dict, token_data: dict) -> None:
         # raises and every failure path allows the trade.
         try:
             import dev_gate
-            _g = await dev_gate.check(call_id, mint, channel)
+            _g = await dev_gate.check(call_id, mint, channel, context="qsim")
             if not _g.allowed:
                 print(f"[qsim] {symbol} skipped — dev gate: {_g.reason} "
                       f"(prior_n={_g.prior_n} rugs={_g.prior_rugs} "
@@ -1040,6 +1040,7 @@ async def run_qsim_monitor() -> None:
         dev_gate.ensure_table()
         print(f"[qsim] dev gate: mode={dev_gate.MODE} min_prior={dev_gate.MIN_PRIOR} "
               f"max_prior_rugs={dev_gate.MAX_PRIOR_RUGS} "
+              f"qsim={dev_gate.MODE_QSIM} live={dev_gate.MODE_LIVE} "
               f"channels={sorted(dev_gate.CHANNELS) or 'ALL'} "
               f"timeout={dev_gate.TIMEOUT_MS:g}ms")
     except Exception as e:

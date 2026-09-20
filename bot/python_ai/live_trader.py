@@ -631,7 +631,7 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         if mint and not mint.startswith(("INFERRED:", "UNKNOWN:")):
             try:
                 import dev_gate
-                _g = await dev_gate.check(call_id, mint, channel_handle)
+                _g = await dev_gate.check(call_id, mint, channel_handle, context="live")
                 if not _g.allowed:
                     print(f"[live] {symbol} skipped — dev gate: {_g.reason} "
                           f"(prior_n={_g.prior_n} rugs={_g.prior_rugs} "
