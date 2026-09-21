@@ -50,16 +50,31 @@ LIQ_RE = re.compile(r'Liquidity\s*:\s*(\S+)', re.IGNORECASE)
 # Txns (24h): 450  or  Txns: 450
 TXNS_RE = re.compile(r'Txns(?:\s*\(24h\))?\s*:\s*(\S+)', re.IGNORECASE)
 
-# Contract Address: <mint>  — same line (volume alert format)
+# Telegram markdown puts the emphasis markers INSIDE the label:
+#     🔗 **Contract Address**: `<mint>`
+# so "Contract Address:" never appears literally — the ** sits between
+# "Address" and the colon, and \s* does not match it. Every one of the 1,020
+# solhousesignal_vip calls in the last 30 days was stored as UNKNOWN: for
+# exactly this reason: no mint means no shadow, no qsim, no creator lookup and
+# no trade, silently. [*_~`] is now allowed anywhere in the label.
+_MD = r'[*_~`\s]*'
 CONTRACT_INLINE_RE = re.compile(
-    r'Contract\s+Address\s*:\s*([1-9A-HJ-NP-Za-km-z]{32,50})',
+    rf'Contract{_MD}Address{_MD}:{_MD}([1-9A-HJ-NP-Za-km-z]{{32,50}})',
     re.IGNORECASE,
 )
-# Contract Address:\n<mint>  — next line (gem + whale format)
 CONTRACT_NEXT_LINE_RE = re.compile(
-    r'Contract\s+Address\s*:\s*\n\s*([1-9A-HJ-NP-Za-km-z]{32,50})',
+    rf'Contract{_MD}Address{_MD}:[^\S\n]*\n{_MD}([1-9A-HJ-NP-Za-km-z]{{32,50}})',
     re.IGNORECASE,
 )
+
+
+def _strip_md(text: str) -> str:
+    """Drop Telegram emphasis markers so EVERY field regex sees a clean label.
+
+    Underscores are deliberately KEPT — they are legal in token names, while
+    '*', '`' and '~' are only ever formatting here.
+    """
+    return ''.join(c for c in text if c not in '*`~')
 
 # Whale wallet: "Wallet: 97 SOL"
 WALLET_RE = re.compile(r'Wallet\s*:\s*([\d,.]+)\s*SOL', re.IGNORECASE)
@@ -132,13 +147,19 @@ def parse(text: str) -> dict | None:
     Detects the message type from the header and extracts all fields.
     Returns a standardised dict, or None if no known header is found.
     """
+    # Normalise ONCE, before any field regex runs. The markers sit inside the
+    # labels ("**Market Cap**:", "**Txns (24h)**:"), so every pattern that
+    # expects "Label:" fails on the raw text — not just the contract address.
+    # All 1,020 VIP calls in 30 days parsed with a NULL mint AND null mcap,
+    # ticker and volume because of this.
+    text = _strip_md(text)
+
     if IS_GEM_ALERT_RE.search(text):
         vip_message_type = 'gem_alert'
     elif IS_WHALE_ALERT_RE.search(text):
         vip_message_type = 'whale_alert'
     elif IS_VOLUME_ALERT_RE.search(text):
         vip_message_type = 'volume_alert'
-        print(f"[vip:volume_alert debug] text preview: {repr(text[:200])}")
     else:
         return None
 
@@ -187,8 +208,10 @@ def parse(text: str) -> dict | None:
     # "🔗 Contract Address: <mint>"), then fall back to next-line.
     mint_address = None
     for line in text.splitlines():
-        if "Contract Address:" in line:
-            parts = line.split("Contract Address:", 1)
+        # Match on the markdown-stripped line, not the raw one.
+        bare = _strip_md(line)
+        if "contract address" in bare.lower():
+            parts = re.split(r'(?i)contract\s*address\s*:?', bare, maxsplit=1)
             candidate = parts[1].strip() if len(parts) > 1 else ""
             # Strip invisible unicode control/format characters (common in
             # styled Telegram messages) before attempting the base58 match.
