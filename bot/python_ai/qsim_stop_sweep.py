@@ -168,6 +168,54 @@ def run(rows, stop: float, bank: float):
     return stopped, banked, neither
 
 
+def survival(rows, levels, min_obs_note: str = "") -> None:
+    """Would a tighter stop have cut the runners BEFORE they ran?
+
+    The %/SOL sweep cannot answer this: it prices every winner as a flat exit at
+    --bank, so it is blind to the 4.3% of trades that reach 5x and carry +532%.
+    That blindness is exactly why the tightest row looked best.
+
+    So ask it directly. For each coin take its HELD-window peak and the lowest
+    quote before that peak — the drawdown the position had to survive to get
+    there. A stop above that low would have cut it first, runner and all.
+    """
+    tiers = (("1: under 2x", 0.0, 2.0), ("2: 2-5x", 2.0, 5.0),
+             ("3: 5-10x", 5.0, 10.0), ("4: 10x+", 10.0, float("inf")))
+    data: dict[str, list[float]] = {t[0]: [] for t in tiers}
+    for r in rows:
+        ms = _series(r.get("series"))
+        if not ms:
+            continue
+        pk_i = max(range(len(ms)), key=lambda i: ms[i])
+        peak = ms[pk_i]
+        low_before = min(ms[:pk_i + 1])
+        for name, lo, hi in tiers:
+            if lo <= peak < hi:
+                data[name].append(low_before)
+                break
+
+    hdr = (f"  {'peak tier':<14}{'coins':>7}{'p50_low':>10}{'p10_low':>10}"
+           + "".join(f"{('surv@' + format(s, '.2f')):>10}" for s in levels))
+    print("\nSURVIVAL — lowest quote BEFORE the peak, by what the coin reached")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for name, _, _ in tiers:
+        v = sorted(data[name])
+        if not v:
+            continue
+        p50 = statistics.median(v)
+        p10 = v[int(0.10 * len(v))]
+        row = f"  {name:<14}{len(v):>7}{p50:>10.4f}{p10:>10.4f}"
+        for s in levels:
+            row += f"{sum(1 for x in v if x > s):>10}"
+        print(row)
+    print()
+    print("  Read the 5-10x and 10x+ rows ACROSS the stop levels. If survival barely")
+    print("  moves from 0.80 to 0.90, tightening is nearly free on the coins that pay.")
+    print("  If it drops sharply, the tighter stop is buying cheaper losses by")
+    print("  selling the runners that fund everything — and %/SOL cannot see it.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -191,6 +239,9 @@ def main() -> int:
                          "already rugs at 8%% instead of 17%% it may buy far less, "
                          "so the two effects must be measured together, not added.")
     ap.add_argument("--factory-min", type=int, default=40)
+    ap.add_argument("--survival", action="store_true",
+                    help="show whether each stop level would have cut the coins "
+                         "that actually ran, before they ran")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -267,6 +318,8 @@ def main() -> int:
     print("  because that is where breakeven arrives at today's win rate.")
     print("  CENSORED rows sit below qsim's real stop: the quote series ends there,")
     print("  so a recovery that holding would have caught is invisible. Lower bound.")
+    if args.survival:
+        survival(rows, levels)
     return 0
 
 
