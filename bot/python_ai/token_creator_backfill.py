@@ -167,7 +167,16 @@ def creator_via_das(mint: str) -> tuple[str | None, str]:
     return None, ""
 
 
-PUMPFUN_API = os.getenv("PUMPFUN_API", "https://frontend-api.pump.fun/coins")
+# pump.fun has moved its API host more than once and fronts it with Cloudflare,
+# which returns 530 to some origins. Try each in turn; this is an OPTIMISATION,
+# never a requirement.
+PUMPFUN_HOSTS = [h for h in os.getenv(
+    "PUMPFUN_API",
+    "https://frontend-api-v3.pump.fun/coins,"
+    "https://frontend-api-v2.pump.fun/coins,"
+    "https://frontend-api.pump.fun/coins",
+).split(",") if h.strip()]
+_PUMPFUN_DEAD = False
 
 
 def creator_via_pumpfun(mint: str) -> tuple[str | None, str]:
@@ -179,21 +188,32 @@ def creator_via_pumpfun(mint: str) -> tuple[str | None, str]:
     the population DAS fails on: getAsset returns no usable creator for them,
     only the pump.fun program as an authority, which is not a deployer.
     """
-    try:
-        r = requests.get(f"{PUMPFUN_API}/{mint}", timeout=TIMEOUT,
-                         headers={"User-Agent": "Mozilla/5.0"})
-    except requests.RequestException as e:
-        raise RpcFail(f"pumpfun {type(e).__name__}")
-    if r.status_code == 404:
-        return None, ""                      # genuinely not a pump.fun coin
-    if r.status_code != 200:
-        raise RpcFail(f"pumpfun http {r.status_code}")
-    try:
-        addr = (r.json() or {}).get("creator")
-    except ValueError:
-        raise RpcFail("pumpfun bad json")
-    if addr and addr not in NOT_A_DEPLOYER:
-        return addr, "pumpfun"
+    global _PUMPFUN_DEAD
+    if _PUMPFUN_DEAD:
+        return None, ""
+    for host in PUMPFUN_HOSTS:
+        try:
+            r = requests.get(f"{host.strip()}/{mint}", timeout=TIMEOUT,
+                             headers={"User-Agent": "Mozilla/5.0"})
+        except requests.RequestException:
+            continue
+        if r.status_code == 404:
+            return None, ""                  # genuinely not a pump.fun coin
+        if r.status_code != 200:
+            continue                         # 530/403/etc — try the next host
+        try:
+            addr = (r.json() or {}).get("creator")
+        except ValueError:
+            continue
+        if addr and addr not in NOT_A_DEPLOYER:
+            return addr, "pumpfun"
+        return None, ""
+    # NEVER raise. Raising made a blocked API look like a transient RPC fault,
+    # so every pump mint was skipped and left permanently unresolved instead of
+    # falling through to the RPC path that actually works.
+    _PUMPFUN_DEAD = True
+    print("[creator] pump.fun API unreachable — using RPC only for this run",
+          flush=True)
     return None, ""
 
 
