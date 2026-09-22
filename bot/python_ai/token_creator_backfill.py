@@ -179,6 +179,67 @@ PUMPFUN_HOSTS = [h for h in os.getenv(
 _PUMPFUN_DEAD = False
 
 
+METAPLEX_PROGRAM = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+
+
+def _metadata_pda(mint: str) -> str | None:
+    """Metaplex metadata PDA: ['metadata', program, mint]."""
+    try:
+        from solders.pubkey import Pubkey
+    except ImportError:
+        return None
+    try:
+        mp = Pubkey.from_string(METAPLEX_PROGRAM)
+        pda, _ = Pubkey.find_program_address(
+            [b"metadata", bytes(mp), bytes(Pubkey.from_string(mint))], mp)
+        return str(pda)
+    except Exception:
+        return None
+
+
+def _signer_of(signature: str) -> str | None:
+    """Fee payer of a transaction — the first signing account."""
+    tx = _rpc({"jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+               "params": [signature, {"maxSupportedTransactionVersion": 0,
+                                      "encoding": "jsonParsed"}]})
+    keys = ((((tx or {}).get("result") or {}).get("transaction") or {})
+            .get("message") or {}).get("accountKeys") or []
+    for k in keys:
+        addr = k.get("pubkey") if isinstance(k, dict) else k
+        signer = k.get("signer") if isinstance(k, dict) else True
+        if signer and addr and addr not in NOT_A_DEPLOYER:
+            return addr
+    return None
+
+
+def creator_via_metadata(mint: str) -> tuple[str | None, str]:
+    """The deployer, via the token's METADATA account rather than the mint.
+
+    The mint itself accumulates a signature for every trade — the coin above has
+    1,000+ and needs deep paging, which is slow and fails on exactly the active
+    coins that matter. Its Metaplex metadata account is created in the SAME
+    transaction but is almost never touched again, so its oldest signature sits
+    in a short first page. Two calls, no paging, and it works for any SPL token
+    with metadata rather than only pump.fun mints.
+
+    DAS cannot answer this: getAsset returns creators:[] and authorities:[] for
+    these tokens (verified), so it is not a fallback, it is a dead end.
+    """
+    pda = _metadata_pda(mint)
+    if not pda:
+        return None, ""
+    sigs = _rpc({"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+                 "params": [pda, {"limit": 1000}]})
+    arr = (sigs or {}).get("result") or []
+    if not arr or len(arr) >= 1000:
+        return None, ""          # no metadata, or unexpectedly busy — don't guess
+    oldest = arr[-1].get("signature")
+    if not oldest:
+        return None, ""
+    addr = _signer_of(oldest)
+    return (addr, "metadata") if addr else (None, "")
+
+
 def creator_via_pumpfun(mint: str) -> tuple[str | None, str]:
     """pump.fun publishes the deployer directly. ONE http call, no RPC, no
     paging — and fast enough for the live gate, which was timing out on 46% of
@@ -269,6 +330,9 @@ def creator_via_first_tx(mint: str, max_pages: int = 6) -> tuple[str | None, str
 def resolve_creator(mint: str) -> tuple[str | None, str]:
     """Cheapest reliable source first: pump.fun for pump mints, then DAS, then
     the paged first-transaction walk."""
+    addr, src = creator_via_metadata(mint)      # cheapest and most general
+    if addr:
+        return addr, src
     if mint.endswith("pump"):
         addr, src = creator_via_pumpfun(mint)
         if addr:
