@@ -278,7 +278,10 @@ def creator_via_pumpfun(mint: str) -> tuple[str | None, str]:
     return None, ""
 
 
-def creator_via_first_tx(mint: str, max_pages: int = 6) -> tuple[str | None, str]:
+MAX_SIG_PAGES = int(os.getenv("CREATOR_MAX_SIG_PAGES", "30"))
+
+
+def creator_via_first_tx(mint: str, max_pages: int = 0) -> tuple[str | None, str]:
     """The mint's OLDEST transaction; its signer deployed it.
 
     getSignaturesForAddress returns NEWEST first with no reverse option, so the
@@ -291,9 +294,13 @@ def creator_via_first_tx(mint: str, max_pages: int = 6) -> tuple[str | None, str
     Capped at max_pages so one very active mint cannot stall the run; past that
     it returns nothing rather than guessing.
     """
+    # Measured: a called coin runs 9k-20k signatures and needs 10-20 pages,
+    # returning in 1.3-3.8s. The old cap of 6 gave up on every one of them —
+    # and the coins with the most transactions are the ones that pumped, so it
+    # failed on precisely the winners.
     before = None
     oldest = None
-    for _ in range(max_pages):
+    for _ in range(max_pages or MAX_SIG_PAGES):
         params: dict = {"limit": 1000}
         if before:
             params["before"] = before
@@ -368,7 +375,8 @@ def ensure_table() -> None:
     conn.commit()
 
 
-def backfill(limit: int, rps: float, dry_run: bool, order: str, called_only: bool) -> None:
+def backfill(limit: int, rps: float, dry_run: bool, order: str,
+             called_only: bool, workers: int = 1) -> None:
     conn = db.get_conn()
     db.safe_rollback()
     print("selecting work (this query can take a minute on 107k tokens)...",
@@ -393,9 +401,43 @@ def backfill(limit: int, rps: float, dry_run: bool, order: str, called_only: boo
         todo = cur.fetchall()
 
     print(f"{len(todo)} tokens need a creator"
-          + (" (dry run)" if dry_run else ""), flush=True)
+          + (" (dry run)" if dry_run else "")
+          + (f"  workers={workers}" if workers > 1 else ""), flush=True)
     ok = miss = transient = 0
     delay = 1.0 / rps if rps > 0 else 0.0
+
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        done_n = 0
+        for start in range(0, len(todo), 500):
+            chunk = todo[start:start + 500]
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(resolve_creator, m): (t, m) for t, m, _ in chunk}
+                for fut in as_completed(futs):
+                    tid, mint = futs[fut]
+                    done_n += 1
+                    try:
+                        addr, src = fut.result()
+                    except RpcFail:
+                        transient += 1
+                        continue
+                    except Exception:
+                        transient += 1
+                        continue
+                    ok += 1 if addr else 0
+                    miss += 0 if addr else 1
+                    if not dry_run:
+                        # psycopg2 connections are NOT thread-safe — every write
+                        # happens here, on the main thread, never in a worker.
+                        _record(tid, mint, addr, src or "unresolved")
+                    if done_n % 100 == 0:
+                        print(f"  {done_n}/{len(todo)}  resolved={ok} "
+                              f"unresolved={miss} transient={transient}", flush=True)
+        print(f"done: resolved {ok}, genuinely unresolved {miss}, "
+              f"transient RPC failures {transient} (not written — rerun to retry)",
+              flush=True)
+        return
+
     for i, (tid, mint, sym) in enumerate(todo, 1):
         try:
             addr, src = resolve_creator(mint)
@@ -551,6 +593,11 @@ def main() -> int:
                          "this once after the rate-limit bug: those rows may be "
                          "throttled lookups recorded as permanent failures.")
     ap.add_argument("--limit", type=int, default=500)
+    ap.add_argument("--workers", type=int, default=1,
+                    help="concurrent RPC lookups. A called coin needs 10-20 "
+                         "signature pages (1.3-3.8s), so sequential is ~3 days "
+                         "for 104k tokens; 12 workers brings it under 6 hours. "
+                         "DB writes stay single-threaded regardless.")
     ap.add_argument("--rps", type=float, default=8.0,
                     help="20 rps throttled badly (98.4%% -> 38.7%% resolution)")
     ap.add_argument("--dry-run", action="store_true")
@@ -574,7 +621,8 @@ def main() -> int:
     if args.report:
         report()
     else:
-        backfill(args.limit, args.rps, args.dry_run, args.order, args.called_only)
+        backfill(args.limit, args.rps, args.dry_run, args.order,
+                 args.called_only, args.workers)
         report()
     return 0
 
