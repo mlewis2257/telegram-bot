@@ -167,23 +167,69 @@ def creator_via_das(mint: str) -> tuple[str | None, str]:
     return None, ""
 
 
-def creator_via_first_tx(mint: str) -> tuple[str | None, str]:
-    """Oldest signature on the mint; its fee payer deployed it. Two calls, so
-    this is the fallback rather than the default."""
-    sigs = _rpc({"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
-                 "params": [mint, {"limit": 1000}]})
-    arr = (sigs or {}).get("result") or []
-    if not arr:
+PUMPFUN_API = os.getenv("PUMPFUN_API", "https://frontend-api.pump.fun/coins")
+
+
+def creator_via_pumpfun(mint: str) -> tuple[str | None, str]:
+    """pump.fun publishes the deployer directly. ONE http call, no RPC, no
+    paging — and fast enough for the live gate, which was timing out on 46% of
+    decisions against the two-call RPC path.
+
+    Most of this flow is pump.fun mints (they end in 'pump'), which is exactly
+    the population DAS fails on: getAsset returns no usable creator for them,
+    only the pump.fun program as an authority, which is not a deployer.
+    """
+    try:
+        r = requests.get(f"{PUMPFUN_API}/{mint}", timeout=TIMEOUT,
+                         headers={"User-Agent": "Mozilla/5.0"})
+    except requests.RequestException as e:
+        raise RpcFail(f"pumpfun {type(e).__name__}")
+    if r.status_code == 404:
+        return None, ""                      # genuinely not a pump.fun coin
+    if r.status_code != 200:
+        raise RpcFail(f"pumpfun http {r.status_code}")
+    try:
+        addr = (r.json() or {}).get("creator")
+    except ValueError:
+        raise RpcFail("pumpfun bad json")
+    if addr and addr not in NOT_A_DEPLOYER:
+        return addr, "pumpfun"
+    return None, ""
+
+
+def creator_via_first_tx(mint: str, max_pages: int = 6) -> tuple[str | None, str]:
+    """The mint's OLDEST transaction; its signer deployed it.
+
+    getSignaturesForAddress returns NEWEST first with no reverse option, so the
+    creation tx is only in the first page when the whole history fits. Anything
+    busier has to be paged with `before`. Taking arr[-1] of one page was wrong
+    in exactly one direction: the coins with the most transactions are the ones
+    that pumped, so the WINNERS were the tokens being misattributed to whichever
+    trader happened to sit at position 1000.
+
+    Capped at max_pages so one very active mint cannot stall the run; past that
+    it returns nothing rather than guessing.
+    """
+    before = None
+    oldest = None
+    for _ in range(max_pages):
+        params: dict = {"limit": 1000}
+        if before:
+            params["before"] = before
+        sigs = _rpc({"jsonrpc": "2.0", "id": 1,
+                     "method": "getSignaturesForAddress",
+                     "params": [mint, params]})
+        arr = (sigs or {}).get("result") or []
+        if not arr:
+            break
+        oldest = arr[-1].get("signature")
+        if len(arr) < 1000:
+            break                            # reached the start of history
+        before = oldest
+    else:
+        return None, ""                      # never reached the beginning
+    if not oldest:
         return None, ""
-    if len(arr) >= 1000:
-        # getSignaturesForAddress returns NEWEST first, so arr[-1] is only the
-        # creation tx when the ENTIRE history fit in one page. At the limit we
-        # are looking at the 1000th-most-recent transaction — a random trader,
-        # not the deployer. Attributing that would be worse than not knowing,
-        # and it biases exactly one way: the coins with the most activity are
-        # the winners, so they would be the ones misattributed.
-        return None, ""
-    oldest = arr[-1].get("signature")
     if not oldest:
         return None, ""
     tx = _rpc({"jsonrpc": "2.0", "id": 1, "method": "getTransaction",
@@ -198,6 +244,19 @@ def creator_via_first_tx(mint: str) -> tuple[str | None, str]:
         if signer and addr and addr not in NOT_A_DEPLOYER:
             return addr, "first_tx"
     return None, ""
+
+
+def resolve_creator(mint: str) -> tuple[str | None, str]:
+    """Cheapest reliable source first: pump.fun for pump mints, then DAS, then
+    the paged first-transaction walk."""
+    if mint.endswith("pump"):
+        addr, src = creator_via_pumpfun(mint)
+        if addr:
+            return addr, src
+    addr, src = creator_via_das(mint)
+    if addr:
+        return addr, src
+    return creator_via_first_tx(mint)
 
 
 def ensure_table() -> None:
@@ -255,9 +314,7 @@ def backfill(limit: int, rps: float, dry_run: bool, order: str, called_only: boo
     delay = 1.0 / rps if rps > 0 else 0.0
     for i, (tid, mint, sym) in enumerate(todo, 1):
         try:
-            addr, src = creator_via_das(mint)
-            if not addr:
-                addr, src = creator_via_first_tx(mint)
+            addr, src = resolve_creator(mint)
         except RpcFail as e:
             # The node could not answer. That says nothing about the mint, so
             # write NOTHING and leave it for the next run.

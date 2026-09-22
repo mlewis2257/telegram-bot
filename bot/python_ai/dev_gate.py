@@ -176,9 +176,7 @@ def _prior_history(creator: str, as_of: datetime) -> tuple[int, int]:
 async def _resolve_creator(mint: str) -> tuple[str | None, str | None]:
     import token_creator_backfill as tcb
     loop = asyncio.get_running_loop()
-    addr, src = await loop.run_in_executor(None, tcb.creator_via_das, mint)
-    if not addr:
-        addr, src = await loop.run_in_executor(None, tcb.creator_via_first_tx, mint)
+    addr, src = await loop.run_in_executor(None, tcb.resolve_creator, mint)
     return (addr or None, src or None)
 
 
