@@ -49,6 +49,7 @@ import time
 from collections import Counter, defaultdict
 from typing import Any
 
+import random
 import requests
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -95,11 +96,29 @@ class RpcFail(Exception):
     """
 
 
-def _rpc(payload: dict, retries: int = 4) -> dict:
+def _helius_url() -> str | None:
+    """A HELIUS endpoint specifically.
+
+    getAsset is a Helius extension, but rpc_pool rotates across generic Solana
+    RPCs too, which reject it. That is why DAS resolved only 3.4% of tokens and
+    almost everything fell through to the slow two-call first_tx path — which in
+    turn timed out on 46% of live gate decisions.
+    """
+    keys = [k.strip() for k in os.getenv("HELIUS_API_KEYS", "").split(",") if k.strip()]
+    if keys:
+        return f"https://mainnet.helius-rpc.com/?api-key={random.choice(keys)}"
+    for env in ("SOLANA_RPC_URL", "SOLANA_RPC_URLS"):
+        for u in os.getenv(env, "").split(","):
+            if "helius" in u:
+                return u.strip()
+    return None
+
+
+def _rpc(payload: dict, retries: int = 4, url_override: str | None = None) -> dict:
     backoff = 1.0
     last = "no endpoint"
     for _ in range(retries):
-        url = rpc_pool.http_url() or SOLANA_RPC_URL
+        url = url_override or rpc_pool.http_url() or SOLANA_RPC_URL
         if not url:
             raise RpcFail("no RPC endpoint configured")
         try:
@@ -130,8 +149,11 @@ def _rpc(payload: dict, retries: int = 4) -> dict:
 
 def creator_via_das(mint: str) -> tuple[str | None, str]:
     """Helius DAS getAsset. For pump.fun mints the dev is normally creators[0]."""
+    hel = _helius_url()
+    if not hel:
+        return None, ""          # no Helius endpoint: DAS cannot work at all
     data = _rpc({"jsonrpc": "2.0", "id": 1, "method": "getAsset",
-                 "params": {"id": mint}})
+                 "params": {"id": mint}}, url_override=hel)
     res = (data or {}).get("result") or {}   # valid reply, possibly empty
     for c in res.get("creators") or []:
         addr = c.get("address")
@@ -152,6 +174,14 @@ def creator_via_first_tx(mint: str) -> tuple[str | None, str]:
                  "params": [mint, {"limit": 1000}]})
     arr = (sigs or {}).get("result") or []
     if not arr:
+        return None, ""
+    if len(arr) >= 1000:
+        # getSignaturesForAddress returns NEWEST first, so arr[-1] is only the
+        # creation tx when the ENTIRE history fit in one page. At the limit we
+        # are looking at the 1000th-most-recent transaction — a random trader,
+        # not the deployer. Attributing that would be worse than not knowing,
+        # and it biases exactly one way: the coins with the most activity are
+        # the winners, so they would be the ones misattributed.
         return None, ""
     oldest = arr[-1].get("signature")
     if not oldest:
