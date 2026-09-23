@@ -27,6 +27,24 @@ Be willing to stop after Phase 0.
 
 ---
 
+## RESULT: Phase 0 ran 2026-09-23 and is NEGATIVE. Project closed.
+
+Order flow: **0.0% coverage** at or before entry. Not null — non-existent. The
+bot only begins observing a token when it is called, so there is no pre-entry
+snapshot to filter on. Making that data exist requires monitoring tokens before
+they are called, which is the Phase 1 build, not the free test Phase 0 was meant
+to be.
+
+Static features re-swept with the order-flow join in place: family-wise
+**p = 0.164**. Best filter +2.33%/SOL against a null 95th percentile of +6.09 —
+the best observed row is BELOW what the search produces from noise. `bank%` peaks
+at 27% against the ~50% breakeven requires.
+
+Pre-registered criterion was p > 0.05 ends it. It is met. Phases 1 and 2 below
+are left for the record, not as a recommendation.
+
+---
+
 ## Phase 0 — order-flow features (days, zero build)
 
 **Why first:** it costs nothing. `ws_market_observations` already stores
