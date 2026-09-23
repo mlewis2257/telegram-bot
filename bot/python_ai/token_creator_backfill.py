@@ -375,6 +375,25 @@ def ensure_table() -> None:
     conn.commit()
 
 
+def _record(token_id: int, mint: str, addr: str | None, src: str) -> None:
+    """Single place that writes a resolution. Called ONLY from the main thread —
+    psycopg2 connections are not thread-safe, so workers return results and the
+    main thread persists them."""
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO token_creators
+                (token_id, mint_address, creator_address, creator_source)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (token_id) DO UPDATE
+                SET creator_address = EXCLUDED.creator_address,
+                    creator_source  = EXCLUDED.creator_source,
+                    resolved_at     = now()
+        """, (token_id, mint, addr, src))
+    conn.commit()
+
+
 def backfill(limit: int, rps: float, dry_run: bool, order: str,
              called_only: bool, workers: int = 1) -> None:
     conn = db.get_conn()
