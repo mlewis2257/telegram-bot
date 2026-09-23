@@ -87,6 +87,8 @@ def _sql(days: int) -> str:
     return f"""
     WITH pk AS (
         SELECT q.call_id, max(q.real_mult) AS ever_peak,
+               max(q.real_mult) FILTER (WHERE q.note IS NULL
+                     OR q.note NOT LIKE 'post_exit_probe%%')   AS held_peak,
                (array_agg(q.real_mult ORDER BY q.observed_at))[1] AS first_mult
         FROM qsim_quote_observations q
         WHERE q.real_mult IS NOT NULL AND q.real_mult > 0 AND q.real_mult <= {MAX_MULT}
@@ -94,7 +96,7 @@ def _sql(days: int) -> str:
     )
     SELECT qp.call_id, qp.entry_time, qp.pnl_sol, qp.sol_in,
            coalesce(qp.channel_handle, '?') AS channel,
-           pk.ever_peak, pk.first_mult AS entry_roundtrip,
+           pk.ever_peak, pk.held_peak, pk.first_mult AS entry_roundtrip,
            {sel}
     FROM qsim_positions qp
     JOIN calls  c   ON c.id   = qp.call_id
@@ -168,6 +170,12 @@ def main() -> int:
     y = np.array([1 if _f(r["ever_peak"]) >= thresh else 0 for r in rows])
     pnl = np.array([_f(r["pnl_sol"]) or 0.0 for r in rows])
     sol = np.array([_f(r["sol_in"]) or 0.0 for r in rows])
+    # bank% uses the HELD window — what you could actually have banked — while
+    # 2x/5x use the full path including post-exit probes, i.e. what the coin did.
+    # Breakeven needs ~50% of trades reaching 1.3x, so bank% is the column that
+    # says whether a selected population can pay under ANY exit.
+    hp = np.array([_f(r.get("held_peak")) or 0.0 for r in rows])
+    ep = np.array([_f(r.get("ever_peak")) or 0.0 for r in rows])
 
     cut = int(len(rows) * args.train_frac)
     X_raw = [[_f(r.get(n)) for n in names] for r in rows]
@@ -184,6 +192,7 @@ def main() -> int:
     Xtr, Xte = X[:cut], X[cut:]
     ytr, yte = y[:cut], y[cut:]
     pnl_te, sol_te = pnl[cut:], sol[cut:]
+    hp_te, ep_te = hp[cut:], ep[cut:]
 
     sc = StandardScaler().fit(Xtr)
     Xtr_s, Xte_s = sc.transform(Xtr), sc.transform(Xte)
@@ -230,14 +239,23 @@ def main() -> int:
 
         print(f"{mname}   test AUC {a:.3f}   (shuffled-label floor {a2:.3f})")
         order = np.argsort(-p)
-        print(f"  {'keep top':<10}{'n':>6}{'win%':>8}{'pnl_sol':>10}{'%/SOL':>9}")
+        print(f"  {'keep top':<10}{'n':>6}{'bank%':>8}{'2x%':>7}{'5x%':>7}"
+              f"{'pnl_sol':>10}{'%/SOL':>9}")
         for frac in (0.10, 0.20, 0.30, 0.50):
             k = max(1, int(len(order) * frac))
             idx = order[:k]
-            s = sol_te[idx].sum()
-            print(f"  {int(frac * 100):>3}%      {k:>6}{100 * yte[idx].mean():>8.1f}"
+            ssum = sol_te[idx].sum()
+            bank = 100.0 * (hp_te[idx] >= 1.3).mean()
+            x2 = 100.0 * (ep_te[idx] >= 2.0).mean()
+            x5 = 100.0 * (ep_te[idx] >= 5.0).mean()
+            print(f"  {int(frac * 100):>3}%      {k:>6}{bank:>8.1f}{x2:>7.1f}{x5:>7.1f}"
                   f"{pnl_te[idx].sum():>10.4f}"
-                  f"{(100 * pnl_te[idx].sum() / s if s else 0):>9.2f}")
+                  f"{(100 * pnl_te[idx].sum() / ssum if ssum else 0):>9.2f}")
+        allbank = 100.0 * (hp_te >= 1.3).mean()
+        print(f"  {'(all)':<10}{len(hp_te):>6}{allbank:>8.1f}"
+              f"{100.0 * (ep_te >= 2.0).mean():>7.1f}"
+              f"{100.0 * (ep_te >= 5.0).mean():>7.1f}"
+              f"{pnl_te.sum():>10.4f}{base:>9.2f}")
         print()
 
     print("  The bar is the test-book %/SOL above, not AUC. A model can rank")
@@ -245,6 +263,10 @@ def main() -> int:
     print("  negative book before it is worth anything.")
     print("  The shuffled-label floor is what this pipeline produces from noise;")
     print("  a real AUC has to beat it, not just beat 0.5.")
+    print("  bank% is the HELD-window rate of reaching 1.3x. Breakeven needs it")
+    print("  near 50% — that is the number deciding whether a selected population")
+    print("  can pay under ANY exit policy, and %/SOL here reflects the CURRENT")
+    print("  exit, which the replay already showed is not the right one.")
     print("  Deciles are OUT OF SAMPLE and chronological — trained on earlier")
     print("  trades, scored on later ones, which is the only split that answers")
     print("  'would this have worked going forward'.")
