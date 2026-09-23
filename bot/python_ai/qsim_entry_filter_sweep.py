@@ -83,6 +83,35 @@ CANDIDATES: list[tuple[str, str, str]] = [
     ("tok", "detecting_wallet_sol",  "detector_sol"),
 ]
 
+# Order-flow features. These live in ws_market_observations, not on calls/tokens,
+# so they are joined rather than looked up in information_schema.
+#
+# THE JOIN CONDITION IS THE WHOLE POINT. feature_edge.py reads the first snapshot
+# in [entry_time, entry_time + 2 min] — i.e. AFTER the entry. A filter cannot use
+# data that does not exist when it has to decide, and post-entry flow is partly a
+# function of the outcome. That leak is what made the earlier ML attempt look
+# predictive (see memory/ml_entry_filter_dead_end.md). Here it is the LATEST
+# snapshot at or BEFORE entry_time, strictly.
+OF_FEATURES = [
+    ("of_net_pressure", "(ofq.of->>'net_pressure')::numeric"),
+    ("of_buy_vol",      "(ofq.of->>'buy_vol_sol')::numeric"),
+    ("of_uniq_buyers",  "(ofq.of->>'unique_buyers')::numeric"),
+    ("of_n_buys",       "(ofq.of->>'n_buys')::numeric"),
+]
+
+OF_JOIN = """
+LEFT JOIN LATERAL (
+    SELECT o.market_json->'order_flow' AS of
+    FROM ws_market_observations o
+    WHERE o.mint_address = tok.mint_address
+      AND o.observed_at <= qp.entry_time          -- STRICTLY at or before entry
+      AND o.market_json ? 'order_flow'
+      AND o.market_json->'order_flow' <> 'null'::jsonb
+    ORDER BY o.observed_at DESC
+    LIMIT 1
+) ofq ON true
+"""
+
 DERIVED = [
     # name, numerator, denominator — ratios are often the real tell (thin
     # liquidity against a big mcap is the classic drain setup)
@@ -109,7 +138,9 @@ def _rows(days: int, feats: list[tuple[str, str, str]]) -> list[dict[str, Any]]:
     from psycopg2.extras import RealDictCursor
     import db
 
-    sel = ",\n       ".join(f"{a}.{col} AS {name}" for a, col, name in feats)
+    cols = [f"{a}.{col} AS {name}" for a, col, name in feats]
+    cols += [f"{expr} AS {name}" for name, expr in OF_FEATURES]
+    sel = ",\n       ".join(cols)
     sql = f"""
     SELECT qp.call_id, qp.sol_in, qp.pnl_sol, qp.pnl_pct,
            coalesce(qp.partial_fraction, 0) AS partial_fraction,
@@ -117,6 +148,7 @@ def _rows(days: int, feats: list[tuple[str, str, str]]) -> list[dict[str, Any]]:
     FROM qsim_positions qp
     JOIN calls  c   ON c.id   = qp.call_id
     JOIN tokens tok ON tok.id = qp.token_id
+    {OF_JOIN}
     WHERE qp.status = 'closed'
       AND qp.entry_time >= now() - (%(days)s || ' days')::interval
       AND qp.sol_in > 0
@@ -210,6 +242,8 @@ def main() -> int:
     vectors: dict[str, list[float | None]] = {}
     for _, _, name in feats:
         vectors[name] = [_f(r.get(name)) for r in rows]
+    for name, _ in OF_FEATURES:
+        vectors[name] = [_f(r.get(name)) for r in rows]
     colname = {name: name for _, _, name in feats}
     for dname, num, den in DERIVED:
         nk = next((nm for _, c, nm in feats if c == num), None)
@@ -230,8 +264,18 @@ def main() -> int:
             idx.sort(key=lambda i: vec[i])  # type: ignore[arg-type,return-value]
             usable[name] = idx
 
+    of_cov = sum(1 for r in rows if r.get("of_net_pressure") is not None) / n
     print(f"window        {args.days}d   {n} closed trades   "
           f"book {book_pnl:+.4f} SOL ({base:+.2f}%/SOL)")
+    print(f"order flow    {100 * of_cov:.1f}% of trades have a snapshot at or "
+          f"BEFORE entry")
+    if of_cov < 0.10:
+        print("              ^ ws_* observations mostly START at entry, so this "
+              "data does not exist")
+        print("                when the decision has to be made. Order flow "
+              "cannot be an entry")
+        print("                filter here regardless of what the sweep below "
+              "says.")
     print(f"features      {len(vectors)} candidates, {len(usable)} testable "
           f"(coverage >= {args.min_cov:.0%}, n >= {args.min_keep})")
     print()
