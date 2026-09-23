@@ -140,6 +140,11 @@ def main() -> int:
                     help="include entry_roundtrip, which is measured AFTER entry "
                          "and partly leaks early price movement. Output is "
                          "labelled contaminated.")
+    ap.add_argument("--write-scores", action="store_true",
+                    help="persist OUT-OF-SAMPLE scores for the test period to "
+                         "qsim_model_scores, so the exit replay can be run on "
+                         "the population the model would actually have selected")
+    ap.add_argument("--score-model", choices=("logistic", "gbm"), default="logistic")
     ap.add_argument("--seed", type=int, default=20260923)
     args = ap.parse_args()
 
@@ -267,6 +272,36 @@ def main() -> int:
     print("  near 50% — that is the number deciding whether a selected population")
     print("  can pay under ANY exit policy, and %/SOL here reflects the CURRENT")
     print("  exit, which the replay already showed is not the right one.")
+    if args.write_scores:
+        import db
+        mdl = models[args.score_model]
+        Xb = Xte_s if args.score_model == "logistic" else Xte
+        scores = mdl.predict_proba(Xb)[:, 1]
+        conn = db.get_conn(); db.safe_rollback()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS qsim_model_scores (
+                    call_id    integer PRIMARY KEY,
+                    score      numeric NOT NULL,
+                    model      text,
+                    scored_at  timestamptz NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("DELETE FROM qsim_model_scores")
+            for r, sc_ in zip(rows[cut:], scores):
+                cur.execute("""
+                    INSERT INTO qsim_model_scores (call_id, score, model)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (call_id) DO UPDATE SET score = EXCLUDED.score,
+                        model = EXCLUDED.model, scored_at = now()
+                """, (int(r["call_id"]), float(sc_), args.score_model))
+        conn.commit()
+        print(f"\n  wrote {len(scores)} OUT-OF-SAMPLE scores "
+              f"({args.score_model}) to qsim_model_scores")
+        print("  Only test-period rows are written. Scoring the training rows "
+              "would be")
+        print("  in-sample and would flatter any exit measured on them.")
+        print()
     print("  Deciles are OUT OF SAMPLE and chronological — trained on earlier")
     print("  trades, scored on later ones, which is the only split that answers")
     print("  'would this have worked going forward'.")

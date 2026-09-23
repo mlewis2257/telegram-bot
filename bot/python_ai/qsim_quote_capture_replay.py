@@ -2571,6 +2571,14 @@ def main() -> None:
     )
     parser.add_argument("--days", type=int, default=1)
     parser.add_argument("--since", default=None, help="only include qsim entries at/after this timestamp")
+    parser.add_argument("--model-top", type=float, default=0.0,
+                        help="restrict to the top PCT (e.g. 10) of qsim_model_scores. "
+                             "Those scores are OUT OF SAMPLE — written only for the "
+                             "model's test period — so this asks what the exits would "
+                             "have done on the population the model would actually "
+                             "have picked. The model lifts the 2x rate 19.6%% -> 33.1%% "
+                             "while barely moving the 1.3%% bank rate, so a HIGHER bank "
+                             "target is the pre-registered hypothesis, not a search.")
     parser.add_argument("--clean-devs", type=int, default=0,
                         help="restrict to tokens whose deployer had >= N prior "
                              "tokens and NO prior rug. The exit comparison that "
@@ -2665,6 +2673,23 @@ def main() -> None:
     }
 
     rows = _rows(params)
+    if getattr(args, "model_top", 0.0) > 0:
+        import db as _db
+        _c = _db.get_conn(); _db.safe_rollback()
+        with _c.cursor() as _cur:
+            _cur.execute("SELECT call_id, score FROM qsim_model_scores")
+            _sc = {int(a): float(b) for a, b in _cur.fetchall()}
+        if not _sc:
+            print("no qsim_model_scores — run qsim_model_test.py --write-scores first")
+            return 1
+        scored = [r for r in rows if int(r.get("call_id") or -1) in _sc]
+        scored.sort(key=lambda r: -_sc[int(r["call_id"])])
+        k = max(1, int(len(scored) * args.model_top / 100.0))
+        before = len(rows)
+        rows = scored[:k]
+        print(f"model filter: top {args.model_top:g}% = {len(rows)} of {len(scored)} "
+              f"scored positions ({before} total rows, unscored rows are the "
+              f"model's TRAINING period and are excluded)")
     if getattr(args, "clean_devs", 0):
         from dev_history_edge import clean_token_ids
         allowed = clean_token_ids(args.clean_devs, args.clean_factory_min)
