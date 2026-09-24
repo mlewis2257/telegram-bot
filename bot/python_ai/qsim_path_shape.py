@@ -255,11 +255,26 @@ def sim_ladder(s: list[float], rungs: list[tuple[float, float]], stop: float,
 # the many coins that only ever reach 2x) to back-loaded (holds for the tail),
 # because which end wins is the entire question and should not be assumed.
 LADDERS: dict[str, list[tuple[float, float]]] = {
-    "even_2_5_10_20":  [(2.0, 0.2), (5.0, 0.2), (10.0, 0.2), (20.0, 0.2)],
-    "front_1p5_2_3_5": [(1.5, 0.2), (2.0, 0.2), (3.0, 0.2), (5.0, 0.2)],
-    "half_2_then_5_10": [(2.0, 0.5), (5.0, 0.25), (10.0, 0.25)],
-    "thirds_2_5":      [(2.0, 0.34), (5.0, 0.33)],
-    "wide_3_10_30":    [(3.0, 0.3), (10.0, 0.3), (30.0, 0.2)],
+    # The bot's own bank_1p3x, as a baseline to beat rather than a thing to
+    # assume. It banks 70% at 1.3x and leaves 30% to a trail, and on this book
+    # it beats every ladder whose first rung sits at 1.5x or higher — because
+    # 88% of positions never reach 2x, so a high first rung simply never fires.
+    # Coverage dominates rung placement by roughly an order of magnitude.
+    "bank1p3_runner":   [(1.3, 0.7)],
+    # The real question these exist to answer: the 1.3x bank is doing the work,
+    # so what should happen to the 30% RUNNER it leaves behind? Today that
+    # remainder goes to a trail, which is the machinery that gapped on GTF and
+    # realised 0.4% of what it aimed for. These put rungs there instead.
+    "bank1p3_3_10":     [(1.3, 0.7), (3.0, 0.15), (10.0, 0.10)],
+    "bank1p3_2_5_20":   [(1.3, 0.7), (2.0, 0.10), (5.0, 0.10), (20.0, 0.05)],
+    "bank1p3_5_30":     [(1.3, 0.7), (5.0, 0.15), (30.0, 0.10)],
+    "bank1p2_2_5_20":   [(1.2, 0.6), (2.0, 0.15), (5.0, 0.15), (20.0, 0.05)],
+    "bank1p4_3_10":     [(1.4, 0.7), (3.0, 0.15), (10.0, 0.10)],
+    # Kept from the first pass: high first rungs, all of which lost to the
+    # bank. Retained so the coverage effect stays visible in the output.
+    "even_2_5_10_20":   [(2.0, 0.2), (5.0, 0.2), (10.0, 0.2), (20.0, 0.2)],
+    "front_1p5_2_3_5":  [(1.5, 0.2), (2.0, 0.2), (3.0, 0.2), (5.0, 0.2)],
+    "wide_3_10_30":     [(3.0, 0.3), (10.0, 0.3), (30.0, 0.2)],
 }
 
 
