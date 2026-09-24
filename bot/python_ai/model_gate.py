@@ -41,7 +41,7 @@ score cut from the HELD-OUT portion's distribution. Taking the cut from training
 scores would put the threshold where the model is overconfident and let far more
 than the intended percentage through.
 
-    python3 model_gate.py --train --days 60          # fit, calibrate, persist
+    python3 model_gate.py --train --days 30          # fit, calibrate, persist
     python3 model_gate.py --report                   # blocked vs allowed outcomes
     python3 model_gate.py --check 279013             # score one call
 
@@ -331,6 +331,23 @@ async def check(call_id: int | None, channel: str | None,
         return Decision(True, f"error:{type(e).__name__}", None, None, ms)
 
 
+def _recent_call_ids(n: int) -> list[int]:
+    """Most recent calls that actually have a token row — the population the
+    gate will be asked about. Used by --check so proving the decision-time
+    join does not require hunting for a call_id by hand."""
+    try:
+        conn = db.get_conn()
+        db.safe_rollback()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT c.id FROM calls c JOIN tokens tok ON tok.id = c.token_id "
+                "ORDER BY c.id DESC LIMIT %s", (n,))
+            return [int(r[0]) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[model_gate] could not list recent calls: {e}")
+        return []
+
+
 def _features_for_call(call_id: int) -> dict | None:
     from psycopg2.extras import RealDictCursor
     conn = db.get_conn()
@@ -374,8 +391,12 @@ def train(days: int, top_pct: float, test_frac: float = 0.35) -> dict:
     if y_tr.sum() < 20 or y_te.sum() < 10:
         raise SystemExit(f"too few winners to fit (train {y_tr.sum()}, test {y_te.sum()})")
 
-    model = GradientBoostingClassifier(random_state=20260924, n_estimators=200,
-                                       max_depth=3, learning_rate=0.05)
+    # Deliberately IDENTICAL to qsim_model_test.py's gbm (n_estimators=150,
+    # max_depth=3, default learning rate). The gate exists to act on that
+    # tool's result; fitting a differently-tuned model here would make the
+    # measured AUC and decile lift describe something this never runs.
+    model = GradientBoostingClassifier(random_state=20260924,
+                                       n_estimators=150, max_depth=3)
     model.fit(X_tr, y_tr)
 
     # The cut comes from HELD-OUT scores. Taking it from training scores puts it
@@ -452,8 +473,15 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--train", action="store_true")
     ap.add_argument("--report", action="store_true")
-    ap.add_argument("--check", type=int, default=None, metavar="CALL_ID")
-    ap.add_argument("--days", type=int, default=60)
+    ap.add_argument("--check", nargs="?", type=int, const=0, default=None,
+                    metavar="CALL_ID",
+                    help="score one call; with no id, scores the 5 most recent "
+                         "calls that have a token row — which is what proves the "
+                         "decision-time join works")
+    # 30, not 60: qsim's record past ~30 days predates fixes and is not
+    # comparable. Training on 60d measurably degrades the model — AUC 0.586
+    # and a 13.0% base 2x rate, against 0.627 and 18.7% on the recent window.
+    ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--top-pct", type=float, default=TOP_PCT)
     args = ap.parse_args()
 
@@ -478,12 +506,29 @@ def main() -> int:
         if b is None:
             print("no usable model — run --train first")
             return 1
-        d = asyncio.run(check(args.check, None, context="qsim"))
-        print(f"call_id={args.check}  allowed={d.allowed}  reason={d.reason}")
-        print(f"  score {d.score if d.score is None else f'{d.score:.4f}'}  "
-              f"threshold {d.threshold if d.threshold is None else f'{d.threshold:.4f}'}"
-              f"  {d.latency_ms:.0f}ms")
-        print(f"  model age {model_age_hours(b):.1f}h  test AUC {b.get('test_auc', float('nan')):.3f}")
+        ids = [args.check] if args.check else _recent_call_ids(5)
+        if not ids:
+            print("no recent calls with a token row — nothing to score")
+            return 1
+        print(f"model age {model_age_hours(b):.1f}h  test AUC "
+              f"{b.get('test_auc', float('nan')):.3f}  threshold {b['threshold']:.4f}")
+        print(f"{'call_id':>10}{'allowed':>9}{'reason':>22}{'score':>9}{'ms':>6}")
+        print("-" * 56)
+        ok = 0
+        for cid in ids:
+            d = asyncio.run(check(cid, None, context="qsim"))
+            sc = "   -  " if d.score is None else f"{d.score:.4f}"
+            if d.reason not in ("no_features", "no_model"):
+                ok += 1
+            print(f"{cid:>10}{str(d.allowed):>9}{d.reason[:21]:>22}{sc:>9}{d.latency_ms:>6.0f}")
+        print()
+        if ok:
+            print(f"  {ok}/{len(ids)} scored — the decision-time join works.")
+        else:
+            print("  NOTHING SCORED. Every row came back no_features, which means the")
+            print("  calls -> tokens join at decision time is not resolving. The gate")
+            print("  fails open, so it would allow everything and silently never gate.")
+            return 1
         return 0
 
     if args.report:
