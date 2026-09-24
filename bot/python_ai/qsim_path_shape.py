@@ -199,6 +199,70 @@ def sim_target(s: list[float], target: float, stop: float) -> float:
     return s[-1]
 
 
+def sim_ladder(s: list[float], rungs: list[tuple[float, float]], stop: float,
+               runner_trail: float | None = None) -> float:
+    """
+    Sell in pieces ON THE WAY UP. Returns the blended exit multiple.
+
+    `rungs` is [(multiple, fraction), ...] ascending: sell `fraction` of the bag
+    at the first quote at or above `multiple`.
+
+    This is structurally different from both policies above, and it is different
+    in exactly the two places they each fail:
+
+      a TRAIL needs the price to come back down THROUGH a level. GTF's did not —
+      it went 63.5x to 0.024x in one step — so the trail transacted at 0.4% of
+      what it aimed for. A rung has already sold on the way up and needs nothing
+      on the way down.
+
+      a SINGLE TARGET at 5x never fires on a coin that peaks at 4.5x, so it
+      rides that coin all the way to the stop. NATGEO, SAMSUNG and Kroger each
+      peaked between 3.5x and 4.5x and a lone 5x target collected nothing from
+      any of them. A ladder's low rungs fire first and bank the move that did
+      happen.
+
+    Whatever is left after the last rung is the runner. It exits on `stop` if no
+    rung has fired yet, or on `runner_trail` off the peak once one has — the
+    remainder is house money, so a wide trail on it is not the same bet as a
+    wide trail on the whole position.
+    """
+    rungs = sorted(rungs)
+    remaining = 1.0
+    proceeds = 0.0
+    fired = [False] * len(rungs)
+    peak = 0.0
+    for m in s:
+        if m > peak:
+            peak = m
+        for i, (tgt, frac) in enumerate(rungs):
+            if not fired[i] and m >= tgt:
+                f = min(frac, remaining)
+                proceeds += f * m
+                remaining -= f
+                fired[i] = True
+        if remaining <= 1e-9:
+            return proceeds
+        any_fired = any(fired)
+        if not any_fired and m <= stop:
+            return proceeds + remaining * m
+        if any_fired and runner_trail is not None and peak > 0 \
+                and m <= peak * (1.0 - runner_trail):
+            return proceeds + remaining * m
+    return proceeds + remaining * s[-1]
+
+
+# Candidate ladders. Deliberately spanning front-loaded (banks early, catches
+# the many coins that only ever reach 2x) to back-loaded (holds for the tail),
+# because which end wins is the entire question and should not be assumed.
+LADDERS: dict[str, list[tuple[float, float]]] = {
+    "even_2_5_10_20":  [(2.0, 0.2), (5.0, 0.2), (10.0, 0.2), (20.0, 0.2)],
+    "front_1p5_2_3_5": [(1.5, 0.2), (2.0, 0.2), (3.0, 0.2), (5.0, 0.2)],
+    "half_2_then_5_10": [(2.0, 0.5), (5.0, 0.25), (10.0, 0.25)],
+    "thirds_2_5":      [(2.0, 0.34), (5.0, 0.33)],
+    "wide_3_10_30":    [(3.0, 0.3), (10.0, 0.3), (30.0, 0.2)],
+}
+
+
 # ── Report ────────────────────────────────────────────────────────────────────
 
 def _pct(n: int, d: int) -> str:
@@ -220,6 +284,10 @@ def main() -> int:
                     help="realised/nominal below this is a gap, not a retrace")
     ap.add_argument("--targets", default="2,3,5,10",
                     help="flat targets to price, comma separated")
+    ap.add_argument("--runner-trail", type=float, default=0.50,
+                    help="trail on the REMAINDER after a rung has fired "
+                         "(default 0.50). It is house money by then, so this is "
+                         "not the same bet as a wide trail on the whole position.")
     ap.add_argument("--post-exit", action="store_true",
                     help="include post-exit probes: a CEILING, not an estimate")
     args = ap.parse_args()
@@ -340,6 +408,28 @@ def main() -> int:
               f"{statistics.median(exits):>10.2f}")
     print()
 
+    # ── Ladders: sell in pieces on the way up ─────────────────────────────────
+    print("SELLING IN PIECES ON THE WAY UP")
+    print("  A rung banks the move that DID happen and needs no retracement, so")
+    print("  neither the gapping nor the never-reached-the-target problem applies.")
+    print(f"  Runner trail on the remainder: {args.runner_trail:.0%} off peak.")
+    print()
+    lhdr = (f"{'ladder':<20}{'PnL SOL':>11}{'%/SOL':>10}{'vs actual':>12}"
+            f"{'any rung':>10}{'med exit':>10}")
+    print(lhdr)
+    print("-" * len(lhdr))
+    ladder_results = []
+    for name, rungs in LADDERS.items():
+        exits = [sim_ladder(r["s"], rungs, args.stop, args.runner_trail) for r in usable]
+        pnl = fixed_pnl + sum(float(r["sol_in"]) * (e - 1.0) for r, e in zip(usable, exits))
+        lowest = min(t for t, _ in rungs)
+        hits = sum(1 for r in usable if max(r["s"]) >= lowest)
+        ladder_results.append((name, pnl, exits))
+        print(f"{name:<20}{pnl:>11.3f}{100 * pnl / deployed:>9.2f}%"
+              f"{pnl - base_pnl:>+12.3f}{_pct(hits, n):>10}"
+              f"{statistics.median(exits):>10.2f}")
+    print()
+
     # ── The gapped rows specifically ──────────────────────────────────────────
     g = shapes["gapped"]
     if g:
@@ -369,13 +459,18 @@ def main() -> int:
 
     best = max(targets, key=_target_pnl)
     best_pnl = _target_pnl(best)
+    best_ladder, best_ladder_pnl, _ = max(ladder_results, key=lambda x: x[1])
+    if best_ladder_pnl > best_pnl:
+        best, best_pnl = best_ladder, best_ladder_pnl
+    else:
+        best = f"{best:g}x"
     gap_to_be = -base_pnl
 
     print("=" * len(thdr))
     print("DOES FIXING THE EXIT CLOSE THE GAP?")
     print("=" * len(thdr))
     print(f"  gap to breakeven            {gap_to_be:+.3f} SOL")
-    print(f"  best flat target ({best:g}x)       {best_pnl - base_pnl:+.3f} SOL over actual")
+    print(f"  best exit policy ({best})".ljust(32) + f"{best_pnl - base_pnl:+.3f} SOL over actual")
     if gap_to_be > 0:
         print(f"  closes                      {100 * (best_pnl - base_pnl) / gap_to_be:.0f}% of it")
     print()
