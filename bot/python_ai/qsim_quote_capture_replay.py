@@ -1445,6 +1445,7 @@ def _bank_or_run_return(
     window_mins: float,
     stall_ticks: int,
     current_return: float,
+    held_until: datetime | None = None,
 ) -> float:
     """
     Bank ordinary winners, but hold fast strength briefly for a bigger target.
@@ -1456,6 +1457,14 @@ def _bank_or_run_return(
 
     This avoids pretending the bot can pause at 1.4x, watch for a later 2x, and
     still magically sell the old 1.4x if momentum vanishes.
+
+    `held_until` bounds the BANK leg, exactly as _partial_bank_runner_return does, and
+    for the same reason: under --include-post-exit the points list runs past qsim's own
+    exit, so without this the policy banks at 1.4x on a position that was hard-stopped
+    at -35% and never reached 1.4x while it was owned. That is not a bank, it is a
+    trade you did not have. This was measured once before, where it turned 27 real
+    banks into 32 and inflated the runner's apparent edge; this function was the one
+    call site that never got the fix.
     """
     if not points:
         return current_return
@@ -1469,6 +1478,12 @@ def _bank_or_run_return(
         last_mult = mult
 
         if runner_started_at is None:
+            if (
+                held_until is not None
+                and observed_at is not None
+                and observed_at > held_until
+            ):
+                return current_return
             if mult < bank:
                 continue
             if mult < runner_arm:
@@ -2270,6 +2285,7 @@ def _view(
             window_mins=policy["window_mins"],
             stall_ticks=policy["stall_ticks"],
             current_return=fallback_return,
+            held_until=_parse_dt(row.get("exit_time")),
         )
 
     for policy in SOFT_STOP_POLICIES:
@@ -2557,6 +2573,18 @@ def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
         ]
     if policy.startswith("pbr_"):
         spec = next(item for item in PARTIAL_BANK_RUNNER_POLICIES if item["name"] == policy)
+        return [
+            value
+            for view in views
+            if (
+                value := _partial_bank_runner_hit_mult(
+                    _quote_points(view.row), bank=spec["bank"],
+                    held_until=_parse_dt(view.row.get("exit_time")),
+                )
+            ) is not None
+        ]
+    if policy.startswith("pbg_"):
+        spec = next(item for item in PARTIAL_BANK_RUNG_POLICIES if item["name"] == policy)
         return [
             value
             for view in views
