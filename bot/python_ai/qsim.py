@@ -204,6 +204,23 @@ QSIM_POST_EXIT_BANKS_FIRST = os.getenv("QSIM_POST_EXIT_BANKS_FIRST", "true").low
 QSIM_PARTIAL_BANK_ENABLED  = os.getenv("QSIM_PARTIAL_BANK_ENABLED", "false").lower() == "true"
 QSIM_PARTIAL_BANK_FRACTION = float(os.getenv("QSIM_PARTIAL_BANK_FRACTION", "0.70"))  # fraction SOLD
 QSIM_RUNNER_TARGET_MULT    = float(os.getenv("QSIM_RUNNER_TARGET_MULT", "0"))        # 0 = none
+# ABSOLUTE CEILING. Unconditional: if the raw sell quote says we are at this
+# multiple, sell, whatever any overlay, floor, trail or runner rule thinks.
+#
+# Everything else in this file waits for a retracement, and GTF is what that
+# costs — a sustained 61.5x booked at 2.115x, because it rugged from its peak in
+# 91 seconds with no quote in between and no rule fires without a pullback. The
+# runner target existed for this and is set to 0; lock_or_bank is worse still,
+# since it suppresses base exits once armed and would ride 60x down to its 1.35
+# floor.
+#
+# This is not a forecast and needs no edge estimate: at 30x, selling returns 30x.
+# It costs exactly nothing on a position that never reaches the level, which on
+# 17 days was 1541 of 1544 trades. Measured on the replay: a 20x ceiling is worth
+# +69.42 per 1 SOL (+3.47 SOL) on 4 trades, 30x is +83.80 (+4.19) on 3, against a
+# book of -8.86 SOL. 20x is preferred over the larger 30x number for resting on
+# four coins rather than three.
+QSIM_CEILING_MULT          = float(os.getenv("QSIM_CEILING_MULT", "0"))             # 0 = none
 QSIM_RUNNER_FLOOR_MULT     = float(os.getenv("QSIM_RUNNER_FLOOR_MULT", "1.10"))
 QSIM_RUNNER_TRAIL_PCT      = float(os.getenv("QSIM_RUNNER_TRAIL_PCT", "0.30"))
 QSIM_RUNNER_STALL_MINS     = float(os.getenv("QSIM_RUNNER_STALL_MINS", "60"))
@@ -933,6 +950,25 @@ async def _qsim_tick(pos: dict) -> None:
         peak_mult=(real_peak / entry) if real_peak > 0 else real_mult,
         result=result,
     )
+    # ABSOLUTE CEILING — applied LAST so nothing can suppress it. It has to sit
+    # here rather than earlier: the overlay block sets result=ExitResult(False)
+    # whenever it is armed, so a ceiling decided before that point would be
+    # silently thrown away by exactly the configuration that needs it most.
+    #
+    # Mirrors the hard stop on the other side — the stop refuses to ride a loser
+    # down, this refuses to ride a winner back. Keyed off real_mult, the raw
+    # executable sell quote, so it reads the price the bag would actually fetch
+    # rather than a guarded or peak-capped value that lags when it matters.
+    #
+    # Reason is "ceiling", which is deliberately NOT the overlay's name, so the
+    # partial-bank branch below cannot fire on it: a ceiling sells everything.
+    if QSIM_CEILING_MULT > 0 and real_mult >= QSIM_CEILING_MULT:
+        if not (result.should_exit and result.reason == "ceiling"):
+            print(f"[qsim] CEILING {symbol} call_id={call_id} {real_mult:.2f}x "
+                  f">= {QSIM_CEILING_MULT:g}x — taking it"
+                  + (f" (overriding {result.reason})" if result.should_exit else ""))
+        result = ExitResult(True, "ceiling", exit_mcap=synth_cur)
+
     db.insert_qsim_quote_observation(
         call_id=call_id,
         sol_out=sol_out,
@@ -1084,6 +1120,9 @@ async def run_qsim_monitor() -> None:
           f"banks_first={QSIM_POST_EXIT_BANKS_FIRST}")
     print(f"[qsim] bank exit enabled={QSIM_BANK_EXIT_ENABLED} mult={QSIM_BANK_EXIT_MULT:g}x")
     print(f"[qsim] exit overlay: {_QSIM_EXIT_OVERLAY.name if _QSIM_EXIT_OVERLAY else 'none'}")
+    print(f"[qsim] absolute ceiling: {QSIM_CEILING_MULT:g}x (unconditional, overrides every overlay)"
+          if QSIM_CEILING_MULT > 0 else
+          "[qsim] absolute ceiling: OFF — nothing caps a runner; a 60x can round-trip to the floor")
     print(f"[qsim] adaptive cadence: ON — base {QSIM_TICK_SECS:g}s, "
           f"near {QSIM_TICK_SECS * QSIM_CADENCE_NEAR_MULT:g}s / far "
           f"{min(QSIM_TICK_SECS * QSIM_CADENCE_FAR_MULT, QSIM_STALE_DECISION_SECS * 0.5):g}s, "
