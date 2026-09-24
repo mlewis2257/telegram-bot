@@ -272,6 +272,25 @@ PARTIAL_BANK_RUNG_POLICIES = (
     },
 )
 
+# LOCK + TRAIL + CEILING. lock_or_bank with the hole closed: once armed it still
+# locks a floor, but it also trails the running peak, so a coin that reaches 8x
+# and reverses exits near 5.6x instead of riding back to 1.35x. trail=0.99 is a
+# deliberate control — it disables the trail and should reproduce lock_or_bank,
+# which is how we know the difference measured is the trail and not the wiring.
+LOCK_TRAIL_POLICIES = (
+    {"name": "lt_a1p75_f1p35_tr30_c20", "trigger": 1.75, "floor": 1.35, "trail": 0.30, "ceiling": 20.0},
+    {"name": "lt_a1p75_f1p35_tr40_c20", "trigger": 1.75, "floor": 1.35, "trail": 0.40, "ceiling": 20.0},
+    {"name": "lt_a1p75_f1p35_tr50_c20", "trigger": 1.75, "floor": 1.35, "trail": 0.50, "ceiling": 20.0},
+    {"name": "lt_a1p75_f1p35_tr30_cNONE", "trigger": 1.75, "floor": 1.35, "trail": 0.30, "ceiling": 0.0},
+    {"name": "lt_a1p5_f1p2_tr30_c20",   "trigger": 1.50, "floor": 1.20, "trail": 0.30, "ceiling": 20.0},
+    {"name": "lt_a2x_f1p55_tr30_c20",   "trigger": 2.00, "floor": 1.55, "trail": 0.30, "ceiling": 20.0},
+    # CONTROL: trail disabled AND ceiling off, so it must reproduce
+    # lock_or_bank_1p75x_1p35x exactly. An earlier version left the ceiling at
+    # 20x, which would diverge on any coin reaching 20x and quietly make the
+    # control not a control.
+    {"name": "lt_a1p75_f1p35_tr99_cNONE", "trigger": 1.75, "floor": 1.35, "trail": 0.99, "ceiling": 0.0},
+)
+
 BANK_OR_RUN_POLICIES = (
     {
         "name": "bor_b1p3_a1p7_t3x_f1p2_w10m_s3",
@@ -1457,6 +1476,57 @@ def _runner_window_return(
     return last_mult - 1.0
 
 
+def _lock_trail_return(
+    mults: list[float],
+    trigger: float,
+    floor: float,
+    trail: float,
+    ceiling: float,
+    current_return: float,
+) -> float:
+    """
+    Arm at trigger, then exit at whichever is HIGHER: the absolute floor, or a
+    trail off the running peak. Ceiling takes it outright.
+
+    This exists because lock_or_bank has a hole. Once armed it suppresses every
+    base exit, so between its floor and infinity there is NOTHING — a coin that
+    arms at 1.75x, runs to 8x and reverses rides all the way back to 1.35x,
+    giving back 83% of the move with no rule firing. That is most of why
+    lock_or_bank scores -164 on the full book against bank_2x's -45: most coins
+    that clear 1.75x do not reach 20x, they reach 3-8x and come back.
+
+    max(floor, peak*(1-trail)) is the whole fix, and the two terms cover
+    different phases. Early, peak is low so the FLOOR binds and protects the
+    lock. Later, the trail overtakes it and protects the run:
+
+        peak 2x,  trail 30%  ->  trail 1.40 vs floor 1.35  ->  1.40
+        peak 8x,  trail 30%  ->  trail 5.60 vs floor 1.35  ->  5.60
+
+    Never armed means never interfered with: the caller keeps `current_return`,
+    so this reads as an overlay on the live config rather than a replacement.
+    """
+    armed = False
+    peak = 0.0
+    for m in mults:
+        if m > peak:
+            peak = m
+        if not armed:
+            if m >= trigger:
+                armed = True
+            # An arming quote cannot also trigger the exit: at m == trigger the
+            # trail level is trigger*(1-trail), strictly below m, so nothing
+            # fires on the same tick that armed it.
+            continue
+        if ceiling > 0 and m >= ceiling:
+            return m - 1.0
+        level = max(floor, peak * (1.0 - trail))
+        if m <= level:
+            return m - 1.0
+    if armed and mults:
+        return mults[-1] - 1.0
+    return current_return
+
+
 def _bank_or_run_return(
     points: list[tuple[datetime | None, float]],
     *,
@@ -1766,6 +1836,32 @@ def _partial_bank_runner_hit_mult(
         if mult >= bank:
             return mult
     return None
+
+
+def _lock_trail_hit_mult(mults: list[float], trigger: float, floor: float,
+                         trail: float, ceiling: float) -> float | None:
+    """The multiple this policy actually exits at, or None if it never armed.
+
+    Mirrors _lock_trail_return step for step. Reusing _lock_hit_mult(or_bank=True)
+    here looked fine and was not: it returns the LAST quote for an armed position
+    that never reached the floor, while this policy exits on the TRAIL, so avg_hit
+    would have described a price the policy never traded at. That is the same
+    defect the pbg_ hit columns had.
+    """
+    armed = False
+    peak = 0.0
+    for m in mults:
+        if m > peak:
+            peak = m
+        if not armed:
+            if m >= trigger:
+                armed = True
+            continue
+        if ceiling > 0 and m >= ceiling:
+            return m
+        if m <= max(floor, peak * (1.0 - trail)):
+            return m
+    return mults[-1] if (armed and mults) else None
 
 
 def _bank_or_run_hit_mult(
@@ -2297,6 +2393,12 @@ def _view(
             held_until=_parse_dt(row.get("exit_time")),
         )
 
+    for policy in LOCK_TRAIL_POLICIES:
+        returns[policy["name"]] = _lock_trail_return(
+            mults, policy["trigger"], policy["floor"], policy["trail"],
+            policy["ceiling"], fallback_return,
+        )
+
     for policy in BANK_OR_RUN_POLICIES:
         returns[policy["name"]] = _bank_or_run_return(
             points,
@@ -2514,6 +2616,17 @@ def _print_summary(views: list[ReplayRow]) -> None:
     for policy in PARTIAL_BANK_RUNG_POLICIES:
         _print_policy_row(policy["name"], views, current, width=40)
 
+    print("\nLock + Trail + Ceiling Totals")
+    print("  (lock_or_bank with the hole closed: once armed it ALSO trails the peak,")
+    print("   so 8x-then-reverse exits near 5.6x instead of riding back to the floor.")
+    print("   tr99_cNONE disables the trail AND the ceiling, so it must reproduce")
+    print("   lock_or_bank_1p75x_1p35x exactly — that is how we know the difference")
+    print("   measured is the trail and not the wiring.)")
+    print(f"{'policy':<28} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 97)
+    for policy in LOCK_TRAIL_POLICIES:
+        _print_policy_row(policy["name"], views, current, width=28)
+
     print("\nBank-Or-Run Totals")
     print(f"{'policy':<32} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
     print("-" * 101)
@@ -2603,6 +2716,15 @@ def _policy_hit_mults(policy: str, views: list[ReplayRow]) -> list[float]:
                     held_until=_parse_dt(view.row.get("exit_time")),
                 )
             ) is not None
+        ]
+    if policy.startswith("lt_"):
+        spec = next(item for item in LOCK_TRAIL_POLICIES if item["name"] == policy)
+        return [
+            value
+            for view in views
+            if (value := _lock_trail_hit_mult(
+                _quote_mults(view.row), spec["trigger"], spec["floor"],
+                spec["trail"], spec["ceiling"])) is not None
         ]
     if policy.startswith("pbg_"):
         spec = next(item for item in PARTIAL_BANK_RUNG_POLICIES if item["name"] == policy)

@@ -235,9 +235,14 @@ class LiveExitOverlay:
     confirm_ticks: int = 1
     lock_trigger_mult: float | None = None
     lock_floor_mult: float | None = None
+    lock_trail_pct: float | None = None
 
 
 LIVE_EXIT_OVERLAYS: dict[str, LiveExitOverlay] = {
+    "lock_trail_a1p75_f1p35_tr30": LiveExitOverlay("lock_trail_a1p75_f1p35_tr30", "lock_trail", lock_trigger_mult=1.75, lock_floor_mult=1.35, lock_trail_pct=0.3),
+    "lock_trail_a1p75_f1p35_tr40": LiveExitOverlay("lock_trail_a1p75_f1p35_tr40", "lock_trail", lock_trigger_mult=1.75, lock_floor_mult=1.35, lock_trail_pct=0.4),
+    "lock_trail_a1p5_f1p2_tr30": LiveExitOverlay("lock_trail_a1p5_f1p2_tr30", "lock_trail", lock_trigger_mult=1.5, lock_floor_mult=1.2, lock_trail_pct=0.3),
+    "lock_trail_a2x_f1p55_tr30": LiveExitOverlay("lock_trail_a2x_f1p55_tr30", "lock_trail", lock_trigger_mult=2.0, lock_floor_mult=1.55, lock_trail_pct=0.3),
     "bank_1p2x": LiveExitOverlay("bank_1p2x", "bank", bank_mult=1.2),
     "bank_1p3x": LiveExitOverlay("bank_1p3x", "bank", bank_mult=1.3),
     "bank_1p4x": LiveExitOverlay("bank_1p4x", "bank", bank_mult=1.4),
@@ -315,6 +320,27 @@ def _apply_live_exit_overlay(
         if state.get(armed_key) and current_mult <= floor:
             return ExitResult(True, overlay.name, exit_mcap=current_mcap), True
         return ExitResult(False), bool(state.get(armed_key))
+
+    if overlay.kind == "lock_trail":
+        # See qsim.py for the rationale. Exit level is max(floor, peak*(1-trail)):
+        # the floor binds early, the trail takes over once the peak is high enough.
+        trigger = overlay.lock_trigger_mult or 0.0
+        floor   = overlay.lock_floor_mult or 0.0
+        trail   = overlay.lock_trail_pct or 0.0
+        if trigger <= 0 or floor <= 0 or trail <= 0:
+            return ExitResult(False), False
+        armed_key = f"{overlay.name}:armed"
+        peak_key  = f"{overlay.name}:peak"
+        peak = max(float(state.get(peak_key, 0.0)), current_mult)
+        state[peak_key] = peak
+        if not state.get(armed_key):
+            if current_mult >= trigger:
+                state[armed_key] = True
+                return ExitResult(False), True
+            return ExitResult(False), False
+        if current_mult <= max(floor, peak * (1.0 - trail)):
+            return ExitResult(True, overlay.name, exit_mcap=current_mcap), True
+        return ExitResult(False), True
 
     return ExitResult(False), False
 
