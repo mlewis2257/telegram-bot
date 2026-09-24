@@ -187,9 +187,18 @@ def audit(path: str) -> dict:
         name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
         if name in defs:
             passed = {kw.arg for kw in node.keywords if kw.arg}
+            # A caller can bound a bare-mults policy by pre-truncating the data:
+            # `mults = _held_mults(points, exit_time)` leaves nothing post-exit to
+            # look ahead at. Missing this was the audit's third false-positive
+            # class and the most consequential — it made every bank_*/lock_*/
+            # dyn_*/winner_* number look contaminated when the caller had bounded
+            # them since e44c007.
+            src_args = " ".join(
+                ast.unparse(a) for a in list(node.args) + [k.value for k in node.keywords])
             defs[name]["calls"].append({
                 "line": node.lineno,
                 "passes_held_until": "held_until" in passed,
+                "data_prebounded": "_held_mults" in src_args or "mults" in src_args,
             })
 
     violations, unbounded, ok = [], [], []
@@ -206,9 +215,15 @@ def audit(path: str) -> dict:
             continue
         bounded = info["accepts_held_until"] and all(
             c["passes_held_until"] for c in info["calls"])
+        data_bounded = bool(info["calls"]) and all(
+            c.get("data_prebounded") for c in info["calls"])
         if bounded:
             ok.append({"fn": name, "def_line": info["line"],
                        "why": "free option closed by a held_until bound"})
+        elif data_bounded:
+            ok.append({"fn": name, "def_line": info["line"],
+                       "why": "caller passes _held_mults — data truncated at exit_time, "
+                              "nothing post-exit to look ahead at"})
         elif info["takes_timestamps"]:
             violations.append(
                 {"fn": name, "def_line": info["line"],
