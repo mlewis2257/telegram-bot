@@ -45,6 +45,23 @@ difference between what a flat target would have realised and what actually
 happened, times the size actually deployed. That number either closes the gap to
 breakeven or it does not, and it is not a matter of opinion.
 
+EVERY CLOSED POSITION COUNTS, INCLUDING THE ONES THAT CANNOT BE REPLAYED
+------------------------------------------------------------------------
+A position quoted fewer than twice cannot have a policy simulated against it.
+The tempting move is to drop it as a data-quality problem. That is wrong, and
+it is wrong in a specific, well-documented way: the coins that die fastest are
+exactly the coins that produce the fewest quotes, so the drop removes losers
+and nothing else. --min-obs did this once already and turned a -9.94%/SOL book
+into -0.71%.
+
+The first version of THIS tool did it too, and the tell was that `actual` PnL
+changed between an in-life run and a --post-exit run. Realised PnL cannot
+depend on which quotes you look at; only the denominator can. So those
+positions stay in `deployed` and in the baseline, and every counterfactual
+policy is charged their ACTUAL result — no exit rule could have done anything
+different with a single price. `actual` is now identical across both runs,
+which is the invariant to check if this tool is ever edited again.
+
 SUSTAINED PRICES ONLY
 ---------------------
 Every multiple is min(m[i], m[i+1]) — a price is only credited if the NEXT quote
@@ -209,26 +226,40 @@ def main() -> int:
 
     targets = [float(t) for t in args.targets.split(",") if t.strip()]
     rows = _rows(args.days, args.channel, args.post_exit)
-    usable = []
+
+    # A position with fewer than two sustained quotes cannot have a policy
+    # replayed against it. It must NOT be dropped: the coins that die fastest
+    # produce the fewest quotes, so excluding them is an outcome filter wearing
+    # a data-quality hat — the same mistake --min-obs made, which turned a
+    # -9.94%/SOL book into -0.71% by discarding 97% of the loss.
+    #
+    # They stay in the baseline and in `deployed`, and every counterfactual
+    # policy is charged their ACTUAL result, since no exit rule could have done
+    # anything different with a single price.
+    usable, unsimulatable = [], []
     for r in rows:
         s = sustained(list(r.get("mults") or []))
         if len(s) < 2:
-            continue
-        r["s"] = s
-        usable.append(r)
+            unsimulatable.append(r)
+        else:
+            r["s"] = s
+            usable.append(r)
 
     if not usable:
         print("no positions with two or more priced quotes in this window")
         return 1
 
     n = len(usable)
-    deployed = sum(float(r["sol_in"]) for r in usable)
-    actual_pnl = sum(float(r["pnl_sol"] or 0) for r in usable)
+    # Denominators span EVERY closed position, simulatable or not.
+    deployed = sum(float(r["sol_in"]) for r in rows)
+    actual_pnl = sum(float(r["pnl_sol"] or 0) for r in rows)
+    # Carried unchanged into every policy total below.
+    fixed_pnl = sum(float(r["pnl_sol"] or 0) for r in unsimulatable)
 
     print(f"window      {args.days}d"
           + (f"   channel={args.channel}" if args.channel != "any" else ""))
-    print(f"positions   {n} of {len(rows)} closed  "
-          f"({len(rows) - n} dropped: fewer than two priced quotes)")
+    print(f"positions   {len(rows)} closed  ({n} replayable, "
+          f"{len(unsimulatable)} carried at their actual result: under two quotes)")
     print(f"deployed    {deployed:.2f} SOL      actual PnL {actual_pnl:+.3f} SOL "
           f"({100 * actual_pnl / deployed:+.2f}%/SOL)")
     print(f"quotes      {'in-life + POST-EXIT PROBES (ceiling)' if args.post_exit else 'in-life only (conservative)'}")
@@ -295,14 +326,14 @@ def main() -> int:
     # The trail as simulated here, so target-vs-trail is a like-for-like
     # comparison rather than a comparison against whatever mix of overlays,
     # floors and time stops the live config happened to be running.
-    tr_pnl = sum(float(r["sol_in"]) * (r["trail_realised"] - 1.0) for r in usable)
+    tr_pnl = fixed_pnl + sum(float(r["sol_in"]) * (r["trail_realised"] - 1.0) for r in usable)
     print(f"{'trail (sim)':<14}{tr_pnl:>11.3f}{100 * tr_pnl / deployed:>9.2f}%"
           f"{tr_pnl - base_pnl:>+12.3f}{'—':>12}"
           f"{statistics.median([r['trail_realised'] for r in usable]):>10.2f}")
 
     for t in targets:
         exits = [sim_target(r["s"], t, args.stop) for r in usable]
-        pnl = sum(float(r["sol_in"]) * (e - 1.0) for r, e in zip(usable, exits))
+        pnl = fixed_pnl + sum(float(r["sol_in"]) * (e - 1.0) for r, e in zip(usable, exits))
         hits = sum(1 for e in exits if e >= t)
         print(f"{'target ' + f'{t:g}x':<14}{pnl:>11.3f}{100 * pnl / deployed:>9.2f}%"
               f"{pnl - base_pnl:>+12.3f}{_pct(hits, n):>12}"
@@ -332,10 +363,12 @@ def main() -> int:
         print()
 
     # ── The verdict, stated as arithmetic ─────────────────────────────────────
-    best = max(targets, key=lambda t: sum(
-        float(r["sol_in"]) * (sim_target(r["s"], t, args.stop) - 1.0) for r in usable))
-    best_pnl = sum(float(r["sol_in"]) * (sim_target(r["s"], best, args.stop) - 1.0)
-                   for r in usable)
+    def _target_pnl(t: float) -> float:
+        return fixed_pnl + sum(
+            float(r["sol_in"]) * (sim_target(r["s"], t, args.stop) - 1.0) for r in usable)
+
+    best = max(targets, key=_target_pnl)
+    best_pnl = _target_pnl(best)
     gap_to_be = -base_pnl
 
     print("=" * len(thdr))
