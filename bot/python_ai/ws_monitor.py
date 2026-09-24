@@ -35,6 +35,7 @@ import paper_trader
 import paper_trader_b
 import live_trader
 import peak_guard
+import position_alerts
 import lane_policy
 from exit_config import EXIT_A_PAPER, EXIT_B_PAPER
 
@@ -510,6 +511,14 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
             # Phase 2: real (sell-quote) basis when armed, else the feed triple unchanged.
             exit_cur, exit_peak, exit_entry, _basis, _raw_mult = await live_trader.live_exit_basis(
                 call_id, position_live, eff_mcap_live, peak_mcap_live, entry_price)
+            # Read-only climbing alert — changes no exit decision (see position_alerts).
+            await position_alerts.maybe_alert(
+                call_id, position_live,
+                mult=_raw_mult if _raw_mult else (exit_cur / exit_entry if exit_entry else 0.0),
+                peak_mult=(exit_peak / exit_entry) if exit_entry else 0.0,
+                basis=_basis,
+                cfg=_EXIT_LIVE,
+            )
             result_live = live_trader.check_live_exits(
                 call_id, exit_cur, exit_peak, exit_entry,
                 exit_config=_EXIT_LIVE,

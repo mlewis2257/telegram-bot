@@ -37,6 +37,7 @@ import jupiter
 import alert_bot
 import data_fetcher
 import peak_guard
+import position_alerts
 import wallet as _wallet
 import lane_policy
 from paper_trader import (
@@ -1074,6 +1075,7 @@ async def close_live_position(
         )
         _runner_window_until.pop(call_id, None)
         _live_exit_state.pop(call_id, None)
+        position_alerts.clear(call_id)
         try:
             await alert_bot.send_live_sell_alert(
                 symbol=symbol,

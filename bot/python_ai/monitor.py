@@ -38,6 +38,7 @@ import paper_trader_b
 import live_trader
 import lane_policy
 import peak_guard
+import position_alerts
 import jupiter
 import wallet as _wallet
 from exit_config import EXIT_A_PAPER, EXIT_B_PAPER
@@ -538,6 +539,15 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
                 # is unavailable. The feed peak above is still persisted for records/fallback.
                 exit_cur, exit_peak, exit_entry, _basis, _raw_mult = await live_trader.live_exit_basis(
                     call_id, pos_live, live_eff, live_peak_mcap, live_entry_price)
+                # Read-only: say out loud that a held position is climbing, and where
+                # the bot would get out. Changes no exit decision (see position_alerts).
+                await position_alerts.maybe_alert(
+                    call_id, pos_live,
+                    mult=_raw_mult if _raw_mult else (exit_cur / exit_entry if exit_entry else 0.0),
+                    peak_mult=(exit_peak / exit_entry) if exit_entry else 0.0,
+                    basis=_basis,
+                    cfg=live_trader._LIVE_EXIT_CONFIG,
+                )
                 live_exit = live_trader.check_live_exits(
                     call_id, exit_cur, exit_peak, exit_entry,
                     exit_config=live_trader._LIVE_EXIT_CONFIG,
@@ -875,6 +885,14 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None,
                     # Phase 2: real (sell-quote) basis when armed, else the feed triple unchanged.
                     exit_cur, exit_peak, exit_entry, _basis, _raw_mult = await live_trader.live_exit_basis(
                         call_id, pos_live, current_mcap, live_peak_mcap, live_entry_price)
+                    # Read-only climbing alert — see the site in the watchlist loop above.
+                    await position_alerts.maybe_alert(
+                        call_id, pos_live,
+                        mult=_raw_mult if _raw_mult else (exit_cur / exit_entry if exit_entry else 0.0),
+                        peak_mult=(exit_peak / exit_entry) if exit_entry else 0.0,
+                        basis=_basis,
+                        cfg=live_trader._LIVE_EXIT_CONFIG,
+                    )
                     live_exit = live_trader.check_live_exits(
                         call_id, exit_cur, exit_peak, exit_entry,
                         exit_config=live_trader._LIVE_EXIT_CONFIG,
