@@ -102,7 +102,8 @@ def _parse(v: Any):
 
 
 def simulate(row: dict, trigger: float, ceiling: float, stop: float,
-             trail: float, roundtrip: float) -> dict | None:
+             trail: float, roundtrip: float, min_mult: float = 0.0,
+             origins: set[str] | None = None) -> dict | None:
     """
     Re-enter at the first post-exit quote above prior_peak * trigger, then exit on
     ceiling / trail-from-new-peak / stop, else the last quote.
@@ -124,8 +125,16 @@ def simulate(row: dict, trigger: float, ceiling: float, stop: float,
     if not held or not after:
         return None
 
+    if origins and str(row.get("exit_reason")) not in origins:
+        return None
+
     prior_peak = max(m for _, m in held)
-    bar = prior_peak * trigger
+    # A RELATIVE bar alone is useless on a position that never went up: its prior
+    # peak is ~1.0, so "new high" means "ticked back above the stop", which is a
+    # bounce. Measured on 30d: 325 hard_stop origins triggered, 12% win, -3.93 SOL
+    # — the entire loss of the rule. min_mult is an ABSOLUTE floor against the
+    # ORIGINAL entry, so strength has to be real rather than relative to a low bar.
+    bar = max(prior_peak * trigger, min_mult)
 
     entry = None
     for at, m in after:
@@ -180,6 +189,14 @@ def main() -> int:
     ap.add_argument("--trail", type=float, default=0.30)
     ap.add_argument("--roundtrip", type=float, default=0.976,
                     help="measured round trip charged to the re-entry")
+    ap.add_argument("--min-mult", type=float, default=0.0,
+                    help="absolute floor: the re-entry price must also be at least "
+                         "this multiple of the ORIGINAL entry. Without it a "
+                         "stopped-out coin ticking back to 1.05 counts as a new high.")
+    ap.add_argument("--origins", default="",
+                    help="comma list of ORIGINAL exit_reasons to allow, e.g. "
+                         "runner_trail,profit_floor,5x_tp — the groups that had "
+                         "already run before exiting. Empty = all.")
     ap.add_argument("--by-reason", action="store_true",
                     help="split by how the ORIGINAL position exited")
     ap.add_argument("--detail", type=int, default=15)
@@ -190,12 +207,17 @@ def main() -> int:
         print("no closed positions with an exit time in this window")
         return 1
 
+    origins = {o.strip() for o in args.origins.split(",") if o.strip()} or None
     sims = [s for s in (simulate(r, args.trigger, args.ceiling, args.stop,
-                                 args.trail, args.roundtrip) for r in rows) if s]
+                                 args.trail, args.roundtrip, args.min_mult,
+                                 origins) for r in rows) if s]
 
     n, k = len(rows), len(sims)
     print(f"window        {args.days}d   {n} closed positions")
-    print(f"trigger       new high >= prior peak x {args.trigger:g}")
+    print(f"trigger       new high >= prior peak x {args.trigger:g}"
+          + (f"  AND >= {args.min_mult:g}x original entry" if args.min_mult > 0 else ""))
+    if origins:
+        print(f"origins       only {sorted(origins)}")
     print(f"re-entry exit ceiling {args.ceiling:g}x  stop {args.stop:g}x  "
           f"trail {args.trail:.0%}  round trip {args.roundtrip:g}")
     print()
