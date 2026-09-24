@@ -82,6 +82,19 @@ MONITOR_COLD_EVERY_PASSES = int(os.getenv("MONITOR_COLD_EVERY_PASSES", "6"))
 MILESTONE_THRESHOLDS    = [2.0, 5.0, 10.0]  # send alert on first crossing of each
 SUPPRESS_HISTORICAL_HOURS = 2  # don't fire milestones/drawdowns for stored peaks on old tokens
 
+# WHO gets milestone/drawdown alerts. The watchlist is the whole trending firehose —
+# hundreds of calls we merely TRACK — and alerting on all of it buries the handful of
+# messages that concern money actually at risk. An alert you scroll past is worse than
+# no alert, because it trains you to scroll past the next one.
+#   held  (default) only calls with an open position — paper A/B or live
+#   live            only calls with an open LIVE position — real money only
+#   all             legacy: every call on the watchlist
+MONITOR_ALERT_SCOPE = os.getenv("MONITOR_ALERT_SCOPE", "held").strip().lower()
+if MONITOR_ALERT_SCOPE not in ("held", "live", "all"):
+    print(f"[monitor] WARNING: MONITOR_ALERT_SCOPE={MONITOR_ALERT_SCOPE!r} invalid — using 'held'")
+    MONITOR_ALERT_SCOPE = "held"
+print(f"[monitor] alert scope: {MONITOR_ALERT_SCOPE}")
+
 DRAWDOWN_WARN = 0.30   # 30% from peak → ⚠️ pulling back alert
 DRAWDOWN_DUMP = 0.50   # 50% from peak → 🚨 dump alert
 
@@ -250,13 +263,19 @@ def _save_alerts_state() -> None:
 
 # ── Per-token processing ──────────────────────────────────────────────────────
 
-async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | None = None) -> dict:
+async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | None = None,
+                         alerts_allowed: bool = True) -> dict:
     """
     Fetch current price for one token, update peak if higher, fire any alerts.
     Returns {new_peak: bool, alerts_sent: int, skipped: bool}.
 
     Rows with data_only=True (VIP paused calls) only update peak_multiplier.
     All alert, exit, and circuit-breaker logic is skipped for them.
+
+    `alerts_allowed` gates ONLY the Telegram messages (see MONITOR_ALERT_SCOPE).
+    Peak tracking and exit checks run regardless: a call can be out of alert
+    scope and still hold a position that needs exiting, and the peak data has to
+    stay complete for every watchlist row or the outcome record goes wrong.
     """
     call_id      = row["call_id"]
     symbol       = row["symbol"] or "?"
@@ -373,81 +392,106 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
     if call_id not in _alerts_first_seen and sent:
         _alerts_first_seen[call_id] = datetime.now(timezone.utc).isoformat()
 
-    # ── Milestone threshold alerts ────────────────────────────────────────────
-    for threshold in MILESTONE_THRESHOLDS:
-        key = f"{int(threshold)}x"
-        if active_peak >= threshold and key not in sent:
-            # Suppress if token is old and the stored peak already exceeded the
-            # threshold — this is a historical peak, not a live crossing.
-            if not recently_created and stored_peak >= threshold:
-                sent.add(key)  # mark so we never re-evaluate this threshold
-                continue
-            sent.add(key)
-            _alerts_first_seen.setdefault(call_id, datetime.now(timezone.utc).isoformat())
-            result["alerts_sent"] += 1
-            print(f"  [monitor] → milestone alert: {symbol} hit {key}")
-            if not dry_run:
-                await alert_bot.send_monitor_milestone(
-                    call_id=call_id,
-                    symbol=symbol,
-                    mint_address=mint,
-                    multiplier=threshold,
-                    mcap_at_call=row["mcap_at_call"],
-                    current_mcap=current_mcap,
-                    source_message_id=row.get("source_message_id"),
-                    channel_handle=row.get("channel_handle"),
-                )
-                await asyncio.sleep(1.0)
-                _save_alerts_state()
-
-    # ── Drawdown alerts ───────────────────────────────────────────────────────
-    if active_peak > 0 and current_mult < active_peak:
-        drawdown = (active_peak - current_mult) / active_peak
-
-        # Suppress if we never witnessed the peak live this pass and the token
-        # isn't freshly created — avoids firing on stored historical peaks at startup.
-        if not recently_created and not is_new_peak:
-            sent.update({"30pct_drawdown", "50pct_dump"})
-        else:
-            # Check 50% first — avoids sending both alerts for the same drop
+    # ── Alert scope: is there money on this call? ─────────────────────────────
+    # Peak tracking above already ran and MUST keep running for every watchlist
+    # row — it is what makes the outcome data honest, and it is free. Only the
+    # Telegram messages are scoped. When a call is out of scope its thresholds
+    # are marked as already-sent, so opening a position in something that has
+    # ALREADY run does not then replay its history at you.
+    if not alerts_allowed:
+        newly_marked = False
+        for threshold in MILESTONE_THRESHOLDS:
+            key = f"{int(threshold)}x"
+            if active_peak >= threshold and key not in sent:
+                sent.add(key)
+                newly_marked = True
+        if active_peak > 0 and current_mult < active_peak:
+            drawdown = (active_peak - current_mult) / active_peak
+            if drawdown >= DRAWDOWN_WARN and "30pct_drawdown" not in sent:
+                sent.add("30pct_drawdown")
+                newly_marked = True
             if drawdown >= DRAWDOWN_DUMP and "50pct_dump" not in sent:
                 sent.add("50pct_dump")
-                sent.add("30pct_drawdown")  # severe alert supersedes the milder one
+                newly_marked = True
+        if newly_marked and not dry_run:
+            _save_alerts_state()
+
+    if alerts_allowed:
+        # ── Milestone threshold alerts ────────────────────────────────────────────
+        for threshold in MILESTONE_THRESHOLDS:
+            key = f"{int(threshold)}x"
+            if active_peak >= threshold and key not in sent:
+                # Suppress if token is old and the stored peak already exceeded the
+                # threshold — this is a historical peak, not a live crossing.
+                if not recently_created and stored_peak >= threshold:
+                    sent.add(key)  # mark so we never re-evaluate this threshold
+                    continue
+                sent.add(key)
                 _alerts_first_seen.setdefault(call_id, datetime.now(timezone.utc).isoformat())
                 result["alerts_sent"] += 1
-                print(f"  [monitor] → dump alert: {symbol} -{drawdown:.0%} from peak")
+                print(f"  [monitor] → milestone alert: {symbol} hit {key}")
                 if not dry_run:
-                    await alert_bot.send_drawdown_alert(
+                    await alert_bot.send_monitor_milestone(
                         call_id=call_id,
                         symbol=symbol,
                         mint_address=mint,
-                        peak_mult=active_peak,
-                        current_mult=current_mult,
-                        drawdown_pct=drawdown * 100,
-                        entry_mult=current_mult,
-                        severe=True,
+                        multiplier=threshold,
+                        mcap_at_call=row["mcap_at_call"],
+                        current_mcap=current_mcap,
+                        source_message_id=row.get("source_message_id"),
+                        channel_handle=row.get("channel_handle"),
                     )
                     await asyncio.sleep(1.0)
                     _save_alerts_state()
 
-            elif drawdown >= DRAWDOWN_WARN and "30pct_drawdown" not in sent:
-                sent.add("30pct_drawdown")
-                _alerts_first_seen.setdefault(call_id, datetime.now(timezone.utc).isoformat())
-                result["alerts_sent"] += 1
-                print(f"  [monitor] → drawdown alert: {symbol} -{drawdown:.0%} from peak")
-                if not dry_run:
-                    await alert_bot.send_drawdown_alert(
-                        call_id=call_id,
-                        symbol=symbol,
-                        mint_address=mint,
-                        peak_mult=active_peak,
-                        current_mult=current_mult,
-                        drawdown_pct=drawdown * 100,
-                        entry_mult=current_mult,
-                        severe=False,
-                    )
-                    await asyncio.sleep(1.0)
-                    _save_alerts_state()
+        # ── Drawdown alerts ───────────────────────────────────────────────────────
+        if active_peak > 0 and current_mult < active_peak:
+            drawdown = (active_peak - current_mult) / active_peak
+
+            # Suppress if we never witnessed the peak live this pass and the token
+            # isn't freshly created — avoids firing on stored historical peaks at startup.
+            if not recently_created and not is_new_peak:
+                sent.update({"30pct_drawdown", "50pct_dump"})
+            else:
+                # Check 50% first — avoids sending both alerts for the same drop
+                if drawdown >= DRAWDOWN_DUMP and "50pct_dump" not in sent:
+                    sent.add("50pct_dump")
+                    sent.add("30pct_drawdown")  # severe alert supersedes the milder one
+                    _alerts_first_seen.setdefault(call_id, datetime.now(timezone.utc).isoformat())
+                    result["alerts_sent"] += 1
+                    print(f"  [monitor] → dump alert: {symbol} -{drawdown:.0%} from peak")
+                    if not dry_run:
+                        await alert_bot.send_drawdown_alert(
+                            call_id=call_id,
+                            symbol=symbol,
+                            mint_address=mint,
+                            peak_mult=active_peak,
+                            current_mult=current_mult,
+                            drawdown_pct=drawdown * 100,
+                            entry_mult=current_mult,
+                            severe=True,
+                        )
+                        await asyncio.sleep(1.0)
+                        _save_alerts_state()
+
+                elif drawdown >= DRAWDOWN_WARN and "30pct_drawdown" not in sent:
+                    sent.add("30pct_drawdown")
+                    _alerts_first_seen.setdefault(call_id, datetime.now(timezone.utc).isoformat())
+                    result["alerts_sent"] += 1
+                    print(f"  [monitor] → drawdown alert: {symbol} -{drawdown:.0%} from peak")
+                    if not dry_run:
+                        await alert_bot.send_drawdown_alert(
+                            call_id=call_id,
+                            symbol=symbol,
+                            mint_address=mint,
+                            peak_mult=active_peak,
+                            current_mult=current_mult,
+                            drawdown_pct=drawdown * 100,
+                            entry_mult=current_mult,
+                            severe=False,
+                        )
+                        await asyncio.sleep(1.0)
+                        _save_alerts_state()
 
     # ── Paper trade exit check ────────────────────────────────────────────────
     if not dry_run:
@@ -949,24 +993,44 @@ async def run_pass(pass_num: int, dry_run: bool) -> dict:
     # COLD = milestone-tracking only — poll once every MONITOR_COLD_EVERY_PASSES.
     # This is the core of the rate-limit fix: the trending firehose bloats COLD,
     # so polling it every pass was flooding both DexScreener and Jupiter.
+    # Built on every pass including --dry-run: these are READS, and dry-run is
+    # how you preview what the alert scope will actually do. Skipping it there
+    # left the preview showing the unscoped firehose, which is the opposite of
+    # what a preview is for.
     hot_ids: set[int] = set()
-    if not dry_run:
-        try:
-            for p in db.get_open_paper_positions(is_strategy_b=False):
-                hot_ids.add(p["call_id"])
-            for p in db.get_open_paper_positions(is_strategy_b=True):
-                hot_ids.add(p["call_id"])
-            for p in db.get_open_live_positions():
-                hot_ids.add(p["call_id"])
-        except Exception as e:
-            print(f"[monitor] hot-set build failed — treating all as hot: {e}")
-            hot_ids = {r["call_id"] for r in watchlist}
+    live_ids: set[int] = set()
+    hot_set_ok = True
+    try:
+        for p in db.get_open_paper_positions(is_strategy_b=False):
+            hot_ids.add(p["call_id"])
+        for p in db.get_open_paper_positions(is_strategy_b=True):
+            hot_ids.add(p["call_id"])
+        for p in db.get_open_live_positions():
+            live_ids.add(p["call_id"])
+        hot_ids |= live_ids
+    except Exception as e:
+        print(f"[monitor] hot-set build failed — treating all as hot: {e}")
+        hot_ids = {r["call_id"] for r in watchlist}
+        hot_set_ok = False
+    # Which calls may send Telegram messages this pass (MONITOR_ALERT_SCOPE).
+    # None means "everything", which is both the legacy behaviour and the
+    # fallback when the position query failed: a failed lookup must degrade to
+    # NOISY, never to SILENT — an over-alerting monitor is annoying, one that
+    # silently stops reporting a position that is moving is a money problem.
+    if MONITOR_ALERT_SCOPE == "all" or not hot_set_ok:
+        alert_ids: set[int] | None = None
+    elif MONITOR_ALERT_SCOPE == "live":
+        alert_ids = live_ids
+    else:
+        alert_ids = hot_ids
+
     cold_due = dry_run or (pass_num % MONITOR_COLD_EVERY_PASSES == 0)
     watchlist = [r for r in watchlist if (r["call_id"] in hot_ids or cold_due)]
     count = len(watchlist)
 
     print(f"[monitor] Pass {pass_num} — watching {count}/{total} active call(s) "
-          f"({len(hot_ids)} hot{', +cold' if cold_due else ''})")
+          f"({len(hot_ids)} hot{', +cold' if cold_due else ''}; "
+          f"alerting {'all' if alert_ids is None else len(alert_ids)})")
 
     # One Jupiter batch call for all active mints — avoids N DexScreener calls.
     active_mints = [
@@ -991,7 +1055,10 @@ async def run_pass(pass_num: int, dry_run: bool) -> dict:
                     continue
                 _data_only_last_fetch[call_id] = now
 
-            result = await _process_token(row, dry_run, prefetched_prices=prefetched_prices)
+            result = await _process_token(
+                row, dry_run, prefetched_prices=prefetched_prices,
+                alerts_allowed=(alert_ids is None or call_id in alert_ids),
+            )
             checked_call_ids.add(call_id)
             await asyncio.sleep(sleep_per_call)
 
