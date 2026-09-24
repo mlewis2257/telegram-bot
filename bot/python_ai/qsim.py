@@ -654,6 +654,22 @@ async def qsim_open(score_result: dict, token_data: dict) -> None:
         except Exception as e:
             print(f"[qsim] dev gate error (allowing): {type(e).__name__} {e}")
 
+        # MODEL GATE. Scores the call from pre-entry features and skips the ones
+        # the model ranks below its decile cut. Defaults to SHADOW, which logs
+        # the decision and still takes the trade — that keeps the blocked group
+        # trading as the control arm, without which a filtered book can only be
+        # compared against a different month. Never raises; every failure allows.
+        try:
+            import model_gate
+            _m = await model_gate.check(call_id, channel, context="qsim")
+            if not _m.allowed:
+                print(f"[qsim] {symbol} skipped — model gate: {_m.reason} "
+                      f"(score={_m.score:.4f} thr={_m.threshold:.4f} "
+                      f"{_m.latency_ms:.0f}ms) call_id={call_id}")
+                return
+        except Exception as e:
+            print(f"[qsim] model gate error (allowing): {type(e).__name__} {e}")
+
         size = float(spec["size"])
         try:
             tokens_raw = await jupiter.get_buy_quote(mint, size, raise_on_ratelimit=True)
@@ -1038,6 +1054,21 @@ async def run_qsim_monitor() -> None:
     try:
         import dev_gate
         dev_gate.ensure_table()
+        try:
+            import model_gate as _mg
+            _mg.ensure_table()
+            _b = _mg._load()
+            if _b is None:
+                print("[model_gate] no model on disk — gate allows everything. "
+                      "Run: python3 model_gate.py --train --days 60")
+            else:
+                print(f"[model_gate] mode={_mg.MODE} qsim={_mg.MODE_QSIM} "
+                      f"live={_mg.MODE_LIVE} top={_mg.TOP_PCT:g}% "
+                      f"thr={_b['threshold']:.4f} age={_mg.model_age_hours(_b):.1f}h "
+                      f"auc={_b.get('test_auc', float('nan')):.3f} "
+                      f"channels={sorted(_mg.CHANNELS) or 'ALL'}")
+        except Exception as _e:
+            print(f"[model_gate] startup check failed (gate will allow): {_e}")
         print(f"[qsim] dev gate: mode={dev_gate.MODE} min_prior={dev_gate.MIN_PRIOR} "
               f"max_prior_rugs={dev_gate.MAX_PRIOR_RUGS} "
               f"qsim={dev_gate.MODE_QSIM} live={dev_gate.MODE_LIVE} "
