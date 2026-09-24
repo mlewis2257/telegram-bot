@@ -86,7 +86,21 @@ MAX_SANE_PEAK = float(os.getenv("QSIM_MAX_SANE_PEAK", "1000"))
 MAX_SANE_PNL_PCT = float(os.getenv("QSIM_MAX_SANE_PNL_PCT", "100000"))   # +1000x
 MIN_SANE_PNL_PCT = -100.5
 MAX_QOBS_MULT = float(os.getenv("QSIM_REPLAY_MAX_QOBS_MULT", "1000"))
-THRESHOLDS = (2.0, 3.0, 5.0)
+# 10/20/30/50 are the CEILING levels. Everything else in this file caps the whole
+# distribution — a 2x bank takes 2x on the coin that was going to do 40x. A ceiling
+# binds ONLY on positions that already reached it, so it costs nothing on the 99%
+# that never get near and converts the rare monster into cash.
+#
+# The case for them is GTF: sustained 61.5x, booked 2.115x, because every exit in
+# the config waits for a retracement and it rugged from its peak in 91 seconds with
+# no quote in between. A rule that says "we are at 30x and have taken nothing, sell"
+# needs no retracement and no forecast — only a price that is already on the tape.
+#
+# Note the obs_/floor_ policies fall back to the CURRENT result when the level is
+# never touched, which is what makes these readable as an overlay on the live config
+# rather than a replacement for it. `mults` is truncated at exit_time (_held_mults),
+# so "touched 30x" means touched it WHILE HELD.
+THRESHOLDS = (2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 50.0)
 BANK_LEVELS = (1.20, 1.30, 1.40, 1.50, 1.75, 2.0)
 BANK_FRACTIONS = (0.25, 0.50, 0.75)
 BANK_REMAINDER_STOPS = (0.85, 1.0, 1.10)
@@ -2411,12 +2425,11 @@ def _print_summary(views: list[ReplayRow]) -> None:
     print("\nReplay Totals")
     print(f"{'policy':<14} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
     print("-" * 83)
-    policies = [
-        "best_raw", "raw_config",
-        "floor_2x", "obs_2x", "confirm_2x",
-        "floor_3x", "obs_3x", "confirm_3x",
-        "floor_5x", "obs_5x", "confirm_5x",
-    ]
+    # Generated from THRESHOLDS so adding a level cannot silently fail to print.
+    policies = ["best_raw", "raw_config"]
+    for _t in THRESHOLDS:
+        _s = _level_suffix(_t)
+        policies += [f"floor_{_s}", f"obs_{_s}", f"confirm_{_s}"]
     for policy in policies:
         _print_policy_row(policy, views, current)
 
