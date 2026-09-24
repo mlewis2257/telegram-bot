@@ -20,12 +20,33 @@ A policy can only be trusted under --include-post-exit if its ENTRY leg is
 bounded by the real exit time. Whether it is, is a mechanical property of the
 function signature and its call site, so it can be checked mechanically.
 
+THE ACTUAL DEFECT IS A FREE OPTION, NOT POST-EXIT DATA
+-----------------------------------------------------
+The first two versions of this audit checked the wrong property. Reading quotes
+from after qsim's exit is not itself wrong: a policy with a looser stop HOLDS
+LONGER than qsim did, and asking what that would have returned is the entire
+point of --include-post-exit. _runner_window_return does exactly that and is
+sound — it ends with `return last_mult - 1.0`, so it takes whatever the last
+observed price gives, good or bad.
+
+What bor_ actually did was worse and subtler. It banked at 1.4x when a coin
+recovered after the real exit, and fell back to `current_return` — qsim's
+ACTUAL, stop-protected result — when it did not. Post-exit upside with
+stop-protected downside. Heads it wins, tails it takes the stop. That is a free
+option, and it is why it was the only profitable family in the book.
+
+So the property to check is: can this policy return `current_return` AFTER it
+has looked at the price series? If yes, it is picking its downside from one
+world and its upside from another. If it always ends on an observed price, it
+is consistent whatever quotes it saw.
+
 WHAT IT CHECKS
 --------------
-  1. Every `_*_return` function in the replay: does it accept `held_until`?
-  2. Every call site: is `held_until` actually passed?
-  3. Functions taking `mults` (bare floats, no timestamps) CANNOT be bounded
-     without a signature change, and are reported as structurally unbounded.
+  1. Free option: does `current_return` appear anywhere outside the leading
+     `if not points:` guard — as a return, or as the else-branch of a
+     conditional expression?
+  2. Is that free option closed by a `held_until` bound (the bor_ fix), which
+     forces the fallback consistently for every row it could apply to?
 
 Exit code is non-zero when a policy COULD be bounded and is not — either it
 accepts held_until and a caller omits it, or it receives `points` and ignores
@@ -53,12 +74,93 @@ import sys
 
 TARGET = os.path.join(os.path.dirname(__file__), "qsim_quote_capture_replay.py")
 
+# Functions whose `current_return` fallback has been READ and found consistent:
+# it fires only when the policy never engaged at all, and every path on which it
+# did engage returns a price observed at the time. These never pair post-exit
+# upside with qsim's stop-protected downside, which is the actual defect.
+#
+# This is a reviewed list, not an inferred one. A static check cannot tell
+# `if in_recovery` from `if first is not None` — they are the same shape and
+# opposite meanings — so anything added here needs a human to have read it and
+# a reason recorded next to it.
+CONSISTENT_BY_REVIEW: dict[str, str] = {
+    "_runner_window_return":
+        "ends `return last_mult - 1.0`; no fallback after the scan at all",
+    "_soft_stop_recovery_return":
+        "`if in_recovery` = the soft stop engaged; if it did, every exit is an observed price",
+    "_bank_soft_stop_return":
+        "same in_recovery shape as _soft_stop_recovery_return",
+    "_conditional_stop_delay_return":
+        "`if in_delay` = the delay engaged; same shape",
+}
+
 
 def _arg_names(fn: ast.FunctionDef) -> set[str]:
     a = fn.args
     return {x.arg for x in (a.posonlyargs + a.args + a.kwonlyargs)} | {
         x.arg for x in ([a.vararg] if a.vararg else []) + ([a.kwarg] if a.kwarg else [])
     }
+
+
+def _guard_node(fn: ast.FunctionDef) -> ast.AST | None:
+    """The leading `if not points: return current_return` guard, if present.
+
+    Its fallback is not a free option: nothing has been observed yet, so there is
+    no other world to pick an upside from.
+    """
+    body = list(fn.body)
+    # Skip the docstring. Without this the guard is never found in any function
+    # that has one, which silently turned the guard's own fallback into a
+    # reported free option — three false positives, and the reason
+    # _runner_window_return alone looked clean: it has no docstring.
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        body = body[1:]
+    first = body[0] if body else None
+    if isinstance(first, ast.If) and isinstance(first.test, ast.UnaryOp) \
+            and isinstance(first.test.op, ast.Not):
+        return first
+    return None
+
+
+def _free_option(fn: ast.FunctionDef) -> bool:
+    """
+    True if `current_return` is reachable on a path where the policy ALSO books
+    exits at prices it only saw because of post-exit data.
+
+    Two placements are NOT a free option, and both took a manual read to
+    separate from the one that is:
+
+      the leading `if not points:` guard — nothing has been observed yet, so
+      there is no other world to borrow an upside from.
+
+      anything in CONSISTENT_BY_REVIEW — see that list.
+
+    An earlier version tried to exempt the terminal
+    `return X if engaged else current_return` pattern automatically. That is
+    wrong: it also exempts `return first - 1.0 if first is not None else
+    current_return` in _bank_return, where the condition means "a crossing
+    exists ANYWHERE in the series, post-exit included" rather than "the policy
+    engaged". Those two read identically to an AST and mean opposite things.
+
+    Separating them needs the function's semantics, not its shape, so this no
+    longer guesses. Everything with a fallback is flagged unless it is on the
+    reviewed list below, which is short, named, and justified per entry.
+    """
+    guard = _guard_node(fn)
+    skip = set(map(id, ast.walk(guard))) if guard is not None else set()
+
+
+    for node in ast.walk(fn):
+        if id(node) in skip:
+            continue
+        if isinstance(node, ast.Return) and node.value is not None:
+            for sub in ast.walk(node.value):
+                if id(sub) in skip:
+                    continue
+                if isinstance(sub, ast.Name) and sub.id == "current_return":
+                    return True
+    return False
 
 
 def audit(path: str) -> dict:
@@ -68,12 +170,12 @@ def audit(path: str) -> dict:
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name.endswith("_return"):
             names = _arg_names(node)
+            if "current_return" not in names:
+                continue
             defs[node.name] = {
                 "accepts_held_until": "held_until" in names,
-                # A function given only bare floats has no timestamps to compare
-                # against an exit time, so it cannot be bounded without a
-                # signature change. That is a design fact, not an oversight.
                 "takes_timestamps": "points" in names,
+                "free_option": _free_option(node),
                 "line": node.lineno,
                 "calls": [],
             }
@@ -94,21 +196,31 @@ def audit(path: str) -> dict:
     for name, info in sorted(defs.items()):
         if not info["calls"]:
             continue
-        if info["accepts_held_until"]:
-            bad = [c["line"] for c in info["calls"] if not c["passes_held_until"]]
-            (violations if bad else ok).append(
-                {"fn": name, "def_line": info["line"], "bad_call_lines": bad,
-                 "why": "accepts held_until but a caller omits it"})
+        if name in CONSISTENT_BY_REVIEW:
+            ok.append({"fn": name, "def_line": info["line"],
+                       "why": f"reviewed: {CONSISTENT_BY_REVIEW[name]}"})
+            continue
+        if not info["free_option"]:
+            ok.append({"fn": name, "def_line": info["line"],
+                       "why": "no current_return fallback after the scan"})
+            continue
+        bounded = info["accepts_held_until"] and all(
+            c["passes_held_until"] for c in info["calls"])
+        if bounded:
+            ok.append({"fn": name, "def_line": info["line"],
+                       "why": "free option closed by a held_until bound"})
         elif info["takes_timestamps"]:
-            # It receives `points`, so the timestamps are RIGHT THERE and it
-            # simply does not use them. That is the bor_ bug in its original
-            # form — fixable, therefore a violation, not a fact of life.
             violations.append(
-                {"fn": name, "def_line": info["line"], "bad_call_lines": [],
-                 "why": "takes points (timestamps available) but has no held_until parameter"})
+                {"fn": name, "def_line": info["line"],
+                 "bad_call_lines": [c["line"] for c in info["calls"]
+                                    if not c["passes_held_until"]],
+                 "why": "falls back to current_return after reading the series, "
+                        "and takes points so it COULD bound itself"})
         else:
-            unbounded.append({"fn": name, "def_line": info["line"],
-                              "reason": "takes bare mults — no timestamps to bound with"})
+            unbounded.append(
+                {"fn": name, "def_line": info["line"],
+                 "reason": "falls back to current_return after reading the series; "
+                           "takes bare mults so it cannot bound itself"})
     return {"violations": violations, "unbounded": unbounded, "bounded_ok": ok}
 
 
@@ -126,17 +238,19 @@ def main() -> int:
 
     print(f"LOOK-AHEAD AUDIT  {os.path.basename(args.path)}")
     print()
-    print(f"BOUNDED — safe under --include-post-exit ({len(res['bounded_ok'])})")
+    print(f"SAFE under --include-post-exit ({len(res['bounded_ok'])})")
     for r in res["bounded_ok"]:
         print(f"  ok    {r['fn']:<42} line {r['def_line']}")
+        print(f"        {r['why']}")
     print()
-    print(f"STRUCTURALLY UNBOUNDED — do NOT read these with --include-post-exit "
+    print(f"FREE OPTION, UNFIXABLE IN PLACE — do NOT read with --include-post-exit "
           f"({len(res['unbounded'])})")
     for r in res["unbounded"]:
-        print(f"  warn  {r['fn']:<42} line {r['def_line']}  ({r['reason']})")
+        print(f"  warn  {r['fn']:<42} line {r['def_line']}")
+        print(f"        {r['reason']}")
     print()
     if res["violations"]:
-        print(f"VIOLATIONS — could be bounded, is not ({len(res['violations'])})")
+        print(f"VIOLATIONS — free option that could be closed, and is not ({len(res['violations'])})")
         for r in res["violations"]:
             where = f", unbounded call(s) at {r['bad_call_lines']}" if r["bad_call_lines"] else ""
             print(f"  FAIL  {r['fn']:<42} def line {r['def_line']}{where}")
@@ -147,10 +261,10 @@ def main() -> int:
         print("  profitable family in the book until it was bounded.")
         return 1
 
-    print("VIOLATIONS  none — every function that can bound itself is called that way.")
+    print("VIOLATIONS  none — every closable free option is closed.")
     print()
     print("Reminder: 'no violations' does NOT mean every number is post-exit safe.")
-    print("The structurally unbounded list above still must be read WITHOUT the flag.")
+    print("The free-option list above still must be read WITHOUT the flag.")
     return 0
 
 
