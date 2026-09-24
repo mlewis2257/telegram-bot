@@ -825,12 +825,20 @@ def _observations(raw: Any) -> list[dict[str, Any]]:
 
 
 def _quote_mults(row: dict[str, Any]) -> list[float]:
-    mults: list[float] = []
-    for obs in _observations(row.get("observations")):
-        mult = _f(obs.get("real_mult"))
-        if 0 < mult <= MAX_QOBS_MULT:
-            mults.append(mult)
-    return mults
+    """Held-window multiples for a row — the same series the RETURNS are computed on.
+
+    This used to return every observation, post-exit included, while the returns were
+    computed on `_held_mults(points, exit_time)`. The sums were therefore correct and the
+    hit%/hits/avg_hit columns DESCRIBING them were not: under --include-post-exit,
+    bank_2x reported 251 hits at an average fill of 2.57 when the truth for the window it
+    was actually paid on is 194 hits at 2.32. Every number in the report agreed except the
+    ones a reader uses to judge whether a policy is broadly based or carried by a handful
+    of rows — which is exactly the judgement those columns exist for.
+
+    Caught by an invariant, not by reading: bank_2x's `delta` is identical with and
+    without --include-post-exit (+131.96 both), so its `hits` must be too, and it was not.
+    """
+    return _held_mults(_quote_points(row), _parse_dt(row.get("exit_time")))
 
 
 def _parse_dt(value: Any) -> datetime | None:
