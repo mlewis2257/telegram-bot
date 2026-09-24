@@ -193,6 +193,71 @@ PARTIAL_BANK_RUNNER_POLICIES = (
     },
 )
 
+# PARTIAL BANK + RUNG LADDER. The runner leg above exits on ONE target, or on the
+# floor/trail/stall if it has none. Both of those need something to happen on the way
+# DOWN before they transact, and qsim_path_shape measured what that costs: of the coins
+# that reached 2x, 18-23% gapped past the trail's level rather than through it, realising
+# a median 8-9% of what the trail aimed for. GTF aimed at 52.3x and sold at 0.024x.
+#
+# A rung sells on the way UP, where the price demonstrably existed, and needs nothing
+# afterwards. These keep the 1.3x bank exactly as it is — path_shape found 1.3 beats both
+# 1.2 and 1.4, so the bank level is already on its optimum and is not the variable here —
+# and replace the runner's single target with a ladder.
+#
+# Measured in qsim_path_shape on 17 days: rungs at 2/5/20x beat the trail runner by +0.31
+# to +0.36 SOL at BOTH stop levels tested, and the effect survives excluding GTF (at
+# --stop 0.90 GTF stops out at 0.88 before it ever runs, and the gain is still +0.308).
+# That is a simplified simulator without this file's floors, stalls and time stops, which
+# is why it is re-measured here against the real machinery before anything ships.
+#
+# Same post-exit caveat as the block above, and for the same reason: the rungs above the
+# bank generally fire after qsim's own exit, so these rows need --include-post-exit and
+# are an upper bound to the extent post-exit sampling is dense. The bank leg is still
+# bounded by held_until, so no rung can be credited on a position already stopped out.
+PARTIAL_BANK_RUNG_POLICIES = (
+    {   # the path_shape winner, ported onto the real machinery
+        "name": "pbg_b1p3_s70_r2_5_20_f1p1_tr30_w60m",
+        "bank": 1.30, "fraction": 0.70,
+        "rungs": ((2.0, 0.10), (5.0, 0.10), (20.0, 0.05)),
+        "floor": 1.10, "trail_pct": 0.30, "window_mins": 60.0,
+    },
+    {   # fewer, higher rungs
+        "name": "pbg_b1p3_s70_r3_10_f1p1_tr30_w60m",
+        "bank": 1.30, "fraction": 0.70,
+        "rungs": ((3.0, 0.15), (10.0, 0.10)),
+        "floor": 1.10, "trail_pct": 0.30, "window_mins": 60.0,
+    },
+    {   # reach further before selling anything off the runner
+        "name": "pbg_b1p3_s70_r5_30_f1p1_tr30_w60m",
+        "bank": 1.30, "fraction": 0.70,
+        "rungs": ((5.0, 0.15), (30.0, 0.10)),
+        "floor": 1.10, "trail_pct": 0.30, "window_mins": 60.0,
+    },
+    {   # WIDE trail on what is left after the rungs. Once three rungs have sold, the
+        # remainder is house money and a 30% trail on it is not the same bet as a 30%
+        # trail on a whole position — this is where a fat tail is allowed to run.
+        "name": "pbg_b1p3_s70_r2_5_20_f1p1_tr50_w60m",
+        "bank": 1.30, "fraction": 0.70,
+        "rungs": ((2.0, 0.10), (5.0, 0.10), (20.0, 0.05)),
+        "floor": 1.10, "trail_pct": 0.50, "window_mins": 60.0,
+    },
+    {   # no floor on the remainder. The 1.1 floor is what stops a banked winner
+        # round-tripping, but after the rungs have fired there is little left to protect
+        # and the floor mostly just ends the trade early.
+        "name": "pbg_b1p3_s70_r2_5_20_f0_tr50_w60m",
+        "bank": 1.30, "fraction": 0.70,
+        "rungs": ((2.0, 0.10), (5.0, 0.10), (20.0, 0.05)),
+        "floor": 0.0, "trail_pct": 0.50, "window_mins": 60.0,
+    },
+    {   # smaller bank, bigger ladder — tests whether the 70% bank is itself too large
+        # once the runner has rungs to sell into.
+        "name": "pbg_b1p3_s50_r2_5_20_f1p1_tr30_w60m",
+        "bank": 1.30, "fraction": 0.50,
+        "rungs": ((2.0, 0.20), (5.0, 0.20), (20.0, 0.10)),
+        "floor": 1.10, "trail_pct": 0.30, "window_mins": 60.0,
+    },
+)
+
 BANK_OR_RUN_POLICIES = (
     {
         "name": "bor_b1p3_a1p7_t3x_f1p2_w10m_s3",
@@ -1539,6 +1604,113 @@ def _partial_bank_runner_return(
     return fraction * (banked_mult - 1.0) + (1.0 - fraction) * (last_mult - 1.0)
 
 
+def _partial_bank_rungs_return(
+    points: list[tuple[datetime | None, float]],
+    *,
+    bank: float,
+    fraction: float,
+    rungs: tuple[tuple[float, float], ...],
+    floor: float,
+    trail_pct: float,
+    window_mins: float,
+    current_return: float,
+    held_until: datetime | None = None,
+) -> float:
+    """
+    Sell `fraction` at the first quote >= bank, then sell the remainder in RUNGS on the
+    way up rather than at a single target.
+
+    `rungs` is ((multiple, fraction_of_whole_position), ...). Fractions are of the whole
+    position, not of the runner, so bank 0.70 with rungs summing to 0.25 leaves a 0.05
+    tail running. Whatever is left after every rung has fired exits on the floor, the
+    trail off the runner's own peak, the stall window, or the last quote — exactly as the
+    single-target runner does.
+
+    WHY RUNGS AND NOT A TARGET. A target exits the WHOLE runner at one price, so it has
+    to be set either low (and cap a 60x at 2x) or high (and never fire on the 88% of
+    coins that never get there). A ladder does both: the low rung collects from the coin
+    that only ever reached 2.4x, the high rung is still in the water when one goes to 20x.
+    Neither needs a price to exist on the way down, which is what the floor and the trail
+    both require and what GTF did not provide.
+
+    `held_until` bounds the BANK leg only, for the reason the single-target runner
+    documents: a bank that only becomes reachable after qsim sold is not a bank. The rungs
+    above it legitimately read post-exit quotes, which is what makes these rows an upper
+    bound rather than a capture estimate.
+    """
+    if not points:
+        return current_return
+
+    ladder = sorted(rungs)
+    banked_mult: float | None = None
+    runner_peak = 0.0
+    last_high_at: float | None = None
+    last_mult = points[-1][1]
+    realised = 0.0        # sum of fraction * (mult - 1) already sold
+    remaining = 0.0       # fraction of the WHOLE position still held
+    fired = [False] * len(ladder)
+
+    def _take(mult: float) -> None:
+        """Fire every rung this quote has reached. Mutates realised/remaining/fired."""
+        nonlocal realised, remaining
+        for i, (rung_mult, rung_frac) in enumerate(ladder):
+            if not fired[i] and mult >= rung_mult:
+                take = min(rung_frac, remaining)
+                realised += take * (mult - 1.0)
+                remaining -= take
+                fired[i] = True
+
+    for observed_at, mult in points:
+        last_mult = mult
+        ts = observed_at.timestamp() if observed_at is not None else None
+
+        if banked_mult is None:
+            if (
+                held_until is not None
+                and observed_at is not None
+                and observed_at > held_until
+            ):
+                return current_return
+            if mult < bank:
+                continue
+            banked_mult = mult
+            realised = fraction * (mult - 1.0)
+            remaining = 1.0 - fraction
+            runner_peak = mult
+            last_high_at = ts
+            # A gap-up can clear the bank AND several rungs on the same quote. GTF's
+            # bank fired at 3.011x, not 1.3x, so this is the normal case on exactly the
+            # violent moves the ladder exists to catch, not an edge case.
+            _take(mult)
+            if remaining <= 1e-9:
+                return realised
+            continue
+
+        # ── runner leg ────────────────────────────────────────────────────────
+        _take(mult)
+        if remaining <= 1e-9:
+            return realised
+
+        if floor > 0 and mult <= floor:
+            return realised + remaining * (mult - 1.0)
+        if runner_peak > 0 and mult <= runner_peak * (1.0 - trail_pct):
+            return realised + remaining * (mult - 1.0)
+
+        if mult > runner_peak:
+            runner_peak = mult
+            last_high_at = ts
+        elif (
+            last_high_at is not None
+            and ts is not None
+            and ts >= last_high_at + window_mins * 60.0
+        ):
+            return realised + remaining * (mult - 1.0)
+
+    if banked_mult is None:
+        return current_return
+    return realised + remaining * (last_mult - 1.0)
+
+
 def _partial_bank_runner_hit_mult(
     points: list[tuple[datetime | None, float]],
     *,
@@ -2075,6 +2247,19 @@ def _view(
             held_until=_parse_dt(row.get("exit_time")),
         )
 
+    for policy in PARTIAL_BANK_RUNG_POLICIES:
+        returns[policy["name"]] = _partial_bank_rungs_return(
+            points,
+            bank=policy["bank"],
+            fraction=policy["fraction"],
+            rungs=policy["rungs"],
+            floor=policy["floor"],
+            trail_pct=policy["trail_pct"],
+            window_mins=policy["window_mins"],
+            current_return=fallback_return,
+            held_until=_parse_dt(row.get("exit_time")),
+        )
+
     for policy in BANK_OR_RUN_POLICIES:
         returns[policy["name"]] = _bank_or_run_return(
             points,
@@ -2282,6 +2467,15 @@ def _print_summary(views: list[ReplayRow]) -> None:
     print("-" * 105)
     for policy in PARTIAL_BANK_RUNNER_POLICIES:
         _print_policy_row(policy["name"], views, current, width=36)
+
+    print("\nPartial Bank + Rung Ladder Totals")
+    print("  (rungs sell on the way UP, so gapping cannot reach them — but they fire")
+    print("   after qsim's own exit, so this needs --include-post-exit and is an UPPER BOUND.")
+    print("   Compare against pbr_* above, which is the same bank with a single target.)")
+    print(f"{'policy':<40} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
+    print("-" * 109)
+    for policy in PARTIAL_BANK_RUNG_POLICIES:
+        _print_policy_row(policy["name"], views, current, width=40)
 
     print("\nBank-Or-Run Totals")
     print(f"{'policy':<32} {'sum':>10} {'delta':>10} {'all_win%':>9} {'avg':>8} {'hit%':>7} {'hits':>7} {'avg_hit':>9}")
