@@ -66,9 +66,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 import db  # noqa: E402
 
 # Exit reasons that are the FLOOR giving up a live position. `runner_floor` is
-# queried but every partial-banked row is then EXCLUDED from the comparison and
-# counted separately — see the guard in report(). It is listed here so the
-# excluded count is visible rather than silently absent.
+# the same rule acting on the runner leg after a partial bank; those rows are
+# INCLUDED, with the banked leg carried as cash — see _held_sol_out, whose
+# arithmetic was verified against the observations rather than assumed.
 FLOOR_REASONS = ("profit_floor", "stale_profit_floor", "runner_floor")
 
 
@@ -132,38 +132,57 @@ def _simulate(mults: list[float], bank: float, stop: float) -> tuple[float, str]
     return mults[-1], "terminal"
 
 
+def _held_sol_out(row: dict, mult: float) -> float:
+    """SOL the position returns at price-multiple `mult`, carrying the partial bank.
+
+    VERIFIED 2026-09-24, not assumed. `real_mult` is a PRICE multiple: it is
+    normalized by the bag still held, so it is continuous across the partial
+    bank while `sol_out` steps down by the sold fraction. On call_id 282470
+    (frac 0.70, sol_in 0.05):
+
+        before  sol_out 0.069524 / 0.05          = 1.3905 == real_mult
+        after   sol_out 0.019532 / (0.30 * 0.05) = 1.3021 == real_mult
+
+    Confirmed again on 283036 (0.020340 / 0.015 = 1.356) and 283052
+    (0.025308 / 0.015 = 1.6872). So the runner's value at `mult` is
+    (1 - frac) * sol_in * mult, and the banked leg is already cash.
+
+    This mirrors how qsim composes the real close: db.py notes "sol_out on the
+    final close is partial_sol_out + the runner's own sell quote".
+    """
+    sol_in = float(row["sol_in"])
+    frac = float(row["partial_fraction"] or 0.0)
+    banked = float(row["partial_sol_out"] or 0.0)
+    if frac > 0.0 and banked > 0.0:
+        return banked + (1.0 - frac) * sol_in * mult
+    return sol_in * mult
+
+
 def report(days: float, bank: float, stop: float, detail: bool) -> None:
     rows = _rows(days, FLOOR_REASONS)
     if not rows:
         print("no floor exits in window")
         return
 
-    resolved, unresolved, partial = [], [], []
+    resolved, unresolved = [], []
     for r in rows:
         sol_in = float(r["sol_in"])
         actual_pnl = float(r["sol_out"] or 0.0) - sol_in
-        # A partial-banked row is EXCLUDED, not modelled. `real_mult` may be the
-        # runner's value rather than the price multiple, and if it is, crediting
-        # sol_in * mult applies the size reduction twice. That is exactly the
-        # confounded-column mistake this project has made four times before, so
-        # the rows are dropped and counted rather than guessed at. Confirm the
-        # semantics on a partial-banked position and they can come back in.
-        if r["partial_sol_out"] is not None:
-            partial.append({**r, "actual_pnl": actual_pnl})
-            continue
         mults = _post_quotes(int(r["call_id"]), r["exit_time"])
         if not mults:
             unresolved.append({**r, "actual_pnl": actual_pnl})
             continue
         mult, why = _simulate(mults, bank, stop)
-        held_pnl = sol_in * mult - sol_in
+        held_pnl = _held_sol_out(r, mult) - sol_in
         resolved.append({**r, "actual_pnl": actual_pnl, "held_pnl": held_pnl,
                          "mult": mult, "why": why, "n_post": len(mults)})
 
     print(f"FLOOR COST  last {days:g}d   bank={bank:g}x  stop={stop:g}x")
     print(f"  floor exits: {len(rows)}   resolved: {len(resolved)}   "
-          f"unresolved (no post-exit quotes): {len(unresolved)}   "
-          f"excluded (partial bank): {len(partial)}")
+          f"unresolved (no post-exit quotes): {len(unresolved)}")
+    n_partial = sum(1 for x in resolved if x["partial_sol_out"] is not None)
+    print(f"  of the resolved, {n_partial} had a partial bank — the runner leg "
+          f"is carried at (1-frac)*sol_in*mult, see _held_sol_out")
     if not resolved:
         print("  nothing resolved — no comparison to make")
         return
