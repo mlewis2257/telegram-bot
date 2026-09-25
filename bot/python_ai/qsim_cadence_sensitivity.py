@@ -116,9 +116,18 @@ def _in_life_quotes(days: float) -> dict[int, list[tuple[float, float]]]:
 
 def _thin(series: list[tuple[float, float]], min_gap: float
           ) -> list[tuple[float, float]]:
-    """Keep the first quote, then each quote >= min_gap after the last kept.
+    """Keep the first quote, then each quote >= min_gap after the last kept,
+    and ALWAYS the last quote of the position's life.
 
     min_gap 0 returns the series untouched, which is qsim's real sampling.
+
+    THE FINAL QUOTE IS NOT OPTIONAL. Without it, thinning drops whatever falls
+    within min_gap of the previous kept quote — and the tail of a position's
+    series is disproportionately its death. The first version of this function
+    omitted it and produced a +20 SOL improvement from looking LESS often,
+    because coarse sampling was truncating positions before they died and
+    valuing them at a mid-life price. A position's life ends when it ends; how
+    often you looked changes what you SAW, not when it was over.
     """
     if min_gap <= 0 or not series:
         return series
@@ -126,6 +135,8 @@ def _thin(series: list[tuple[float, float]], min_gap: float
     for ts, m in series[1:]:
         if ts - kept[-1][0] >= min_gap:
             kept.append((ts, m))
+    if kept[-1][0] != series[-1][0]:
+        kept.append(series[-1])
     return kept
 
 
