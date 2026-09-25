@@ -117,26 +117,42 @@ def _trail_for(peak: float, base: float, t3: float, t5: float, t10: float) -> fl
 
 
 def _simulate(mults: list[float], stop: float, base: float,
-              t3: float, t5: float, t10: float) -> tuple[float, str]:
-    """Walk the series; sell on the stop or the ratcheting trail, else terminal.
+              t3: float, t5: float, t10: float,
+              floor_arm: float, floor: float) -> tuple[float, str]:
+    """Walk the series; sell on the stop, the profit floor, or the ratcheting
+    trail, else terminal.
 
-    The exit level is max(stop, peak * (1 - trail)): the hard stop governs while
-    the coin is near entry (a 50% trail off a 1.0 peak sits at 0.50, below the
-    0.80 stop), and the trail takes over once the peak has climbed.
+    Exit level each tick is max(stop, armed_floor, peak * (1 - trail)).
+
+    THE FLOOR IS LOAD-BEARING AND THE FIRST VERSION OMITTED IT. Without it a
+    coin peaking at 1.3 has a trail level of 0.65 — below the 0.80 stop — so it
+    rides to the stop, where qsim's real config banks it at 1.10. That cost
+    -13.05 SOL on the 1229 coins that never reach 2x and -4.79 on the 2-3x
+    band, swamping the +7.81 the ratchet earns on the 63 that reach 5x+. The
+    floor and the ratchet protect almost disjoint populations: of 334 floor
+    exits measured by qsim_floor_cost, only 25 would have reached 2x if held.
+
+    floor_arm 0 disables the floor, which reproduces the original behaviour.
     """
     peak = mults[0]
+    armed = False
     for m in mults:
         if m > peak:
             peak = m
+        if floor_arm > 0 and peak >= floor_arm:
+            armed = True
         trail = _trail_for(peak, base, t3, t5, t10)
-        level = max(stop, peak * (1.0 - trail))
+        lvl_floor = floor if armed else 0.0
+        level = max(stop, lvl_floor, peak * (1.0 - trail))
         if m <= level:
+            if level == lvl_floor and lvl_floor > 0:
+                return m, "floor"
             return m, ("stop" if level == stop else "trail")
     return mults[-1], "terminal"
 
 
 def report(days: float, stop: float, base: float, t3: float, t5: float,
-           t10: float, detail: bool) -> None:
+           t10: float, floor_arm: float, floor: float, detail: bool) -> None:
     pos = _positions(days)
     ser = _series(days)
     resolved, unresolved = [], []
@@ -147,13 +163,15 @@ def report(days: float, stop: float, base: float, t3: float, t5: float,
         if not mults:
             unresolved.append({**p, "actual": actual})
             continue
-        mult, why = _simulate(mults, stop, base, t3, t5, t10)
+        mult, why = _simulate(mults, stop, base, t3, t5, t10, floor_arm, floor)
         resolved.append({**p, "actual": actual, "held": sol_in * mult - sol_in,
                          "mult": mult, "why": why, "n_obs": len(mults),
                          "peak": max(mults)})
 
     print(f"RATCHET TRAIL  last {days:g}d   stop={stop:g}x   "
           f"trail: base {base:.0%} / 3x {t3:.0%} / 5x {t5:.0%} / 10x {t10:.0%}")
+    print(f"  profit floor: "
+          + (f"arm at {floor_arm:g}x, hold {floor:g}x" if floor_arm > 0 else "DISABLED"))
     print(f"  positions: {len(pos)}   resolved: {len(resolved)}   "
           f"no quotes: {len(unresolved)}")
     if not resolved:
@@ -169,7 +187,7 @@ def report(days: float, stop: float, base: float, t3: float, t5: float,
     print(f"  ratchet trail                 {held:+.4f} SOL   {100*held/dep:+.2f}%/SOL")
     print(f"  DIFFERENCE                    {held - act:+.4f} SOL")
     print()
-    for why in ("trail", "stop", "terminal"):
+    for why in ("trail", "floor", "stop", "terminal"):
         sub = [x for x in resolved if x["why"] == why]
         if not sub:
             continue
@@ -219,10 +237,15 @@ def main() -> int:
     ap.add_argument("--t3", type=float, default=0.40, help="trail at 3x+")
     ap.add_argument("--t5", type=float, default=0.30, help="trail at 5x+")
     ap.add_argument("--t10", type=float, default=0.20, help="trail at 10x+")
+    ap.add_argument("--floor-arm", type=float, default=1.30, dest="floor_arm",
+                    help="peak at which the profit floor arms (0 disables)")
+    ap.add_argument("--floor", type=float, default=1.10,
+                    help="floor level once armed")
     ap.add_argument("--detail", action="store_true")
     a = ap.parse_args()
     try:
-        report(a.days, a.stop, a.base, a.t3, a.t5, a.t10, a.detail)
+        report(a.days, a.stop, a.base, a.t3, a.t5, a.t10, a.floor_arm,
+               a.floor, a.detail)
     finally:
         db.close_conn()
     return 0
