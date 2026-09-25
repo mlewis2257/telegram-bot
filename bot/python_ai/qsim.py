@@ -39,6 +39,7 @@ import entry_quality
 import jupiter
 import peak_guard
 import lane_policy
+import ratchet_shadow
 import live_trader                       # reuse the PURE _effective_fill_mcap only
 from exit_config import EXIT_A_PAPER, EXIT_RIDE, ExitResult, apply_exit_config
 
@@ -856,6 +857,8 @@ async def _qsim_tick(pos: dict) -> None:
             db.close_qsim_position(call_id, exit_price=0.0, sol_out=partial_sol,
                                    exit_reason=reason, decision_gap_secs=gap_secs,
                                    max_gap_secs=q["max_gap_secs"], obs_count=q["obs_count"])
+            ratchet_shadow.finalize(call_id, 0.0)
+            ratchet_shadow.clear(call_id)
             peak_guard.clear(f"qsim:{call_id}")
             _cleanup(call_id)
             # pnl is NOT -sol_in in runner mode: whatever was banked at the partial is kept.
@@ -896,6 +899,8 @@ async def _qsim_tick(pos: dict) -> None:
                                    sol_out=total_out, exit_reason=reason,
                                    decision_gap_secs=gap_secs,
                                    max_gap_secs=q["max_gap_secs"], obs_count=q["obs_count"])
+            ratchet_shadow.finalize(call_id, runner_mult)
+            ratchet_shadow.clear(call_id)
             peak_guard.clear(f"qsim:{call_id}")
             peak_guard.clear(f"qsimT:{call_id}")
             _cleanup(call_id)
@@ -907,6 +912,9 @@ async def _qsim_tick(pos: dict) -> None:
 
     real_mult   = sol_out / sol_in
     _last_mult[call_id] = real_mult      # drives this position's next cadence
+    # Shadow only: records what a ratcheting trail WOULD have done on this
+    # quote stream. Swallows everything; cannot affect the exit below.
+    ratchet_shadow.observe(call_id, real_mult)
     synth_cur   = entry * real_mult
     cfg = _qsim_exit_config(pos.get("variant") or "early")
     raw_hard_stop_pct = _qsim_hard_stop_pct(pos, cfg)
@@ -929,6 +937,8 @@ async def _qsim_tick(pos: dict) -> None:
         db.close_qsim_position(call_id, exit_price=synth_cur, sol_out=sol_out,
                                exit_reason=reason, decision_gap_secs=gap_secs,
                                max_gap_secs=q["max_gap_secs"], obs_count=q["obs_count"])
+        ratchet_shadow.finalize(call_id, real_mult)
+        ratchet_shadow.clear(call_id)
         peak_guard.clear(f"qsim:{call_id}")
         peak_guard.clear(f"qsimT:{call_id}")
         _cleanup(call_id)
@@ -1044,6 +1054,8 @@ async def _qsim_tick(pos: dict) -> None:
                                sol_out=sol_out, exit_reason=reason,
                                decision_gap_secs=gap_secs,
                                max_gap_secs=q["max_gap_secs"], obs_count=q["obs_count"])
+        ratchet_shadow.finalize(call_id, real_mult)
+        ratchet_shadow.clear(call_id)
         peak_guard.clear(f"qsim:{call_id}")
         peak_guard.clear(f"qsimT:{call_id}")
         _cleanup(call_id)
@@ -1120,6 +1132,18 @@ async def run_qsim_monitor() -> None:
     # calls yet" were indistinguishable — and the startup line below now reports
     # the gate's config, so a misconfigured DEV_GATE_CHANNELS is visible at once
     # instead of looking like the gate silently doing nothing.
+    # Shadow-only exit policy: creates its table and prints its config so an
+    # unset RATCHET_SHADOW_ENABLED is visible rather than looking like silence.
+    try:
+        ratchet_shadow.ensure_table()
+        print(f"[ratchet_shadow] enabled={ratchet_shadow.ENABLED} "
+              f"trail={ratchet_shadow.BASE:g}/{ratchet_shadow.T3:g}/"
+              f"{ratchet_shadow.T5:g}/{ratchet_shadow.T10:g} "
+              f"floor={ratchet_shadow.FLOOR_ARM:g}->{ratchet_shadow.FLOOR:g} "
+              f"stop={ratchet_shadow.STOP:g}")
+    except Exception as e:
+        print(f"[ratchet_shadow] table init failed, shadow will not record: {e}")
+
     try:
         import dev_gate
         dev_gate.ensure_table()
