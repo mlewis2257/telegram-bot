@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -70,8 +71,13 @@ T10       = float(os.getenv("RATCHET_SHADOW_T10", "0.20"))
 FLOOR_ARM = float(os.getenv("RATCHET_SHADOW_FLOOR_ARM", "1.30"))
 FLOOR     = float(os.getenv("RATCHET_SHADOW_FLOOR", "1.10"))
 STOP      = float(os.getenv("RATCHET_SHADOW_STOP", "0.80"))
+# How long to keep tracking a position qsim has already sold. The ratchet is
+# the slower policy by construction, so without post-exit tracking it can only
+# ever exit EARLIER than qsim and can never capture a tail — which is exactly
+# what the first three days measured: every runner bucket came back delta 0.
+TRACK_SECS = float(os.getenv("RATCHET_SHADOW_TRACK_MINS", "360")) * 60.0
 
-# call_id -> {"peak": float, "armed": bool, "seen": int, "done": bool}
+# call_id -> {"peak", "armed", "seen", "done", "post_since", "last"}
 _state: dict[int, dict] = {}
 
 
@@ -129,10 +135,18 @@ def observe(call_id: int, mult: float) -> None:
             st = _state[call_id] = {"peak": mult, "armed": False,
                                     "seen": 0, "done": False}
         st["seen"] += 1
+        st["last"] = mult
         if st["done"]:
             return
         if mult > st["peak"]:
             st["peak"] = mult
+        ps = st.get("post_since")
+        if ps is not None and (time.monotonic() - ps) > TRACK_SECS:
+            # Tracking window is up. Book the terminal value at the price on the
+            # tape, never a fallback to qsim's own result.
+            st["done"] = True
+            _record(call_id, "terminal", mult, max(st["peak"], mult), st["seen"])
+            return
         peak = st["peak"]
         if FLOOR_ARM > 0 and peak >= FLOOR_ARM:
             st["armed"] = True
@@ -165,6 +179,68 @@ def finalize(call_id: int, mult: float) -> None:
         st = _state.get(call_id)
         if st is not None and not st["done"] and mult is not None and mult >= 0:
             _record(call_id, "terminal", mult, max(st["peak"], mult), st["seen"])
+    except Exception:
+        pass
+
+
+def tracking(call_id: int) -> bool:
+    """True if qsim has sold but the ratchet is still holding this position.
+
+    qsim's post-exit loop uses this to fast-track the quote cadence for exactly
+    these rows — they are the only ones where the two policies can diverge.
+    """
+    if not ENABLED:
+        return False
+    st = _state.get(call_id)
+    return bool(st and not st["done"] and st.get("post_since") is not None)
+
+
+def hand_off(call_id: int, mult: float) -> bool:
+    """qsim closed but the ratchet has not fired. Keep the state alive so the
+    post-exit probe can keep feeding it. Returns True if still tracking.
+
+    Called INSTEAD of finalize() at qsim's close. Finalizing there is what made
+    the first version structurally unable to measure anything: the shadow's last
+    observation was qsim's own exit price, so every terminal row was identical
+    to actual by construction.
+    """
+    if not ENABLED:
+        return False
+    try:
+        st = _state.get(call_id)
+        if st is None or st["done"]:
+            return False
+        st["post_since"] = time.monotonic()
+        if mult and mult > 0:
+            st["last"] = mult
+        return True
+    except Exception:
+        return False
+
+
+def sweep() -> None:
+    """Finalize handed-off positions whose tracking window expired without any
+    further quote — otherwise a coin that stops being quoted leaks forever and
+    never books a result, silently dropping it from the shadow arm."""
+    if not ENABLED:
+        return
+    try:
+        now = time.monotonic()
+        for cid, st in list(_state.items()):
+            ps = st.get("post_since")
+            if ps is None:
+                continue                      # qsim still holds it; not ours yet
+            if st["done"]:
+                # Fired during post-exit tracking. Its row is already written, so
+                # the entry is dead weight — qsim's close path calls clear() only
+                # on the non-handed-off branch, so nothing else pops these.
+                _state.pop(cid, None)
+                continue
+            if (now - ps) > TRACK_SECS:
+                st["done"] = True
+                last = st.get("last") or st["peak"]
+                _record(cid, "terminal", last, st["peak"], st["seen"])
+                _state.pop(cid, None)
     except Exception:
         pass
 

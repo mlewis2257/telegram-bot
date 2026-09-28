@@ -188,6 +188,13 @@ QSIM_POST_EXIT_YIELD_OVERDUE = float(os.getenv("QSIM_POST_EXIT_YIELD_OVERDUE", "
 # answer "how much of the run would a trailing stop have captured", so they are served first
 # and never starve. Measured 2026-09-05: 40% of banked trades reached 2x AFTER the bank.
 QSIM_POST_EXIT_BANKS_FIRST = os.getenv("QSIM_POST_EXIT_BANKS_FIRST", "true").lower() == "true"
+# Fast lane for positions the ratchet shadow is still holding after qsim sold.
+# Those are the ONLY rows where the two policies can diverge, and a trail needs
+# to see the path down, so they get a real cadence instead of the slow research
+# probe. Jupiter free tier is 1/s = 60/min total, so this is funded by cutting
+# QSIM_POST_EXIT_OBS_MAX_PER_MIN, not added on top.
+QSIM_SHADOW_FAST_CADENCE = float(os.getenv("QSIM_SHADOW_FAST_CADENCE_SECS", "60"))
+QSIM_SHADOW_FAST_MAX_PER_MIN = int(os.getenv("QSIM_SHADOW_FAST_MAX_PER_MIN", "5"))
 
 # ── PARTIAL BANK + RUNNER ────────────────────────────────────────────────────
 # Sell most of the bag when the bank overlay fires, then KEEP RIDING the rest. Measured on
@@ -251,6 +258,7 @@ _qsim_exit_state: dict[int, dict] = {}       # call_id -> named overlay state
 _noroute_streak: dict[int, int] = {}      # call_id -> consecutive no-route sell quotes
 _quote_window: list[float] = []           # monotonic timestamps of recent quotes (budget window)
 _post_exit_quote_window: list[float] = [] # monotonic timestamps of recent post-exit quotes
+_shadow_fast_window: list[float] = []     # monotonic timestamps of recent fast-lane quotes
 _backoff_until: float = 0.0               # monotonic time until which quoting is paused (429 backoff)
 
 
@@ -791,6 +799,16 @@ def _budget_ok() -> bool:
     return len(_quote_window) < QSIM_MAX_QUOTES_PER_MIN
 
 
+def _shadow_fast_budget_ok() -> bool:
+    """Own per-minute allowance so the fast lane cannot eat the whole budget."""
+    if QSIM_SHADOW_FAST_MAX_PER_MIN <= 0:
+        return False
+    now = time.monotonic()
+    while _shadow_fast_window and now - _shadow_fast_window[0] > 60.0:
+        _shadow_fast_window.pop(0)
+    return len(_shadow_fast_window) < QSIM_SHADOW_FAST_MAX_PER_MIN and _budget_ok()
+
+
 def _post_exit_budget_ok() -> bool:
     """True if post-exit research probes still have their small reserved budget."""
     if QSIM_POST_EXIT_OBS_MAX_PER_MIN <= 0:
@@ -899,8 +917,12 @@ async def _qsim_tick(pos: dict) -> None:
                                    sol_out=total_out, exit_reason=reason,
                                    decision_gap_secs=gap_secs,
                                    max_gap_secs=q["max_gap_secs"], obs_count=q["obs_count"])
-            ratchet_shadow.finalize(call_id, runner_mult)
-            ratchet_shadow.clear(call_id)
+            # Hand the ratchet to the post-exit fast lane rather than finalising
+            # here: finalising at qsim's close pins the shadow to qsim's own exit
+            # price, which is why every runner bucket read delta 0.
+            if not ratchet_shadow.hand_off(call_id, runner_mult):
+                ratchet_shadow.finalize(call_id, runner_mult)
+                ratchet_shadow.clear(call_id)
             peak_guard.clear(f"qsim:{call_id}")
             peak_guard.clear(f"qsimT:{call_id}")
             _cleanup(call_id)
@@ -937,8 +959,12 @@ async def _qsim_tick(pos: dict) -> None:
         db.close_qsim_position(call_id, exit_price=synth_cur, sol_out=sol_out,
                                exit_reason=reason, decision_gap_secs=gap_secs,
                                max_gap_secs=q["max_gap_secs"], obs_count=q["obs_count"])
-        ratchet_shadow.finalize(call_id, real_mult)
-        ratchet_shadow.clear(call_id)
+        # Hand the ratchet to the post-exit fast lane rather than finalising
+        # here: finalising at qsim's close pins the shadow to qsim's own exit
+        # price, which is why every runner bucket read delta 0.
+        if not ratchet_shadow.hand_off(call_id, real_mult):
+            ratchet_shadow.finalize(call_id, real_mult)
+            ratchet_shadow.clear(call_id)
         peak_guard.clear(f"qsim:{call_id}")
         peak_guard.clear(f"qsimT:{call_id}")
         _cleanup(call_id)
@@ -1054,8 +1080,12 @@ async def _qsim_tick(pos: dict) -> None:
                                sol_out=sol_out, exit_reason=reason,
                                decision_gap_secs=gap_secs,
                                max_gap_secs=q["max_gap_secs"], obs_count=q["obs_count"])
-        ratchet_shadow.finalize(call_id, real_mult)
-        ratchet_shadow.clear(call_id)
+        # Hand the ratchet to the post-exit fast lane rather than finalising
+        # here: finalising at qsim's close pins the shadow to qsim's own exit
+        # price, which is why every runner bucket read delta 0.
+        if not ratchet_shadow.hand_off(call_id, real_mult):
+            ratchet_shadow.finalize(call_id, real_mult)
+            ratchet_shadow.clear(call_id)
         peak_guard.clear(f"qsim:{call_id}")
         peak_guard.clear(f"qsimT:{call_id}")
         _cleanup(call_id)
@@ -1102,6 +1132,8 @@ async def _qsim_post_exit_tick(pos: dict) -> None:
 
     real_mult = sol_out / sol_in
     synth_cur = entry * real_mult
+    # The shadow keeps running on these quotes if it has not fired yet.
+    ratchet_shadow.observe(call_id, real_mult)
     db.insert_qsim_quote_observation(
         call_id=call_id,
         sol_out=sol_out,
@@ -1175,6 +1207,10 @@ async def run_qsim_monitor() -> None:
           f"mins={QSIM_POST_EXIT_OBS_MINS:g} cadence={QSIM_POST_EXIT_OBS_CADENCE_SECS:g}s "
           f"limit={QSIM_POST_EXIT_OBS_LIMIT} cap={QSIM_POST_EXIT_OBS_MAX_PER_MIN}/min "
           f"banks_first={QSIM_POST_EXIT_BANKS_FIRST}")
+    print(f"[qsim] shadow fast lane: cadence={QSIM_SHADOW_FAST_CADENCE:g}s "
+          f"cap={QSIM_SHADOW_FAST_MAX_PER_MIN}/min "
+          f"track={ratchet_shadow.TRACK_SECS / 60:g}min "
+          f"(does NOT yield; funded from the post-exit cap)")
     print(f"[qsim] bank exit enabled={QSIM_BANK_EXIT_ENABLED} mult={QSIM_BANK_EXIT_MULT:g}x")
     print(f"[qsim] exit overlay: {_QSIM_EXIT_OVERLAY.name if _QSIM_EXIT_OVERLAY else 'none'}")
     print(f"[qsim] absolute ceiling: {QSIM_CEILING_MULT:g}x (unconditional, overrides every overlay)"
@@ -1250,11 +1286,44 @@ async def run_qsim_monitor() -> None:
                 if _probes_yield and QSIM_POST_EXIT_OBS_ENABLED:
                     print(f"[qsim] post-exit probes yielding — an open position is "
                           f"{worst_overdue:.1f}x past its target cadence")
+
+                # Book any handed-off position whose tracking window ran out
+                # without further quotes, so it cannot leak and silently vanish
+                # from the shadow arm.
+                ratchet_shadow.sweep()
+
+                # FAST LANE. Positions qsim has sold but the ratchet still holds
+                # are the only rows where the two policies can diverge, and a
+                # trail needs to see the path down. These do NOT yield: live
+                # positions are chronically overdue on a 1/s Jupiter tier, so a
+                # yielding fast lane would never run at all. It is bounded
+                # instead by its own small per-minute allowance, funded by
+                # cutting the slow research probe.
+                if (QSIM_POST_EXIT_OBS_ENABLED and ratchet_shadow.ENABLED
+                        and time.monotonic() >= _backoff_until):
+                    fast = [p for p in db.get_recent_closed_qsim_positions_for_post_exit(
+                                QSIM_POST_EXIT_OBS_MINS, QSIM_POST_EXIT_OBS_LIMIT)
+                            if ratchet_shadow.tracking(p["call_id"])]
+                    for pos in fast:
+                        cid = pos["call_id"]
+                        if now - _last_post_exit_quote_ts.get(cid, 0.0) < QSIM_SHADOW_FAST_CADENCE:
+                            continue
+                        if not _shadow_fast_budget_ok():
+                            break
+                        _shadow_fast_window.append(time.monotonic())
+                        await _qsim_post_exit_tick(pos)
+                        if time.monotonic() < _backoff_until:
+                            break
+
                 if QSIM_POST_EXIT_OBS_ENABLED and not _probes_yield and time.monotonic() >= _backoff_until:
                     closed_positions = db.get_recent_closed_qsim_positions_for_post_exit(
                         QSIM_POST_EXIT_OBS_MINS,
                         QSIM_POST_EXIT_OBS_LIMIT,
                     )
+                    # Anything the fast lane owns is skipped here so it is not
+                    # quoted twice in one pass out of two different budgets.
+                    closed_positions = [p for p in closed_positions
+                                        if not ratchet_shadow.tracking(p["call_id"])]
                     if QSIM_POST_EXIT_BANKS_FIRST:
                         # Banked exits first: they are the only rows that can measure the
                         # runner's capture fraction, and a trail simulated on gappy samples
