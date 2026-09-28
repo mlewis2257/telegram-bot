@@ -179,10 +179,23 @@ def report(days: float = 14.0) -> None:
     db.safe_rollback()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
-            SELECT s.decision, s.exit_mult, s.peak_mult, s.obs_seen,
-                   qp.sol_in, qp.sol_out, qp.exit_reason
+            SELECT s.decision, s.exit_mult, s.obs_seen,
+                   qp.sol_in, qp.sol_out, qp.exit_reason,
+                   -- Bucket on how far the COIN ran, over every quote ever taken
+                   -- on it. s.peak_mult is the peak AT THE MOMENT THE RATCHET
+                   -- DECIDED and stops updating after that, so a coin the ratchet
+                   -- sold at the floor and which then ran 10x was landing in
+                   -- "never 2x" — burying the one row this whole test is about.
+                   COALESCE(pk.max_mult, s.peak_mult) AS peak_mult
             FROM qsim_ratchet_shadow s
             JOIN qsim_positions qp ON qp.call_id = s.call_id
+            LEFT JOIN LATERAL (
+                SELECT max(o.real_mult) AS max_mult
+                  FROM qsim_quote_observations o
+                 WHERE o.call_id = s.call_id
+                   AND o.real_mult IS NOT NULL
+                   AND NOT coalesce(o.no_route, false)
+            ) pk ON true
             WHERE qp.status = 'closed'
               AND qp.entry_time >= now() - (%s || ' days')::interval
               AND qp.sol_in > 0
@@ -207,6 +220,8 @@ def report(days: float = 14.0) -> None:
     print(f"  ratchet (shadow)         {sh:+.4f} SOL   {100*sh/dep:+.2f}%/SOL")
     print(f"  DIFFERENCE               {sh - act:+.4f} SOL")
     print()
+    print("  buckets are the coin's PEAK OVER ALL QUOTES, in-life and post-exit —")
+    print("  not the peak the ratchet saw before it decided.")
     print(f"  {'bucket':<16}{'n':>5}{'actual':>11}{'ratchet':>11}{'delta':>11}")
     tiers = (("reached 10x+", 10.0), ("reached 5-10x", 5.0), ("reached 3-5x", 3.0),
              ("reached 2-3x", 2.0), ("never 2x", 0.0))
