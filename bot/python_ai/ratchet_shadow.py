@@ -277,6 +277,8 @@ def report(days: float = 14.0) -> None:
               AND qp.sol_in > 0
         """, (days,))
         rows = [dict(r) for r in cur.fetchall()]
+        cur.execute("SELECT min(decided_at) AS oldest FROM qsim_ratchet_shadow")
+        oldest = (cur.fetchone() or {}).get("oldest")
     if not rows:
         print("no paired shadow decisions yet — "
               "needs RATCHET_SHADOW_ENABLED=true and closed positions")
@@ -288,6 +290,9 @@ def report(days: float = 14.0) -> None:
              for r in rows)
 
     print(f"RATCHET SHADOW  last {days:g}d   paired positions: {len(rows)}")
+    if oldest:
+        print(f"  NOTE: the shadow only started recording {oldest:%Y-%m-%d %H:%M} UTC, "
+              f"so the effective window is shorter than --days suggests.")
     print(f"  trail base {BASE:.0%} / 3x {T3:.0%} / 5x {T5:.0%} / 10x {T10:.0%}"
           f"   floor {FLOOR_ARM:g}->{FLOOR:g}   stop {STOP:g}")
     print()
