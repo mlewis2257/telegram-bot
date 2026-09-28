@@ -72,17 +72,27 @@ def _positions(days: float) -> dict[int, dict]:
         return {int(r["call_id"]): dict(r) for r in cur.fetchall()}
 
 
-def _series(days: float) -> dict[int, list[float]]:
-    """Every observed price multiple per position in time order, in-life AND
-    post-exit. `real_mult` is a verified PRICE multiple, normalized by the bag
-    still held, so it stays comparable across a partial bank."""
+def _series(days: float) -> dict[int, list[tuple[float, bool]]]:
+    """(multiple, was_still_held) per observation, in time order.
+
+    The flag is load-bearing. The BANK may only be taken on a quote qsim
+    actually saw while holding; a coin that hard-stopped at 0.78 and recovered
+    to 2.5x afterwards did not give anyone a 2.5x fill. Banking on post-exit
+    quotes is the bor_ free option -- post-exit upside with the live config's
+    stop-protected downside -- and the first cut of this file did exactly that,
+    reporting +15 SOL with 289 positions "reaching" a bank that only 188 really
+    did.
+
+    The RUNNER may use post-exit quotes, because it genuinely holds longer than
+    qsim did. That is the legitimate half of --include-post-exit."""
     from psycopg2.extras import RealDictCursor
     conn = db.get_conn()
     db.safe_rollback()
     out: dict[int, list[float]] = defaultdict(list)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
-            SELECT o.call_id, o.real_mult
+            SELECT o.call_id, o.real_mult,
+                   (o.observed_at <= qp.exit_time) AS in_life
             FROM qsim_quote_observations o
             JOIN qsim_positions qp ON qp.call_id = o.call_id
             WHERE qp.status = 'closed'
@@ -92,22 +102,25 @@ def _series(days: float) -> dict[int, list[float]]:
             ORDER BY o.call_id, o.observed_at
         """, (days,))
         for r in cur.fetchall():
-            out[int(r["call_id"])].append(float(r["real_mult"]))
+            out[int(r["call_id"])].append((float(r["real_mult"]),
+                                           bool(r["in_life"])))
     return out
 
 
-def _simulate(mults: list[float], bank: float, keep: float,
+def _simulate(series: list[tuple[float, bool]], bank: float, keep: float,
               target: float, stop: float) -> tuple[float, str] | None:
     """Blended multiple for the whole position, and what closed the runner.
 
     None means the coin never reached `bank`, so the policy did nothing and the
     row keeps qsim's actual result.
     """
-    idx = next((i for i, m in enumerate(mults) if m >= bank), None)
+    # The bank must land on a quote taken WHILE HELD. See _series.
+    idx = next((i for i, (m, live) in enumerate(series)
+                if live and m >= bank), None)
     if idx is None:
         return None
-    bank_mult = mults[idx]
-    rest = mults[idx + 1:]
+    bank_mult = series[idx][0]
+    rest = [m for m, _ in series[idx + 1:]]
     if not rest:
         # Banked on the last quote there is; the runner has nowhere to go and
         # is marked at the same price rather than assumed to survive.
@@ -131,8 +144,8 @@ def _run(pos: dict, ser: dict, bank: float, keep: float,
         a = float(p["sol_out"] or 0.0) - sol_in
         act += a
         dep += sol_in
-        mults = ser.get(cid) or []
-        res = _simulate(mults, bank, keep, target, stop) if mults else None
+        series = ser.get(cid) or []
+        res = _simulate(series, bank, keep, target, stop) if series else None
         if res is None:
             sh += a                      # never reached the bank: identical arms
             continue
@@ -141,7 +154,8 @@ def _run(pos: dict, ser: dict, bank: float, keep: float,
         sh += h
         engaged += 1
         counts[why] += 1
-        deltas.append((h - a, p.get("symbol") or "?", mult, why, max(mults)))
+        deltas.append((h - a, p.get("symbol") or "?", mult, why,
+                       max(m for m, _ in series)))
     return {"actual": act, "policy": sh, "deployed": dep, "engaged": engaged,
             "counts": dict(counts), "deltas": deltas}
 
@@ -160,13 +174,21 @@ def report(days: float, bank: float, keep: float, target: float,
               f"({len(pos)} positions, {missing} with no quotes)")
         print(f"  {'keep':>6}{'target':>8}{'engaged':>9}{'actual':>10}"
               f"{'policy':>10}{'delta':>10}")
-        for k in (0.10, 0.20, 0.30, 0.50):
+        for k in (0.0, 0.10, 0.20, 0.30, 0.50):
             for t in (3.0, 5.0, 10.0, 0.0):
                 r = _run(pos, ser, bank, k, t, stop)
                 label = f"{t:g}x" if t > 0 else "none"
                 print(f"  {k:>6.0%}{label:>8}{r['engaged']:>9}"
                       f"{r['actual']:>10.3f}{r['policy']:>10.3f}"
                       f"{r['policy'] - r['actual']:>10.3f}")
+        print()
+        print("  READ keep=0% FIRST. It is the control: bank the WHOLE position")
+        print("  at the bank level and keep no runner, so its delta is purely")
+        print("  the overlay change against whatever the window actually ran.")
+        print("  The 17d window was mostly bank_1p3x with a 70% partial, so that")
+        print("  row is large and has nothing to do with running a slice.")
+        print("  The RUNNER is worth (its row) minus (the keep=0% row); if that")
+        print("  is negative at every keep, running a slice costs you.")
         print()
         print("  target 'none' = the runner only ever exits on the stop or on")
         print("  the last quote, which is the pure hold-longer case.")
