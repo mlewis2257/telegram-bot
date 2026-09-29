@@ -280,6 +280,11 @@ def _resolve_live_exit_overlay() -> LiveExitOverlay | None:
 
 _LIVE_EXIT_OVERLAY = _resolve_live_exit_overlay()
 print(f"[live] exit overlay: {_LIVE_EXIT_OVERLAY.name if _LIVE_EXIT_OVERLAY else 'none'}")
+try:
+    import entry_filter as _ef
+    print(_ef.describe())
+except Exception as _e:
+    print(f"[live] entry filter import FAILED — every entry will be skipped: {_e}")
 
 
 def _apply_live_exit_overlay(
@@ -647,6 +652,28 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         if max_mcap and actual_entry and actual_entry > max_mcap:
             print(f"[live] {symbol} skipped — mcap ${actual_entry/1000:.0f}k too high for {channel_handle or 'unknown'} (max ${max_mcap/1000:.0f}k)")
             db.set_call_skip_reason(call_id, "mcap_too_high")
+            return False
+
+        # ── mcap band + dev_sold filter (REAL MONEY ONLY) ─────────────────────
+        # Gates on msg_mcap (= calls.mcap_at_call), NOT actual_entry. The band
+        # was measured on mcap_at_call, and the two diverge badly on fast risers
+        # where the feed under-records the entry by ~2.3x — gating on the live
+        # quote would select a different population than the one measured.
+        # Fails CLOSED, unlike dev_gate: positions with missing token metadata
+        # ran -17.60%/SOL at a 24.9% win rate against -8.70% and 34.2% for those
+        # with it, so declining to trade what we cannot verify is the measured
+        # action rather than the merely cautious one.
+        try:
+            import entry_filter
+            _ok, _why = entry_filter.check(mint, msg_mcap)
+            if not _ok:
+                print(f"[live] {symbol} skipped — entry filter: {_why}")
+                db.set_call_skip_reason(call_id, "entry_filter")
+                return False
+        except Exception as e:
+            print(f"[live] {symbol} skipped — entry filter unavailable: "
+                  f"{type(e).__name__} {e}")
+            db.set_call_skip_reason(call_id, "entry_filter")
             return False
 
         # ── Clean-deployer gate ───────────────────────────────────────────────
