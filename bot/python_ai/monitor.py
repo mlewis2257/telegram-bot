@@ -604,6 +604,7 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
                         call_id, exit_cur, exit_peak, exit_entry,
                         exit_config=live_trader._LIVE_EXIT_CONFIG,
                         raw_mult=_raw_mult,
+                        basis=_basis,
                     )
                     if live_exit.should_exit:
                         # Decision uses the real basis; the RECORD keeps the feed exit mcap
@@ -948,6 +949,7 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None,
                             call_id, exit_cur, exit_peak, exit_entry,
                             exit_config=live_trader._LIVE_EXIT_CONFIG,
                             raw_mult=_raw_mult,
+                            basis=_basis,
                         )
                         if live_exit.should_exit:
                             # Decision on real basis; record keeps feed exit mcap (see above).

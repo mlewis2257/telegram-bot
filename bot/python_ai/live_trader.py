@@ -214,6 +214,21 @@ LIVE_EXIT_USE_QUOTE = os.getenv("LIVE_EXIT_USE_QUOTE", "false").lower() == "true
 # you cannot act on anyway. Set false to restore the old feed fallback.
 LIVE_EXIT_REQUIRE_QUOTE = os.getenv("LIVE_EXIT_REQUIRE_QUOTE", "true").lower() == "true"
 LIVE_NOROUTE_WARN_AT    = int(os.getenv("LIVE_NOROUTE_WARN_AT", "6"))  # mirrors QSIM_RUG_FAILS
+# With no quote, ONE protective rule may still fire: a collapse. Silencing every rule
+# during a quote outage leaves a rugging position unmanaged, and "we couldn't sell anyway"
+# is not true — a 429 is a rate limit, and continuous polling is what exhausts the budget,
+# not a single sell. So the profit side stays silent (feed entry lag reads HIGH, which
+# fires banks EARLY and gives up real upside) while a collapse can still get out.
+#
+# BOTH legs must agree, and each is chosen to err toward NOT firing:
+#   current/peak  <= LIVE_PROTECTIVE_DD   both legs post-entry, so entry lag cannot touch
+#                                         this ratio at all.
+#   current/entry <= hard stop            needed because drawdown-from-peak ALONE would
+#                                         false-fire: a coin that ran 5x then fell 80% is
+#                                         back at entry, not rugging. Entry lag biases this
+#                                         leg HIGH, so a lagged feed saying "below entry"
+#                                         is conservative evidence that it really is.
+LIVE_PROTECTIVE_DD = float(os.getenv("LIVE_PROTECTIVE_DD", "0.20"))
 _SELL_QUOTE_TTL   = float(os.getenv("LIVE_SELL_QUOTE_TTL", "2.5"))  # seconds
 LIVE_QUOTE_PEAK_PENDING_TTL_SECS = float(
     os.getenv(
@@ -312,8 +327,11 @@ def _resolve_live_exit_overlay() -> LiveExitOverlay | None:
 _LIVE_EXIT_OVERLAY = _resolve_live_exit_overlay()
 print(f"[live] exit overlay: {_LIVE_EXIT_OVERLAY.name if _LIVE_EXIT_OVERLAY else 'none'}")
 print(f"[live] exit basis: quote={'ON' if LIVE_EXIT_USE_QUOTE else 'OFF'}"
-      f"  require_quote={'ON (no quote -> no decision, qsim-style)' if LIVE_EXIT_REQUIRE_QUOTE else 'OFF (feed fallback)'}"
+      f"  require_quote={'ON' if LIVE_EXIT_REQUIRE_QUOTE else 'OFF (feed fallback)'}"
       f"  sane_mult_ceiling={LIVE_MAX_SANE_MULT:g}x")
+if LIVE_EXIT_REQUIRE_QUOTE:
+    print(f"[live] no quote -> profit-side exits PAUSED, collapse guard armed at "
+          f"<={LIVE_PROTECTIVE_DD:.0%} of peak AND below the hard stop")
 try:
     import entry_filter as _ef
     print(_ef.describe())
@@ -1037,8 +1055,13 @@ async def live_exit_basis(
         _now = time.monotonic()
         if _now - _no_quote_logged.get(call_id, 0.0) >= _NO_QUOTE_LOG_SECS:
             _no_quote_logged[call_id] = _now
-            print(f"[live] call_id={call_id} NO EXIT DECISION — {why}; holding and "
-                  f"re-quoting (LIVE_EXIT_REQUIRE_QUOTE=true)")
+            print(f"[live] call_id={call_id} PROFIT-SIDE EXITS PAUSED — {why}; "
+                  f"collapse guard still armed")
+        # Hand back a PROTECTIVE basis rather than nothing, so a collapse can still get
+        # out while every profit-side rule stays silent. If the feed legs are unusable
+        # too there is genuinely nothing to decide on.
+        if feed_current > 0 and feed_peak > 0 and feed_anchor > 0:
+            return feed_current, feed_peak, feed_anchor, "feed_protective", None
         return None
 
     # PERMANENT cases fall back to the feed: they can never reach the quote basis, so
@@ -1264,6 +1287,7 @@ def check_live_exits(
     entry_mcap: float,
     exit_config: ExitConfig = None,
     raw_mult: float | None = None,
+    basis: str = "real",
 ) -> ExitResult:
     """
     Check whether the open live position for call_id should be exited.
@@ -1286,6 +1310,22 @@ def check_live_exits(
         return ExitResult(False)
 
     if entry_mcap <= 0:
+        return ExitResult(False)
+
+    # ── No quote this tick: collapse guard ONLY ───────────────────────────────────
+    # Everything below this block reads the feed's ruler, whose entry lag biases the
+    # multiple HIGH — which fires banks and floors EARLY and gives up real upside. So on
+    # the protective basis none of it runs. What DOES run needs both legs to agree, each
+    # chosen to err toward silence (see LIVE_PROTECTIVE_DD).
+    if basis == "feed_protective":
+        cfg_p = exit_config or _LIVE_EXIT_CONFIG
+        stop_p = cfg_p.hard_stop_pct if cfg_p and cfg_p.hard_stop_pct > 0 else 0.20
+        dd = (current_mcap / peak_mcap) if peak_mcap > 0 else 1.0
+        from_entry = current_mcap / entry_mcap
+        if dd <= LIVE_PROTECTIVE_DD and from_entry <= (1.0 - stop_p):
+            print(f"[live] call_id={call_id} COLLAPSE with no quote — "
+                  f"{dd:.0%} of its own peak and {from_entry:.2f}x from entry; selling")
+            return ExitResult(True, "rug", exit_mcap=current_mcap)
         return ExitResult(False)
 
     # Never act on a 0/null current_mcap (dead/unavailable feed). On LIVE this would fire

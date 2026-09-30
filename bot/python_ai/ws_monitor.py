@@ -527,6 +527,7 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
                     call_id, exit_cur, exit_peak, exit_entry,
                     exit_config=_EXIT_LIVE,
                     raw_mult=_raw_mult,
+                    basis=_basis,
                 )
                 if result_live.should_exit:
                     # Decision on real basis; record keeps feed exit mcap (exit_price col)
