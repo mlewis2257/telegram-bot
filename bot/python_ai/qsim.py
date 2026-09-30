@@ -1227,10 +1227,18 @@ async def run_qsim_monitor() -> None:
           f"mins={QSIM_POST_EXIT_OBS_MINS:g} cadence={QSIM_POST_EXIT_OBS_CADENCE_SECS:g}s "
           f"limit={QSIM_POST_EXIT_OBS_LIMIT} cap={QSIM_POST_EXIT_OBS_MAX_PER_MIN}/min "
           f"banks_first={QSIM_POST_EXIT_BANKS_FIRST}")
-    print(f"[qsim] shadow fast lane: cadence={QSIM_SHADOW_FAST_CADENCE:g}s "
-          f"cap={QSIM_SHADOW_FAST_MAX_PER_MIN}/min "
-          f"track={ratchet_shadow.TRACK_SECS / 60:g}min "
-          f"(does NOT yield; funded from the post-exit cap)")
+    # Say whether the lane is actually RUNNING, not just how it is configured. This line
+    # printed unconditionally, so it read identically with RATCHET_SHADOW_ENABLED=false
+    # and gave a false all-clear when the lane had been turned off to free its 5/min.
+    # The whole point of a startup banner is that only the log proves what loaded.
+    if ratchet_shadow.ENABLED:
+        print(f"[qsim] shadow fast lane: ON cadence={QSIM_SHADOW_FAST_CADENCE:g}s "
+              f"cap={QSIM_SHADOW_FAST_MAX_PER_MIN}/min "
+              f"track={ratchet_shadow.TRACK_SECS / 60:g}min "
+              f"(does NOT yield; funded from the post-exit cap)")
+    else:
+        print("[qsim] shadow fast lane: OFF (RATCHET_SHADOW_ENABLED is not 'true') "
+              "— its quote allowance is released")
     print(f"[qsim] bank exit enabled={QSIM_BANK_EXIT_ENABLED} mult={QSIM_BANK_EXIT_MULT:g}x")
     print(f"[qsim] exit overlay: {_QSIM_EXIT_OVERLAY.name if _QSIM_EXIT_OVERLAY else 'none'}")
     print(f"[qsim] absolute ceiling: {QSIM_CEILING_MULT:g}x (unconditional, overrides every overlay)"
