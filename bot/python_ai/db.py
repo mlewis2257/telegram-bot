@@ -2071,26 +2071,49 @@ def get_open_live_position(call_id: int) -> dict | None:
 def update_live_position_peak(
     call_id: int,
     current_mcap: float,
-    current_mult: float,
+    current_mult: float | None = None,
 ) -> None:
-    """Persist the highest observed peak for one open live position."""
+    """Persist the highest observed FEED peak (peak_mcap) for one open live position.
+
+    current_mult is normally None now. peak_multiplier is written from the REAL
+    (sell-quote) basis by update_live_real_peak instead, because a FEED peak over a
+    FILL entry mixes two rulers: a still coin then reads feed_entry/fill_entry, which
+    put 4 of 5 live positions under their own 0.80 hard stop at birth (fixed 589390f).
+    With None this ratchets on peak_mcap and leaves peak_multiplier untouched; passing
+    a mult keeps the old behaviour for a caller that has a genuine same-ruler pair.
+    """
     conn = get_conn()
     safe_rollback()
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE trading_positions
-            SET peak_mcap       = %s,
-                peak_multiplier = %s,
-                peak_at         = NOW(),
-                updated_at      = NOW()
-            WHERE call_id       = %s
-              AND is_simulation = FALSE
-              AND status        = 'open'
-              AND (peak_multiplier IS NULL OR peak_multiplier < %s)
-            """,
-            (current_mcap, current_mult, call_id, current_mult),
-        )
+        if current_mult is None:
+            cur.execute(
+                """
+                UPDATE trading_positions
+                SET peak_mcap  = %s,
+                    peak_at    = NOW(),
+                    updated_at = NOW()
+                WHERE call_id       = %s
+                  AND is_simulation = FALSE
+                  AND status        = 'open'
+                  AND (peak_mcap IS NULL OR peak_mcap < %s)
+                """,
+                (current_mcap, call_id, current_mcap),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE trading_positions
+                SET peak_mcap       = %s,
+                    peak_multiplier = %s,
+                    peak_at         = NOW(),
+                    updated_at      = NOW()
+                WHERE call_id       = %s
+                  AND is_simulation = FALSE
+                  AND status        = 'open'
+                  AND (peak_multiplier IS NULL OR peak_multiplier < %s)
+                """,
+                (current_mcap, current_mult, call_id, current_mult),
+            )
         conn.commit()
 
 
@@ -2122,12 +2145,18 @@ def get_live_real_peak(call_id: int) -> float | None:
         return None
 
 
-def update_live_real_peak(call_id: int, real_peak_mcap: float) -> None:
+def update_live_real_peak(call_id: int, real_peak_mcap: float,
+                          real_peak_mult: float | None = None) -> None:
     """
     Best-effort ratchet of the REAL-basis peak for one open live position. Only raises
     the stored value (never lowers it), so it is safe to call from both sol-monitor and
     sol-ws-monitor — the DB row is the cross-process shared floor for the real-peak trail.
     Never raises (missing column pre-migration is a silent no-op). See get_live_real_peak.
+
+    real_peak_mult (= real_peak_mcap / entry_price_fill) also lands in peak_multiplier.
+    That column is the REAL multiple now, the direct analogue of qsim's peak_multiplier
+    = real_peak/entry, which reduces to max(sol_out/sol_in) because entry cancels. It is
+    written here rather than by the feed writer so both legs come from one ruler.
     """
     if not real_peak_mcap or real_peak_mcap <= 0:
         return
@@ -2138,14 +2167,19 @@ def update_live_real_peak(call_id: int, real_peak_mcap: float) -> None:
             cur.execute(
                 """
                 UPDATE trading_positions
-                SET real_peak_mcap = %s,
-                    updated_at     = NOW()
+                SET real_peak_mcap  = %s,
+                    peak_multiplier = CASE
+                        WHEN %s IS NULL THEN peak_multiplier
+                        WHEN peak_multiplier IS NULL OR peak_multiplier < %s THEN %s
+                        ELSE peak_multiplier END,
+                    updated_at      = NOW()
                 WHERE call_id       = %s
                   AND is_simulation = FALSE
                   AND status        = 'open'
                   AND (real_peak_mcap IS NULL OR real_peak_mcap < %s)
                 """,
-                (real_peak_mcap, call_id, real_peak_mcap),
+                (real_peak_mcap, real_peak_mult, real_peak_mult, real_peak_mult,
+                 call_id, real_peak_mcap),
             )
             conn.commit()
     except Exception as e:

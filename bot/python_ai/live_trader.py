@@ -203,6 +203,17 @@ LIVE_EXIT_QUOTE_LOG = os.getenv("LIVE_EXIT_QUOTE_LOG", "false").lower() == "true
 # real_peak_mcap column (see migration). Any quote failure or missing fill silently
 # falls back to the feed basis — a bad quote must never force or block a real sell.
 LIVE_EXIT_USE_QUOTE = os.getenv("LIVE_EXIT_USE_QUOTE", "false").lower() == "true"
+# Decide exits ONLY off a real sell quote, the way qsim does. qsim's ratios are sound
+# because entry cancels out of every one of them: real_mult = sol_out/sol_in, synth =
+# entry*real_mult, peak_mult = real_peak/entry -- one ruler, real executable SOL. Live's
+# feed path had no such cancellation (feed numerator, fill denominator, two independent
+# sources) and that mix put 4 of 5 positions under their own hard stop at birth.
+# With this on, a tick with no usable quote makes NO DECISION: hold and re-quote next
+# tick. That is safe in a way it would not be for paper, because executing a live exit
+# needs a Jupiter route too -- a feed-driven decision during a quote outage is a decision
+# you cannot act on anyway. Set false to restore the old feed fallback.
+LIVE_EXIT_REQUIRE_QUOTE = os.getenv("LIVE_EXIT_REQUIRE_QUOTE", "true").lower() == "true"
+LIVE_NOROUTE_WARN_AT    = int(os.getenv("LIVE_NOROUTE_WARN_AT", "6"))  # mirrors QSIM_RUG_FAILS
 _SELL_QUOTE_TTL   = float(os.getenv("LIVE_SELL_QUOTE_TTL", "2.5"))  # seconds
 LIVE_QUOTE_PEAK_PENDING_TTL_SECS = float(
     os.getenv(
@@ -230,6 +241,19 @@ RUNNER_WINDOW_MINS          = float(os.getenv("RUNNER_WINDOW_MINS", "10"))
 RUNNER_WINDOW_FLOOR_MULT    = float(os.getenv("RUNNER_WINDOW_FLOOR_MULT", "1.0"))
 RUNNER_WINDOW_PROTECTED_REASONS = {"trail_stop", "profit_floor"}
 _sell_quote_cache: dict = {}  # mint -> (sol_out, monotonic_ts)
+# mint -> last _exit_sell_quote status ("ok"/"no_route"/"rate_limited"/"error"). Lets the
+# exit path tell "this coin is unsellable" from "Jupiter is throttling us", which decide
+# very different things: the first is news about the position, the second is news about us.
+_LAST_QUOTE_STATUS: dict[str, str] = {}
+# mint -> consecutive genuine no-route quotes. Reset by any successful quote. Purely
+# observational: it is LOGGED, never acted on. A live bag that Jupiter has dropped cannot
+# be sold, so there is no exit to take — and auto-closing it at -100% is precisely the
+# bug 63a7e71 fixed for paper (KITWIFMIT booked -100% after running 2.13x).
+_noroute_streak: dict[str, int] = {}
+# call_id -> monotonic ts of the last "no exit decision" line, so a quote outage does not
+# print once per position per tick for as long as it lasts.
+_no_quote_logged: dict[int, float] = {}
+_NO_QUOTE_LOG_SECS = float(os.getenv("LIVE_NO_QUOTE_LOG_SECS", "60"))
 _live_exit_state: dict[int, dict] = {}
 _runner_window_until: dict[int, float] = {}
 
@@ -287,6 +311,9 @@ def _resolve_live_exit_overlay() -> LiveExitOverlay | None:
 
 _LIVE_EXIT_OVERLAY = _resolve_live_exit_overlay()
 print(f"[live] exit overlay: {_LIVE_EXIT_OVERLAY.name if _LIVE_EXIT_OVERLAY else 'none'}")
+print(f"[live] exit basis: quote={'ON' if LIVE_EXIT_USE_QUOTE else 'OFF'}"
+      f"  require_quote={'ON (no quote -> no decision, qsim-style)' if LIVE_EXIT_REQUIRE_QUOTE else 'OFF (feed fallback)'}"
+      f"  sane_mult_ceiling={LIVE_MAX_SANE_MULT:g}x")
 try:
     import entry_filter as _ef
     print(_ef.describe())
@@ -875,32 +902,38 @@ def _effective_fill_mcap(
         return None
 
 
-async def _exit_sell_quote(mint: str, tokens_held: int) -> float | None:
+async def _exit_sell_quote(mint: str, tokens_held: int) -> tuple[float | None, str]:
     """
     Sell-quote for the live EXIT path, hardened against transient Jupiter 429s.
     Opts into RateLimitError (raise_on_ratelimit=True) so a rate-limit is distinguished
     from a genuine no-route: a 429 is retried up to _EXIT_QUOTE_RETRIES times with a
     short backoff (the quote usually clears within a few hundred ms), while a no-route
-    (None with no 429) returns immediately — the bag is unsellable this tick and the
-    caller falls back to feed. Never raises; never blocks a sell beyond retries*retry_ms.
+    (None with no 429) returns immediately — retrying won't conjure liquidity.
+    Never raises; never blocks a sell beyond retries*retry_ms.
+
+    Returns (sol_out, status). status is "ok", "no_route" (the bag is genuinely
+    unsellable this tick), "rate_limited" (throttled — the bag is fine, we aren't)
+    or "error". The caller needs that distinction: a no-route says something about
+    the COIN, a 429 says something about US, and only the former may ever count
+    toward declaring a position dead.
     """
     attempts = _EXIT_QUOTE_RETRIES + 1
     for i in range(attempts):
         try:
             out = await jupiter.get_sell_quote(mint, tokens_held, raise_on_ratelimit=True)
             if out is None:
-                return None  # genuine no-route — retrying won't conjure liquidity
-            return out
+                return None, "no_route"  # retrying won't conjure liquidity
+            return out, "ok"
         except jupiter.RateLimitError:
             if i < attempts - 1:
                 await asyncio.sleep(_EXIT_QUOTE_RETRY_MS / 1000.0)
                 continue
-            print(f"[live] exit quote 429 after {attempts} tries for {mint[:8]} — feed fallback")
-            return None
+            print(f"[live] exit quote 429 after {attempts} tries for {mint[:8]}")
+            return None, "rate_limited"
         except Exception as e:
-            print(f"[live] exit quote error for {mint[:8]}: {e} — feed fallback")
-            return None
-    return None
+            print(f"[live] exit quote error for {mint[:8]}: {e}")
+            return None, "error"
+    return None, "error"
 
 
 async def live_effective_current(pos: dict) -> tuple[float, float] | None:
@@ -928,7 +961,15 @@ async def live_effective_current(pos: dict) -> tuple[float, float] | None:
         if cached and (now - cached[1]) < _SELL_QUOTE_TTL:
             sol_out = cached[0]
         else:
-            sol_out = await _exit_sell_quote(mint, tokens_held)
+            sol_out, _status = await _exit_sell_quote(mint, tokens_held)
+            _LAST_QUOTE_STATUS[mint] = _status
+            if _status == "no_route":
+                _noroute_streak[mint] = _noroute_streak.get(mint, 0) + 1
+                if _noroute_streak[mint] in (LIVE_NOROUTE_WARN_AT, LIVE_NOROUTE_WARN_AT * 3):
+                    print(f"[live] {mint[:8]} NO ROUTE x{_noroute_streak[mint]} — bag may be "
+                          f"unsellable; holding (a no-route bag cannot be exited)")
+            elif _status == "ok":
+                _noroute_streak.pop(mint, None)
             if sol_out is None or sol_out <= 0:
                 return None
             _sell_quote_cache[mint] = (sol_out, now)
@@ -945,9 +986,10 @@ async def live_exit_basis(
     feed_current: float,
     feed_peak: float,
     feed_entry: float,
-) -> tuple[float, float, float, str, float | None]:
+) -> tuple[float, float, float, str, float | None] | None:
     """
-    Return the (current, peak, entry) triple to hand check_live_exits, plus a basis tag.
+    Return the (current, peak, entry) triple to hand check_live_exits, plus a basis tag,
+    or None meaning MAKE NO DECISION THIS TICK.
 
     Phase 2: when LIVE_EXIT_USE_QUOTE is on AND we have a real fill anchor + a live
     sell-quote, the triple is on the REAL (wallet) basis:
@@ -955,9 +997,19 @@ async def live_exit_basis(
         entry   = entry_price_fill                              (the real fill)
         peak    = ratcheted real peak (guard-corroborated, DB-shared across processes)
     so every exit ratio (drawdown-from-peak, multiple-from-entry) reflects what the bag
-    is really worth, not the laggy feed. On ANY failure (quote unavailable, no recorded
-    fill, flag off) it returns the FEED triple unchanged — a bad quote must never force
-    or block a sell. Returns (current, peak, entry, "real"|"feed", raw_mult).
+    is really worth, not the laggy feed. Returns (current, peak, entry, basis, raw_mult).
+
+    WHAT HAPPENS WHEN THERE IS NO QUOTE depends on WHY, and the two cases differ:
+
+      TRANSIENT (quote 429'd or errored) — under LIVE_EXIT_REQUIRE_QUOTE returns None:
+        no decision, hold, re-quote next tick. Handing the feed's ruler to the exit
+        rules is what produced two false hard stops on live day 1, and a feed decision
+        during a quote outage is unactionable anyway since the sell needs a route too.
+
+      PERMANENT (no entry_price_fill recorded, or LIVE_EXIT_USE_QUOTE off) — returns the
+        FEED triple. These positions can NEVER reach the quote basis, so returning None
+        would mean they never exit at all. A pre-instrumentation row on the feed's ruler
+        is worse than qsim but far better than unmanaged.
 
     `raw_mult` is the UNGUARDED executable multiple (quote_sol_out / sol_in) — the same
     number qsim calls `real_mult`. It is None on the feed basis. check_live_exits uses it
@@ -972,18 +1024,38 @@ async def live_exit_basis(
     # three callsites were fixed, but enforcing it here is what stops a fourth from
     # reintroducing it, and this function already has pos to check against.
     feed_anchor = float(pos.get("entry_price") or 0) or feed_entry
+    feed_triple = (feed_current, feed_peak, feed_anchor, "feed", None)
+
+    def _no_quote(why: str):
+        """Transient quote failure. None = no decision under LIVE_EXIT_REQUIRE_QUOTE.
+
+        Throttled: during a 429 storm this fires every tick on every open position, and
+        the point of the line is to tell you the basis went away, not to fill the log.
+        """
+        if not LIVE_EXIT_REQUIRE_QUOTE:
+            return feed_triple
+        _now = time.monotonic()
+        if _now - _no_quote_logged.get(call_id, 0.0) >= _NO_QUOTE_LOG_SECS:
+            _no_quote_logged[call_id] = _now
+            print(f"[live] call_id={call_id} NO EXIT DECISION — {why}; holding and "
+                  f"re-quoting (LIVE_EXIT_REQUIRE_QUOTE=true)")
+        return None
+
+    # PERMANENT cases fall back to the feed: they can never reach the quote basis, so
+    # returning None would leave the position unmanaged forever.
     if not LIVE_EXIT_USE_QUOTE:
-        return feed_current, feed_peak, feed_anchor, "feed", None
+        return feed_triple
     try:
         real_entry = float(pos.get("entry_price_fill") or 0)
         if real_entry <= 0:
-            return feed_current, feed_peak, feed_anchor, "feed", None  # pre-instrumentation position
+            return feed_triple                      # pre-instrumentation position
         eff = await live_effective_current(pos)
         if not eff:
-            return feed_current, feed_peak, feed_anchor, "feed", None  # quote failed → feed fallback
+            mint = pos.get("mint_address") or ""
+            return _no_quote(_LAST_QUOTE_STATUS.get(mint, "quote unavailable"))
         synth_current, real_mult = eff
         if synth_current <= 0:
-            return feed_current, feed_peak, feed_anchor, "feed", None
+            return _no_quote("quote produced a non-positive value")
         # Ratchet the real peak off observed sell-quote value. Seed from the DB row so the
         # peak is shared across sol-monitor + sol-ws-monitor and survives restarts; the
         # guard adds the same single-tick corroboration used on the feed side.
@@ -999,7 +1071,10 @@ async def live_exit_basis(
             pending_ttl_secs=LIVE_QUOTE_PEAK_PENDING_TTL_SECS,
         )
         if real_peak > prior_peak:
-            db.update_live_real_peak(call_id, real_peak)
+            # peak_multiplier rides along on the REAL basis here (real_peak/real_entry),
+            # so both legs share one ruler — the qsim-equivalent number.
+            db.update_live_real_peak(call_id, real_peak,
+                                     real_peak / real_entry if real_entry > 0 else None)
         eff_current = min(synth_current, real_peak) if real_peak > 0 else synth_current
         return eff_current, real_peak, real_entry, "real", real_mult
     except Exception as e:

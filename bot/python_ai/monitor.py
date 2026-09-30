@@ -580,42 +580,46 @@ async def _process_token(row: dict, dry_run: bool, prefetched_prices: dict | Non
                 prior_live   = max(live_db_peak, peak_mcap)
                 live_peak_mcap = peak_guard.guard_peak(f"monL:{call_id}", current_mcap, prior_live)
                 if live_peak_mcap > live_db_peak and live_entry_price > 0:
-                    db.update_live_position_peak(call_id, live_peak_mcap, live_peak_mcap / live_entry_price)
+                    # peak_mcap only — peak_multiplier is written from the real basis by
+                    # live_exit_basis so both its legs share one ruler.
+                    db.update_live_position_peak(call_id, live_peak_mcap)
                 live_eff = min(current_mcap, live_peak_mcap) if live_peak_mcap > 0 else current_mcap
-                # Phase 2: swap the feed triple for the real (sell-quote) basis when armed;
-                # returns the feed triple unchanged when LIVE_EXIT_USE_QUOTE is off or a quote
-                # is unavailable. The feed peak above is still persisted for records/fallback.
-                exit_cur, exit_peak, exit_entry, _basis, _raw_mult = await live_trader.live_exit_basis(
+                # Real (sell-quote) basis when armed. None = no usable quote this tick, so
+                # make NO decision and re-quote next pass rather than handing the exit rules
+                # the feed's ruler (see live_exit_basis / LIVE_EXIT_REQUIRE_QUOTE).
+                _basis_res = await live_trader.live_exit_basis(
                     call_id, pos_live, live_eff, live_peak_mcap, live_entry_price)
-                # Read-only: say out loud that a held position is climbing, and where
-                # the bot would get out. Changes no exit decision (see position_alerts).
-                await position_alerts.maybe_alert(
-                    call_id, pos_live,
-                    mult=_raw_mult if _raw_mult else (exit_cur / exit_entry if exit_entry else 0.0),
-                    peak_mult=(exit_peak / exit_entry) if exit_entry else 0.0,
-                    basis=_basis,
-                    cfg=live_trader._LIVE_EXIT_CONFIG,
-                )
-                live_exit = live_trader.check_live_exits(
-                    call_id, exit_cur, exit_peak, exit_entry,
-                    exit_config=live_trader._LIVE_EXIT_CONFIG,
-                    raw_mult=_raw_mult,
-                )
-                if live_exit.should_exit:
-                    # Decision uses the real basis; the RECORD keeps the feed exit mcap
-                    # (exit_price col) so it stays auditable against exit_price_fill.
-                    await live_trader.close_live_position(call_id, live_eff, live_exit.reason)
-                    peak_guard.clear(f"monL:{call_id}")
-                    print(f"  [live] {symbol} closed — {live_exit.reason} [basis={_basis}]")
-                elif live_trader.LIVE_EXIT_QUOTE_LOG:
-                    # Phase-1 observation: quote the real sellable value, log real vs
-                    # feed multiple. Read-only — drives no sells (see LIVE_EXIT_QUOTE_LOG).
-                    _eff_obs = await live_trader.live_effective_current(pos_live)
-                    if _eff_obs:
-                        _synth, _rmult = _eff_obs
-                        _fmult = (current_mcap / live_entry_price) if live_entry_price else 0.0
-                        print(f"  [live] MULT {symbol} call_id={call_id} "
-                              f"real={_rmult:.2f}x feed={_fmult:.2f}x")
+                if _basis_res is not None:
+                    exit_cur, exit_peak, exit_entry, _basis, _raw_mult = _basis_res
+                    # Read-only: say out loud that a held position is climbing, and where
+                    # the bot would get out. Changes no exit decision (see position_alerts).
+                    await position_alerts.maybe_alert(
+                        call_id, pos_live,
+                        mult=_raw_mult if _raw_mult else (exit_cur / exit_entry if exit_entry else 0.0),
+                        peak_mult=(exit_peak / exit_entry) if exit_entry else 0.0,
+                        basis=_basis,
+                        cfg=live_trader._LIVE_EXIT_CONFIG,
+                    )
+                    live_exit = live_trader.check_live_exits(
+                        call_id, exit_cur, exit_peak, exit_entry,
+                        exit_config=live_trader._LIVE_EXIT_CONFIG,
+                        raw_mult=_raw_mult,
+                    )
+                    if live_exit.should_exit:
+                        # Decision uses the real basis; the RECORD keeps the feed exit mcap
+                        # (exit_price col) so it stays auditable against exit_price_fill.
+                        await live_trader.close_live_position(call_id, live_eff, live_exit.reason)
+                        peak_guard.clear(f"monL:{call_id}")
+                        print(f"  [live] {symbol} closed — {live_exit.reason} [basis={_basis}]")
+                    elif live_trader.LIVE_EXIT_QUOTE_LOG:
+                        # Phase-1 observation: quote the real sellable value, log real vs
+                        # feed multiple. Read-only — drives no sells (see LIVE_EXIT_QUOTE_LOG).
+                        _eff_obs = await live_trader.live_effective_current(pos_live)
+                        if _eff_obs:
+                            _synth, _rmult = _eff_obs
+                            _fmult = (current_mcap / live_entry_price) if live_entry_price else 0.0
+                            print(f"  [live] MULT {symbol} call_id={call_id} "
+                                  f"real={_rmult:.2f}x feed={_fmult:.2f}x")
         except Exception as le:
             print(f"  [live] exit check error for {symbol} call_id={call_id}: {le}")
 
@@ -925,27 +929,30 @@ async def _check_paper_exits(skip_call_ids: set[int] | None = None,
                         current_mcap,
                     )
                     if live_peak_mcap > float(pos_live["peak_mcap"] or 0) and live_entry_price > 0:
-                        db.update_live_position_peak(call_id, live_peak_mcap, live_peak_mcap / live_entry_price)
-                    # Phase 2: real (sell-quote) basis when armed, else the feed triple unchanged.
-                    exit_cur, exit_peak, exit_entry, _basis, _raw_mult = await live_trader.live_exit_basis(
+                        # peak_mcap only; peak_multiplier comes off the real basis.
+                        db.update_live_position_peak(call_id, live_peak_mcap)
+                    # None = no usable quote this tick: no decision, re-quote next sweep.
+                    _basis_res = await live_trader.live_exit_basis(
                         call_id, pos_live, current_mcap, live_peak_mcap, live_entry_price)
-                    # Read-only climbing alert — see the site in the watchlist loop above.
-                    await position_alerts.maybe_alert(
-                        call_id, pos_live,
-                        mult=_raw_mult if _raw_mult else (exit_cur / exit_entry if exit_entry else 0.0),
-                        peak_mult=(exit_peak / exit_entry) if exit_entry else 0.0,
-                        basis=_basis,
-                        cfg=live_trader._LIVE_EXIT_CONFIG,
-                    )
-                    live_exit = live_trader.check_live_exits(
-                        call_id, exit_cur, exit_peak, exit_entry,
-                        exit_config=live_trader._LIVE_EXIT_CONFIG,
-                        raw_mult=_raw_mult,
-                    )
-                    if live_exit.should_exit:
-                        # Decision on real basis; record keeps feed exit mcap (see site above).
-                        await live_trader.close_live_position(call_id, current_mcap, live_exit.reason)
-                        print(f"  [live] {symbol} closed — {live_exit.reason} [basis={_basis}]")
+                    if _basis_res is not None:
+                        exit_cur, exit_peak, exit_entry, _basis, _raw_mult = _basis_res
+                        # Read-only climbing alert — see the site in the watchlist loop above.
+                        await position_alerts.maybe_alert(
+                            call_id, pos_live,
+                            mult=_raw_mult if _raw_mult else (exit_cur / exit_entry if exit_entry else 0.0),
+                            peak_mult=(exit_peak / exit_entry) if exit_entry else 0.0,
+                            basis=_basis,
+                            cfg=live_trader._LIVE_EXIT_CONFIG,
+                        )
+                        live_exit = live_trader.check_live_exits(
+                            call_id, exit_cur, exit_peak, exit_entry,
+                            exit_config=live_trader._LIVE_EXIT_CONFIG,
+                            raw_mult=_raw_mult,
+                        )
+                        if live_exit.should_exit:
+                            # Decision on real basis; record keeps feed exit mcap (see above).
+                            await live_trader.close_live_position(call_id, current_mcap, live_exit.reason)
+                            print(f"  [live] {symbol} closed — {live_exit.reason} [basis={_basis}]")
             except Exception as le:
                 print(f"  [live] exit check error for {symbol} call_id={call_id}: {le}")
 
