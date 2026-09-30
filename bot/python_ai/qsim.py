@@ -730,6 +730,20 @@ async def qsim_open(score_result: dict, token_data: dict) -> None:
             print(f"[qsim] model gate error (allowing): {type(e).__name__} {e}")
 
         size = float(spec["size"])
+        # COUNT THIS AGAINST THE BUDGET. The open path used to quote unbudgeted, so
+        # cap=15/min governed only the monitor loop while opens spent 2 more per
+        # candidate with no accounting. Averaged out that is small, but meme calls arrive
+        # in BURSTS: ten calls in a minute is 20 uncounted quotes on top of the 15, out of
+        # Jupiter's ~60 — and it lands exactly when live is quoting the same coins, which
+        # is why live's 429s cluster instead of spreading out. qsim is the measuring
+        # instrument; it must never outbid live for the endpoint live SELLS through.
+        # Dropping an open here is the same outcome a 429 already produced below, just
+        # chosen deliberately rather than by whoever hit the API first.
+        if not _budget_ok():
+            print(f"[qsim] {symbol} open skipped — quote budget spent this minute "
+                  f"call_id={call_id}")
+            return
+        _quote_window.append(time.monotonic())
         try:
             tokens_raw = await jupiter.get_buy_quote(mint, size, raise_on_ratelimit=True)
         except jupiter.RateLimitError:
@@ -759,6 +773,12 @@ async def qsim_open(score_result: dict, token_data: dict) -> None:
             )
             return
         if QSIM_ENTRY_ROUNDTRIP_MIN_MULT > 0:
+            # Second budgeted call on the open path — see the buy quote above.
+            if not _budget_ok():
+                print(f"[qsim] {symbol} open skipped — quote budget spent before "
+                      f"roundtrip call_id={call_id}")
+                return
+            _quote_window.append(time.monotonic())
             try:
                 roundtrip_sol = await jupiter.get_sell_quote(mint, tokens_raw, raise_on_ratelimit=True)
             except jupiter.RateLimitError:
