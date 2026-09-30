@@ -213,6 +213,13 @@ LIVE_QUOTE_PEAK_PENDING_TTL_SECS = float(
 LIVE_NO_BOUNCE_STOP_ENABLED = os.getenv("LIVE_NO_BOUNCE_STOP_ENABLED", "false").lower() == "true"
 NO_BOUNCE_ARM_MULT          = float(os.getenv("NO_BOUNCE_ARM_MULT", "1.3"))
 NO_BOUNCE_STOP_MULT         = float(os.getenv("NO_BOUNCE_STOP_MULT", "0.9"))
+# Anchor sanity ceiling. A multiple this large is not a runner, it is a corrupt entry
+# anchor: ZPAD (call_id 296124, 2026-09-29) recorded entry_price_fill=0.103 against a
+# feed mcap of 83537 and every ratio off it read 811,024x, which fired bank_2x eight
+# seconds after entry and sold a 0.94x bag as a 2x bank. The largest real multiple this
+# project has ever observed is 168x, so 1000 rejects the impossible without ever
+# touching a genuine trade. qsim has had QSIM_CEILING_MULT for this; live had nothing.
+LIVE_MAX_SANE_MULT          = float(os.getenv("LIVE_MAX_SANE_MULT", "1000"))
 LIVE_BANK_EXIT_ENABLED      = os.getenv("LIVE_BANK_EXIT_ENABLED", "false").lower() == "true"
 LIVE_BANK_EXIT_MULT         = float(os.getenv("LIVE_BANK_EXIT_MULT", "1.3"))
 LIVE_EXIT_OVERLAY_STRATEGY  = os.getenv("LIVE_EXIT_OVERLAY_STRATEGY", "").strip()
@@ -842,8 +849,25 @@ def _effective_fill_mcap(
         sol_usd = data_fetcher.get_sol_price_usd()
         if not sol_usd:
             return None
-        tokens_whole = tokens_raw / (10 ** (decimals if decimals is not None else 6))
+        # decimals=0 is a FAILURE READING, not a valid one. The swap result can carry an
+        # explicit 0 (ZPAD, 2026-09-29) and `0 is not None` let it through, so 10**0
+        # skipped the divide and returned a mcap 1e6 low — which then drove an instant
+        # bank_2x. Both the supply divide above and the caller's tokens_display already
+        # coerce 0 -> 6; this was the one site that did not, and the only one whose
+        # output becomes the exit anchor.
+        dec = decimals if (decimals is not None and decimals > 0) else 6
+        tokens_whole = tokens_raw / (10 ** dec)
         if tokens_whole <= 0 or supply_whole <= 0:
+            return None
+        # INVARIANT: a 0.05 SOL buy cannot acquire more tokens than the token has. When
+        # the exponent is wrong the two sides disagree by orders of magnitude, which is
+        # far cheaper to detect than to guess the right one. Returning None leaves
+        # entry_price_fill NULL, so the exit anchors on the feed — degraded (that is the
+        # live_exit_feed_anchor_bug behaviour) but never a 1e6 error driving a sell.
+        if tokens_whole > supply_whole:
+            print(f"[live] effective mcap INCOHERENT for {mint[:8]}: {tokens_whole:.0f} "
+                  f"tokens vs supply {supply_whole:.0f} (decimals={decimals}) "
+                  f"— no fill anchor recorded, exits stay on the feed basis")
             return None
         return (sol_amount * sol_usd) * supply_whole / tokens_whole
     except Exception as e:
@@ -1212,6 +1236,16 @@ def check_live_exits(
         return ExitResult(False)
 
     current_mult = current_mcap / entry_mcap
+    # A multiple past the ceiling means entry_mcap is CORRUPT, not that the coin mooned.
+    # Every rule below divides by it, so they are all meaningless and all go quiet. The
+    # RAW hard stop above is anchor-independent (raw_mult = sol_out / sol_in) and keeps
+    # protecting the downside whenever a sell quote is available, so going quiet here
+    # costs upside capture, not safety. Acting on the corrupt value is what sold ZPAD.
+    if LIVE_MAX_SANE_MULT > 0 and current_mult > LIVE_MAX_SANE_MULT:
+        print(f"[live] ANCHOR CORRUPT call_id={call_id}: current_mult={current_mult:,.0f}x"
+              f"  current={current_mcap:.6f}  entry={entry_mcap:.6f}"
+              f"  — anchor-derived exits suppressed, raw hard stop still live")
+        return ExitResult(False)
     peak_mult = (peak_mcap / entry_mcap) if peak_mcap > 0 else current_mult
     if (
         LIVE_NO_BOUNCE_STOP_ENABLED
