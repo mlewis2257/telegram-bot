@@ -411,6 +411,37 @@ def _apply_live_exit_overlay(
 _EXIT_QUOTE_RETRIES  = int(os.getenv("LIVE_EXIT_QUOTE_RETRIES", "2"))       # extra tries after the first
 _EXIT_QUOTE_RETRY_MS = float(os.getenv("LIVE_EXIT_QUOTE_RETRY_MS", "180"))  # backoff between tries (ms)
 
+# The ENTRY side had no retry at all, which is why a 429 deleted a candidate outright.
+# Measured 2026-09-30: 27 of 114 live skips were rate limits (19 pre-entry buy quote, 8
+# roundtrip sell quote) against 6 trades actually taken — the API was rejecting four
+# times more candidates than the strategy was. Two of that day's five in-band banks went
+# this way (CAKE +0.0507 got as far as submitting the buy; NTDA +0.0503 never quoted),
+# worth more than the day's whole P&L. A gate that drops a coin because the API was busy
+# is not selecting anything, it is thinning the flow at random.
+_ENTRY_QUOTE_RETRIES  = int(os.getenv("LIVE_ENTRY_QUOTE_RETRIES", "3"))
+_ENTRY_QUOTE_RETRY_MS = float(os.getenv("LIVE_ENTRY_QUOTE_RETRY_MS", "250"))
+
+
+async def _entry_quote_retry(make_call, what: str, symbol: str, call_id: int):
+    """Entry-side Jupiter quote with the bounded 429 retry the exit path already had.
+
+    Returns (value, ok). ok=False means rate-limited after every attempt; the caller
+    still skips, but only after actually trying. A genuine no-route is NOT a 429 and
+    comes back as (None, True) — retrying cannot conjure liquidity, and the caller
+    already distinguishes that case.
+    """
+    attempts = _ENTRY_QUOTE_RETRIES + 1
+    for i in range(attempts):
+        try:
+            return await make_call(), True
+        except jupiter.RateLimitError:
+            if i < attempts - 1:
+                await asyncio.sleep(_ENTRY_QUOTE_RETRY_MS / 1000.0)
+                continue
+            print(f"[live] {symbol} {what} 429 after {attempts} tries call_id={call_id}")
+            return None, False
+    return None, False
+
 
 def _rpc_url() -> str:
     return os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -752,9 +783,10 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             and mint
             and not mint.startswith(("INFERRED:", "UNKNOWN:"))
         ):
-            try:
-                quote_tokens = await jupiter.get_buy_quote(mint, size, raise_on_ratelimit=True)
-            except jupiter.RateLimitError:
+            quote_tokens, _ok = await _entry_quote_retry(
+                lambda: jupiter.get_buy_quote(mint, size, raise_on_ratelimit=True),
+                "pre-entry buy quote", symbol, call_id)
+            if not _ok:
                 print(f"[live] {symbol} skipped — pre-entry buy quote 429 call_id={call_id}")
                 db.set_call_skip_reason(call_id, "entry_quote_429")
                 return False
@@ -781,9 +813,10 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
                 db.set_call_skip_reason(call_id, gate.reason)
                 return False
             if LIVE_ENTRY_ROUNDTRIP_MIN_MULT > 0:
-                try:
-                    roundtrip_sol = await jupiter.get_sell_quote(mint, quote_tokens, raise_on_ratelimit=True)
-                except jupiter.RateLimitError:
+                roundtrip_sol, _ok = await _entry_quote_retry(
+                    lambda: jupiter.get_sell_quote(mint, quote_tokens, raise_on_ratelimit=True),
+                    "pre-entry roundtrip sell quote", symbol, call_id)
+                if not _ok:
                     print(f"[live] {symbol} skipped — pre-entry roundtrip sell quote 429 call_id={call_id}")
                     db.set_call_skip_reason(call_id, "entry_roundtrip_429")
                     return False
