@@ -478,12 +478,13 @@ async def handle_log_notification(ws, mint: str, call_id: int, signature: str | 
     try:
         position_live = db.get_open_live_position(call_id)
         if position_live:
-            # Anchor exit multiples on the REAL fill, not the laggy feed entry (see monitor.py):
-            # the feed under-records entry on fast risers, inflating multiples and mis-timing exits.
-            entry_price   = position_live.get("entry_price_fill") or position_live["entry_price"]
+            # Feed entry for the feed triple: current_mcap and peak_mcap are feed numbers, so
+            # mixing in entry_price_fill made a still coin read feed_entry/fill_entry and put
+            # positions under the hard stop at birth (see monitor.py for the two that were).
+            # live_exit_basis reads entry_price_fill itself for the quote basis.
+            entry_price   = float(position_live["entry_price"] or 0)
             peak_mcap_db  = position_live["peak_mcap"]
             peak_mult_db  = position_live["peak_multiplier"]
-            current_mult  = (current_mcap / entry_price) if entry_price else 0.0
 
             # Merge DB peak, in-memory cache, and paper A's DexScreener peak.
             # Entry prices are confirmed identical, so paper A's peak is a valid

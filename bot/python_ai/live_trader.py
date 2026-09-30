@@ -964,18 +964,26 @@ async def live_exit_basis(
     for the bank overlay and the hard stop so live evaluates those off the RAW quote exactly
     like qsim after 6da293d / e81d4d7; every other exit rule stays on the guarded triple.
     """
+    # SINGLE-RULER INVARIANT. feed_current and feed_peak are feed numbers, so the feed
+    # triple's entry leg must be the feed entry. A caller handing us entry_price_fill
+    # instead makes a still coin read feed_entry/fill_entry — ClapCat and BUTTHOLE (fills
+    # 1.39x and 1.40x the feed) sat at 0.718 and 0.715, under the 0.80 hard stop from
+    # birth, and were both sold while their real quotes were worth 0.98 and 1.05. All
+    # three callsites were fixed, but enforcing it here is what stops a fourth from
+    # reintroducing it, and this function already has pos to check against.
+    feed_anchor = float(pos.get("entry_price") or 0) or feed_entry
     if not LIVE_EXIT_USE_QUOTE:
-        return feed_current, feed_peak, feed_entry, "feed", None
+        return feed_current, feed_peak, feed_anchor, "feed", None
     try:
         real_entry = float(pos.get("entry_price_fill") or 0)
         if real_entry <= 0:
-            return feed_current, feed_peak, feed_entry, "feed", None  # pre-instrumentation position
+            return feed_current, feed_peak, feed_anchor, "feed", None  # pre-instrumentation position
         eff = await live_effective_current(pos)
         if not eff:
-            return feed_current, feed_peak, feed_entry, "feed", None  # quote failed → feed fallback
+            return feed_current, feed_peak, feed_anchor, "feed", None  # quote failed → feed fallback
         synth_current, real_mult = eff
         if synth_current <= 0:
-            return feed_current, feed_peak, feed_entry, "feed", None
+            return feed_current, feed_peak, feed_anchor, "feed", None
         # Ratchet the real peak off observed sell-quote value. Seed from the DB row so the
         # peak is shared across sol-monitor + sol-ws-monitor and survives restarts; the
         # guard adds the same single-tick corroboration used on the feed side.
@@ -996,7 +1004,7 @@ async def live_exit_basis(
         return eff_current, real_peak, real_entry, "real", real_mult
     except Exception as e:
         print(f"[live] exit-basis calc failed, using feed: {e}")
-        return feed_current, feed_peak, feed_entry, "feed", None
+        return feed_current, feed_peak, feed_anchor, "feed", None
 
 
 async def close_live_position(
