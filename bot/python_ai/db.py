@@ -2007,8 +2007,16 @@ def open_live_position(
             """
             INSERT INTO trading_positions
                 (token_id, call_id, is_simulation, entry_price, sol_in,
-                 tokens_held, tx_signature, router, entry_time, status)
-            SELECT c.token_id, %s, FALSE, %s, %s, %s, %s, %s, NOW(), 'open'
+                 tokens_held, tx_signature, router, entry_time, status,
+                 peak_multiplier)
+            -- Seed peak_multiplier at 1.0: a position's peak IS its entry until
+            -- something beats it. Since the real-basis ratchet only fires on
+            -- real_peak > prior_peak, and prior_peak is itself seeded at the fill,
+            -- a coin that only ever goes DOWN never triggers a write — which left
+            -- peak_multiplier NULL on every straight-down loser (Ansemmas,
+            -- cockroach, PULL, CASHTAGXT). That silently breaks "did it ever run"
+            -- analysis and hid the data needed to diagnose those exits.
+            SELECT c.token_id, %s, FALSE, %s, %s, %s, %s, %s, NOW(), 'open', 1.0
             FROM calls c
             WHERE c.id = %s
               AND NOT EXISTS (
