@@ -201,11 +201,33 @@ def backtest(days: float) -> None:
         print(f"  {r['side']:<9}{r['n']:>6}{float(r['deployed']):>10.2f}"
               f"{float(r['pnl_sol']):>10.4f}{float(r['pct_per_sol']):>9.2f}"
               f"{float(r['win_pct']):>7.1f}{float(r['rug_pct']):>7.1f}")
+    # Describe the gate that actually ran. The old footer was hardcoded for a
+    # mcap+dev_sold config and read "~4% of volume, n=70" under numbers that had
+    # since become 387 and 23% — a stale caveat under correct figures is worse
+    # than none, because it looks like it was checked.
+    kept = next((r for r in rows if r["side"] == "KEPT"), None)
+    tot_n = sum(int(r["n"]) for r in rows) or 1
     print()
-    print("  KEPT is ~4% of volume. Do not read its pnl as an edge — the cell is")
-    print("  n=70 over 21d and its two ingredients are each NEGATIVE alone. The")
-    print("  replicated part is the mcap band; the combination is why a small")
-    print("  live test is worth running, not a reason to size up.")
+    if kept:
+        print(f"  KEPT is {100.0*int(kept['n'])/tot_n:.0f}% of positions "
+              f"({int(kept['n'])} of {tot_n}) under the gate ACTUALLY configured:")
+    print(f"    mcap_at_call {MCAP_MIN/1000:g}k-{MCAP_MAX/1000:g}k"
+          f"{'  +  dev_sold = false' if REQUIRE_DEV_NOT_SOLD else ''}"
+          f"{'  +  security_flag not unknown/null' if BLOCK_SECURITY_UNKNOWN else ''}")
+    print()
+    print("  Evidence behind each, which is NOT the same strength:")
+    print("    mcap band        replicated in both halves on three metrics, and")
+    print("                     out of sample at 5.3 sigma on rug rate (n~3300).")
+    if BLOCK_SECURITY_UNKNOWN:
+        print("    security unknown 4.51 sigma on rug rate (10.6% vs 1.34%), measured")
+        print("                     on qsim which has no security gate. NULL is an")
+        print("                     inference, not a measurement (n=0 in the window).")
+    if REQUIRE_DEV_NOT_SOLD:
+        print("    dev_sold=false   3.7 sigma on rug rate, but NEGATIVE alone on pnl;")
+        print("                     the mcap+dev_sold cell was n=70 and unproven.")
+    print()
+    print("  This spans ALL lanes. LIVE_LANES holds solwhaletrending only, so the")
+    print("  slice live actually trades is smaller than KEPT shown here.")
 
 
 if __name__ == "__main__":
