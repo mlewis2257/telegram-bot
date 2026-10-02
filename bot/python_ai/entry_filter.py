@@ -118,6 +118,14 @@ REQUIRE_DEV_NOT_SOLD = (
 _raw_block = os.getenv("LIVE_ENTRY_BLOCK_SECURITY_FLAGS", "safe")
 BLOCK_SECURITY_FLAGS = {s.strip().lower() for s in _raw_block.split(",") if s.strip()}
 
+# Date the bank_2x overlay went live. Positions before it took NO bank exit, so any
+# window reaching back past it is comparing two different strategies. --backtest warns
+# when the window starts earlier; see the note at that check for why the first version
+# of the warning (zero-bank rows) missed the case that matters.
+from datetime import date as _date  # noqa: E402
+OVERLAY_START = _date.fromisoformat(
+    os.getenv("QSIM_BANK_OVERLAY_START", "2026-09-23"))
+
 
 def describe() -> str:
     if not ENABLED:
@@ -276,13 +284,21 @@ def backtest(days: float, since: str | None = None,
               f"{float(r['pnl_sol']):>10.4f}{float(r['pct_per_sol']):>9.2f}"
               f"{float(r['win_pct']):>7.1f}{float(r['rug_pct']):>7.1f}"
               f"{int(r['banks']):>7}")
-    # banks=0 on a row means the window predates the bank_2x overlay, so the result
-    # describes a different strategy. Say so rather than letting it pass as a number.
-    if any(int(r["banks"]) == 0 for r in rows):
+    # Warn on the window's START DATE, not on a zero-bank row. The first version only
+    # caught windows entirely before the overlay — but a STRADDLING window still shows
+    # banks in aggregate and passed silently, which is the case that actually matters and
+    # the exact confound that made my first security_flag conclusion wrong (68% of that
+    # evidence came from pre-overlay rows while the totals looked populated).
+    from datetime import date, timedelta
+    _start = (date.fromisoformat(since) if since
+              else date.today() - timedelta(days=days))
+    if _start < OVERLAY_START:
+        _pre = (OVERLAY_START - _start).days
         print()
-        print("  WARNING: a row shows ZERO bank exits, so this window reaches back")
-        print("  before the bank_2x overlay (~2026-09-23). Re-run with")
-        print("  --since 2026-09-23 or the comparison measures the exit config.")
+        print(f"  WARNING: this window starts {_start} — {_pre} day(s) before the")
+        print(f"  bank_2x overlay ({OVERLAY_START}). Those rows ran NO bank exit at all,")
+        print("  so they describe a different strategy and will drag any comparison")
+        print(f"  toward it. Re-run with --since {OVERLAY_START} for the live regime.")
     # Describe the gate that actually ran. The old footer was hardcoded for a
     # mcap+dev_sold config and read "~4% of volume, n=70" under numbers that had
     # since become 387 and 23% — a stale caveat under correct figures is worse
