@@ -247,8 +247,17 @@ LIVE_PROTECTIVE_DD = float(os.getenv("LIVE_PROTECTIVE_DD", "0.20"))
 # positions on this lane -- blocking 26% of flow compounds the binding constraint, which
 # is coverage, not selection.
 #
-# Set true to restore the old behaviour. paper_trader_b keeps its own gate untouched so
-# its history stays continuous.
+# LEGACY, and it should stay off. entry_filter's LIVE_ENTRY_BLOCK_SECURITY_FLAGS is now
+# the SINGLE authority for security gating — having it in two files is precisely how
+# 'warning' (the best group) ended up blocked here while 'unknown' walked past, because
+# this gate string-matches one value and knows nothing about the others.
+#
+# The later measurement, on the bank_2x era only, moved the answer again: 'safe' is the
+# group to block (lowest bank rate, worst pnl, zero rugs), not 'warning'. That lives in
+# entry_filter, where the whole set is configurable in one place.
+#
+# Set true only to reproduce historical behaviour. paper_trader_b keeps its own gate
+# untouched so its history stays continuous.
 LIVE_BLOCK_SECURITY_WARNING = (
     os.getenv("LIVE_BLOCK_SECURITY_WARNING", "false").strip().lower() == "true"
 )
