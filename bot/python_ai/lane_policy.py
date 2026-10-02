@@ -403,8 +403,22 @@ LIVE_LANES: dict[tuple[str, str, str], dict] = {
     # stop), MAX_OPEN_LIVE_POSITIONS=5 (raised from 3; 5 x 0.05 = 0.25 SOL max exposure), EXIT_STRATEGY=paper_a (EXIT_A_PAPER: early + profit_floor,
     # now enabled for solwhaletrending). "exit"/"size" below are the lane defaults; process-wide
     # EXIT_STRATEGY is the real exit — keep any exit_live_v2 out of .env.
+    # SATURDAY CUT 2026-10-02. In-band, this lane, Saturday is the one weekday result that
+    # replicated ACROSS exit configs at near-identical magnitude:
+    #     pre-bank  46 trades  -12.46%/SOL
+    #     bank era  46 trades  -13.18%/SOL
+    # 92 trades at -12.82% against a lane average of ~-3%. Only THREE Saturdays, and the
+    # 4.3-sigma Saturday that turned out to be two broken Saturdays is why day-of-week
+    # results need per-week consistency — what distinguishes this one is that the magnitude
+    # held when the strategy underneath it changed, not the day count. Worth ~+0.028 SOL/day
+    # averaged.
+    #
+    # FRIDAY STAYS CUT, but note the evidence does NOT support it: -1.82% pre-bank and
+    # +0.12% in the bank era, i.e. neutral, on 93 trades. That cut was made on pre-bank
+    # data. Restoring it is ~1/6th more flow at roughly zero PnL cost, on a lane where
+    # coverage is the binding constraint — operator's call, not changed here.
     ("solwhaletrending", "none", "low_score"): {
-        "days": {"Mon", "Tue", "Wed", "Thu", "Sat", "Sun"},
+        "days": {"Mon", "Tue", "Wed", "Thu", "Sun"},
         "exit": EXIT_EARLY, "size": 0.05,
     },
 }
