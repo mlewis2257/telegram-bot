@@ -118,6 +118,30 @@ REQUIRE_DEV_NOT_SOLD = (
 _raw_block = os.getenv("LIVE_ENTRY_BLOCK_SECURITY_FLAGS", "safe")
 BLOCK_SECURITY_FLAGS = {s.strip().lower() for s in _raw_block.split(",") if s.strip()}
 
+# Age exemption for an in-band blocked flag. 'safe' underperforms specifically when YOUNG:
+#   <15m   safe 57 trades  -13.02%/SOL  bank  8.8%
+#   >=15m  safe 21 trades   +3.97%/SOL  bank 19.0%
+# 0 disables the exemption (block the flag at any age). NULL age never qualifies — if we
+# cannot establish the coin is old, the measured-bad young case is the default.
+SAFE_MIN_AGE_MIN = float(os.getenv("LIVE_ENTRY_SAFE_MIN_AGE_MIN", "15"))
+
+# Flags tradeable OUTSIDE the mcap band. Empty = out-of-band blocked entirely (the band
+# alone decides), which is what this did before.
+#   out  warning  11 trades  +33.13%/SOL  bank 27.3%
+#   out  unknown 122         -12.81%      bank 21.3%
+#   out  safe     20         -15.59%      bank  5.0%
+_raw_out = os.getenv("LIVE_ENTRY_OUT_BAND_ALLOW_FLAGS", "warning")
+OUT_BAND_ALLOW_FLAGS = {s.strip().lower() for s in _raw_out.split(",") if s.strip()}
+
+# SIZE OF THE EVIDENCE, stated because it is small and the rule is not:
+# the band and the in-band 'safe' block rest on n=78-221 and replicated orderings. The
+# two refinements above do NOT. out-band warning is ELEVEN trades carried by three banks,
+# and the safe age exemption is twenty-one. A band x flag x age rule fitted to ~375
+# positions with cells at 11 and 21 is the overfitting signature flagged on the
+# mcap+dev_sold cell at n=70 -- each cell was selected because of the sign it happened to
+# show, and two or three of six such cells flip on noise alone. Raised twice, and the
+# operator's call; these are the knobs to revert first if forward results disagree.
+
 # Date the bank_2x overlay went live. Positions before it took NO bank exit, so any
 # window reaching back past it is comparing two different strategies. --backtest warns
 # when the window starts earlier; see the note at that check for why the first version
@@ -130,29 +154,39 @@ OVERLAY_START = _date.fromisoformat(
 def describe() -> str:
     if not ENABLED:
         return "[entry_filter] DISABLED"
-    return (f"[entry_filter] ENABLED — mcap_at_call {MCAP_MIN/1000:g}k-{MCAP_MAX/1000:g}k"
+    _blk = (f"blocked in-band: {','.join(sorted(BLOCK_SECURITY_FLAGS))}"
+            + (f" unless age>={SAFE_MIN_AGE_MIN:g}m" if SAFE_MIN_AGE_MIN > 0 else "")
+            ) if BLOCK_SECURITY_FLAGS else "all flags traded in-band"
+    _out = (f"out-of-band allowed: {','.join(sorted(OUT_BAND_ALLOW_FLAGS))}"
+            if OUT_BAND_ALLOW_FLAGS else "out-of-band blocked")
+    return (f"[entry_filter] ENABLED — mcap {MCAP_MIN/1000:g}k-{MCAP_MAX/1000:g}k"
             f"{', dev_sold must be false' if REQUIRE_DEV_NOT_SOLD else ''}"
-            f"{', security_flag blocked: ' + ','.join(sorted(BLOCK_SECURITY_FLAGS)) if BLOCK_SECURITY_FLAGS else ', all security_flags traded'}")
+            f" | {_blk} | {_out}")
 
 
-def _token_flags(mint: str) -> tuple[bool | None, str | None, bool]:
-    """(dev_sold, security_flag, row_found) for this mint, in ONE lookup.
+def _token_flags(mint: str) -> tuple[bool | None, str | None, float | None, bool]:
+    """(dev_sold, security_flag, token_age_minutes, row_found) in ONE lookup.
 
     row_found distinguishes "no tokens row at all" from "row exists, column NULL".
     The old _dev_sold collapsed those into None; both still skip, but the reason
     printed is now accurate, which matters because 'no row' and 'dev_sold is NULL'
     want different follow-up.
+
+    token_age_minutes shares security_flag's provenance guarantee — both are written
+    `COALESCE(col, %s)` by upsert_token_realtime_metadata, so first detection wins and
+    nothing overwrites them. Genuine pre-entry values, not hindsight.
     """
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT dev_sold, security_flag FROM tokens WHERE mint_address = %s LIMIT 1",
-            (mint,))
+            "SELECT dev_sold, security_flag, token_age_minutes "
+            "FROM tokens WHERE mint_address = %s LIMIT 1", (mint,))
         row = cur.fetchone()
     if row is None:
-        return None, None, False
-    return row[0], row[1], True
+        return None, None, None, False
+    age = float(row[2]) if row[2] is not None else None
+    return row[0], row[1], age, True
 
 
 def check(mint: str | None, msg_mcap: float | None) -> tuple[bool, str]:
@@ -165,35 +199,60 @@ def check(mint: str | None, msg_mcap: float | None) -> tuple[bool, str]:
     try:
         if not msg_mcap or msg_mcap <= 0:
             return False, "no_mcap_at_call"
-        if msg_mcap < MCAP_MIN:
-            return False, f"mcap {msg_mcap/1000:.0f}k below {MCAP_MIN/1000:g}k"
-        if msg_mcap > MCAP_MAX:
-            return False, f"mcap {msg_mcap/1000:.0f}k above {MCAP_MAX/1000:g}k"
-        if REQUIRE_DEV_NOT_SOLD or BLOCK_SECURITY_FLAGS:
-            if not mint or mint.startswith(("INFERRED:", "UNKNOWN:")):
-                # dev_sold fails CLOSED here (its own docstring argues why). The security
-                # list does NOT: the rule is "block safe", and a coin we cannot identify
-                # is not known to be safe. Blocking it would smuggle an unmeasured gate in
-                # under cover of a measured one, and coverage is the binding constraint.
-                if REQUIRE_DEV_NOT_SOLD:
-                    return False, "no_mint_for_dev_sold"
-                return True, "pass_no_mint"
-            ds, sec, found = _token_flags(mint)
-            if not found:
-                if REQUIRE_DEV_NOT_SOLD:
-                    return False, "no_tokens_row"
-                return True, "pass_no_tokens_row"
-            if BLOCK_SECURITY_FLAGS:
-                # 'null' is the token for a row that exists with no flag written.
-                _sec = (sec or "").strip().lower() or "null"
-                if _sec in BLOCK_SECURITY_FLAGS:
-                    return False, f"security_flag={_sec}"
+        in_band = MCAP_MIN <= msg_mcap <= MCAP_MAX
+        mc = f"{msg_mcap/1000:.0f}k"
+
+        # Out-of-band is no longer an unconditional reject: OUT_BAND_ALLOW_FLAGS names
+        # the flags tradeable outside the band. Empty set restores the old behaviour.
+        if not in_band and not OUT_BAND_ALLOW_FLAGS:
+            return False, (f"mcap {mc} below {MCAP_MIN/1000:g}k" if msg_mcap < MCAP_MIN
+                           else f"mcap {mc} above {MCAP_MAX/1000:g}k")
+
+        need_flags = (REQUIRE_DEV_NOT_SOLD or BLOCK_SECURITY_FLAGS
+                      or not in_band)
+        if not need_flags:
+            return True, "pass"
+
+        if not mint or mint.startswith(("INFERRED:", "UNKNOWN:")):
+            # dev_sold fails CLOSED (its own docstring argues why), and so does
+            # out-of-band, which is only reachable by positively identifying an allowed
+            # flag. The in-band security list does NOT: the rule is "block safe", and a
+            # coin we cannot identify is not known to be safe — blocking it would smuggle
+            # an unmeasured gate in under cover of a measured one, and coverage is the
+            # binding constraint.
             if REQUIRE_DEV_NOT_SOLD:
-                if ds is None:
-                    return False, "dev_sold unknown"
-                if ds:
-                    return False, "dev_sold=true"
-        return True, "pass"
+                return False, "no_mint_for_dev_sold"
+            if not in_band:
+                return False, f"mcap {mc} out of band, no mint to check flag"
+            return True, "pass_no_mint"
+        ds, sec, age, found = _token_flags(mint)
+        if not found:
+            if REQUIRE_DEV_NOT_SOLD:
+                return False, "no_tokens_row"
+            if not in_band:
+                return False, f"mcap {mc} out of band, no tokens row"
+            return True, "pass_no_tokens_row"
+
+        # 'null' is the token for a row that exists with no flag written.
+        _sec = (sec or "").strip().lower() or "null"
+
+        if not in_band:
+            if _sec not in OUT_BAND_ALLOW_FLAGS:
+                return False, f"mcap {mc} out of band, security_flag={_sec}"
+        elif _sec in BLOCK_SECURITY_FLAGS:
+            # Age exemption: the block is measured on YOUNG coins of this flag.
+            if SAFE_MIN_AGE_MIN > 0 and age is not None and age >= SAFE_MIN_AGE_MIN:
+                pass
+            else:
+                _why = "age unknown" if age is None else f"age {age:.0f}m"
+                return False, f"security_flag={_sec} ({_why})"
+
+        if REQUIRE_DEV_NOT_SOLD:
+            if ds is None:
+                return False, "dev_sold unknown"
+            if ds:
+                return False, "dev_sold=true"
+        return True, "pass" if in_band else f"pass_out_band_{_sec}"
     except Exception as e:
         # Fails CLOSED. See the module docstring: missing metadata is the WORST
         # bucket in the data, so declining to trade what we cannot verify is the
@@ -228,16 +287,32 @@ def backtest(days: float, since: str | None = None,
     # Mirror the ACTUAL config rather than a hardcoded rule: this previously always
     # required dev_sold = false even with REQUIRE_DEV_NOT_SOLD off, so --backtest
     # described a gate live was not running.
-    conds = ["c.mcap_at_call BETWEEN %s AND %s"]
-    params: list = [MCAP_MIN, MCAP_MAX]
+    # Mirrors check()'s three branches. Parameterised, never interpolated — these values
+    # come from the environment. SEC matches check()'s "blank or missing -> 'null'".
+    SEC = "coalesce(nullif(lower(trim(t.security_flag)), ''), 'null')"
+    BAND = "c.mcap_at_call BETWEEN %s AND %s"
+    params: list = []
+
+    # in-band leg
+    in_leg = [BAND]
+    params += [MCAP_MIN, MCAP_MAX]
+    if BLOCK_SECURITY_FLAGS:
+        if SAFE_MIN_AGE_MIN > 0:
+            in_leg.append(f"({SEC} <> ALL(%s) OR t.token_age_minutes >= %s)")
+            params += [sorted(BLOCK_SECURITY_FLAGS), SAFE_MIN_AGE_MIN]
+        else:
+            in_leg.append(f"{SEC} <> ALL(%s)")
+            params.append(sorted(BLOCK_SECURITY_FLAGS))
+    legs = ["(" + " AND ".join(in_leg) + ")"]
+
+    # out-of-band leg
+    if OUT_BAND_ALLOW_FLAGS:
+        legs.append(f"(NOT ({BAND}) AND {SEC} = ANY(%s))")
+        params += [MCAP_MIN, MCAP_MAX, sorted(OUT_BAND_ALLOW_FLAGS)]
+
+    conds = ["(" + " OR ".join(legs) + ")"]
     if REQUIRE_DEV_NOT_SOLD:
         conds.append("t.dev_sold = false")
-    if BLOCK_SECURITY_FLAGS:
-        # Parameterised, not interpolated: these values come from the environment.
-        # NULLIF(...,'') then COALESCE mirrors check()'s "blank or missing -> 'null'".
-        conds.append("coalesce(nullif(lower(trim(t.security_flag)), ''), 'null') "
-                     "<> ALL(%s)")
-        params.append(sorted(BLOCK_SECURITY_FLAGS))
     pred = " AND ".join(conds)
 
     where = ["qp.status = 'closed'"]
