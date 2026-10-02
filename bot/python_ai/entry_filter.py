@@ -64,6 +64,35 @@ MCAP_MAX = float(os.getenv("LIVE_ENTRY_MCAP_MAX", "120000"))
 REQUIRE_DEV_NOT_SOLD = (
     os.getenv("LIVE_ENTRY_REQUIRE_DEV_NOT_SOLD", "true").strip().lower() == "true"
 )
+# Block security_flag = 'unknown'. Measured 2026-10-02 on live's exact lane and band
+# (solwhaletrending, mcap 80-120k, 21d of closed qsim positions, which have NO security
+# gate so the counterfactual exists):
+#
+#   unknown   245   -0.9797 SOL   -8.00%/SOL   rug 10.6%   bank 6.12%
+#   safe      212   +0.0655 SOL   +0.62%/SOL   rug  0.5%   bank 3.77%
+#   warning   160   +0.3619 SOL   +4.52%/SOL   rug  2.5%   bank 6.88%
+#
+# unknown rugs 10.6% against 1.34% for flagged coins, z = 4.51. live_trader blocks
+# 'warning' and lets 'unknown' straight through, because the gate reads
+# `security_flag == "warning"` and 'unknown' is a non-matching string. So live has been
+# rejecting its best segment and trading the one losing 8%/SOL.
+#
+# It is a genuine PRE-ENTRY value: db.upsert_token_realtime_metadata writes
+# `security_flag = COALESCE(security_flag, %s)`, so the first detection wins and nothing
+# can overwrite it later. The reverse-causation worry (rugged -> unreadable -> 'unknown')
+# cannot apply, because the flag predates the outcome.
+#
+# 'warning' is deliberately left to live_trader's existing gate. Its apparent edge over
+# 'safe' is only z = 1.30 on bank rate, so unblocking it is not established; this change
+# rests on the 4.51 sigma rug finding alone.
+BLOCK_SECURITY_UNKNOWN = (
+    os.getenv("LIVE_ENTRY_BLOCK_SECURITY_UNKNOWN", "true").strip().lower() == "true"
+)
+# 'unknown' is the measured category. NULL means no flag was ever written, which is
+# strictly LESS information than a failed scan, so it is blocked too — but note that is
+# an inference, not a measurement: the 21d window had ZERO null-flag positions in this
+# lane, so it costs nothing either way and nothing in the numbers above depends on it.
+_SECURITY_BLOCKED = {"", "unknown"}
 
 
 def describe() -> str:
@@ -71,19 +100,28 @@ def describe() -> str:
         return "[entry_filter] DISABLED"
     return (f"[entry_filter] ENABLED — mcap_at_call {MCAP_MIN/1000:g}k-{MCAP_MAX/1000:g}k"
             f"{', dev_sold must be false' if REQUIRE_DEV_NOT_SOLD else ''}"
+            f"{', security_flag unknown/null blocked' if BLOCK_SECURITY_UNKNOWN else ''}"
             f" (fails CLOSED on missing data)")
 
 
-def _dev_sold(mint: str) -> bool | None:
-    """tokens.dev_sold for this mint. None means unknown OR the lookup failed —
-    the caller treats both the same way, which is to skip."""
+def _token_flags(mint: str) -> tuple[bool | None, str | None, bool]:
+    """(dev_sold, security_flag, row_found) for this mint, in ONE lookup.
+
+    row_found distinguishes "no tokens row at all" from "row exists, column NULL".
+    The old _dev_sold collapsed those into None; both still skip, but the reason
+    printed is now accurate, which matters because 'no row' and 'dev_sold is NULL'
+    want different follow-up.
+    """
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT dev_sold FROM tokens WHERE mint_address = %s LIMIT 1", (mint,))
+            "SELECT dev_sold, security_flag FROM tokens WHERE mint_address = %s LIMIT 1",
+            (mint,))
         row = cur.fetchone()
-    return None if row is None else row[0]
+    if row is None:
+        return None, None, False
+    return row[0], row[1], True
 
 
 def check(mint: str | None, msg_mcap: float | None) -> tuple[bool, str]:
@@ -100,14 +138,20 @@ def check(mint: str | None, msg_mcap: float | None) -> tuple[bool, str]:
             return False, f"mcap {msg_mcap/1000:.0f}k below {MCAP_MIN/1000:g}k"
         if msg_mcap > MCAP_MAX:
             return False, f"mcap {msg_mcap/1000:.0f}k above {MCAP_MAX/1000:g}k"
-        if REQUIRE_DEV_NOT_SOLD:
+        if REQUIRE_DEV_NOT_SOLD or BLOCK_SECURITY_UNKNOWN:
             if not mint or mint.startswith(("INFERRED:", "UNKNOWN:")):
-                return False, "no_mint_for_dev_sold"
-            ds = _dev_sold(mint)
-            if ds is None:
-                return False, "dev_sold unknown"
-            if ds:
-                return False, "dev_sold=true"
+                return False, "no_mint_for_token_flags"
+            ds, sec, found = _token_flags(mint)
+            if not found:
+                return False, "no_tokens_row"
+            if BLOCK_SECURITY_UNKNOWN:
+                if (sec or "").strip().lower() in _SECURITY_BLOCKED:
+                    return False, f"security_flag={sec or 'null'}"
+            if REQUIRE_DEV_NOT_SOLD:
+                if ds is None:
+                    return False, "dev_sold unknown"
+                if ds:
+                    return False, "dev_sold=true"
         return True, "pass"
     except Exception as e:
         # Fails CLOSED. See the module docstring: missing metadata is the WORST
@@ -119,12 +163,21 @@ def check(mint: str | None, msg_mcap: float | None) -> tuple[bool, str]:
 def backtest(days: float) -> None:
     """What the filter would have kept, on closed qsim positions."""
     from psycopg2.extras import RealDictCursor
+    # Mirror the ACTUAL config rather than a hardcoded rule: this previously always
+    # required dev_sold = false even with REQUIRE_DEV_NOT_SOLD off, so --backtest
+    # described a gate live was not running.
+    conds = ["c.mcap_at_call BETWEEN %s AND %s"]
+    if REQUIRE_DEV_NOT_SOLD:
+        conds.append("t.dev_sold = false")
+    if BLOCK_SECURITY_UNKNOWN:
+        conds.append(
+            "coalesce(lower(trim(t.security_flag)), '') NOT IN ('', 'unknown')")
+    pred = " AND ".join(conds)
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SELECT CASE WHEN c.mcap_at_call BETWEEN %s AND %s
-                         AND t.dev_sold = false THEN 'KEPT' ELSE 'skipped' END AS side,
+        cur.execute(f"""
+            SELECT CASE WHEN {pred} THEN 'KEPT' ELSE 'skipped' END AS side,
                    count(*)                                              AS n,
                    round(sum(qp.sol_in)::numeric, 2)                     AS deployed,
                    round(sum(qp.sol_out - qp.sol_in)::numeric, 4)        AS pnl_sol,

@@ -672,7 +672,18 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         # ── Security flag ──────────────────────────────────────────────────────
         security_flag = (token_data.get("security_flag") or token_onchain.get("security_flag"))
         if security_flag == "warning":
-            print(f"[live] {symbol} skipped — security=warning")
+            # call_id was missing here while every other skip line carries it, so these
+            # skips could not be joined to anything — not in the DB (set_call_skip_reason
+            # was a no-op behind the lane label) and not in the log either. YPAID, a
+            # +0.0514 bank_2x, was only traceable because its symbol happened to be unique.
+            #
+            # LEFT IN PLACE DELIBERATELY, but the measurement does not support it:
+            # over 21d on this lane and band, 'warning' ran +4.52%/SOL at a 2.5% rug rate
+            # against 'safe' at +0.62% and 0.5%, and 'unknown' at -8.00% and 10.6%. The
+            # edge of 'warning' over 'safe' is only z = 1.30 so unblocking is not
+            # established — but 'unknown' is z = 4.51 and walks straight past this check,
+            # because it is a non-matching string. entry_filter blocks that one now.
+            print(f"[live] {symbol} skipped — security={security_flag} call_id={call_id}")
             db.set_call_skip_reason(call_id, "security_warning")
             return False
 

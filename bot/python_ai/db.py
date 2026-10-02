@@ -3327,8 +3327,25 @@ def set_call_skip_reason(call_id: int, reason: str) -> None:
     """
     Record why a call was not traded.
 
-    Only writes if skip_reason is currently NULL — first skip reason wins.
-    Silently no-ops if call_id is falsy or the UPDATE affects 0 rows.
+    TWO COLUMNS, and the distinction matters:
+
+    `skip_reason` keeps its original semantics — first write wins, NULL-guarded.
+    It is NOT just a note: it is the LANE KEY. lane_policy reads it as `category`
+    (see strip_anchor_floor, `(skip_reason or "") == "low_score"`), so the router's
+    label must never be overwritten or lane routing silently changes.
+
+    `live_skip_reason` ALWAYS takes the latest value. Because the router has
+    already written the lane label by the time live evaluates an entry, the
+    NULL-guard made this function a no-op for every call live could possibly
+    trade — so live's own reasons were never recorded anywhere. That is why
+    `WHERE skip_reason = 'security_warning'` returns zero rows while the log
+    plainly shows live skipping on it, and why auditing live's skips has meant
+    grepping pm2 logs instead of running a query.
+
+    Needs a one-time migration; the write is best-effort and a missing column is
+    a silent no-op, the same contract as update_live_real_peak:
+
+        ALTER TABLE calls ADD COLUMN IF NOT EXISTS live_skip_reason text;
     """
     if not call_id:
         return
@@ -3348,7 +3365,20 @@ def set_call_skip_reason(call_id: int, reason: str) -> None:
             conn.commit()
     except Exception as e:
         safe_rollback()
-        print(f"[db] set_call_skip_reason failed call_id={call_id} reason={reason}: {e}")
+        print(f"[db] set_call_skip_reason skipped (call_id={call_id}): {e}")
+    # Separate transaction on purpose: a missing live_skip_reason column must not
+    # roll back the skip_reason write above.
+    try:
+        conn = get_conn()
+        safe_rollback()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE calls SET live_skip_reason = %s WHERE id = %s",
+                (reason, call_id),
+            )
+            conn.commit()
+    except Exception:
+        safe_rollback()   # pre-migration: silent, by design
 
 
 def get_call_skip_reason(call_id: int) -> str | None:
