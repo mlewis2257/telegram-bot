@@ -229,6 +229,29 @@ LIVE_NOROUTE_WARN_AT    = int(os.getenv("LIVE_NOROUTE_WARN_AT", "6"))  # mirrors
 #                                         leg HIGH, so a lagged feed saying "below entry"
 #                                         is conservative evidence that it really is.
 LIVE_PROTECTIVE_DD = float(os.getenv("LIVE_PROTECTIVE_DD", "0.20"))
+# Default OFF, i.e. security_flag='warning' is TRADED. Measured 2026-10-02 over 21d on
+# solwhaletrending / mcap 80-120k, against qsim which has no security gate:
+#
+#   unknown   245   -8.00%/SOL   rug 10.6%      <- blocked by entry_filter (z = 4.51)
+#   safe      212   +0.62%/SOL   rug  0.5%
+#   warning   160   +4.52%/SOL   rug  2.5%      <- the BEST group, and this gate blocked it
+#
+# I first kept this gate because 'warning' beating 'safe' is only z = 1.30. That was the
+# wrong test: the decision is not "is warning better than safe", it is "is warning worth
+# trading at all", and the null for that is ZERO. +4.52%/SOL on 160 trades survives
+# stripping 3 of its 11 banks (~1 sigma on the count) and stays at +0.167 SOL.
+#
+# The tail risk the flag warns about is PRICED, not hidden: qsim books consecutive
+# no-routes as a rug (QSIM_RUG_FAILS=6), so an unsellable honeypot lands in that 2.5%,
+# and a transfer-tax coin lands in realized PnL. And 'warning' is 160 of 617 in-band
+# positions on this lane -- blocking 26% of flow compounds the binding constraint, which
+# is coverage, not selection.
+#
+# Set true to restore the old behaviour. paper_trader_b keeps its own gate untouched so
+# its history stays continuous.
+LIVE_BLOCK_SECURITY_WARNING = (
+    os.getenv("LIVE_BLOCK_SECURITY_WARNING", "false").strip().lower() == "true"
+)
 _SELL_QUOTE_TTL   = float(os.getenv("LIVE_SELL_QUOTE_TTL", "2.5"))  # seconds
 LIVE_QUOTE_PEAK_PENDING_TTL_SECS = float(
     os.getenv(
@@ -337,6 +360,11 @@ try:
     print(_ef.describe())
 except Exception as _e:
     print(f"[live] entry filter import FAILED — every entry will be skipped: {_e}")
+# Printed loudly because the DEFAULT changed 2026-10-02: 'warning' used to be blocked and
+# is now traded. A default flip on real money has to be visible in the startup log.
+print("[live] security_flag=warning: "
+      + ("BLOCKED" if LIVE_BLOCK_SECURITY_WARNING else
+         "TRADED (measured +4.52%/SOL, rug 2.5%, n=160/21d — the best of the three)"))
 
 
 def _apply_live_exit_overlay(
@@ -671,18 +699,7 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
 
         # ── Security flag ──────────────────────────────────────────────────────
         security_flag = (token_data.get("security_flag") or token_onchain.get("security_flag"))
-        if security_flag == "warning":
-            # call_id was missing here while every other skip line carries it, so these
-            # skips could not be joined to anything — not in the DB (set_call_skip_reason
-            # was a no-op behind the lane label) and not in the log either. YPAID, a
-            # +0.0514 bank_2x, was only traceable because its symbol happened to be unique.
-            #
-            # LEFT IN PLACE DELIBERATELY, but the measurement does not support it:
-            # over 21d on this lane and band, 'warning' ran +4.52%/SOL at a 2.5% rug rate
-            # against 'safe' at +0.62% and 0.5%, and 'unknown' at -8.00% and 10.6%. The
-            # edge of 'warning' over 'safe' is only z = 1.30 so unblocking is not
-            # established — but 'unknown' is z = 4.51 and walks straight past this check,
-            # because it is a non-matching string. entry_filter blocks that one now.
+        if security_flag == "warning" and LIVE_BLOCK_SECURITY_WARNING:
             print(f"[live] {symbol} skipped — security={security_flag} call_id={call_id}")
             db.set_call_skip_reason(call_id, "security_warning")
             return False
