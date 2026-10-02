@@ -193,8 +193,29 @@ def check(mint: str | None, msg_mcap: float | None) -> tuple[bool, str]:
         return False, f"filter_error:{type(e).__name__}"
 
 
-def backtest(days: float) -> None:
-    """What the filter would have kept, on closed qsim positions."""
+def _live_channels() -> list[str]:
+    """Channel handles in LIVE_LANES — the only ones live can trade."""
+    try:
+        import lane_policy
+        return sorted({k[0] for k in lane_policy.LIVE_LANES})
+    except Exception:
+        return []
+
+
+def backtest(days: float, since: str | None = None,
+             all_lanes: bool = False) -> None:
+    """What the filter would have kept, on closed qsim positions.
+
+    DEFAULTS TO LIVE'S OWN LANES. Without that this measured both lanes including
+    solhousesignal, which LIVE_LANES does not hold, and reported it as what the
+    gate would do for live — 443 positions at -3.36%/SOL where live's actual slice
+    over the bank era was 143 at +2.70%. A verification tool describing a
+    population the thing being verified cannot trade is worse than no tool.
+
+    --since matters just as much. qsim ran NO bank overlay before 2026-09-23 (zero
+    bank exits in every group), so a 21-day window is two-thirds a different
+    strategy. Any comparison that straddles it is measuring the exit config.
+    """
     from psycopg2.extras import RealDictCursor
     # Mirror the ACTUAL config rather than a hardcoded rule: this previously always
     # required dev_sold = false even with REQUIRE_DEV_NOT_SOLD off, so --backtest
@@ -210,6 +231,20 @@ def backtest(days: float) -> None:
                      "<> ALL(%s)")
         params.append(sorted(BLOCK_SECURITY_FLAGS))
     pred = " AND ".join(conds)
+
+    where = ["qp.status = 'closed'"]
+    channels = [] if all_lanes else _live_channels()
+    if channels:
+        where.append("qp.channel_handle = ANY(%s)")
+        params.append(channels)
+    if since:
+        where.append("qp.entry_time >= %s::date")
+        params.append(since)
+        window = f"since {since}"
+    else:
+        where.append("qp.entry_time >= now() - (%s || ' days')::interval")
+        params.append(days)
+        window = f"over {days:g}d"
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -221,23 +256,33 @@ def backtest(days: float) -> None:
                    round((100.0 * sum(qp.sol_out - qp.sol_in)
                           / NULLIF(sum(qp.sol_in), 0))::numeric, 2)      AS pct_per_sol,
                    round(100.0 * avg((qp.pnl_pct > 0)::int)::numeric, 1) AS win_pct,
-                   round(100.0 * avg((qp.pnl_pct <= -90)::int)::numeric, 1) AS rug_pct
+                   round(100.0 * avg((qp.pnl_pct <= -90)::int)::numeric, 1) AS rug_pct,
+                   count(*) FILTER (WHERE qp.exit_reason LIKE '%%bank%%')  AS banks
             FROM qsim_positions qp
             JOIN calls  c ON c.id = qp.call_id
             JOIN tokens t ON t.id = qp.token_id
-            WHERE qp.status = 'closed'
-              AND qp.entry_time >= now() - (%s || ' days')::interval
+            WHERE {' AND '.join(where)}
             GROUP BY 1 ORDER BY 1
-        """, tuple(params + [days]))
+        """, tuple(params))
         rows = [dict(r) for r in cur.fetchall()]
+    _scope = ("ALL lanes" if all_lanes
+              else (", ".join(channels) if channels else "ALL lanes (no LIVE_LANES)"))
     print(describe())
-    print(f"\n  what it would have done over {days:g}d:\n")
+    print(f"\n  scope: {_scope}   {window}\n")
     print(f"  {'side':<9}{'n':>6}{'deployed':>10}{'pnl_sol':>10}"
-          f"{'%/SOL':>9}{'win%':>7}{'rug%':>7}")
+          f"{'%/SOL':>9}{'win%':>7}{'rug%':>7}{'banks':>7}")
     for r in rows:
         print(f"  {r['side']:<9}{r['n']:>6}{float(r['deployed']):>10.2f}"
               f"{float(r['pnl_sol']):>10.4f}{float(r['pct_per_sol']):>9.2f}"
-              f"{float(r['win_pct']):>7.1f}{float(r['rug_pct']):>7.1f}")
+              f"{float(r['win_pct']):>7.1f}{float(r['rug_pct']):>7.1f}"
+              f"{int(r['banks']):>7}")
+    # banks=0 on a row means the window predates the bank_2x overlay, so the result
+    # describes a different strategy. Say so rather than letting it pass as a number.
+    if any(int(r["banks"]) == 0 for r in rows):
+        print()
+        print("  WARNING: a row shows ZERO bank exits, so this window reaches back")
+        print("  before the bank_2x overlay (~2026-09-23). Re-run with")
+        print("  --since 2026-09-23 or the comparison measures the exit config.")
     # Describe the gate that actually ran. The old footer was hardcoded for a
     # mcap+dev_sold config and read "~4% of volume, n=70" under numbers that had
     # since become 387 and 23% — a stale caveat under correct figures is worse
@@ -264,18 +309,27 @@ def backtest(days: float) -> None:
         print("    dev_sold=false   3.7 sigma on rug rate, but NEGATIVE alone on pnl;")
         print("                     the mcap+dev_sold cell was n=70 and unproven.")
     print()
-    print("  This spans ALL lanes. LIVE_LANES holds solwhaletrending only, so the")
-    print("  slice live actually trades is smaller than KEPT shown here.")
+    print()
+    print("  Scope is LIVE_LANES by default — the slice live can actually trade.")
+    print("  --all-lanes widens it (useful for research, NOT for verifying live).")
 
 
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--backtest", type=float, metavar="DAYS")
+    ap.add_argument("--backtest", type=float, metavar="DAYS", default=21.0,
+                    nargs="?", const=21.0)
+    ap.add_argument("--since", metavar="YYYY-MM-DD",
+                    help="start date instead of --backtest DAYS. Use 2026-09-23 to "
+                         "stay inside the bank_2x era; earlier windows ran no bank "
+                         "overlay at all and measure a different strategy.")
+    ap.add_argument("--all-lanes", action="store_true",
+                    help="all channels, not just LIVE_LANES. Research only — it "
+                         "reports a population live cannot trade.")
     a = ap.parse_args()
     try:
-        if a.backtest:
-            backtest(a.backtest)
+        if a.backtest or a.since:
+            backtest(a.backtest, since=a.since, all_lanes=a.all_lanes)
         else:
             print(describe())
     finally:
