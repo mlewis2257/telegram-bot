@@ -946,7 +946,13 @@ def _effective_fill_mcap(
     pump.fun 1e9 default. Returns None on any failure — must never block a trade.
     """
     try:
+        # Every failure path below SAYS WHY. Three of them used to return None silently,
+        # which left qsim's "entry mcap calc failed" skip (397 lost opens in the log)
+        # pointing at five possible causes with no way to tell them apart. A skip you
+        # cannot attribute is a skip you cannot fix.
         if not mint or not tokens_raw or not sol_amount or sol_amount <= 0:
+            print(f"[live] effective mcap: bad inputs mint={bool(mint)} "
+                  f"tokens_raw={tokens_raw} sol_amount={sol_amount}")
             return None
         supply_whole = None
         try:
@@ -963,6 +969,8 @@ def _effective_fill_mcap(
             supply_whole = 1_000_000_000.0  # pump.fun standard total supply
         sol_usd = data_fetcher.get_sol_price_usd()
         if not sol_usd:
+            print(f"[live] effective mcap: no SOL/USD price for {mint[:8]} "
+                  f"— every fill anchor fails while this is down")
             return None
         # decimals=0 is a FAILURE READING, not a valid one. The swap result can carry an
         # explicit 0 (ZPAD, 2026-09-29) and `0 is not None` let it through, so 10**0
@@ -973,6 +981,9 @@ def _effective_fill_mcap(
         dec = decimals if (decimals is not None and decimals > 0) else 6
         tokens_whole = tokens_raw / (10 ** dec)
         if tokens_whole <= 0 or supply_whole <= 0:
+            print(f"[live] effective mcap: nonpositive for {mint[:8]} "
+                  f"tokens_whole={tokens_whole} supply_whole={supply_whole} "
+                  f"(decimals={decimals} -> {dec})")
             return None
         # INVARIANT: a 0.05 SOL buy cannot acquire more tokens than the token has. When
         # the exponent is wrong the two sides disagree by orders of magnitude, which is
