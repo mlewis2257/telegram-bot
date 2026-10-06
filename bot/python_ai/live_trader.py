@@ -21,6 +21,7 @@ To re-enable: delete the flag file and restart.
 """
 
 import asyncio
+import json
 import os
 import sys
 import time
@@ -39,6 +40,7 @@ import data_fetcher
 import peak_guard
 import position_alerts
 import wallet as _wallet
+import rpc_pool
 import lane_policy
 from paper_trader import (
     TAKE_PROFIT_5X,
@@ -491,6 +493,51 @@ def _rpc_url() -> str:
     return os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
 
+def _sol_balance_with_failover() -> float:
+    """Wallet SOL balance, tried across every configured RPC endpoint.
+
+    This check runs before EVERY live buy and used to be pinned to SOLANA_RPC_URL. When
+    that one Helius key ran out of monthly credits (2026-10-06, -32429 "max usage
+    reached") the call raised, the guard read it as "balance check failed", and live
+    stopped entering entirely while the other configured keys sat unused. rpc_pool
+    already rotates and cools down exhausted keys for the price path; the one call that
+    gates real entries was the one not using it.
+
+    Order: the pool's next healthy endpoint first, then every other configured endpoint
+    INCLUDING ones in cooldown — a cooled key is a worse bet, not a forbidden one, and
+    declining to enter because we skipped an endpoint that would have answered is the
+    failure this exists to prevent. SOLANA_RPC_URL is the last resort when no pool is
+    configured at all.
+
+    A genuine low balance is NOT an RPC failure and is raised at once: another endpoint
+    cannot add SOL. wallet.get_sol_balance signals it with ValueError — but so does a
+    non-JSON response body (JSONDecodeError subclasses ValueError), which IS an endpoint
+    failure, so that one is caught first.
+    """
+    order: list[str] = []
+    first = rpc_pool.http_url()
+    for u in ([first] if first else []) + rpc_pool.endpoints():
+        if u and u not in order:
+            order.append(u)
+    if not order:
+        order = [_rpc_url()]
+
+    last_err: Exception | None = None
+    for url in order:
+        try:
+            return _wallet.get_sol_balance(url)
+        except json.JSONDecodeError as e:
+            last_err = e
+            rpc_pool.penalize(url)
+        except ValueError:
+            raise
+        except Exception as e:
+            last_err = e
+            rpc_pool.penalize(url)
+    raise RuntimeError(f"all {len(order)} RPC endpoint(s) failed; last: "
+                       f"{type(last_err).__name__} {str(last_err)[:120]}")
+
+
 # ── Circuit breaker ────────────────────────────────────────────────────────────
 
 async def _trip_circuit_breaker(loss: float, limit: float, kind: str = "daily") -> None:
@@ -645,7 +692,7 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         # ── Guard 6: SOL balance (allowlist per-lane size overrides the default when set) ──
         size = float(_lane.get("size") or _position_size(label))
         try:
-            balance = _wallet.get_sol_balance(_rpc_url())
+            balance = _sol_balance_with_failover()
             if balance < size + 0.05:
                 print(
                     f"[live] {symbol} skipped — SOL balance {balance:.4f}"
