@@ -1,6 +1,5 @@
 -- migrate_v30.sql
--- Capture TWO changes that were applied to production by hand on 2026-10-02/03 and never
--- committed. Without this file, a rebuild from the repo lands on migrate_v28's constraint,
+-- Capture changes that were applied to production by hand and never committed. Without this file, a rebuild from the repo lands on migrate_v28's constraint,
 -- which contains NO bank reasons at all — so live would sell on-chain, fail the DB close,
 -- and strand every bank exit at status='closing'. That exact failure happened once (ZPAD,
 -- call_id 296124) and the constraint rejecting the write is the ONLY reason the underlying
@@ -12,8 +11,16 @@
 -- ── 1. exit_reason: add every LIVE_EXIT_OVERLAYS key ─────────────────────────────────
 -- Sourced from live_trader.LIVE_EXIT_OVERLAYS plus the base reasons from v28. 'rug' is
 -- also written by the collapse guard (live_trader check_live_exits, basis=feed_protective).
--- NULL is allowed explicitly: v28's IN (...) form rejected NULL, which blocked the row
--- from ever being opened with exit_reason unset.
+-- NULL is spelled out for readability only: a CHECK passes on NULL, so v28 allowed it too.
+--
+-- ONE TRANSACTION, on purpose. Each constraint is a DROP followed by an ADD, and this list
+-- was inferred from the code, not read from production. If an existing row holds a value
+-- that is not listed, the ADD fails — and without the transaction the DROP has already
+-- committed, leaving the column with NO constraint. Inside BEGIN/COMMIT the failure rolls
+-- the DROP back and production is untouched. Run the pre-flight queries at the bottom
+-- first and add any value they show that is missing here.
+
+BEGIN;
 
 ALTER TABLE trading_positions
 DROP CONSTRAINT IF EXISTS trading_positions_exit_reason_check;
@@ -36,7 +43,9 @@ CHECK (exit_reason IS NULL OR exit_reason = ANY (ARRAY[
     'lock_or_bank_1p3x_1p1x','lock_or_bank_1p4x_1p15x','lock_or_bank_1p5x_1p2x',
     'lock_or_bank_1p75x_1p35x','lock_or_bank_2x_1p55x',
     -- no-bounce stop (live_trader LIVE_NO_BOUNCE_STOP_ENABLED)
-    'no_bounce_stop'
+    'no_bounce_stop',
+    -- runner window floor (live_trader LIVE_RUNNER_WINDOW_ENABLED, off by default)
+    'runner_floor_stop'
 ]::text[]));
 
 -- ── 2. calls.live_skip_reason ────────────────────────────────────────────────────────
@@ -79,10 +88,20 @@ CHECK (skip_reason IS NULL OR skip_reason = ANY (ARRAY[
     -- live entry path (live_trader), missing from v29
     'entry_filter','entry_quote_429','entry_roundtrip_429','entry_quote_no_route',
     -- entry_quality gate reasons
-    'entry_exec_ratio','entry_roundtrip'
+    'entry_exec_ratio','entry_roundtrip',
+    -- dev_gate block on the live path (only written in enforce mode)
+    'dev_gate'
 ]::text[]));
 
--- ── Verify ───────────────────────────────────────────────────────────────────────────
+COMMIT;
+
+-- ── Pre-flight (run BEFORE this file; compare against the two lists above) ───────────
+-- SELECT pg_get_constraintdef(oid) FROM pg_constraint
+--  WHERE conname IN ('trading_positions_exit_reason_check','calls_skip_reason_check');
+-- SELECT DISTINCT exit_reason FROM trading_positions;
+-- SELECT DISTINCT skip_reason FROM calls;
+--
+-- ── Verify (after) ───────────────────────────────────────────────────────────────────
 -- SELECT pg_get_constraintdef(oid) FROM pg_constraint
 --  WHERE conname IN ('trading_positions_exit_reason_check','calls_skip_reason_check');
 -- SELECT column_name FROM information_schema.columns
@@ -90,5 +109,6 @@ CHECK (skip_reason IS NULL OR skip_reason = ANY (ARRAY[
 --
 -- On the VPS, TablePlus connects as the app user and cannot ALTER. Run as:
 --   sudo -u postgres psql -d solana_signals -v ON_ERROR_STOP=1 -f migrate_v30.sql
--- Production already has items 1 and 2 applied by hand; all three statements are
--- idempotent, so re-running is safe and only item 3 should actually change anything.
+-- Production is believed to have items 1 and 2 applied by hand already, but that has not
+-- been read back from the database — the pre-flight above is what confirms it. The file
+-- is idempotent and transactional: it either applies whole or changes nothing.
