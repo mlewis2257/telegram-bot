@@ -61,8 +61,14 @@ import db  # noqa: E402
 ENABLED = os.getenv("LIVE_ENTRY_FILTER_ENABLED", "false").strip().lower() == "true"
 MCAP_MIN = float(os.getenv("LIVE_ENTRY_MCAP_MIN", "80000"))
 MCAP_MAX = float(os.getenv("LIVE_ENTRY_MCAP_MAX", "120000"))
+# DEFAULT false, matching both the running config and the evidence. dev_sold=false moves
+# RUGS ONLY (2.8% vs 8.8%, 3.7 sigma) but is NEGATIVE alone on pnl (-0.45%), and the
+# mcap+dev_sold cell that looked like +8.05%/SOL was n=70 with each ingredient negative on
+# its own — the textbook overfitting signature. It also cut volume to ~4% of the book on a
+# lane where coverage is the binding constraint. Defaulted to true until 2026-10-05, which
+# meant a lost .env line would have silently switched live to an unproven n=70 cell.
 REQUIRE_DEV_NOT_SOLD = (
-    os.getenv("LIVE_ENTRY_REQUIRE_DEV_NOT_SOLD", "true").strip().lower() == "true"
+    os.getenv("LIVE_ENTRY_REQUIRE_DEV_NOT_SOLD", "false").strip().lower() == "true"
 )
 # Block security_flag = 'unknown'. Measured 2026-10-02 on live's exact lane and band
 # (solwhaletrending, mcap 80-120k, 21d of closed qsim positions, which have NO security
@@ -85,67 +91,54 @@ REQUIRE_DEV_NOT_SOLD = (
 # 'warning' is deliberately left to live_trader's existing gate. Its apparent edge over
 # 'safe' is only z = 1.30 on bank rate, so unblocking it is not established; this change
 # rests on the 4.51 sigma rug finding alone.
-# Comma-separated security_flag values to BLOCK. One list, one place: previously
-# live_trader blocked 'warning' and entry_filter blocked 'unknown', which is exactly how
-# the worst group ended up traded and the best group blocked. entry_filter is now the
-# single authority. Use the literal token "null" to block rows with no flag; empty string
-# blocks nothing.
+# Comma-separated security_flag values to BLOCK, in-band. One list, one place: live_trader
+# used to block 'warning' while entry_filter blocked 'unknown', which is exactly how the
+# worst group ended up traded and the best group blocked. entry_filter is the single
+# authority. Token "null" blocks rows with no flag; empty string blocks nothing.
 #
-# DEFAULT 'safe', which looks backwards and is not. Measured on live's lane and band
-# (solwhaletrending, mcap 80-120k) over the bank_2x era only, since the pre-09-23 window
-# has ZERO banks in every group and contaminated the first version of this analysis:
+# DEFAULTS ARE THE SETTLED CONFIG (2026-10-04). They used to be the LOSING config — block
+# safe, a 15-minute age exemption, out-of-band warning allowed — which on 2026-10-04 cost
+# 0.22 SOL and 4 of the 5 banks live missed, turning a +0.10 day into -0.12. Three .env
+# lines were the only thing holding the right behaviour, and a .env append has silently
+# dropped a line before. Code defaults must not be a config one bad append away from a
+# known-losing state.
 #
-#   IN   warning  67   +4.80%/SOL   bank 16.4%   win 31.3%
-#   IN   unknown  76   +0.85%       bank 22.4%   win 36.8%
-#   IN   safe     78   -8.44%       bank 11.5%   win 26.9%   rug 0.0%
+# WHY 'safe' ONLY. Live's own fills and qsim agree over 7d on live's lane and band:
 #
-# `safe` has the LOWEST bank rate and the WORST pnl while never rugging once. This book is
-# carried entirely by banks, so rug avoidance is not what it needs — the security scanner
-# is doing its job perfectly and its job is the wrong one.
+#            live (41 fills)          qsim in-band swt (7d)
+#   safe     20   +25.64%/SOL         63   +13.69%   bank 23.8%
+#   unknown  14   -14.09%             37    -0.89%   bank 21.6%
+#   warning   7   -27.04%  0 banks    44    -0.69%   bank 18.2%
 #
-# It is not an age proxy, which was the obvious confound and was checked: within the <15m
-# bucket that holds 80% of in-band flow, average ages are 3.5 / 4.9 / 3.4 minutes across
-# safe / unknown / warning, and the ordering STILL separates (-13.02 / -1.02 / +3.93).
-# Within that controlled stratum safe banks 8.8% against 18.2% for the other two, z = 1.83.
+# Live's 'warning' was 0-for-7 — no banks, 0% win rate.
 #
-# The ordering has replicated across six slices: pooled, IN band, out band, 7d, 10d, and
-# a single day where all three were positive and safe was still last.
-#
-# NOT blocked, deliberately: 'safe' positions older than 15m run +3.97%/SOL at a 19.0%
-# bank rate, so the real effect may be safe-AND-young. That cell is n=21, and a two-
-# variable conditional rule fitted to 221 trades is the same overfitting signature as the
-# mcap+dev_sold cell at n=70. One variable, the one that replicated.
-_raw_block = os.getenv("LIVE_ENTRY_BLOCK_SECURITY_FLAGS", "safe")
+# AND IT IS NOT STABLE. 'safe' swung -8.44% (Sep 23 -> Oct 2) to +13.69% (Sep 27 -> Oct 4)
+# on overlapping windows; out-of-band swung -15.59% (n=20) to +26.03% (n=13). This is the
+# best available read, NOT a proven edge. I reversed on this column four times in one
+# session before landing here — see the memory note security-flag-trade-safe-only before
+# re-opening it, and prefer live's fills over qsim when they disagree on the same lane.
+_raw_block = os.getenv("LIVE_ENTRY_BLOCK_SECURITY_FLAGS", "warning,unknown")
 BLOCK_SECURITY_FLAGS = {s.strip().lower() for s in _raw_block.split(",") if s.strip()}
 
-# Age exemption for an in-band blocked flag. 'safe' underperforms specifically when YOUNG:
-#   <15m   safe 57 trades  -13.02%/SOL  bank  8.8%
-#   >=15m  safe 21 trades   +3.97%/SOL  bank 19.0%
-# 0 disables the exemption (block the flag at any age). NULL age never qualifies — if we
-# cannot establish the coin is old, the measured-bad young case is the default.
-SAFE_MIN_AGE_MIN = float(os.getenv("LIVE_ENTRY_SAFE_MIN_AGE_MIN", "15"))
+# Age exemption for an in-band blocked flag. DEFAULT 0 = OFF. 'safe' older than 15m did
+# read +3.97%/SOL at a 19.0% bank rate against -13.02% for younger, but that cell is n=21,
+# and on 2026-10-04 four safe-young coins banked at 2.0x-3.26x while this exemption was
+# blocking them. A band x flag x age rule fitted to ~375 positions with cells at 11 and 21
+# is the overfitting signature already flagged on the mcap+dev_sold cell at n=70.
+SAFE_MIN_AGE_MIN = float(os.getenv("LIVE_ENTRY_SAFE_MIN_AGE_MIN", "0"))
 
-# Flags tradeable OUTSIDE the mcap band. Empty = out-of-band blocked entirely (the band
-# alone decides), which is what this did before.
-#   out  warning  11 trades  +33.13%/SOL  bank 27.3%
-#   out  unknown 122         -12.81%      bank 21.3%
-#   out  safe     20         -15.59%      bank  5.0%
-_raw_out = os.getenv("LIVE_ENTRY_OUT_BAND_ALLOW_FLAGS", "warning")
+# Flags tradeable OUTSIDE the mcap band. DEFAULT EMPTY = out-of-band blocked; the band
+# alone decides. Out-of-band 'warning' read +33.13%/SOL but that is ELEVEN trades carried
+# by three banks, and its avg mcap (185,924) sits in the 180-300k bucket that measured
+# -12.84%/SOL on 368 trades. The band is 5.3 sigma on ~3,300 trades — the best-measured
+# thing in this project. Do not widen it on 11 trades.
+_raw_out = os.getenv("LIVE_ENTRY_OUT_BAND_ALLOW_FLAGS", "")
 OUT_BAND_ALLOW_FLAGS = {s.strip().lower() for s in _raw_out.split(",") if s.strip()}
 
-# SIZE OF THE EVIDENCE, stated because it is small and the rule is not:
-# the band and the in-band 'safe' block rest on n=78-221 and replicated orderings. The
-# two refinements above do NOT. out-band warning is ELEVEN trades carried by three banks,
-# and the safe age exemption is twenty-one. A band x flag x age rule fitted to ~375
-# positions with cells at 11 and 21 is the overfitting signature flagged on the
-# mcap+dev_sold cell at n=70 -- each cell was selected because of the sign it happened to
-# show, and two or three of six such cells flip on noise alone. Raised twice, and the
-# operator's call; these are the knobs to revert first if forward results disagree.
-
 # Date the bank_2x overlay went live. Positions before it took NO bank exit, so any
-# window reaching back past it is comparing two different strategies. --backtest warns
-# when the window starts earlier; see the note at that check for why the first version
-# of the warning (zero-bank rows) missed the case that matters.
+# window reaching back past it compares two different strategies. --backtest warns when
+# the window starts earlier; see the note at that check for why the first version of the
+# warning (zero-bank rows) missed the case that matters.
 from datetime import date as _date  # noqa: E402
 OVERLAY_START = _date.fromisoformat(
     os.getenv("QSIM_BANK_OVERLAY_START", "2026-09-23"))
@@ -243,9 +236,13 @@ def check(mint: str | None, msg_mcap: float | None) -> tuple[bool, str]:
             # Age exemption: the block is measured on YOUNG coins of this flag.
             if SAFE_MIN_AGE_MIN > 0 and age is not None and age >= SAFE_MIN_AGE_MIN:
                 pass
-            else:
+            elif SAFE_MIN_AGE_MIN > 0:
+                # Only mention age when the exemption is actually armed, otherwise the
+                # reason reads as though age was the deciding factor when it was not.
                 _why = "age unknown" if age is None else f"age {age:.0f}m"
-                return False, f"security_flag={_sec} ({_why})"
+                return False, f"security_flag={_sec} ({_why} < {SAFE_MIN_AGE_MIN:g}m)"
+            else:
+                return False, f"security_flag={_sec}"
 
         if REQUIRE_DEV_NOT_SOLD:
             if ds is None:
@@ -393,9 +390,15 @@ def backtest(days: float, since: str | None = None,
     print("    mcap band        replicated in both halves on three metrics, and")
     print("                     out of sample at 5.3 sigma on rug rate (n~3300).")
     if BLOCK_SECURITY_FLAGS:
-        print("    security list    'safe' has the LOWEST bank rate and WORST pnl while")
-        print("                     never rugging; ordering replicated across six slices")
-        print("                     and survives the age control (z = 1.83 within <15m).")
+        # Config-driven, not hardcoded prose. The previous text argued for blocking
+        # 'safe' and kept printing that after the config inverted to block
+        # warning+unknown — a stale rationale under live numbers reads as though it
+        # was checked.
+        print(f"    security list    blocking {','.join(sorted(BLOCK_SECURITY_FLAGS))}.")
+        print("                     Live's 41 fills and qsim's 7d agree 'safe' is best")
+        print("                     (+25.64%/SOL live, +13.69% qsim; warning 0-for-7 on")
+        print("                     live). BUT safe's sign FLIPS across overlapping")
+        print("                     windows (-8.44% -> +13.69%) — best read, not proven.")
     if REQUIRE_DEV_NOT_SOLD:
         print("    dev_sold=false   3.7 sigma on rug rate, but NEGATIVE alone on pnl;")
         print("                     the mcap+dev_sold cell was n=70 and unproven.")

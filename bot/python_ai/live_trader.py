@@ -369,11 +369,18 @@ try:
     print(_ef.describe())
 except Exception as _e:
     print(f"[live] entry filter import FAILED — every entry will be skipped: {_e}")
-# Printed loudly because the DEFAULT changed 2026-10-02: 'warning' used to be blocked and
-# is now traded. A default flip on real money has to be visible in the startup log.
-print("[live] security_flag=warning: "
-      + ("BLOCKED" if LIVE_BLOCK_SECURITY_WARNING else
-         "TRADED (measured +4.52%/SOL, rug 2.5%, n=160/21d — the best of the three)"))
+# This gate is LEGACY and off; entry_filter's list is the single authority and currently
+# blocks 'warning' in-band. The old text here claimed warning was "TRADED … the best of
+# the three", which contradicted the running config and would mislead anyone reading the
+# startup log. Say what this switch does and point at the real one.
+print("[live] security_flag=warning (legacy gate): "
+      + ("BLOCKED HERE" if LIVE_BLOCK_SECURITY_WARNING else
+         "not blocked here — entry_filter's list decides, see the line above"))
+# The hard stop is the single most consequential exit number and it is SILENT when
+# unset: with no LIVE_HARD_STOP_PCT the config default applies (-35%), not the -20% every
+# analysis in this project assumes. Always print it.
+print(f"[live] hard_stop in force: -{_LIVE_EXIT_CONFIG.hard_stop_pct*100:.0f}%"
+      f"{'  (LIVE_HARD_STOP_PCT override)' if _hs_env else '  (config default — no override set)'}")
 
 
 def _apply_live_exit_overlay(
