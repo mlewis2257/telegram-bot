@@ -46,7 +46,19 @@ FAILOVER_STALE_GRACE_SECONDS = 30.0
 DEX_RATE_LIMIT_COOLDOWN_SECONDS = 5.0
 DEX_MINT_FAILURE_BASE_COOLDOWN_SECONDS = 10.0
 DEX_MINT_FAILURE_MAX_COOLDOWN_SECONDS = 60.0
-SUPPLY_CACHE_TTL = 300  # 5 minutes — meme coin supply rarely changes
+# Token supply is asked of the RPC every time a market cap is computed from a Jupiter
+# price, which is every mint on every monitor / shadow-monitor / exit sweep. At the old
+# 5-minute TTL each watched mint cost 288 getTokenSupply calls a day PER PROCESS, for a
+# number that on a pump.fun token is fixed at mint and only ever falls through a burn.
+# With a few hundred mints on watch that is the steady drain on the Helius quota that
+# the bot itself (as opposed to the research backfills) was responsible for. 24h cuts it
+# 288-fold; the cost is that a burn is reflected up to a day late in the FEED mcap, which
+# no live exit decision reads (those run off sell quotes).
+SUPPLY_CACHE_TTL = float(os.getenv("SUPPLY_CACHE_TTL", "86400"))
+# A failed lookup used to be retried on the very next price poll, so a dead key or an
+# unreadable mint was hammered once per sweep. Remember the miss briefly instead.
+SUPPLY_NEG_CACHE_TTL = float(os.getenv("SUPPLY_NEG_CACHE_TTL", "300"))
+SUPPLY_CACHE_MAX = int(os.getenv("SUPPLY_CACHE_MAX", "20000"))
 HELIUS_TX_MAX_PRICE_RATIO = float(os.getenv("HELIUS_TX_MAX_PRICE_RATIO", "3.0"))
 # Sticky last-known-good mcap TTL. The helius_tx sanity check normally validates a
 # computed mcap against the fresh price cache, but that cache goes cold during a
@@ -71,6 +83,7 @@ _price_cache: dict[str, tuple[dict, float]] = {}   # mint → (result, monotonic
 _last_good_mcap: dict[str, tuple[float, float]] = {}  # mint → (mcap, monotonic_time)
 _sol_price_cache: tuple[float, float] | None = None   # (price_usd, monotonic_time)
 _supply_cache: dict[str, tuple[int, int, float]] = {}  # mint → (supply, decimals, monotonic_time)
+_supply_miss: dict[str, float] = {}                    # mint → monotonic time of last failed lookup
 _dex_rate_limited_until = 0.0
 _dex_mint_cooldowns: dict[str, float] = {}   # mint -> monotonic deadline
 _dex_mint_failures: dict[str, int] = {}      # mint -> consecutive Dex failure count
@@ -639,11 +652,22 @@ def _fetch_token_supply_helius(mint: str) -> tuple:
     Results are cached for SUPPLY_CACHE_TTL seconds.
     Returns (amount_raw, decimals) or (None, None) on any failure.
     """
+    now = time.monotonic()
     cached = _supply_cache.get(mint)
-    if cached and (time.monotonic() - cached[2]) < SUPPLY_CACHE_TTL:
+    if cached and (now - cached[2]) < SUPPLY_CACHE_TTL:
         return cached[0], cached[1]
+    missed = _supply_miss.get(mint)
+    if missed is not None and (now - missed) < SUPPLY_NEG_CACHE_TTL:
+        return None, None
     if not rpc_pool.count() and not SOLANA_RPC_URL:
         return None, None
+
+    def _miss():
+        if len(_supply_miss) >= SUPPLY_CACHE_MAX:
+            _supply_miss.clear()
+        _supply_miss[mint] = time.monotonic()
+        return None, None
+
     try:
         resp = _rpc_post({
             "jsonrpc": "2.0",
@@ -652,18 +676,21 @@ def _fetch_token_supply_helius(mint: str) -> tuple:
             "params":  [mint],
         })
         if not resp or resp.status_code != 200:
-            return None, None
+            return _miss()
         data  = resp.json()
         value = (data.get("result") or {}).get("value") or {}
         amount   = value.get("amount")
         decimals = value.get("decimals")
         if amount is None or decimals is None:
-            return None, None
+            return _miss()
+        if len(_supply_cache) >= SUPPLY_CACHE_MAX:
+            _supply_cache.clear()          # crude bound; a refill costs one call per mint
         _supply_cache[mint] = (int(amount), int(decimals), time.monotonic())
+        _supply_miss.pop(mint, None)
         return int(amount), int(decimals)
     except Exception as e:
         log.warning(f"[fetcher] Helius supply fetch failed for {mint[:8]}...: {e}")
-        return None, None
+        return _miss()
 
 
 def fetch_top_holders_helius(mint: str, top_n: int = 20) -> list[dict]:
@@ -1223,7 +1250,7 @@ def get_mcap_blended(mint: str, jup_price_usd: float) -> Optional[float]:
 
     This is the SAME single-source computation _fetch_jupiter_price uses; it
     just reuses an already-fetched batch price so no extra price call is needed.
-    Supply is served from a 5-minute cache (_fetch_token_supply_helius), so this
+    Supply is served from a long-lived cache (_fetch_token_supply_helius), so this
     is usually free.
 
     IMPORTANT: do NOT scale a cached mcap by a cross-source price ratio. The
