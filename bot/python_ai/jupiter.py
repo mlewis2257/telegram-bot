@@ -15,6 +15,8 @@ Falls back to sole-signer construction if populate is unavailable (solders < 0.1
 Environment
 -----------
 JUPITER_API_KEY            — optional; sent as x-api-key header if set
+JUPITER_API_KEY_2          — optional; if set, quotes and swaps use THIS key so they have
+                             their own quota, separate from price polling
 LIVE_TRADING_ENABLED       — must be the string 'true' to execute real swaps
 SOLANA_NETWORK             — 'mainnet' or 'devnet' (default: mainnet)
 SOLANA_RPC_URL             — Solana RPC endpoint for balance/token checks
@@ -63,9 +65,21 @@ def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         headers = {"Content-Type": "application/json"}
-        api_key = os.getenv("JUPITER_API_KEY")
+        # Quotes and real swaps can run on their OWN key. Jupiter's quota is 10 requests
+        # per ~10s PER KEY and is shared across price/v3 and swap/v2 (measured 2026-10-06:
+        # one counter climbed across a quote, three price calls and a quote). On a single
+        # key the price polling in data_fetcher (20-44 calls/min) was filling the window
+        # that qsim's quotes, live's quotes AND live's real buys and sells all need.
+        # JUPITER_API_KEY_2 keeps those off the price feed's bucket; unset, it falls
+        # back to JUPITER_API_KEY and behaves exactly as before.
+        swap_key = os.getenv("JUPITER_API_KEY_2", "").strip()
+        api_key = swap_key or os.getenv("JUPITER_API_KEY")
         if api_key:
             headers["x-api-key"] = api_key
+        print("[jupiter] swap/quote client key: "
+              + ("JUPITER_API_KEY_2 (own quota)" if swap_key
+                 else "JUPITER_API_KEY (SHARED with price polling)" if api_key
+                 else "none (keyless)"))
         _client = httpx.AsyncClient(headers=headers, timeout=30.0)
     return _client
 

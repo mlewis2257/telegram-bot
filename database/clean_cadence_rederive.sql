@@ -28,6 +28,9 @@
 -- comparison measures the config change instead. Frozen config as of 2026-10-05:
 -- solwhaletrending / mcap 80-120k / security_flag safe only / Mon-Thu+Sun / bank_2x.
 
+-- No pager: psql otherwise hands wide output to `less`, which looks like a hang.
+\pset pager off
+
 \echo '=============================================================='
 \echo 'STEP 0 — CADENCE GATE. If this fails, everything below is void.'
 \echo '=============================================================='
