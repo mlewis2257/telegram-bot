@@ -96,6 +96,8 @@ _ws_http = (os.getenv("WS_RPC_URL") or os.getenv("SOLANA_RPC_URL")
 if not _ws_http:
     raise RuntimeError("No RPC endpoint for ws_monitor (set SOLANA_RPC_URL or WS_RPC_URL)")
 WS_URL = _ws_http.replace("https://", "wss://").replace("http://", "ws://")
+_WS_EXPLICIT = bool(os.getenv("WS_RPC_URL"))
+_ws_current  = [WS_URL]   # the endpoint the socket is on; see connect_with_retry
 
 HEARTBEAT_INTERVAL    = 30    # seconds between pings
 POLL_INTERVAL         = 2     # seconds between new-position polls
@@ -649,7 +651,7 @@ async def connect_with_retry() -> None:
     poll_task = asyncio.create_task(poll_new_positions(ws_ref))
     try:
         while True:
-            ws_url = WS_URL   # pinned; HTTP rotation handled separately by rpc_pool
+            ws_url = _ws_current[0]   # sticky; only moved off a quota-exhausted key
             try:
                 async with websockets.connect(
                     ws_url,
@@ -685,6 +687,19 @@ async def connect_with_retry() -> None:
                 # exhausted one.
                 if rpc_pool.is_quota_error(getattr(e, "status_code", None), repr(e)):
                     rpc_pool.penalize(ws_url)
+                    # The comment above this block always promised a rotation, but ws_url
+                    # was re-read from the pinned WS_URL every loop, so an exhausted key
+                    # was retried every 60s forever (2026-10-06: per-swap exits down for
+                    # hours with a working key configured). Move ONLY on a quota error —
+                    # the pin exists because wss support is plan-specific, and a key that
+                    # is out of credits serves no plan at all. An explicit WS_RPC_URL is
+                    # an operator decision and is never overridden.
+                    nxt = rpc_pool.ws_url()
+                    if not _WS_EXPLICIT and nxt and nxt != ws_url:
+                        _ws_current[0] = nxt
+                        backoff = 1
+                        print(f"[ws_monitor] {ws_url[:40]}... is out of quota — "
+                              f"switching websocket to {nxt[:40]}...")
                 print(f"[ws_monitor] disconnected: {e!r} — retrying in {backoff}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX)

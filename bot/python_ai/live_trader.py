@@ -21,7 +21,6 @@ To re-enable: delete the flag file and restart.
 """
 
 import asyncio
-import json
 import os
 import sys
 import time
@@ -490,52 +489,21 @@ async def _entry_quote_retry(make_call, what: str, symbol: str, call_id: int):
 
 
 def _rpc_url() -> str:
-    return os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+    # Pool first: it skips endpoints that recently reported quota exhaustion. Falls back
+    # to the single env URL when no pool is configured.
+    return rpc_pool.http_url() or os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
 
 def _sol_balance_with_failover() -> float:
-    """Wallet SOL balance, tried across every configured RPC endpoint.
+    """Wallet SOL balance across every configured RPC endpoint (wallet.get_sol_balance_any).
 
     This check runs before EVERY live buy and used to be pinned to SOLANA_RPC_URL. When
     that one Helius key ran out of monthly credits (2026-10-06, -32429 "max usage
     reached") the call raised, the guard read it as "balance check failed", and live
-    stopped entering entirely while the other configured keys sat unused. rpc_pool
-    already rotates and cools down exhausted keys for the price path; the one call that
-    gates real entries was the one not using it.
-
-    Order: the pool's next healthy endpoint first, then every other configured endpoint
-    INCLUDING ones in cooldown — a cooled key is a worse bet, not a forbidden one, and
-    declining to enter because we skipped an endpoint that would have answered is the
-    failure this exists to prevent. SOLANA_RPC_URL is the last resort when no pool is
-    configured at all.
-
-    A genuine low balance is NOT an RPC failure and is raised at once: another endpoint
-    cannot add SOL. wallet.get_sol_balance signals it with ValueError — but so does a
-    non-JSON response body (JSONDecodeError subclasses ValueError), which IS an endpoint
-    failure, so that one is caught first.
+    stopped entering entirely while other configured keys sat unused. jupiter.buy_token
+    makes the same check a second time and shares the same helper.
     """
-    order: list[str] = []
-    first = rpc_pool.http_url()
-    for u in ([first] if first else []) + rpc_pool.endpoints():
-        if u and u not in order:
-            order.append(u)
-    if not order:
-        order = [_rpc_url()]
-
-    last_err: Exception | None = None
-    for url in order:
-        try:
-            return _wallet.get_sol_balance(url)
-        except json.JSONDecodeError as e:
-            last_err = e
-            rpc_pool.penalize(url)
-        except ValueError:
-            raise
-        except Exception as e:
-            last_err = e
-            rpc_pool.penalize(url)
-    raise RuntimeError(f"all {len(order)} RPC endpoint(s) failed; last: "
-                       f"{type(last_err).__name__} {str(last_err)[:120]}")
+    return _wallet.get_sol_balance_any(_rpc_url())
 
 
 # ── Circuit breaker ────────────────────────────────────────────────────────────

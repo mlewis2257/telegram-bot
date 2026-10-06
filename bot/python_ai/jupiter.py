@@ -91,7 +91,10 @@ def _is_devnet() -> bool:
 
 
 def _rpc_url() -> str:
-    return os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+    # Pool first: it skips endpoints that recently reported quota exhaustion. Falls back
+    # to the single env URL when no pool is configured.
+    import rpc_pool
+    return rpc_pool.http_url() or os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
 
 # ── Core API calls ─────────────────────────────────────────────────────────────
@@ -295,11 +298,19 @@ async def buy_token(
         return await _mock_buy_response(mint_address, lamports)
 
     import wallet as _wallet
+    # Reserve check. Tried across every RPC endpoint, and an RPC OUTAGE is not a reason to
+    # refuse the buy: this used to call one pinned endpoint and catch only ValueError, so
+    # an exhausted Helius key raised straight out of buy_token and killed every live entry
+    # (2026-10-06) even though live_trader had already verified the balance moments
+    # earlier. Only a confirmed low balance (ValueError) blocks.
     try:
-        _wallet.get_sol_balance(_rpc_url())
+        _wallet.get_sol_balance_any(_rpc_url())
     except ValueError as e:
         print(f"[jupiter] buy_token skipped — {e}")
         return {"success": False, "error": str(e), "code": 0}
+    except Exception as e:
+        print(f"[jupiter] buy_token: reserve check unavailable ({e}); proceeding — "
+              f"live_trader verified the balance before calling")
 
     keypair       = _wallet.get_keypair()
     wallet_address = str(keypair.pubkey())

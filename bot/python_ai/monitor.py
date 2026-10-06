@@ -640,7 +640,7 @@ async def _check_live_stale(dry_run: bool) -> None:
         return
 
     wallet_addr = _wallet.get_public_key()
-    rpc_url     = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+    rpc_url     = live_trader._rpc_url()   # pool-aware; skips quota-exhausted keys
 
     for pos in positions:
         call_id = pos["call_id"]
