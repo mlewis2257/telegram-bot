@@ -344,6 +344,54 @@ Persistent notes live in
 
 ---
 
+## 10b. The clean-cadence week — what to actually do
+
+**Window opens 2026-10-05** (cadence fix). Re-measure at ~**2026-10-12**.
+
+**DO NOTHING to the entry gates.** The window only works if the config holds still;
+change one and the comparison measures the change. Frozen config is §2.
+
+**Daily, 20 seconds** — confirm the window is still clean:
+
+```sql
+SELECT round(percentile_cont(0.5) WITHIN GROUP
+             (ORDER BY decision_gap_secs)::numeric,0) AS med_gap_s,
+       count(*) AS n,
+       count(*) FILTER (WHERE exit_reason LIKE 'stale%') AS stale
+FROM qsim_positions
+WHERE status='closed' AND entry_time >= now() - interval '24 hours';
+```
+
+Want `med_gap_s` <= 40 and `stale` near 0. If the median climbs back toward 80s, qsim is
+starved again — `positions / (QSIM_MAX_QUOTES_PER_MIN/60) = seconds per position`, so more
+open positions need a higher cap. **Any day that fails this is a day of dirty data**, and
+the re-measurement should start from the day after it recovers.
+
+**At the end of the week, one command:**
+
+```bash
+sudo -u postgres psql -d solana_signals -v start="'2026-10-05'" \
+  -f /root/telegram-bot/database/clean_cadence_rederive.sql
+```
+
+That file re-derives all three in order, with the starved readings printed inline for
+comparison and a cadence gate up front that voids the rest if it fails.
+
+**What each outcome means:**
+
+| result | action |
+|---|---|
+| `bank_rate_pct` > `breakeven_pct` | the lane pays; the 2-point gap was measurement. Consider sizing up |
+| still short by ~2 points | real. Entry selection is the only lever left — and it needs better method, not more gates (§6) |
+| lane baseline much less negative than -3% | every qsim-based conclusion this week was pessimistic by that margin |
+| `safe` clearly first again | the safe-only block holds |
+| `warning`/`unknown` lead | revert it: `LIVE_ENTRY_BLOCK_SECURITY_FLAGS=` |
+
+If step 1's `n` is under ~100, **wait longer**. The point is a better-powered read, not a
+faster one.
+
+---
+
 ## 11. If you do one thing
 
 Let it run and **re-derive the bank rate on clean cadence data in a week.** Everything
