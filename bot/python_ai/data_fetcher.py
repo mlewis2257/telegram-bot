@@ -7,6 +7,7 @@ from DexScreener. Results are cached for 60 seconds.
 
 import logging
 import os
+import sys
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -123,8 +124,26 @@ def _last_good_mcap_get(mint: str, max_age: float = HELIUS_TX_LAST_GOOD_TTL) -> 
     return None
 
 
-def _sol_price_cache_get(max_age: float = PRICE_CACHE_TTL_SECONDS) -> Optional[float]:
+# SOL/USD gets its own, longer lifetimes. It shared the 6-second token-price TTL, with NO
+# fallback: one failed refetch meant "no SOL/USD price", which makes _effective_fill_mcap
+# return None, which makes LIVE skip the candidate (missing_executable_entry — CATALYST,
+# 2026-10-06) and QSIM drop the open ("entry mcap calc failed", 397 lost opens). The
+# refetch goes to the Jupiter PRICE endpoint, whose quota is 10 requests per ~10s shared
+# with all price polling, so a rejected call was routine, not rare.
+#
+# SOL moves well under 1% a minute. Everything this number feeds is either a LABEL (the
+# fill mcap; every exit ratio is sol_out/sol_in and cancels it) or the exec-vs-reference
+# entry gate, whose thresholds are tens of percent. A price that is a few minutes old is
+# worth far more than no price.
+SOL_PRICE_TTL_SECONDS   = float(os.getenv("SOL_PRICE_TTL_SECONDS", "60"))
+SOL_PRICE_STALE_MAX_SECONDS = float(os.getenv("SOL_PRICE_STALE_MAX_SECONDS", "1800"))
+_sol_stale_logged = 0.0
+
+
+def _sol_price_cache_get(max_age: float | None = None) -> Optional[float]:
     global _sol_price_cache
+    if max_age is None:
+        max_age = SOL_PRICE_TTL_SECONDS
     if _sol_price_cache and (time.monotonic() - _sol_price_cache[1]) < max_age:
         return _sol_price_cache[0]
     return None
@@ -137,9 +156,11 @@ def _sol_price_cache_set(price_usd: float) -> None:
 
 def get_sol_price_usd() -> Optional[float]:
     """
-    Public SOL/USD accessor — cache first, then Jupiter. Returns None on failure.
+    Public SOL/USD accessor — fresh cache, then Jupiter, then the last known price if it
+    is under SOL_PRICE_STALE_MAX_SECONDS old. None only when there is nothing recent.
     Used to convert real SOL fills into a USD mcap for fill-price recording.
     """
+    global _sol_stale_logged
     cached = _sol_price_cache_get()
     if cached:
         return cached
@@ -150,6 +171,17 @@ def get_sol_price_usd() -> Optional[float]:
             return price
     except Exception:
         pass
+    # Refetch failed. Use the last known price if it is recent enough rather than
+    # returning None and costing the caller a trade.
+    stale = _sol_price_cache_get(max_age=SOL_PRICE_STALE_MAX_SECONDS)
+    if stale:
+        now = time.monotonic()
+        if now - _sol_stale_logged >= 60:
+            _sol_stale_logged = now
+            age = now - _sol_price_cache[1]
+            print(f"[fetcher] SOL/USD refetch failed — using last known ${stale:.2f} "
+                  f"({age:.0f}s old)", flush=True)
+        return stale
     return None
 
 
@@ -630,6 +662,32 @@ def _try_dexscreener_price(mint: str) -> Optional[dict]:
     return None
 
 
+# ── RPC usage tally ───────────────────────────────────────────────────────────
+# Three Helius accounts were drained in one month and nothing in the logs said which
+# calls did it. Every RPC call made through _rpc_post is counted by method, and each
+# process prints its own totals every RPC_TALLY_SECS, so usage can be read with grep
+# instead of guessed. Costs nothing: no extra request, one dict increment per call.
+RPC_TALLY_SECS = float(os.getenv("RPC_TALLY_SECS", "300"))
+_rpc_counts: dict[str, int] = {}
+_rpc_tally_since = time.monotonic()
+_RPC_PROC = os.path.basename(sys.argv[0] or "?")
+
+
+def _rpc_tally(method: Optional[str]) -> None:
+    global _rpc_tally_since
+    m = method or "?"
+    _rpc_counts[m] = _rpc_counts.get(m, 0) + 1
+    now = time.monotonic()
+    elapsed = now - _rpc_tally_since
+    if RPC_TALLY_SECS > 0 and elapsed >= RPC_TALLY_SECS:
+        total = sum(_rpc_counts.values())
+        parts = " ".join(f"{k}={v}" for k, v in sorted(_rpc_counts.items(), key=lambda kv: -kv[1]))
+        print(f"[rpc] {_RPC_PROC} {elapsed / 60:.0f}m: total={total} "
+              f"({total * 3600 / elapsed:.0f}/h) {parts}", flush=True)
+        _rpc_counts.clear()
+        _rpc_tally_since = now
+
+
 def _rpc_post(payload: dict, *, timeout: float = REQUEST_TIMEOUT):
     """POST a JSON-RPC payload to a pooled RPC endpoint.
 
@@ -640,6 +698,7 @@ def _rpc_post(payload: dict, *, timeout: float = REQUEST_TIMEOUT):
     url = rpc_pool.http_url() or SOLANA_RPC_URL
     if not url:
         return None
+    _rpc_tally(payload.get("method") if isinstance(payload, dict) else None)
     resp = requests.post(url, json=payload, timeout=timeout)
     if rpc_pool.is_quota_error(resp.status_code, resp.text[:300] if resp.content else None):
         rpc_pool.penalize(url)
