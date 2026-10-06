@@ -10,10 +10,19 @@
 -- So the lane baseline (~-3%/SOL), the 15.46% bank rate and the safe-vs-rest split are all
 -- suspect and probably PESSIMISTIC.
 --
--- RUN IT:
---   sudo -u postgres psql -d solana_signals -v start="'2026-10-05'" -f clean_cadence_rederive.sql
+-- CORRECTION 2026-10-06: THE CAP WAS NEVER THE CONSTRAINT, and the paragraph above is
+-- wrong about the cause. Over 36h the monitor made 15,838 quote attempts of which 3,905
+-- (24.7%) were 429s -- 3.06 successes per 429, 7.3 quotes/min against cap=30. It fired due
+-- positions back to back, tripped Jupiter's per-SECOND limit, then sat out a 30s backoff:
+-- about 32 of those 36 hours. The "25s with zero stale" reading was a quiet moment; the
+-- 24h after it read a 61s median with 10% stale. Fixed by pacing the monitor's quotes 2s
+-- apart (QSIM_MIN_QUOTE_INTERVAL_SECS, commit ec60097), deployed 2026-10-06.
 --
--- 2026-10-05 is when the cadence fix landed. Wait until ~2026-10-12 for a full week.
+-- RUN IT:
+--   sudo -u postgres psql -d solana_signals -v start="'2026-10-07'" -f clean_cadence_rederive.sql
+--
+-- 2026-10-07 is the first full UTC day after the pacing deploy. Data before it is NOT
+-- comparable. Wait until ~2026-10-14 for a full week.
 --
 -- DO NOT CHANGE AN ENTRY GATE INSIDE THE WINDOW. The config must hold still or the
 -- comparison measures the config change instead. Frozen config as of 2026-10-05:
@@ -22,17 +31,38 @@
 \echo '=============================================================='
 \echo 'STEP 0 — CADENCE GATE. If this fails, everything below is void.'
 \echo '=============================================================='
--- Want med_gap_s <= 40 and stale_pct < 5. Target cadence is QSIM_TICK_SECS=30.
--- A median near 80s means the cap is starved again (check open position count vs
--- QSIM_MAX_QUOTES_PER_MIN: positions / (cap/60) = seconds per position).
+-- Want over_ceiling_pct < 5 and pct_429 in low single digits.
+--
+-- NOT "median <= 40s". That target cannot be met and would restart the clock forever: the
+-- adaptive cadence quotes a position 15-30 points from a threshold every 60s and one
+-- further out every 90s, and a coin sitting at entry is 20 points above a 20% stop. A
+-- ~61s closing gap is the scheduler working as written. What marks starvation is a close
+-- decided across MORE than the 90s design ceiling.
+--
+-- THIS GATE VOIDS THE WINDOW, NEVER INDIVIDUAL ROWS. Do not drop stale_ or long-gap rows
+-- from any step below. Closing-gap length is tied to outcome by the cadence itself -- a
+-- coin near its stop is quoted every 15s, a coin that goes on to bank is usually further
+-- away. Measured 2026-10-04..06: closes with a gap <= 35s banked 1 of 25, longer gaps
+-- about 20%. Filtering on gap selects against banks, the same trap as --min-obs.
 SELECT round(percentile_cont(0.5) WITHIN GROUP
              (ORDER BY qp.decision_gap_secs)::numeric, 0)             AS med_gap_s,
-       round(avg(qp.decision_gap_secs)::numeric, 0)                   AS avg_gap_s,
        count(*)                                                       AS n,
+       count(*) FILTER (WHERE qp.decision_gap_secs > 100)              AS over_ceiling,
+       round(100.0*avg((qp.decision_gap_secs > 100)::int)::numeric, 1) AS over_ceiling_pct,
        count(*) FILTER (WHERE qp.exit_reason LIKE 'stale%')            AS stale,
        round(100.0*avg((qp.exit_reason LIKE 'stale%')::int)::numeric, 1) AS stale_pct
 FROM qsim_positions qp
 WHERE qp.status = 'closed' AND qp.entry_time >= :start::date;
+
+-- Starved baseline: open position 22.8% rate-limited, post-exit probe 37.0%, 7.3/min.
+SELECT CASE WHEN o.note LIKE 'post_exit%' THEN 'post-exit probe'
+            ELSE 'open position' END                                  AS kind,
+       count(*)                                                       AS attempts,
+       count(*) FILTER (WHERE o.rate_limited)                          AS n_429,
+       round(100.0*avg(o.rate_limited::int)::numeric, 1)              AS pct_429
+FROM qsim_quote_observations o
+WHERE o.observed_at >= :start::date
+GROUP BY 1 ORDER BY 1;
 
 \echo ''
 \echo '=============================================================='
@@ -125,5 +155,77 @@ WHERE qp.status = 'closed' AND qp.entry_time >= :start::date
 GROUP BY 1 ORDER BY pnl_sol DESC;
 
 \echo ''
-\echo 'READ IT IN ORDER. Step 0 gates the rest. n under ~100 in step 1 means'
-\echo 'wait longer -- the whole point is a better-powered read, not a faster one.'
+\echo '=============================================================='
+\echo 'STEP 4 — PAIRED CALIBRATION. Is qsim still reading worse than live?'
+\echo '=============================================================='
+-- The same coins, traded by both. Starved baseline, 39 coins 2026-09-29 -> 10-06:
+--
+--   tokens/SOL at entry, qsim over live   0.996   (no entry bias; per-coin scatter ~10%)
+--   return per SOL          qsim +0.5%    live +5.3%
+--   average bank            qsim 2.38x    live 2.10x
+--   average non-bank trade  qsim 0.75x    live 0.90x
+--   break-even bank rate    qsim 15.1%    live 8.4%
+--
+-- qsim exaggerated BOTH tails: deeper stops (late look) and fatter banks (late look lands
+-- past 2x). Three flips carried most of the gap -- JITI, XEET, ANON, where qsim hard-stopped
+-- at 0.78 / 0.28 / 0.47 and live exited profit_floor at 1.00 / 1.26 / 1.05.
+--
+-- That paired gap was under one standard error at n=39, so it is a lead, not a result.
+-- WHAT TO LOOK FOR: if x_gap closes toward zero and the two break-evens converge, qsim is
+-- a usable ruler again for ranking lanes and flags. If qsim still reads several points
+-- worse, its cadence near the stop needs tightening before any stop or runner replay
+-- (stop_grace, partial_runner, floor_checkpoint) can be trusted -- and until then the
+-- strategy is judged on live's wallet. Step 1's break-even is on QSIM's ruler; this is
+-- the step that says whether that ruler can be believed.
+WITH paired AS (
+  SELECT (qp.entry_tokens / qp.sol_in) / (tp.tokens_held / tp.sol_in)  AS tok_ratio,
+         qp.sol_out / qp.sol_in                                        AS qx,
+         tp.sol_out / tp.sol_in                                        AS lx,
+         qp.exit_reason LIKE '%bank%'                                  AS qbank,
+         tp.exit_reason LIKE '%bank%'                                  AS lbank
+  FROM trading_positions tp
+  JOIN qsim_positions qp ON qp.call_id = tp.call_id
+  WHERE tp.is_simulation = FALSE AND tp.status = 'closed' AND qp.status = 'closed'
+    AND tp.entry_time >= :start::date
+    AND tp.tokens_held > 0 AND tp.sol_in > 0 AND qp.sol_in > 0
+)
+SELECT count(*)                                                       AS n,
+       round(avg(tok_ratio)::numeric, 3)                              AS entry_tok_ratio,
+       round(100.0*(avg(qx) - 1)::numeric, 2)                         AS qsim_pct_per_sol,
+       round(100.0*(avg(lx) - 1)::numeric, 2)                         AS live_pct_per_sol,
+       round(100.0*avg(lx - qx)::numeric, 2)                          AS x_gap_pts,
+       round((avg(lx - qx) / NULLIF(stddev_samp(lx - qx) / sqrt(count(*)), 0))::numeric, 2)
+                                                                      AS gap_t,
+       count(*) FILTER (WHERE qbank)                                  AS qsim_banks,
+       count(*) FILTER (WHERE lbank)                                  AS live_banks,
+       round(avg(qx) FILTER (WHERE NOT qbank)::numeric, 3)            AS qsim_nonbank_x,
+       round(avg(lx) FILTER (WHERE NOT lbank)::numeric, 3)            AS live_nonbank_x,
+       round(100.0*((1 - avg(qx) FILTER (WHERE NOT qbank))
+             / NULLIF((avg(qx) FILTER (WHERE qbank) - 1)
+                      + (1 - avg(qx) FILTER (WHERE NOT qbank)), 0))::numeric, 1)
+                                                                      AS qsim_breakeven_pct,
+       round(100.0*((1 - avg(lx) FILTER (WHERE NOT lbank))
+             / NULLIF((avg(lx) FILTER (WHERE lbank) - 1)
+                      + (1 - avg(lx) FILTER (WHERE NOT lbank)), 0))::numeric, 1)
+                                                                      AS live_breakeven_pct
+FROM paired;
+
+-- The flips: same coin, the two rulers disagree by more than 25 points. Read these by
+-- hand -- a handful of them is the whole gap, in either direction.
+SELECT tp.call_id, t.symbol,
+       round((qp.sol_out / qp.sol_in)::numeric, 3)                    AS qsim_x,
+       round((tp.sol_out / tp.sol_in)::numeric, 3)                    AS live_x,
+       qp.exit_reason AS qsim_exit, tp.exit_reason AS live_exit,
+       round(qp.decision_gap_secs)                                    AS qsim_gap_s
+FROM trading_positions tp
+JOIN qsim_positions qp ON qp.call_id = tp.call_id
+JOIN calls c  ON c.id = tp.call_id
+JOIN tokens t ON t.id = c.token_id
+WHERE tp.is_simulation = FALSE AND tp.status = 'closed' AND qp.status = 'closed'
+  AND tp.entry_time >= :start::date AND tp.sol_in > 0 AND qp.sol_in > 0
+  AND abs(tp.sol_out / tp.sol_in - qp.sol_out / qp.sol_in) > 0.25
+ORDER BY (tp.sol_out / tp.sol_in - qp.sol_out / qp.sol_in) DESC;
+
+\echo ''
+\echo 'READ IT IN ORDER. Step 0 gates the WINDOW, never single rows. n under ~100 in'
+\echo 'step 1 means wait longer. Step 4 says whether step 1 is on a ruler you can believe.'
