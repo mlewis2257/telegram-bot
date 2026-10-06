@@ -138,6 +138,16 @@ QSIM_TICK_SECS          = float(os.getenv("QSIM_TICK_SECS", "30"))   # per-posit
 QSIM_LOOP_SECS          = float(os.getenv("QSIM_LOOP_SECS", "3"))    # monitor pass interval
 QSIM_RUG_FAILS          = int(os.getenv("QSIM_RUG_FAILS", "6"))      # consecutive no-route quotes -> close as rug
 QSIM_BACKOFF_SECS       = float(os.getenv("QSIM_BACKOFF_SECS", "30"))  # pause all quoting after a 429
+# Minimum spacing between the MONITOR's Jupiter calls. The per-minute cap above never
+# bound: the loop fired its due positions back to back, tripped Jupiter's per-SECOND limit
+# after about three quotes, and then sat out QSIM_BACKOFF_SECS. Measured 2026-10-04..06
+# over 36h: 15,838 attempts, 3,905 of them 429s, i.e. 3.06 successes per 429 and an
+# effective 7.3 quotes/min against a cap of 30 -- roughly 90% of wall time spent in
+# backoff. That, not the cap, is why decision gaps ran past the 90s design ceiling on a
+# third of closes. 2.0s is 30/min, the same ceiling as the cap, spent evenly, and it
+# leaves the other half of a 1/s tier to live. 0 restores the old burst behaviour.
+# Deliberately NOT applied to qsim_open: an entry quote that waits is a different price.
+QSIM_MIN_QUOTE_INTERVAL_SECS = float(os.getenv("QSIM_MIN_QUOTE_INTERVAL_SECS", "2.0"))
 QSIM_PEAK_PENDING_TTL_SECS = float(
     os.getenv(
         "QSIM_PEAK_PENDING_TTL_SECS",
@@ -260,6 +270,21 @@ _quote_window: list[float] = []           # monotonic timestamps of recent quote
 _post_exit_quote_window: list[float] = [] # monotonic timestamps of recent post-exit quotes
 _shadow_fast_window: list[float] = []     # monotonic timestamps of recent fast-lane quotes
 _backoff_until: float = 0.0               # monotonic time until which quoting is paused (429 backoff)
+_last_monitor_call: float = 0.0           # monotonic time of the monitor's last Jupiter call
+
+
+async def _pace() -> None:
+    """Space the monitor's Jupiter calls QSIM_MIN_QUOTE_INTERVAL_SECS apart.
+
+    The monitor is a single task, so no lock: nothing else can interleave between the
+    sleep and the stamp.
+    """
+    global _last_monitor_call
+    if QSIM_MIN_QUOTE_INTERVAL_SECS > 0:
+        wait = _last_monitor_call + QSIM_MIN_QUOTE_INTERVAL_SECS - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+    _last_monitor_call = time.monotonic()
 
 
 def _qsim_exit_config(variant: str | None):
@@ -860,6 +885,7 @@ async def _qsim_tick(pos: dict) -> None:
     if quote_tokens <= 0 or runner_basis <= 0:
         return
 
+    await _pace()
     try:
         sol_out = await jupiter.get_sell_quote(mint, quote_tokens, raise_on_ratelimit=True)
     except jupiter.RateLimitError:
@@ -1124,6 +1150,7 @@ async def _qsim_post_exit_tick(pos: dict) -> None:
     if sol_in <= 0 or entry <= 0 or tokens <= 0:
         return
 
+    await _pace()
     try:
         sol_out = await jupiter.get_sell_quote(mint, tokens, raise_on_ratelimit=True)
     except jupiter.RateLimitError:
@@ -1223,6 +1250,10 @@ async def run_qsim_monitor() -> None:
         print(f"[qsim] dev gate unavailable: {type(e).__name__} {e}")
     print(f"[qsim] monitor started — lanes={list(QSIM_LANES)} "
           f"cap={QSIM_MAX_QUOTES_PER_MIN}/min cadence={QSIM_TICK_SECS}s enabled={QSIM_ENABLED}")
+    print(f"[qsim] quote pacing: >= {QSIM_MIN_QUOTE_INTERVAL_SECS:g}s between monitor quotes "
+          f"(<= {60.0 / QSIM_MIN_QUOTE_INTERVAL_SECS:.0f}/min), 429 backoff {QSIM_BACKOFF_SECS:g}s"
+          if QSIM_MIN_QUOTE_INTERVAL_SECS > 0 else
+          f"[qsim] quote pacing: OFF — due quotes fire back to back, 429 backoff {QSIM_BACKOFF_SECS:g}s")
     print(f"[qsim] post-exit probes enabled={QSIM_POST_EXIT_OBS_ENABLED} "
           f"mins={QSIM_POST_EXIT_OBS_MINS:g} cadence={QSIM_POST_EXIT_OBS_CADENCE_SECS:g}s "
           f"limit={QSIM_POST_EXIT_OBS_LIMIT} cap={QSIM_POST_EXIT_OBS_MAX_PER_MIN}/min "
