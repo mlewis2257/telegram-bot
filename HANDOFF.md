@@ -161,21 +161,30 @@ cadence on more than ~7 open positions (`20 ÷ (15/60) = 80s` — matched the ob
 median). 12% of exits were `stale_*`. Raised to 30/min on 2026-10-05 and the median
 immediately dropped to **25s with zero stale**.
 
-**The qsim quote cap is PER PROCESS, not global.** `_quote_window` (`qsim.py:259`) is an
-in-memory list, and qsim is imported by *two* processes — opens run in `sol-listener`, the
-monitor in `sol-qsim`. So `cap=30` permits up to 30/min in **each**, and live's own quotes
-are counted **nowhere**. Jupiter's ceiling is ~60/min. **The 10-05 raise from 15 to 30 that
-fixed qsim's cadence may be taking quotes from live entries.** Check before anything else:
+**The qsim quote cap is PER PROCESS — checked 2026-10-05, NOT a problem.** `_quote_window`
+(`qsim.py:259`) is in-memory and qsim is imported by two processes (opens in
+`sol-listener`, monitor in `sol-qsim`), so `cap=30` permits 30/min in *each* while live's
+own quotes are counted nowhere, against a ~60/min Jupiter ceiling. The worry was that the
+10-05 raise from 15 to 30 bought qsim's cadence with live's entries. Measured since the
+last listener restart:
+
+```
+                 lost to 429   taken   coverage
+before fixes          9           2       18%
+after                 8          13       62%
+```
+
+Coverage went UP, so demand reduction more than paid for the raise — entry retries
+(`fad317b`), `QSIM_ENTRY_ROUNDTRIP_MIN_MULT=0`, killing both `qsim_size_impact` processes,
+and `LIVE_SELL_QUOTE_TTL=10`. **Re-check with the commands below if the cap is ever raised
+again**, and if 429s rise the fix is demand reduction or separate per-process caps, not a
+higher cap — buying qsim cadence with live entries is backwards when coverage binds.
 
 ```bash
 tac /root/.pm2/logs/sol-listener-out.log | sed '/\[live\] exit basis:/q' \
   | grep -acE "skipped — pre-entry (buy|roundtrip sell) quote 429"
 tac /root/.pm2/logs/sol-listener-out.log | sed '/\[live\] exit basis:/q' | grep -ac "BUY OK"
 ```
-
-Coverage is the binding constraint, so losing live entries to buy qsim cadence is a bad
-trade. If 429 skips have risen, the fix is demand reduction (raise `LIVE_SELL_QUOTE_TTL`
-further, or give qsim's two processes separate smaller caps), not raising the cap again.
 
 So these three need re-deriving on clean data, in roughly a week:
 
