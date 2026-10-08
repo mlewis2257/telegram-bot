@@ -168,6 +168,18 @@ QSIM_POST_EXIT_OBS_MINS     = float(os.getenv("QSIM_POST_EXIT_OBS_MINS", "90"))
 QSIM_POST_EXIT_OBS_CADENCE_SECS = float(os.getenv("QSIM_POST_EXIT_OBS_CADENCE_SECS", "60"))
 QSIM_POST_EXIT_OBS_LIMIT    = int(os.getenv("QSIM_POST_EXIT_OBS_LIMIT", "50"))
 QSIM_POST_EXIT_OBS_MAX_PER_MIN = int(os.getenv("QSIM_POST_EXIT_OBS_MAX_PER_MIN", "3"))
+# DENSE WINDOW. The slow probe above looks about once an hour, which is enough to learn
+# that a coin printed 5x at some point and useless for anything that depends on the PATH
+# in the first minutes after an exit — whether a floor sold a pullback in a coin that then
+# doubled (BISCOTTI, 2026-10-07: floored at 1.29x, 2.2x two minutes later), or what a
+# runner slice would have had to sit through. For the first DENSE_MINS after a close the
+# position is probed every DENSE_CADENCE_SECS, on its OWN per-minute allowance so it
+# cannot crowd out the 24h tail, and inside the monitor's global pacing so it cannot
+# raise qsim's total Jupiter use past QSIM_MIN_QUOTE_INTERVAL_SECS. It yields to open
+# positions exactly like the slow probe. 0 minutes disables it.
+QSIM_POST_EXIT_DENSE_MINS         = float(os.getenv("QSIM_POST_EXIT_DENSE_MINS", "30"))
+QSIM_POST_EXIT_DENSE_CADENCE_SECS = float(os.getenv("QSIM_POST_EXIT_DENSE_CADENCE_SECS", "60"))
+QSIM_POST_EXIT_DENSE_MAX_PER_MIN  = int(os.getenv("QSIM_POST_EXIT_DENSE_MAX_PER_MIN", "6"))
 # A close is STALE when the position went unobserved longer than this right before the quote
 # that closed it. Such a row is not the exit the strategy would have taken — the thresholds were
 # never evaluated during the gap — so it gets a 'stale_' exit_reason prefix and is excluded from
@@ -269,6 +281,7 @@ _noroute_streak: dict[int, int] = {}      # call_id -> consecutive no-route sell
 _quote_window: list[float] = []           # monotonic timestamps of recent quotes (budget window)
 _post_exit_quote_window: list[float] = [] # monotonic timestamps of recent post-exit quotes
 _shadow_fast_window: list[float] = []     # monotonic timestamps of recent fast-lane quotes
+_dense_window: list[float] = []           # monotonic timestamps of recent dense post-exit quotes
 _backoff_until: float = 0.0               # monotonic time until which quoting is paused (429 backoff)
 _last_monitor_call: float = 0.0           # monotonic time of the monitor's last Jupiter call
 
@@ -854,6 +867,53 @@ def _shadow_fast_budget_ok() -> bool:
     return len(_shadow_fast_window) < QSIM_SHADOW_FAST_MAX_PER_MIN and _budget_ok()
 
 
+def _dense_budget_ok() -> bool:
+    """Own per-minute allowance for the dense post-exit window, inside the global cap."""
+    if QSIM_POST_EXIT_DENSE_MAX_PER_MIN <= 0:
+        return False
+    now = time.monotonic()
+    while _dense_window and now - _dense_window[0] > 60.0:
+        _dense_window.pop(0)
+    return len(_dense_window) < QSIM_POST_EXIT_DENSE_MAX_PER_MIN and _budget_ok()
+
+
+async def _run_dense_post_exit() -> set[int]:
+    """Probe positions closed within the last DENSE_MINS at the dense cadence.
+
+    Returns the call_ids inside the dense window, whether or not they were due this
+    pass, so the slow probe skips them and nothing is quoted from two budgets at once.
+
+    Fetched with its OWN query on purpose. The slow probe's selection is ordered
+    longest-since-last-probe first and LIMITed; a position probed a minute ago sorts
+    last and falls outside that limit whenever more than `limit` coins are in the 24h
+    window, so a dense cadence bolted onto that list would silently never run.
+    """
+    if QSIM_POST_EXIT_DENSE_MINS <= 0 or QSIM_POST_EXIT_DENSE_CADENCE_SECS <= 0:
+        return set()
+    recent = db.get_recent_closed_qsim_positions_for_post_exit(
+        QSIM_POST_EXIT_DENSE_MINS, QSIM_POST_EXIT_OBS_LIMIT)
+    ids = {int(p["call_id"]) for p in recent}
+    now_mono = time.monotonic()
+    for pos in recent:
+        cid = pos["call_id"]
+        if ratchet_shadow.tracking(cid):
+            continue                      # the shadow fast lane owns it
+        last_at = pos.get("last_probe_at")
+        if last_at is not None:
+            ref = last_at if last_at.tzinfo else last_at.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - ref).total_seconds() < QSIM_POST_EXIT_DENSE_CADENCE_SECS:
+                continue
+        if now_mono - _last_post_exit_quote_ts.get(cid, 0.0) < QSIM_POST_EXIT_DENSE_CADENCE_SECS:
+            continue
+        if not _dense_budget_ok():
+            break
+        _dense_window.append(time.monotonic())
+        await _qsim_post_exit_tick(pos)
+        if time.monotonic() < _backoff_until:
+            break
+    return ids
+
+
 def _post_exit_budget_ok() -> bool:
     """True if post-exit research probes still have their small reserved budget."""
     if QSIM_POST_EXIT_OBS_MAX_PER_MIN <= 0:
@@ -1258,6 +1318,10 @@ async def run_qsim_monitor() -> None:
           f"mins={QSIM_POST_EXIT_OBS_MINS:g} cadence={QSIM_POST_EXIT_OBS_CADENCE_SECS:g}s "
           f"limit={QSIM_POST_EXIT_OBS_LIMIT} cap={QSIM_POST_EXIT_OBS_MAX_PER_MIN}/min "
           f"banks_first={QSIM_POST_EXIT_BANKS_FIRST}")
+    print(f"[qsim] post-exit dense window: first {QSIM_POST_EXIT_DENSE_MINS:g}min every "
+          f"{QSIM_POST_EXIT_DENSE_CADENCE_SECS:g}s, cap={QSIM_POST_EXIT_DENSE_MAX_PER_MIN}/min"
+          if QSIM_POST_EXIT_OBS_ENABLED and QSIM_POST_EXIT_DENSE_MINS > 0 else
+          "[qsim] post-exit dense window: OFF")
     # Say whether the lane is actually RUNNING, not just how it is configured. This line
     # printed unconditionally, so it read identically with RATCHET_SHADOW_ENABLED=false
     # and gave a false all-clear when the lane had been turned off to free its 5/min.
@@ -1374,15 +1438,20 @@ async def run_qsim_monitor() -> None:
                         if time.monotonic() < _backoff_until:
                             break
 
+                _dense_ids: set[int] = set()
+                if QSIM_POST_EXIT_OBS_ENABLED and not _probes_yield and time.monotonic() >= _backoff_until:
+                    _dense_ids = await _run_dense_post_exit()
+
                 if QSIM_POST_EXIT_OBS_ENABLED and not _probes_yield and time.monotonic() >= _backoff_until:
                     closed_positions = db.get_recent_closed_qsim_positions_for_post_exit(
                         QSIM_POST_EXIT_OBS_MINS,
                         QSIM_POST_EXIT_OBS_LIMIT,
                     )
-                    # Anything the fast lane owns is skipped here so it is not
-                    # quoted twice in one pass out of two different budgets.
+                    # Anything the fast lane or the dense window owns is skipped here so
+                    # it is not quoted twice in one pass out of two different budgets.
                     closed_positions = [p for p in closed_positions
-                                        if not ratchet_shadow.tracking(p["call_id"])]
+                                        if not ratchet_shadow.tracking(p["call_id"])
+                                        and int(p["call_id"]) not in _dense_ids]
                     if QSIM_POST_EXIT_BANKS_FIRST:
                         # Banked exits first: they are the only rows that can measure the
                         # runner's capture fraction, and a trail simulated on gappy samples
