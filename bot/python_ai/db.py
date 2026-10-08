@@ -1693,6 +1693,71 @@ def get_recent_closed_qsim_positions_for_post_exit(minutes: float, limit: int = 
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
+def get_qsim_fast_probe_candidates(dense_mins: float, bank_mins: float,
+                                   extend_mins: float, extend_min_mult: float,
+                                   limit: int = 50) -> list[dict]:
+    """Closed qsim positions that belong to one of the FAST post-exit windows.
+
+    Three ways in, decided here in SQL rather than by the caller:
+      * any exit within `dense_mins`
+      * a banked exit within `bank_mins`
+      * a banked exit within `extend_mins` whose LATEST look is still >= `extend_min_mult`
+        (the coin is still running — see qsim.QSIM_POST_EXIT_BANK_EXTEND_HOURS)
+
+    The filter lives in the query on purpose. The extended window reaches back hours, and
+    a plain "everything closed in the last N hours ... LIMIT n" list, ordered
+    longest-since-last-probe first, fills up with hourly-cadence positions and pushes the
+    15-second ones off the end — the same silent truncation
+    get_recent_closed_qsim_positions_for_post_exit documents for the newest-first order.
+
+    `last_mult` is the latest look that saw anything: a real multiple, or 0 for a no-route
+    (an unsellable bag is worth nothing, and must drop out of the running set, not linger
+    on its last good quote). Rate-limited looks saw nothing and are skipped. Ordered
+    most-overdue-first, never-probed first, exactly like the hourly selection.
+    """
+    conn = get_conn()
+    safe_rollback()
+    horizon = max(float(dense_mins), float(bank_mins), float(extend_mins), 0.0)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT x.* FROM (
+                SELECT qp.call_id, qp.lane, qp.variant, qp.vip_tier, qp.channel_handle,
+                       qp.entry_price, qp.entry_tokens, qp.entry_decimals, qp.sol_in,
+                       qp.entry_time, qp.exit_time, qp.exit_reason,
+                       t.symbol, t.mint_address,
+                       (SELECT max(qo.observed_at)
+                          FROM qsim_quote_observations qo
+                         WHERE qo.call_id = qp.call_id
+                           AND qo.note LIKE 'post_exit_probe%%') AS last_probe_at,
+                       (SELECT CASE WHEN coalesce(qo.no_route, false) THEN 0
+                                    ELSE qo.real_mult END
+                          FROM qsim_quote_observations qo
+                         WHERE qo.call_id = qp.call_id
+                           AND (qo.real_mult IS NOT NULL OR coalesce(qo.no_route, false))
+                         ORDER BY qo.observed_at DESC
+                         LIMIT 1) AS last_mult
+                FROM qsim_positions qp
+                JOIN tokens t ON t.id = qp.token_id
+                WHERE qp.status = 'closed'
+                  AND qp.exit_time IS NOT NULL
+                  AND qp.exit_time >= now() - (%s || ' minutes')::interval
+            ) x
+            WHERE x.exit_time >= now() - (%s || ' minutes')::interval
+               OR (x.exit_reason LIKE '%%bank%%'
+                   AND x.exit_time >= now() - (%s || ' minutes')::interval)
+               OR (x.exit_reason LIKE '%%bank%%' AND %s > 0
+                   AND x.exit_time >= now() - (%s || ' minutes')::interval
+                   AND x.last_mult >= %s)
+            ORDER BY x.last_probe_at ASC NULLS FIRST, x.exit_time DESC
+            LIMIT %s
+            """,
+            (horizon, dense_mins, bank_mins, extend_mins, extend_mins, extend_min_mult, limit),
+        )
+        cols = [d.name for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
 def partial_bank_qsim_position(call_id: int, fraction: float, partial_sol_out: float,
                                partial_exit_price: float, runner_tokens: int,
                                runner_peak_mult: float) -> bool:

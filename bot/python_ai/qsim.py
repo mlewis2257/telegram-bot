@@ -192,6 +192,18 @@ QSIM_POST_EXIT_DENSE_MAX_PER_MIN  = int(os.getenv("QSIM_POST_EXIT_DENSE_MAX_PER_
 QSIM_POST_EXIT_BANK_MINS         = float(os.getenv("QSIM_POST_EXIT_BANK_MINS", "45"))
 QSIM_POST_EXIT_BANK_CADENCE_SECS = float(os.getenv("QSIM_POST_EXIT_BANK_CADENCE_SECS", "15"))
 QSIM_POST_EXIT_BANK_MAX_PER_MIN  = int(os.getenv("QSIM_POST_EXIT_BANK_MAX_PER_MIN", "8"))
+# STILL RUNNING. The first replay on real paths (2026-10-08) sold its two winners at
+# minute 165 (TikTok, 12.7x high) and minute 105 (PACK, 10.7x) — both AFTER the 45-minute
+# window, on hourly looks. The coins that decide whether a trailed slice is worth having
+# are exactly the ones that outlive the window, so the part of the path that sets their
+# exit was the part seen worst. A banked exit therefore STAYS on the bank cadence past
+# BANK_MINS for as long as its latest look is at or above EXTEND_MIN_MULT (a multiple of
+# ENTRY), up to EXTEND_HOURS after the exit. A coin that fades drops back to the hourly
+# probe on the next pass; if an hourly look later finds it back above the line it returns.
+# No new budget: these share the bank window's cadence and its 8/min allowance, so the
+# cost falls only on the rare coin still running. 0 hours disables the extension.
+QSIM_POST_EXIT_BANK_EXTEND_HOURS    = float(os.getenv("QSIM_POST_EXIT_BANK_EXTEND_HOURS", "6"))
+QSIM_POST_EXIT_BANK_EXTEND_MIN_MULT = float(os.getenv("QSIM_POST_EXIT_BANK_EXTEND_MIN_MULT", "1.5"))
 # A close is STALE when the position went unobserved longer than this right before the quote
 # that closed it. Such a row is not the exit the strategy would have taken — the thresholds were
 # never evaluated during the gap — so it gets a 'stale_' exit_reason prefix and is excluded from
@@ -913,9 +925,18 @@ def _post_exit_tier(pos: dict, now_utc: datetime) -> str | None:
     if age_min < 0:
         return None
     if (QSIM_POST_EXIT_BANK_MINS > 0 and QSIM_POST_EXIT_BANK_CADENCE_SECS > 0
-            and "bank" in (pos.get("exit_reason") or "")
-            and age_min <= QSIM_POST_EXIT_BANK_MINS):
-        return "bank"
+            and "bank" in (pos.get("exit_reason") or "")):
+        if age_min <= QSIM_POST_EXIT_BANK_MINS:
+            return "bank"
+        # Still running: stay on the bank cadence while the latest look holds the line.
+        # A missing last_mult (never seen, or only rate-limited looks) does NOT qualify —
+        # "we do not know" must not keep a coin on the fast cadence for six hours.
+        last_mult = pos.get("last_mult")
+        if (QSIM_POST_EXIT_BANK_EXTEND_HOURS > 0
+                and age_min <= QSIM_POST_EXIT_BANK_EXTEND_HOURS * 60.0
+                and last_mult is not None
+                and float(last_mult) >= QSIM_POST_EXIT_BANK_EXTEND_MIN_MULT):
+            return "bank"
     if (QSIM_POST_EXIT_DENSE_MINS > 0 and QSIM_POST_EXIT_DENSE_CADENCE_SECS > 0
             and age_min <= QSIM_POST_EXIT_DENSE_MINS):
         return "dense"
@@ -940,8 +961,11 @@ async def _run_dense_post_exit() -> set[int]:
     horizon = max(QSIM_POST_EXIT_DENSE_MINS, QSIM_POST_EXIT_BANK_MINS)
     if horizon <= 0:
         return set()
-    recent = db.get_recent_closed_qsim_positions_for_post_exit(
-        horizon, QSIM_POST_EXIT_OBS_LIMIT)
+    extend_mins = (QSIM_POST_EXIT_BANK_EXTEND_HOURS * 60.0
+                   if QSIM_POST_EXIT_BANK_MINS > 0 else 0.0)
+    recent = db.get_qsim_fast_probe_candidates(
+        QSIM_POST_EXIT_DENSE_MINS, QSIM_POST_EXIT_BANK_MINS,
+        extend_mins, QSIM_POST_EXIT_BANK_EXTEND_MIN_MULT, QSIM_POST_EXIT_OBS_LIMIT)
     now_utc = datetime.now(timezone.utc)
     tiered = [(pos, _post_exit_tier(pos, now_utc)) for pos in recent]
     tiered = [(pos, tier) for pos, tier in tiered if tier]
@@ -1396,6 +1420,9 @@ async def run_qsim_monitor() -> None:
           "[qsim] post-exit dense window: OFF")
     print(f"[qsim] post-exit BANK window: banked exits, first {QSIM_POST_EXIT_BANK_MINS:g}min "
           f"every {QSIM_POST_EXIT_BANK_CADENCE_SECS:g}s, cap={QSIM_POST_EXIT_BANK_MAX_PER_MIN}/min"
+          + (f"; stays on while >= {QSIM_POST_EXIT_BANK_EXTEND_MIN_MULT:g}x, up to "
+             f"{QSIM_POST_EXIT_BANK_EXTEND_HOURS:g}h" if QSIM_POST_EXIT_BANK_EXTEND_HOURS > 0
+             else "; no extension")
           if QSIM_POST_EXIT_OBS_ENABLED and QSIM_POST_EXIT_BANK_MINS > 0 else
           "[qsim] post-exit BANK window: OFF")
     # Say whether the lane is actually RUNNING, not just how it is configured. This line
@@ -1516,7 +1543,17 @@ async def run_qsim_monitor() -> None:
 
                 _dense_ids: set[int] = set()
                 if QSIM_POST_EXIT_OBS_ENABLED and not _probes_yield and time.monotonic() >= _backoff_until:
-                    _dense_ids = await _run_dense_post_exit()
+                    # Guarded on its own: a failure in the fast windows (a bad query, a
+                    # schema surprise) must not take the hourly probes down with it. An
+                    # unguarded raise here would abort the pass before they run, every
+                    # pass, and the 24h tail would stop with nothing in the log but
+                    # "monitor pass error".
+                    try:
+                        _dense_ids = await _run_dense_post_exit()
+                    except Exception as _de:
+                        db.safe_rollback()
+                        print(f"[qsim] fast post-exit windows failed this pass "
+                              f"({type(_de).__name__}: {_de}); hourly probes continue")
 
                 if QSIM_POST_EXIT_OBS_ENABLED and not _probes_yield and time.monotonic() >= _backoff_until:
                     closed_positions = db.get_recent_closed_qsim_positions_for_post_exit(
