@@ -1127,10 +1127,17 @@ async def live_exit_basis(
         rules is what produced two false hard stops on live day 1, and a feed decision
         during a quote outage is unactionable anyway since the sell needs a route too.
 
-      PERMANENT (no entry_price_fill recorded, or LIVE_EXIT_USE_QUOTE off) — returns the
+      PERMANENT (LIVE_EXIT_USE_QUOTE off, or no usable anchor of any kind) — returns the
         FEED triple. These positions can NEVER reach the quote basis, so returning None
-        would mean they never exit at all. A pre-instrumentation row on the feed's ruler
-        is worse than qsim but far better than unmanaged.
+        would mean they never exit at all.
+
+      NO FILL RECORDED is NOT one of those any more. It used to be: a position whose
+        entry_price_fill failed to record (Tincan, call_id 312143, 2026-10-08) ran its
+        whole life on the feed's ruler and took a profit_floor exit with a real peak of
+        1.00x — a rule that only arms at 1.35x. But every exit ratio on the quote basis
+        is sol_out / sol_in; the fill is only the LABEL that turns that ratio into an
+        mcap. So the feed entry is used as the label instead, consistently for current,
+        peak and entry, and the ratios are exactly what they would have been.
 
     `raw_mult` is the UNGUARDED executable multiple (quote_sol_out / sol_in) — the same
     number qsim calls `real_mult`. It is None on the feed basis. check_live_exits uses it
@@ -1172,9 +1179,15 @@ async def live_exit_basis(
     if not LIVE_EXIT_USE_QUOTE:
         return feed_triple
     try:
-        real_entry = float(pos.get("entry_price_fill") or 0)
+        # The anchor is a label, not an input: current = anchor * (sol_out / sol_in) and
+        # peak and entry are in the same units, so every ratio the exit rules read is
+        # independent of it. Prefer the real fill; fall back to the feed entry so a
+        # missing fill no longer drops the position onto the feed's ruler.
+        # live_effective_current picks the same anchor by the same rule, which is what
+        # keeps the three legs in one unit.
+        real_entry = float(pos.get("entry_price_fill") or 0) or float(pos.get("entry_price") or 0)
         if real_entry <= 0:
-            return feed_triple                      # pre-instrumentation position
+            return feed_triple                      # nothing to label with at all
         eff = await live_effective_current(pos)
         if not eff:
             mint = pos.get("mint_address") or ""
@@ -1204,8 +1217,13 @@ async def live_exit_basis(
         eff_current = min(synth_current, real_peak) if real_peak > 0 else synth_current
         return eff_current, real_peak, real_entry, "real", real_mult
     except Exception as e:
-        print(f"[live] exit-basis calc failed, using feed: {e}")
-        return feed_current, feed_peak, feed_anchor, "feed", None
+        # This used to hand back the full FEED triple, which re-opened the door every
+        # other branch closes: any error in here (a DB hiccup reading the real peak, say)
+        # put ALL the exit rules on the feed's ruler for that tick, where entry lag reads
+        # the multiple high and fires banks and floors early. Treat it like any other
+        # tick with no usable quote: profit side silent, collapse guard armed.
+        print(f"[live] exit-basis calc failed call_id={call_id}: {type(e).__name__} {e}")
+        return _no_quote(f"basis error {type(e).__name__}")
 
 
 async def close_live_position(
