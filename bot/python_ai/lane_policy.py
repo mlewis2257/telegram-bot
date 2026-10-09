@@ -413,12 +413,17 @@ LIVE_LANES: dict[tuple[str, str, str], dict] = {
     # held when the strategy underneath it changed, not the day count. Worth ~+0.028 SOL/day
     # averaged.
     #
-    # FRIDAY STAYS CUT, but note the evidence does NOT support it: -1.82% pre-bank and
-    # +0.12% in the bank era, i.e. neutral, on 93 trades. That cut was made on pre-bank
-    # data. Restoring it is ~1/6th more flow at roughly zero PnL cost, on a lane where
-    # coverage is the binding constraint — operator's call, not changed here.
+    # FRIDAY RESTORED 2026-10-08, operator's call. The cut dated from 2026-09-04 and was
+    # made on pre-bank data. Measured since, in-band on this lane: -1.82%/SOL pre-bank and
+    # +0.12% in the bank era, on 93 trades — NEUTRAL, not negative, unlike Saturday, whose
+    # -13% held in both eras. So this is not an edge being added; it is ~1/6th more flow
+    # at roughly zero expected PnL cost, on a lane where coverage is the binding
+    # constraint, and more live fills to pair against qsim. qsim already trades every
+    # day, so the clean-cadence re-derive is unaffected; live's own Fridays are a new
+    # sample and should be read separately at first. If live's Fridays run clearly red
+    # over 3-4 weeks, cut it again — on live's fills, not on this note.
     ("solwhaletrending", "none", "low_score"): {
-        "days": {"Mon", "Tue", "Wed", "Thu", "Sun"},
+        "days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sun"},
         "exit": EXIT_EARLY, "size": 0.05,
     },
 }
