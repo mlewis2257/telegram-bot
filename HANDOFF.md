@@ -36,14 +36,17 @@ wins; qsim loses the counterfactual. ~1,032 qsim opens have been lost to 429s.
 
 ```
 lane            solwhaletrending / none / low_score   (LIVE_LANES in lane_policy.py)
-days            Mon Tue Wed Thu Sun                   (Fri AND Sat cut)
+days            Mon Tue Wed Thu Fri Sun               (Sat cut; Fri restored 2026-10-08)
 mcap band       80k-120k                              (entry_filter)
 security_flag   safe ONLY                             LIVE_ENTRY_BLOCK_SECURITY_FLAGS=warning,unknown
 age exemption   off                                   LIVE_ENTRY_SAFE_MIN_AGE_MIN=0
 out-of-band     blocked                               LIVE_ENTRY_OUT_BAND_ALLOW_FLAGS=
 exit            bank_2x + 20% hard stop + profit floor
-size            0.05 SOL, max 5 open
+size            0.05 SOL, max 5 open                  LIVE_SIZE_SOL in .env overrides the lane table's 0.05
+                                                      (unset = lane table; refused above LIVE_SIZE_MAX_SOL=1.0)
 risk cap        MAX_TOTAL_LOSS_SOL=0.35, MAX_DAILY_LOSS_SOL=0
+                MAX_DAILY_LOSS_PCT=<n> sets the daily limit as n% of the day-start bankroll
+                (SOL balance + cost of open positions); with both set the stricter applies
 exit basis      LIVE_EXIT_USE_QUOTE=true, LIVE_EXIT_REQUIRE_QUOTE=true
 quote tuning    LIVE_EXIT_QUOTE_RETRIES=2, LIVE_EXIT_QUOTE_RETRY_MS=400, LIVE_SELL_QUOTE_TTL=10
 guards          LIVE_MAX_SANE_MULT=1000, LIVE_PROTECTIVE_DD=0.20

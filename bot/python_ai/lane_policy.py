@@ -424,6 +424,8 @@ LIVE_LANES: dict[tuple[str, str, str], dict] = {
     # over 3-4 weeks, cut it again — on live's fills, not on this note.
     ("solwhaletrending", "none", "low_score"): {
         "days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sun"},
+        # "size" is the fallback only. Live's trade size is LIVE_SIZE_SOL in .env when that
+        # is set (live_trader._parse_live_size); change size there, not here.
         "exit": EXIT_EARLY, "size": 0.05,
     },
 }

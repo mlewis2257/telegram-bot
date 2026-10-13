@@ -21,6 +21,7 @@ To re-enable: delete the flag file and restart.
 """
 
 import asyncio
+import json
 import os
 import sys
 import time
@@ -117,6 +118,42 @@ print(f"[live] entry roundtrip min: {LIVE_ENTRY_ROUNDTRIP_MIN_MULT:g}x"
       if LIVE_ENTRY_ROUNDTRIP_MIN_MULT > 0 else "[live] entry roundtrip min: disabled")
 
 
+# ── Live trade size (.env, not the lane table) ─────────────────────────────────
+# LIVE_SIZE_SOL is live's trade size in SOL. When set it WINS over the per-lane "size" in
+# lane_policy.LIVE_LANES and over LIVE_POSITION_SIZE_SOL, so sizing up is an .env edit and a
+# listener restart, not a code change. Unset keeps the old behaviour exactly (lane size,
+# then LIVE_POSITION_SIZE_SOL).
+#
+# A NEW variable on purpose: LIVE_POSITION_SIZE_SOL has sat in .env files for months while
+# the lane table overrode it, so giving it precedence now would change the live size on
+# deploy to whatever stale number is in there.
+#
+# LIVE_SIZE_MAX_SOL is a typo guard, not a risk setting: "LIVE_SIZE_SOL=10" for "0.10" is
+# refused and the lane size stays in force. Raise it deliberately when sizing past 1 SOL.
+def _parse_live_size() -> tuple[float | None, str]:
+    raw = os.getenv("LIVE_SIZE_SOL", "").strip()
+    if not raw:
+        return None, "[live] trade size: from the lane table (LIVE_SIZE_SOL unset)"
+    try:
+        cap = float(os.getenv("LIVE_SIZE_MAX_SOL", "1.0") or "1.0")
+    except ValueError:
+        cap = 1.0
+    try:
+        val = float(raw)
+    except ValueError:
+        return None, (f"[live] WARNING: LIVE_SIZE_SOL={raw!r} is not a number — IGNORED, "
+                      f"trade size stays on the lane table")
+    if not (0.0 < val <= cap):
+        return None, (f"[live] WARNING: LIVE_SIZE_SOL={raw} is outside (0, {cap:g}] "
+                      f"(LIVE_SIZE_MAX_SOL) — IGNORED, trade size stays on the lane table")
+    return val, (f"[live] trade size: {val:.4f} SOL  (LIVE_SIZE_SOL — overrides the lane table; "
+                 f"up to {val * int(os.getenv('MAX_OPEN_LIVE_POSITIONS', '5')):.2f} SOL open at once)")
+
+
+LIVE_SIZE_SOL, _size_banner = _parse_live_size()
+print(_size_banner)
+
+
 # ── Per-channel mcap entry limits ──────────────────────────────────────────────
 
 # Per-channel ENTRY ceiling: reject a call whose market cap is already above this, because
@@ -163,6 +200,19 @@ def _max_positions() -> int:
 
 def _max_daily_loss() -> float:
     return float(os.getenv("MAX_DAILY_LOSS_SOL", "1.0"))
+
+
+def _max_daily_loss_pct() -> float:
+    """MAX_DAILY_LOSS_PCT: the daily limit as a percent of the day-start bankroll.
+
+    0/unset = off. A value outside (0, 100] is treated as off — a breaker that can never
+    trip, or that trips on the first losing trade, is worse than the fixed one it replaces.
+    """
+    try:
+        pct = float(os.getenv("MAX_DAILY_LOSS_PCT", "0") or "0")
+    except ValueError:
+        return 0.0
+    return pct if 0.0 < pct <= 100.0 else 0.0
 
 
 def _max_total_loss() -> float:
@@ -506,6 +556,102 @@ def _sol_balance_with_failover() -> float:
     return _wallet.get_sol_balance_any(_rpc_url())
 
 
+# ── Daily loss limit as a share of the bankroll ────────────────────────────────
+# MAX_DAILY_LOSS_SOL is a fixed number and has to be re-typed every time the trade size or
+# the wallet changes. MAX_DAILY_LOSS_PCT sets the same limit as a percent of what the account
+# held at the START of the day, so it follows the bankroll.
+#
+# Two rules keep it honest:
+#   * The bankroll counts SOL that is sitting in open positions. Three positions open at the
+#     day boundary would otherwise read as a wallet 3 x size smaller and shrink the limit.
+#   * Only the LIMIT comes from the wallet. The LOSS is still summed from closed trades in
+#     the database, exactly as before — so a deposit cannot hide a losing day and a
+#     withdrawal cannot trip the breaker.
+#
+# The day is the DATABASE's day (CURRENT_DATE), the same one get_today_live_losses uses.
+# The snapshot is taken at the first buy attempt of the day, not at midnight, so it is
+# rebuilt as  balance + cost of open positions - P&L already realised today,  which is the
+# start-of-day figure whenever it is taken. It is written to a file so a restart mid-day
+# does not move the limit.
+_DAY_BANKROLL_FILE = _STATE_DIR / "day_bankroll.json"
+_day_bankroll: tuple[str, float] | None = None       # (db day, bankroll SOL)
+_day_bankroll_warned: str = ""                       # day we last said "cannot read it"
+
+
+def _day_start_bankroll() -> float | None:
+    """SOL the account held at the start of the database's current day, or None if unknown."""
+    global _day_bankroll, _day_bankroll_warned
+    try:
+        day = db.get_db_today()
+        if _day_bankroll and _day_bankroll[0] == day:
+            return _day_bankroll[1]
+        try:
+            saved = json.loads(_DAY_BANKROLL_FILE.read_text())
+            if saved.get("day") == day and float(saved.get("bankroll") or 0) > 0:
+                _day_bankroll = (day, float(saved["bankroll"]))
+                return _day_bankroll[1]
+        except (OSError, ValueError, TypeError):
+            pass                                  # no file yet, or unreadable: take a new one
+        balance   = float(_sol_balance_with_failover())
+        open_cost = float(db.get_live_open_cost())
+        realized  = float(db.get_today_live_net_pnl())
+        bankroll  = balance + open_cost - realized
+        if bankroll <= 0:
+            raise ValueError(f"bankroll {bankroll:.4f} is not positive")
+        _day_bankroll = (day, bankroll)
+        _STATE_DIR.mkdir(exist_ok=True)
+        _DAY_BANKROLL_FILE.write_text(json.dumps({
+            "day": day, "bankroll": round(bankroll, 6), "balance": round(balance, 6),
+            "open_cost": round(open_cost, 6), "realized_today": round(realized, 6),
+            "taken_at": datetime.now(timezone.utc).isoformat(),
+        }))
+        print(f"[live] day-start bankroll {day}: {bankroll:.4f} SOL  "
+              f"(balance {balance:.4f} + open {open_cost:.4f} - realised today {realized:+.4f})")
+        return bankroll
+    except Exception as e:
+        db.safe_rollback()
+        day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d %H")
+        if _day_bankroll_warned != day_key:        # at most once an hour, not once per call
+            _day_bankroll_warned = day_key
+            print(f"[live] WARNING: day-start bankroll unavailable ({type(e).__name__}: {e}) — "
+                  f"MAX_DAILY_LOSS_PCT cannot be applied; falling back to MAX_DAILY_LOSS_SOL")
+        return None
+
+
+def _daily_loss_limit() -> tuple[float, str]:
+    """(limit in SOL, where it came from). 0 = no daily limit in force.
+
+    With both settings on, the STRICTER one applies. If the percent limit is on but the
+    bankroll cannot be read, the fixed limit alone applies (and if that is off too, there
+    is no daily limit for this check — said loudly by _day_start_bankroll).
+    """
+    limits: list[tuple[float, str]] = []
+    pct = _max_daily_loss_pct()
+    if pct > 0:
+        bankroll = _day_start_bankroll()
+        if bankroll:
+            limits.append((bankroll * pct / 100.0,
+                           f"{pct:g}% of {bankroll:.4f} SOL day-start bankroll"))
+    fixed = _max_daily_loss()
+    if fixed > 0:
+        limits.append((fixed, "MAX_DAILY_LOSS_SOL"))
+    if not limits:
+        return 0.0, "off"
+    return min(limits, key=lambda x: x[0])
+
+
+_pct = _max_daily_loss_pct()
+_raw_pct = os.getenv("MAX_DAILY_LOSS_PCT", "").strip()
+if _raw_pct and _raw_pct not in ("0", "0.0") and _pct <= 0:
+    print(f"[live] WARNING: MAX_DAILY_LOSS_PCT={_raw_pct!r} is not in (0, 100] — IGNORED")
+print("[live] daily loss limit: "
+      + (" and ".join(
+          ([f"{_pct:g}% of the day-start bankroll (MAX_DAILY_LOSS_PCT)"] if _pct > 0 else [])
+          + ([f"{_max_daily_loss():g} SOL (MAX_DAILY_LOSS_SOL)"] if _max_daily_loss() > 0 else []))
+         + ("  — stricter one applies" if _pct > 0 and _max_daily_loss() > 0 else "")
+         if (_pct > 0 or _max_daily_loss() > 0) else "OFF"))
+
+
 # ── Circuit breaker ────────────────────────────────────────────────────────────
 
 async def _trip_circuit_breaker(loss: float, limit: float, kind: str = "daily") -> None:
@@ -581,11 +727,14 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
             return False
 
         # ── Guard 4: loss circuit breakers (net P&L — winners offset losers) ───
-        # Daily breaker: disabled when MAX_DAILY_LOSS_SOL <= 0.
-        max_daily = _max_daily_loss()
+        # Daily breaker: MAX_DAILY_LOSS_PCT of the day-start bankroll and/or the fixed
+        # MAX_DAILY_LOSS_SOL, whichever is stricter. Off when neither is set above 0.
+        max_daily, daily_src = _daily_loss_limit()
         if max_daily > 0:
             today_losses = db.get_today_live_losses()
             if today_losses > max_daily:
+                print(f"[live] daily loss {today_losses:.4f} SOL > limit {max_daily:.4f} SOL "
+                      f"({daily_src})")
                 await _trip_circuit_breaker(today_losses, max_daily, "daily")
                 return False
 
@@ -657,8 +806,10 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
                       f"[{channel_handle}/{token_data.get('vip_tier') or 'none'}/{_cat or 'none'}]")
                 return False
 
-        # ── Guard 6: SOL balance (allowlist per-lane size overrides the default when set) ──
-        size = float(_lane.get("size") or _position_size(label))
+        # ── Guard 6: SOL balance ──
+        # Size: LIVE_SIZE_SOL from .env if set, else the allowlist lane's own size, else
+        # the legacy LIVE_POSITION_SIZE_SOL default.
+        size = float(LIVE_SIZE_SOL or _lane.get("size") or _position_size(label))
         try:
             balance = _sol_balance_with_failover()
             if balance < size + 0.05:

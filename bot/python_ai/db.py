@@ -3111,6 +3111,48 @@ def get_today_live_losses() -> float:
         return float(cur.fetchone()[0])
 
 
+def get_db_today() -> str:
+    """The database's current date as 'YYYY-MM-DD' — the day get_today_live_losses counts."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute("SELECT CURRENT_DATE::text")
+        return str(cur.fetchone()[0])
+
+
+def get_live_open_cost() -> float:
+    """SOL spent on live positions that are still open or closing (their sol_in)."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(SUM(sol_in), 0) FROM trading_positions"
+            " WHERE is_simulation = FALSE AND status IN ('open', 'closing')"
+        )
+        return float(cur.fetchone()[0])
+
+
+def get_today_live_net_pnl() -> float:
+    """Signed net P&L (SOL) on live positions closed today. Negative on a losing day.
+
+    Same rows as get_today_live_losses, without the clamp at zero: the day-start bankroll
+    has to subtract a winning day's gains as well as add back a losing day's losses.
+    """
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(pnl_sol), 0)
+            FROM trading_positions
+            WHERE is_simulation = FALSE
+              AND status        = 'closed'
+              AND exit_time     >= CURRENT_DATE
+            """
+        )
+        return float(cur.fetchone()[0])
+
+
 def get_live_net_loss_since(since) -> float:
     """
     Net loss (SOL) on closed live positions with exit_time >= `since`.
