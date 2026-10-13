@@ -204,6 +204,22 @@ QSIM_POST_EXIT_BANK_MAX_PER_MIN  = int(os.getenv("QSIM_POST_EXIT_BANK_MAX_PER_MI
 # cost falls only on the rare coin still running. 0 hours disables the extension.
 QSIM_POST_EXIT_BANK_EXTEND_HOURS    = float(os.getenv("QSIM_POST_EXIT_BANK_EXTEND_HOURS", "6"))
 QSIM_POST_EXIT_BANK_EXTEND_MIN_MULT = float(os.getenv("QSIM_POST_EXIT_BANK_EXTEND_MIN_MULT", "1.5"))
+# RECOVERY WINDOW — the other half of "still running", for exits that were NOT banks.
+# QI (2026-10-09) was stopped at 0.78x, fell to 0.57x, and was at 36x a day later; BORDR
+# and API did the same. No stop width holds them (a wider stop lost at every level on 114
+# clean-window stops), so the only way to own one is to buy it back, and the only record
+# of the way back was the hourly probe: an "alert at 1.5x" replayed on that record fired
+# at 2.6x on average. A re-entry rule cannot be judged on a path seen once an hour.
+# A non-bank exit whose latest look is at or above RECOVER_MIN_MULT (a multiple of ENTRY)
+# is therefore probed every RECOVER_CADENCE_SECS, up to RECOVER_HOURS after the exit. It
+# drops back to the hourly probe on the first look below the line and returns if an hourly
+# look finds it above again. Own allowance, so it cannot slow the first-30-minute dense
+# window, and inside the monitor's global pacing like every other probe. Research only:
+# nothing here opens, closes or alerts on anything. 0 hours disables it.
+QSIM_POST_EXIT_RECOVER_HOURS        = float(os.getenv("QSIM_POST_EXIT_RECOVER_HOURS", "24"))
+QSIM_POST_EXIT_RECOVER_MIN_MULT     = float(os.getenv("QSIM_POST_EXIT_RECOVER_MIN_MULT", "1.0"))
+QSIM_POST_EXIT_RECOVER_CADENCE_SECS = float(os.getenv("QSIM_POST_EXIT_RECOVER_CADENCE_SECS", "60"))
+QSIM_POST_EXIT_RECOVER_MAX_PER_MIN  = int(os.getenv("QSIM_POST_EXIT_RECOVER_MAX_PER_MIN", "4"))
 # A close is STALE when the position went unobserved longer than this right before the quote
 # that closed it. Such a row is not the exit the strategy would have taken — the thresholds were
 # never evaluated during the gap — so it gets a 'stale_' exit_reason prefix and is excluded from
@@ -307,6 +323,7 @@ _post_exit_quote_window: list[float] = [] # monotonic timestamps of recent post-
 _shadow_fast_window: list[float] = []     # monotonic timestamps of recent fast-lane quotes
 _dense_window: list[float] = []           # monotonic timestamps of recent dense post-exit quotes
 _bank_window: list[float] = []            # monotonic timestamps of recent bank-window quotes
+_recover_window: list[float] = []         # monotonic timestamps of recent recovery-window quotes
 _backoff_until: float = 0.0               # monotonic time until which quoting is paused (429 backoff)
 _last_monitor_call: float = 0.0           # monotonic time of the monitor's last Jupiter call
 
@@ -910,12 +927,23 @@ def _bank_budget_ok() -> bool:
     return _window_budget_ok(_bank_window, QSIM_POST_EXIT_BANK_MAX_PER_MIN)
 
 
+def _recover_budget_ok() -> bool:
+    return _window_budget_ok(_recover_window, QSIM_POST_EXIT_RECOVER_MAX_PER_MIN)
+
+
+def _recover_enabled() -> bool:
+    return (QSIM_POST_EXIT_RECOVER_HOURS > 0 and QSIM_POST_EXIT_RECOVER_CADENCE_SECS > 0
+            and QSIM_POST_EXIT_RECOVER_MAX_PER_MIN > 0)
+
+
 def _post_exit_tier(pos: dict, now_utc: datetime) -> str | None:
-    """'bank', 'dense', or None (leave it to the hourly probe).
+    """'bank', 'dense', 'recover', or None (leave it to the hourly probe).
 
     A banked exit is in the bank window for BANK_MINS; any exit is in the dense window
-    for DENSE_MINS. Bank wins where both apply. A position whose exit_time is missing
-    is nobody's: guessing its age would put it on the fastest cadence forever.
+    for DENSE_MINS. Bank wins where both apply. A NON-bank exit past the dense window is
+    in the recovery window while its latest look is back at or above entry. A position
+    whose exit_time is missing is nobody's: guessing its age would put it on the fastest
+    cadence forever.
     """
     exit_time = pos.get("exit_time")
     if exit_time is None:
@@ -940,38 +968,56 @@ def _post_exit_tier(pos: dict, now_utc: datetime) -> str | None:
     if (QSIM_POST_EXIT_DENSE_MINS > 0 and QSIM_POST_EXIT_DENSE_CADENCE_SECS > 0
             and age_min <= QSIM_POST_EXIT_DENSE_MINS):
         return "dense"
+    # Recovering: a stop or floor exit that has climbed back to entry. Banked exits have
+    # their own extension above and never land here. As there, an unknown last_mult does
+    # not qualify.
+    if (_recover_enabled() and "bank" not in (pos.get("exit_reason") or "")
+            and age_min <= QSIM_POST_EXIT_RECOVER_HOURS * 60.0):
+        last_mult = pos.get("last_mult")
+        if last_mult is not None and float(last_mult) >= QSIM_POST_EXIT_RECOVER_MIN_MULT:
+            return "recover"
     return None
 
 
 async def _run_dense_post_exit() -> set[int]:
-    """Probe recently closed positions at the bank / dense cadences.
+    """Probe recently closed positions at the bank / recovery / dense cadences.
 
-    Returns the call_ids that belong to one of the two fast windows, whether or not
-    they were due this pass, so the hourly probe skips them and nothing is quoted from
-    two budgets at once. A non-bank exit older than DENSE_MINS is NOT returned — it has
-    aged out and belongs to the hourly probe again.
+    Returns the call_ids that belong to one of the fast windows, whether or not they were
+    due this pass, so the hourly probe skips them and nothing is quoted from two budgets
+    at once. A non-bank exit older than DENSE_MINS that is NOT back above entry is not
+    returned — it has aged out and belongs to the hourly probe again.
 
     Fetched with its OWN query on purpose. The hourly probe's selection is ordered
     longest-since-last-probe first and LIMITed; a position probed seconds ago sorts
     last and falls outside that limit whenever more than `limit` coins are in the 24h
     window, so a fast cadence bolted onto that list would silently never run.
 
-    Banked exits are served first: at 15s they are the ones a late look costs most.
+    Banked exits are served first: at 15s they are the ones a late look costs most. Then
+    recovering exits, which are rare; then the first-30-minute dense window.
     """
-    horizon = max(QSIM_POST_EXIT_DENSE_MINS, QSIM_POST_EXIT_BANK_MINS)
+    recover_mins = QSIM_POST_EXIT_RECOVER_HOURS * 60.0 if _recover_enabled() else 0.0
+    horizon = max(QSIM_POST_EXIT_DENSE_MINS, QSIM_POST_EXIT_BANK_MINS, recover_mins)
     if horizon <= 0:
         return set()
     extend_mins = (QSIM_POST_EXIT_BANK_EXTEND_HOURS * 60.0
                    if QSIM_POST_EXIT_BANK_MINS > 0 else 0.0)
     recent = db.get_qsim_fast_probe_candidates(
         QSIM_POST_EXIT_DENSE_MINS, QSIM_POST_EXIT_BANK_MINS,
-        extend_mins, QSIM_POST_EXIT_BANK_EXTEND_MIN_MULT, QSIM_POST_EXIT_OBS_LIMIT)
+        extend_mins, QSIM_POST_EXIT_BANK_EXTEND_MIN_MULT, QSIM_POST_EXIT_OBS_LIMIT,
+        recover_mins=recover_mins, recover_min_mult=QSIM_POST_EXIT_RECOVER_MIN_MULT)
     now_utc = datetime.now(timezone.utc)
     tiered = [(pos, _post_exit_tier(pos, now_utc)) for pos in recent]
     tiered = [(pos, tier) for pos, tier in tiered if tier]
     ids = {int(pos["call_id"]) for pos, _ in tiered}
-    tiered.sort(key=lambda pt: 0 if pt[1] == "bank" else 1)      # stable: keeps overdue order
-    spent = {"bank": False, "dense": False}
+    order = {"bank": 0, "recover": 1, "dense": 2}
+    tiered.sort(key=lambda pt: order[pt[1]])                     # stable: keeps overdue order
+    cadences = {"bank": QSIM_POST_EXIT_BANK_CADENCE_SECS,
+                "recover": QSIM_POST_EXIT_RECOVER_CADENCE_SECS,
+                "dense": QSIM_POST_EXIT_DENSE_CADENCE_SECS}
+    budgets = {"bank": _bank_budget_ok, "recover": _recover_budget_ok,
+               "dense": _dense_budget_ok}
+    windows = {"bank": _bank_window, "recover": _recover_window, "dense": _dense_window}
+    spent = {"bank": False, "recover": False, "dense": False}
     now_mono = time.monotonic()
     for pos, tier in tiered:
         if spent[tier]:
@@ -979,8 +1025,7 @@ async def _run_dense_post_exit() -> set[int]:
         cid = pos["call_id"]
         if ratchet_shadow.tracking(cid):
             continue                      # the shadow fast lane owns it
-        cadence = (QSIM_POST_EXIT_BANK_CADENCE_SECS if tier == "bank"
-                   else QSIM_POST_EXIT_DENSE_CADENCE_SECS)
+        cadence = cadences[tier]
         last_at = pos.get("last_probe_at")
         if last_at is not None:
             ref = last_at if last_at.tzinfo else last_at.replace(tzinfo=timezone.utc)
@@ -988,13 +1033,12 @@ async def _run_dense_post_exit() -> set[int]:
                 continue
         if now_mono - _last_post_exit_quote_ts.get(cid, 0.0) < cadence:
             continue
-        ok = _bank_budget_ok() if tier == "bank" else _dense_budget_ok()
-        if not ok:
-            spent[tier] = True            # this tier is out; the other may still have room
+        if not budgets[tier]():
+            spent[tier] = True            # this tier is out; the others may still have room
             if not _budget_ok():
                 break                     # the global cap is what ran out
             continue
-        (_bank_window if tier == "bank" else _dense_window).append(time.monotonic())
+        windows[tier].append(time.monotonic())
         await _qsim_post_exit_tick(pos, slow_budget=False)
         if time.monotonic() < _backoff_until:
             break
@@ -1425,6 +1469,12 @@ async def run_qsim_monitor() -> None:
              else "; no extension")
           if QSIM_POST_EXIT_OBS_ENABLED and QSIM_POST_EXIT_BANK_MINS > 0 else
           "[qsim] post-exit BANK window: OFF")
+    print(f"[qsim] post-exit RECOVERY window: non-bank exits back at >= "
+          f"{QSIM_POST_EXIT_RECOVER_MIN_MULT:g}x of entry, every "
+          f"{QSIM_POST_EXIT_RECOVER_CADENCE_SECS:g}s up to {QSIM_POST_EXIT_RECOVER_HOURS:g}h, "
+          f"cap={QSIM_POST_EXIT_RECOVER_MAX_PER_MIN}/min"
+          if QSIM_POST_EXIT_OBS_ENABLED and _recover_enabled() else
+          "[qsim] post-exit RECOVERY window: OFF")
     # Say whether the lane is actually RUNNING, not just how it is configured. This line
     # printed unconditionally, so it read identically with RATCHET_SHADOW_ENABLED=false
     # and gave a false all-clear when the lane had been turned off to free its 5/min.

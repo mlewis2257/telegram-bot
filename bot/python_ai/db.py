@@ -1695,14 +1695,17 @@ def get_recent_closed_qsim_positions_for_post_exit(minutes: float, limit: int = 
 
 def get_qsim_fast_probe_candidates(dense_mins: float, bank_mins: float,
                                    extend_mins: float, extend_min_mult: float,
-                                   limit: int = 50) -> list[dict]:
+                                   limit: int = 50, recover_mins: float = 0.0,
+                                   recover_min_mult: float = 1.0) -> list[dict]:
     """Closed qsim positions that belong to one of the FAST post-exit windows.
 
-    Three ways in, decided here in SQL rather than by the caller:
+    Four ways in, decided here in SQL rather than by the caller:
       * any exit within `dense_mins`
       * a banked exit within `bank_mins`
       * a banked exit within `extend_mins` whose LATEST look is still >= `extend_min_mult`
         (the coin is still running — see qsim.QSIM_POST_EXIT_BANK_EXTEND_HOURS)
+      * a NON-bank exit within `recover_mins` whose LATEST look is >= `recover_min_mult`
+        (stopped or floored, now back above entry — QSIM_POST_EXIT_RECOVER_HOURS)
 
     The filter lives in the query on purpose. The extended window reaches back hours, and
     a plain "everything closed in the last N hours ... LIMIT n" list, ordered
@@ -1717,7 +1720,8 @@ def get_qsim_fast_probe_candidates(dense_mins: float, bank_mins: float,
     """
     conn = get_conn()
     safe_rollback()
-    horizon = max(float(dense_mins), float(bank_mins), float(extend_mins), 0.0)
+    horizon = max(float(dense_mins), float(bank_mins), float(extend_mins),
+                  float(recover_mins), 0.0)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1749,10 +1753,14 @@ def get_qsim_fast_probe_candidates(dense_mins: float, bank_mins: float,
                OR (x.exit_reason LIKE '%%bank%%' AND %s > 0
                    AND x.exit_time >= now() - (%s || ' minutes')::interval
                    AND x.last_mult >= %s)
+               OR (coalesce(x.exit_reason, '') NOT LIKE '%%bank%%' AND %s > 0
+                   AND x.exit_time >= now() - (%s || ' minutes')::interval
+                   AND x.last_mult >= %s)
             ORDER BY x.last_probe_at ASC NULLS FIRST, x.exit_time DESC
             LIMIT %s
             """,
-            (horizon, dense_mins, bank_mins, extend_mins, extend_mins, extend_min_mult, limit),
+            (horizon, dense_mins, bank_mins, extend_mins, extend_mins, extend_min_mult,
+             recover_mins, recover_mins, recover_min_mult, limit),
         )
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
