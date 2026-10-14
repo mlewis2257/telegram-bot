@@ -196,6 +196,48 @@ def _parse_live_size() -> tuple[float | None, str]:
 LIVE_SIZE_SOL, _size_banner = _parse_live_size()
 print(_size_banner)
 
+# ── Smaller size on young tokens ───────────────────────────────────────────────
+# Every rug the live lane (solwhaletrending, safe, 80-120k) has taken was a token under
+# 10 minutes old at the call: qsim 15 of 137 young vs 0 of 72 older, 2026-09-23..10-14,
+# and live's deep stops sit in the same group. P&L by age is less certain than that rug
+# count — the age split does NOT hold in the neighbouring flags/bands, where young coins
+# often did better — so young tokens are traded SMALLER rather than skipped: same volume,
+# about half the rug cost. Decided 2026-10-14.
+#   LIVE_SIZE_SOL_YOUNG=0.05   size for tokens younger than LIVE_YOUNG_AGE_MIN. 0/unset = off.
+#   LIVE_YOUNG_AGE_MIN=10      the cutoff in minutes (age at first detection, the same
+#                              tokens.token_age_minutes the analysis used).
+# It can only make a trade SMALLER: if it is set above the normal size, the normal size is
+# used. An unknown age counts as young. Same typo guard as LIVE_SIZE_SOL.
+def _parse_young_size() -> tuple[float | None, float, str]:
+    raw = os.getenv("LIVE_SIZE_SOL_YOUNG", "").strip()
+    try:
+        cutoff = float(os.getenv("LIVE_YOUNG_AGE_MIN", "10") or "10")
+    except ValueError:
+        cutoff = 10.0
+    if not raw or raw in ("0", "0.0"):
+        return None, cutoff, "[live] young-token size: off (LIVE_SIZE_SOL_YOUNG unset)"
+    try:
+        cap = float(os.getenv("LIVE_SIZE_MAX_SOL", "1.0") or "1.0")
+    except ValueError:
+        cap = 1.0
+    try:
+        val = float(raw)
+    except ValueError:
+        return None, cutoff, (f"[live] WARNING: LIVE_SIZE_SOL_YOUNG={raw!r} is not a number — "
+                              f"IGNORED, young tokens trade at the normal size")
+    if not (0.0 < val <= cap):
+        return None, cutoff, (f"[live] WARNING: LIVE_SIZE_SOL_YOUNG={raw} is outside (0, {cap:g}] — "
+                              f"IGNORED, young tokens trade at the normal size")
+    if cutoff <= 0:
+        return None, cutoff, (f"[live] WARNING: LIVE_YOUNG_AGE_MIN={cutoff:g} must be above 0 — "
+                              f"young-token size IGNORED")
+    return val, cutoff, (f"[live] young-token size: {val:.4f} SOL for tokens under {cutoff:g} min "
+                         f"old at the call (unknown age counts as young; never above the normal size)")
+
+
+LIVE_SIZE_SOL_YOUNG, LIVE_YOUNG_AGE_MIN, _young_banner = _parse_young_size()
+print(_young_banner)
+
 
 # ── Per-channel mcap entry limits ──────────────────────────────────────────────
 
@@ -853,6 +895,20 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         # Size: LIVE_SIZE_SOL from .env if set, else the allowlist lane's own size, else
         # the legacy LIVE_POSITION_SIZE_SOL default.
         size = float(LIVE_SIZE_SOL or _lane.get("size") or _position_size(label))
+        if LIVE_SIZE_SOL_YOUNG and mint and LIVE_SIZE_SOL_YOUNG < size:
+            _yage = None
+            try:
+                _yage = _entry_token_age(mint)
+            except Exception as _ye:
+                db.safe_rollback()
+                print(f"[live] {symbol} token age lookup failed "
+                      f"({type(_ye).__name__}: {_ye}) — treating as young")
+            if _yage is None or _yage < LIVE_YOUNG_AGE_MIN:
+                print(f"[live] {symbol} young token "
+                      f"({'age unknown' if _yage is None else f'{_yage:.0f}m'} < "
+                      f"{LIVE_YOUNG_AGE_MIN:g}m) — size {LIVE_SIZE_SOL_YOUNG:.4f} SOL "
+                      f"instead of {size:.4f}")
+                size = LIVE_SIZE_SOL_YOUNG
         try:
             balance = _sol_balance_with_failover()
             if balance < size + 0.05:

@@ -44,6 +44,10 @@ out-of-band     blocked                               LIVE_ENTRY_OUT_BAND_ALLOW_
 exit            bank_2x + 20% hard stop + profit floor
 size            0.05 SOL, max 5 open                  LIVE_SIZE_SOL in .env overrides the lane table's 0.05
                                                       (unset = lane table; refused above LIVE_SIZE_MAX_SOL=1.0)
+                LIVE_SIZE_SOL_YOUNG=<n> trades tokens under LIVE_YOUNG_AGE_MIN (10) minutes old
+                at that smaller size (unknown age = young; never above the normal size)
+entry gate      LIVE_MIN_ENTRY_EXEC_RATIO=<r> skips entries quoting below r x the call mcap
+                (off unless set; 1.00 recommended — below 1.00x: 1 bank in 27, 2026-10-14)
 risk cap        MAX_TOTAL_LOSS_SOL=0.35, MAX_DAILY_LOSS_SOL=0
                 MAX_DAILY_LOSS_PCT=<n> sets the daily limit as n% of the day-start bankroll
                 (SOL balance + cost of open positions); with both set the stricter applies
