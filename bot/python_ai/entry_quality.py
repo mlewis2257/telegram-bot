@@ -131,3 +131,46 @@ def _positive_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return out if out > 0 else None
+
+
+def check_entry_min_ratio(
+    *,
+    min_ratio: float,
+    executable_mcap: float | None,
+    token_data: dict[str, Any] | None,
+    market: dict[str, Any] | None = None,
+) -> EntryRatioDecision:
+    """Refuse an entry whose executable price has NOT lifted off the call price.
+
+    The mirror of check_entry_exec_ratio. A coin quoting at or below the mcap in its own
+    call is usually already being sold into that call: on the live lane (safe, 80-120k)
+    such entries rugged four times as often and lost in every sample looked at
+    (2026-10-13: qsim -12%/SOL on 35 before 10-07, -33% on 9 after; live 0 banks in 18).
+
+    FAILS OPEN, unlike the max-ratio gate: with no executable mcap or no reference there is
+    nothing to compare, and a missing SOL price must not become "skip every trade".
+    `max_ratio` on the returned decision carries the MINIMUM that was applied.
+    """
+    if min_ratio <= 0:
+        return EntryRatioDecision(True, False, "disabled", max_ratio=min_ratio)
+
+    exec_mcap = _positive_float(executable_mcap)
+    if not exec_mcap:
+        return EntryRatioDecision(True, True, "missing_executable_entry", max_ratio=min_ratio)
+
+    ref_mcap, ref_source = trusted_reference_mcap(token_data, market)
+    if not ref_mcap:
+        return EntryRatioDecision(True, True, "missing_reference",
+                                  executable_mcap=exec_mcap, max_ratio=min_ratio)
+
+    ratio = exec_mcap / ref_mcap
+    return EntryRatioDecision(
+        allowed=ratio >= min_ratio,
+        enabled=True,
+        reason="ok" if ratio >= min_ratio else "entry_below_call",
+        executable_mcap=exec_mcap,
+        reference_mcap=ref_mcap,
+        reference_source=ref_source,
+        ratio=ratio,
+        max_ratio=min_ratio,
+    )

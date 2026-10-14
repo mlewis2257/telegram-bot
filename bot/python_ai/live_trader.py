@@ -94,6 +94,17 @@ _pending_mints: set[str] = set()
 _pending_lock = asyncio.Lock()
 
 
+def _entry_token_age(mint: str) -> float | None:
+    """Token age in minutes at first detection (tokens.token_age_minutes), or None."""
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute("SELECT token_age_minutes FROM tokens WHERE mint_address = %s LIMIT 1",
+                    (mint,))
+        row = cur.fetchone()
+    return float(row[0]) if row and row[0] is not None else None
+
+
 # ── Circuit breaker state ──────────────────────────────────────────────────────
 
 _STATE_DIR         = Path(os.path.dirname(__file__)) / ".last_run"
@@ -116,6 +127,38 @@ print(f"[live] max entry exec/ref ratio: {LIVE_MAX_ENTRY_EXEC_RATIO:g}x"
 LIVE_ENTRY_ROUNDTRIP_MIN_MULT = entry_quality.env_float(os.getenv("LIVE_ENTRY_ROUNDTRIP_MIN_MULT"), 0.0)
 print(f"[live] entry roundtrip min: {LIVE_ENTRY_ROUNDTRIP_MIN_MULT:g}x"
       if LIVE_ENTRY_ROUNDTRIP_MIN_MULT > 0 else "[live] entry roundtrip min: disabled")
+# MINIMUM entry/call ratio — skip a coin that has not lifted off its own call price.
+# Found 2026-10-13 on the live lane (safe, 80-120k). Entries quoting below 1.05x of the
+# call's mcap, against entries at or above it:
+#     qsim 09-23..10-06   35 trades  -12.2%/SOL   vs   98 trades  +4.4%
+#     qsim 10-07..10-13    9 trades  -33.0%/SOL   vs   61 trades  +5.4%
+#     live 09-29..10-13   18 trades  -17.1%/SOL, 0 banks   vs   110 trades  +4.8%
+# The loss is rugs, not bank rate: 7 of 44 sold below half against 7 of 159. The 1.05 was
+# picked on the second qsim window and held, unchanged, on the first; live's fills are the
+# same coins on a different ruler, not a third sample. Cells are small — expect the size
+# of the effect to shrink.
+# In finer steps (2026-10-14) it is a SLOPE, not a cliff. Below 1.00x is negative in all
+# three sources (1 bank in 27 trades). 1.00-1.05x DISAGREES: live 9 trades -18.7% and
+# qsim 10-07+ 6 trades -36.5%, but qsim 09-23..10-06 20 trades +1.1% with 5 banks. So
+# 1.00 is the line all three support; 1.05 rests partly on that contested step.
+#   LIVE_MIN_ENTRY_EXEC_RATIO=1.00          on (recommended start). 0/unset = off.
+#   LIVE_MIN_ENTRY_EXEC_RATIO_MAX_AGE_MIN=10   apply it ONLY to tokens younger than this
+#       many minutes at the call (the cell where it bites hardest: -20.7% qsim, -16.2%
+#       live). 0/unset = every token. An unknown age counts as young.
+# Costs one pre-entry buy quote per attempt if neither of the two gates above is already
+# on. Fails open on a missing price. qsim keeps trading everything, so what this skips
+# stays measurable: WHERE calls.live_skip_reason = 'entry_below_call'.
+LIVE_MIN_ENTRY_EXEC_RATIO = entry_quality.env_float(os.getenv("LIVE_MIN_ENTRY_EXEC_RATIO"), 0.0)
+LIVE_MIN_ENTRY_EXEC_RATIO_MAX_AGE_MIN = entry_quality.env_float(
+    os.getenv("LIVE_MIN_ENTRY_EXEC_RATIO_MAX_AGE_MIN"), 0.0)
+if LIVE_MIN_ENTRY_EXEC_RATIO < 0 or LIVE_MIN_ENTRY_EXEC_RATIO > 2.0:
+    print(f"[live] WARNING: LIVE_MIN_ENTRY_EXEC_RATIO={LIVE_MIN_ENTRY_EXEC_RATIO:g} is outside "
+          f"[0, 2] — IGNORED (a minimum that high would skip nearly every trade)")
+    LIVE_MIN_ENTRY_EXEC_RATIO = 0.0
+print(f"[live] min entry exec/ref ratio: {LIVE_MIN_ENTRY_EXEC_RATIO:g}x"
+      + (f", tokens under {LIVE_MIN_ENTRY_EXEC_RATIO_MAX_AGE_MIN:g} min old only"
+         if LIVE_MIN_ENTRY_EXEC_RATIO_MAX_AGE_MIN > 0 else ", all tokens")
+      if LIVE_MIN_ENTRY_EXEC_RATIO > 0 else "[live] min entry exec/ref ratio: disabled")
 
 
 # ── Live trade size (.env, not the lane table) ─────────────────────────────────
@@ -989,7 +1032,8 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
                 print(f"[live] dev gate error (allowing): {type(e).__name__} {e}")
 
         if (
-            (LIVE_MAX_ENTRY_EXEC_RATIO > 0 or LIVE_ENTRY_ROUNDTRIP_MIN_MULT > 0)
+            (LIVE_MAX_ENTRY_EXEC_RATIO > 0 or LIVE_ENTRY_ROUNDTRIP_MIN_MULT > 0
+             or LIVE_MIN_ENTRY_EXEC_RATIO > 0)
             and mint
             and not mint.startswith(("INFERRED:", "UNKNOWN:"))
         ):
@@ -1022,6 +1066,39 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
                 )
                 db.set_call_skip_reason(call_id, gate.reason)
                 return False
+            if LIVE_MIN_ENTRY_EXEC_RATIO > 0:
+                _age = None
+                _min_applies = True
+                if LIVE_MIN_ENTRY_EXEC_RATIO_MAX_AGE_MIN > 0:
+                    # Age-scoped: only tokens younger than the cutoff. A failed lookup
+                    # leaves the age unknown, which counts as young (gate applies).
+                    try:
+                        _age = _entry_token_age(mint)
+                    except Exception as _ae:
+                        db.safe_rollback()
+                        print(f"[live] {symbol} token age lookup failed "
+                              f"({type(_ae).__name__}: {_ae}) — treating as young")
+                    _min_applies = _age is None or _age < LIVE_MIN_ENTRY_EXEC_RATIO_MAX_AGE_MIN
+                if _min_applies:
+                    low = entry_quality.check_entry_min_ratio(
+                        min_ratio=LIVE_MIN_ENTRY_EXEC_RATIO,
+                        executable_mcap=quote_entry,
+                        token_data=token_data,
+                        market=market,
+                    )
+                    if not low.allowed:
+                        print(
+                            f"[live] {symbol} skipped — entry below call: exec/ref ratio "
+                            f"{(low.ratio or 0):.2f}x < {LIVE_MIN_ENTRY_EXEC_RATIO:.2f}x min "
+                            f"exec=${(low.executable_mcap or 0)/1000:.1f}k "
+                            f"ref=${(low.reference_mcap or 0)/1000:.1f}k "
+                            f"age={'?' if _age is None else f'{_age:.0f}m'} call_id={call_id}"
+                        )
+                        db.set_call_skip_reason(call_id, "entry_below_call")
+                        return False
+                    if low.reason != "ok":
+                        print(f"[live] {symbol} min entry ratio not applied ({low.reason}) "
+                              f"call_id={call_id}")
             if LIVE_ENTRY_ROUNDTRIP_MIN_MULT > 0:
                 roundtrip_sol, _ok = await _entry_quote_retry(
                     lambda: jupiter.get_sell_quote(mint, quote_tokens, raise_on_ratelimit=True),
