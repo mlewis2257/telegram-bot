@@ -430,6 +430,27 @@ LIVE_LANES: dict[tuple[str, str, str], dict] = {
     },
 }
 
+# UNLABELLED solwhaletrending calls (score 63+), opt-in. The lane above is literally "calls
+# that scored below 63": telegram_client labels low_score only under 63, and on this channel
+# 63-69 gets no label and 70+ goes out as an alert, so both land in category "none" and
+# were never traded. From 2026-10-09 the channel's coin mix turned younger and less
+# bundled, the scorer rewards both, and ~75% of safe in-band calls moved out of low_score
+# (live fell from 10-17 trades/day to 4-7). Shadow, on the same ruler for both lanes, reads
+# the unlabelled lane level with low_score (+41.5% vs +34.4% since 10-09; shadow overstates
+# this lane by ~41 points against qsim) and with FEWER rugs (3.8% vs 5.7%). qsim began
+# measuring it 2026-10-15 (QSIM_EXTRA_LANES_JSON). Operator's call to trade it live at
+# 0.05 while that measurement runs.
+#
+# Same days, exit and entry filter (safe, 80-120k) as the anchor lane. One difference: the
+# high_holders rug gate only relabels low-score calls, so unlabelled calls are not
+# holder-gated — which is also how shadow and qsim measured them.
+#   LIVE_TRADE_SWT_UNLABELLED=true   on. Unset/false = off, live unchanged.
+if os.getenv("LIVE_TRADE_SWT_UNLABELLED", "false").strip().lower() == "true":
+    LIVE_LANES[("solwhaletrending", "none", "none")] = {
+        "days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sun"},
+        "exit": EXIT_EARLY, "size": 0.05,
+    }
+
 
 def resolve_live(channel: Optional[str], vip_tier: Optional[str], category: Optional[str],
                  now: Optional[datetime] = None) -> dict:

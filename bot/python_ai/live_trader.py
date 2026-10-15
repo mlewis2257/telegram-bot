@@ -326,6 +326,10 @@ LIVE_LANE_STRATEGY   = os.getenv("LIVE_LANE_STRATEGY", "A").strip().upper()
 print("[live] lane-policy gate: "
       + (f"ON (mirrors testbed strategy {LIVE_LANE_STRATEGY})" if LIVE_USE_LANE_POLICY
          else "OFF (strategy_engine entry, not lane-gated)"))
+if LIVE_USE_LANE_POLICY and LIVE_LANE_STRATEGY == "LIVE":
+    print("[live] live lanes: " + ", ".join(
+        f"{c}/{t}/{k} ({','.join(sorted(v.get('days') or []))})"
+        for (c, t, k), v in lane_policy.LIVE_LANES.items()))
 
 # ── Sell-quote exit source of truth (Phase 1: observation) ────────────────────
 # The feed mcap that drives live exits is unreliable at/after entry (under-reports
