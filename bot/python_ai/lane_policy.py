@@ -451,6 +451,15 @@ if os.getenv("LIVE_TRADE_SWT_UNLABELLED", "false").strip().lower() == "true":
         "exit": EXIT_EARLY, "size": 0.05,
     }
 
+# The anchor lane itself can be switched off, operator's call 2026-10-16. Since the Oct 9
+# shift it carries ~2 calls/day, and on live from 10-15 it was 4 trades / -0.149 SOL against
+# the unlabelled lane's 23 / +0.096 (three quarters of that gap is one rug, VEILTRUMP, the
+# first rug on a safe coin over 10 min old). qsim keeps trading low_score (QSIM_LANES), so
+# the lane stays measured and can be switched back on.
+#   LIVE_TRADE_SWT_LOW_SCORE=false   off. Unset/true = on (the default, unchanged).
+if os.getenv("LIVE_TRADE_SWT_LOW_SCORE", "true").strip().lower() == "false":
+    LIVE_LANES.pop(("solwhaletrending", "none", "low_score"), None)
+
 
 def resolve_live(channel: Optional[str], vip_tier: Optional[str], category: Optional[str],
                  now: Optional[datetime] = None) -> dict:

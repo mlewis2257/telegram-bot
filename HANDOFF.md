@@ -38,6 +38,8 @@ wins; qsim loses the counterfactual. ~1,032 qsim opens have been lost to 429s.
 lane            solwhaletrending / none / low_score   (LIVE_LANES in lane_policy.py)
                 + solwhaletrending / none / none when LIVE_TRADE_SWT_UNLABELLED=true
                   (calls scoring 63+, which get no label; see lane_policy.py)
+                LIVE_TRADE_SWT_LOW_SCORE=false removes the low_score lane from live
+                  (qsim keeps trading it)
 days            Mon Tue Wed Thu Fri Sun               (Sat cut; Fri restored 2026-10-08)
 mcap band       80k-120k                              (entry_filter)
 security_flag   safe ONLY                             LIVE_ENTRY_BLOCK_SECURITY_FLAGS=warning,unknown
