@@ -445,9 +445,30 @@ LIVE_LANES: dict[tuple[str, str, str], dict] = {
 # high_holders rug gate only relabels low-score calls, so unlabelled calls are not
 # holder-gated — which is also how shadow and qsim measured them.
 #   LIVE_TRADE_SWT_UNLABELLED=true   on. Unset/false = off, live unchanged.
+#   LIVE_SWT_UNLABELLED_DAYS=Mon,Tue,Wed,Thu,Fri,Sat,Sun   its own day list (UTC days).
+#       Unset = the anchor lane's days (no Saturday). The Saturday cut was measured on the
+#       low_score lane (-13%/SOL in both exit eras); shadow, comparing days WITHIN each lane
+#       (2026-10-17), puts Saturday last with the most rugs for low_score (+26.5%, 9 of 86
+#       below half) but among the better days for the unlabelled lane (+45.8%, 4 of 92).
+_DEFAULT_UNLABELLED_DAYS = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sun"}
+
+
+def _unlabelled_days() -> set:
+    raw = os.getenv("LIVE_SWT_UNLABELLED_DAYS", "").strip()
+    if not raw:
+        return set(_DEFAULT_UNLABELLED_DAYS)
+    days = {d.strip()[:3].title() for d in raw.split(",") if d.strip()}
+    valid = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
+    if not days or days - valid:
+        print(f"[lane_policy] WARNING: LIVE_SWT_UNLABELLED_DAYS={raw!r} has invalid day(s) "
+              f"{sorted(days - valid)} — IGNORED, using {sorted(_DEFAULT_UNLABELLED_DAYS)}")
+        return set(_DEFAULT_UNLABELLED_DAYS)
+    return days
+
+
 if os.getenv("LIVE_TRADE_SWT_UNLABELLED", "false").strip().lower() == "true":
     LIVE_LANES[("solwhaletrending", "none", "none")] = {
-        "days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sun"},
+        "days": _unlabelled_days(),
         "exit": EXIT_EARLY, "size": 0.05,
     }
 
