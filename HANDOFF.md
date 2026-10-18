@@ -56,10 +56,11 @@ steep hold      LIVE_STEEP_HOLD=on skips the 2x bank when qsim had the coin unde
                 3 min earlier; holds for LIVE_STEEP_TARGET (3x) / floor 1.2x / 6h.
                 OFF by default; needs database/migrate_v31.sql. qsim forward-tests it
                 (QSIM_STEEP_TRACK_HOURS=6); score with database/steep_hold_forward_test.sql
-wallet watch    wallet_watch.py (pm2 wallet-watch) records every trade by the operator's
-                followed wallets into tracked_wallet_trades. List: bot/python_ai/
-                tracked_wallets.txt (gitignored). Research only. Watch its 5-min tally
-                and the Helius dashboard for credit use.
+wallet watch    wallet_holdings.py (pm2 wallet-holdings): every 2 min, for coins live or
+                qsim(swt) holds or sold <60 min ago (max 15), ONE getMultipleAccounts reads
+                all followed wallets' balances of that coin; changes go to
+                tracked_wallet_holdings. Ceiling ~10.8k calls/day. List: bot/python_ai/
+                tracked_wallets.txt (gitignored). Research only.
 entry gate      LIVE_MIN_ENTRY_EXEC_RATIO=<r> skips entries quoting below r x the call mcap
                 (off unless set; 1.00 recommended — below 1.00x: 1 bank in 27, 2026-10-14)
 risk cap        MAX_TOTAL_LOSS_SOL=0.35, MAX_DAILY_LOSS_SOL=0

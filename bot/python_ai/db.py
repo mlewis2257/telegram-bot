@@ -2964,57 +2964,88 @@ def get_recent_ws_market_observation_counts(hours: int = 24) -> list[dict]:
         return cur.fetchall()
 
 
-def ensure_tracked_wallet_trades_table() -> None:
-    """Trades made by the wallets the operator follows (wallet_watch.py). Idempotent."""
+def ensure_tracked_wallet_holdings_table() -> None:
+    """Followed wallets' holdings of the coins the bot trades (wallet_holdings.py).
+
+    One row per CHANGE: the first non-zero reading of a wallet's balance of a coin, and
+    every reading after that differs from the previous one. prev_balance is NULL on a
+    first reading (since this process started), so "held before we looked" and
+    "bought while we watched" stay distinguishable. Idempotent.
+    """
     conn = get_conn()
     safe_rollback()
     with conn.cursor() as cur:
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS tracked_wallet_trades (
+            CREATE TABLE IF NOT EXISTS tracked_wallet_holdings (
                 id           bigserial PRIMARY KEY,
-                wallet       text NOT NULL,
-                signature    text NOT NULL,
                 mint         text NOT NULL,
-                side         text NOT NULL,          -- 'buy' | 'sell'
-                sol_amount   numeric,                -- SOL spent (buy) or received (sell)
-                token_amount numeric,
-                block_time   timestamptz,
-                observed_at  timestamptz NOT NULL DEFAULT now(),
-                UNIQUE (signature, wallet, mint)
+                wallet       text NOT NULL,
+                balance      numeric NOT NULL,      -- ui units of the coin
+                prev_balance numeric,               -- NULL = first reading
+                call_id      integer,               -- the position that made us look
+                source       text,                  -- 'live' | 'qsim'
+                observed_at  timestamptz NOT NULL DEFAULT now()
             )
             """
         )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_twt_mint_time ON tracked_wallet_trades (mint, block_time)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_twt_wallet_time ON tracked_wallet_trades (wallet, block_time)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_twh_mint_time ON tracked_wallet_holdings (mint, observed_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_twh_wallet_time ON tracked_wallet_holdings (wallet, observed_at)")
         conn.commit()
 
 
-def insert_tracked_wallet_trades(rows: list[dict]) -> int:
-    """Insert parsed trades; duplicates (same signature, wallet, mint) are ignored.
-    Returns how many were new."""
+def get_holdings_watch_coins(after_exit_mins: float, limit: int) -> list[dict]:
+    """Coins to check: live positions open or closed within `after_exit_mins`, then
+    solwhaletrending qsim positions on the same terms. Live first, then open before
+    recently closed, newest first. One row per mint."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (mint) mint, call_id, source, prio, t
+            FROM (
+                SELECT t.mint_address AS mint, tp.call_id, 'live' AS source,
+                       CASE WHEN tp.status IN ('open','closing') THEN 0 ELSE 1 END AS prio,
+                       COALESCE(tp.exit_time, tp.entry_time) AS t
+                FROM trading_positions tp JOIN tokens t ON t.id = tp.token_id
+                WHERE tp.is_simulation = FALSE
+                  AND (tp.status IN ('open','closing')
+                       OR tp.exit_time >= now() - (%s || ' minutes')::interval)
+                UNION ALL
+                SELECT t.mint_address, qp.call_id, 'qsim',
+                       CASE WHEN qp.status = 'open' THEN 2 ELSE 3 END,
+                       COALESCE(qp.exit_time, qp.entry_time)
+                FROM qsim_positions qp JOIN tokens t ON t.id = qp.token_id
+                WHERE qp.channel_handle = 'solwhaletrending'
+                  AND (qp.status = 'open'
+                       OR qp.exit_time >= now() - (%s || ' minutes')::interval)
+            ) x
+            WHERE mint IS NOT NULL AND mint NOT LIKE 'INFERRED:%%' AND mint NOT LIKE 'UNKNOWN:%%'
+            ORDER BY mint, prio, t DESC
+            """,
+            (after_exit_mins, after_exit_mins),
+        )
+        rows = [dict(zip(("mint", "call_id", "source", "prio", "t"), r)) for r in cur.fetchall()]
+    rows.sort(key=lambda r: (r["prio"], -(r["t"].timestamp() if r["t"] else 0)))
+    return rows[:limit]
+
+
+def insert_tracked_wallet_holdings(rows: list[dict]) -> int:
     if not rows:
         return 0
     conn = get_conn()
     safe_rollback()
-    new = 0
     with conn.cursor() as cur:
         for r in rows:
             cur.execute(
-                """
-                INSERT INTO tracked_wallet_trades
-                    (wallet, signature, mint, side, sol_amount, token_amount, block_time)
-                VALUES (%s, %s, %s, %s, %s, %s, to_timestamp(%s))
-                ON CONFLICT (signature, wallet, mint) DO NOTHING
-                RETURNING id
-                """,
-                (r["wallet"], r["signature"], r["mint"], r["side"], r.get("sol_amount"),
-                 r.get("token_amount"), r.get("ts")),
+                "INSERT INTO tracked_wallet_holdings (mint, wallet, balance, prev_balance, call_id, source)"
+                " VALUES (%s, %s, %s, %s, %s, %s)",
+                (r["mint"], r["wallet"], r["balance"], r.get("prev_balance"),
+                 r.get("call_id"), r.get("source")),
             )
-            if cur.fetchone() is not None:
-                new += 1
         conn.commit()
-    return new
+    return len(rows)
 
 
 def ensure_manual_exit_calls_table() -> None:
