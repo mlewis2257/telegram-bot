@@ -22,3 +22,6 @@ node_modules/
 .last_run/
 *.session
 .telegram_client.pid
+
+# Operator's followed-wallet list for wallet_watch.py (kept off GitHub)
+bot/python_ai/tracked_wallets.txt

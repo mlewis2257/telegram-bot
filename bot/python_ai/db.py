@@ -2964,6 +2964,59 @@ def get_recent_ws_market_observation_counts(hours: int = 24) -> list[dict]:
         return cur.fetchall()
 
 
+def ensure_tracked_wallet_trades_table() -> None:
+    """Trades made by the wallets the operator follows (wallet_watch.py). Idempotent."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracked_wallet_trades (
+                id           bigserial PRIMARY KEY,
+                wallet       text NOT NULL,
+                signature    text NOT NULL,
+                mint         text NOT NULL,
+                side         text NOT NULL,          -- 'buy' | 'sell'
+                sol_amount   numeric,                -- SOL spent (buy) or received (sell)
+                token_amount numeric,
+                block_time   timestamptz,
+                observed_at  timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (signature, wallet, mint)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_twt_mint_time ON tracked_wallet_trades (mint, block_time)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_twt_wallet_time ON tracked_wallet_trades (wallet, block_time)")
+        conn.commit()
+
+
+def insert_tracked_wallet_trades(rows: list[dict]) -> int:
+    """Insert parsed trades; duplicates (same signature, wallet, mint) are ignored.
+    Returns how many were new."""
+    if not rows:
+        return 0
+    conn = get_conn()
+    safe_rollback()
+    new = 0
+    with conn.cursor() as cur:
+        for r in rows:
+            cur.execute(
+                """
+                INSERT INTO tracked_wallet_trades
+                    (wallet, signature, mint, side, sol_amount, token_amount, block_time)
+                VALUES (%s, %s, %s, %s, %s, %s, to_timestamp(%s))
+                ON CONFLICT (signature, wallet, mint) DO NOTHING
+                RETURNING id
+                """,
+                (r["wallet"], r["signature"], r["mint"], r["side"], r.get("sol_amount"),
+                 r.get("token_amount"), r.get("ts")),
+            )
+            if cur.fetchone() is not None:
+                new += 1
+        conn.commit()
+    return new
+
+
 def ensure_manual_exit_calls_table() -> None:
     """Log of the operator's real-time 'I'd sell here' calls, for scoring the human exit
     read against the mechanical rules. App-owned table, self-creates."""
