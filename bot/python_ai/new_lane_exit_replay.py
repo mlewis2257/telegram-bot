@@ -54,6 +54,8 @@ class Rules:
     floors: tuple = ((1.6, 1.30), (1.35, 1.15))
     steep: tuple | None = None          # (x3_max, target, floor, hours)
     buyback: tuple | None = None        # (trigger, stop_frac, bank_mult, hours)
+    target: float | None = None         # sell everything at the first look >= target
+    trail: tuple | None = None          # (arm, pct): once peak >= arm, sell at peak*(1-pct)
     label: str = ""
 
 
@@ -108,6 +110,8 @@ def simulate(path: list, r: Rules) -> Result:
         peak = max(peak, m)
         if m <= r.stop:
             return _with_buyback(path, r, Result(m, "stop", t))
+        if r.target is not None and m >= r.target:
+            return Result(m, "target", t)
         if r.bank is not None and m >= r.bank:
             if r.steep is not None:
                 x3 = _x3(path, t)
@@ -120,6 +124,8 @@ def simulate(path: list, r: Rules) -> Result:
                 return _with_buyback(path, r, Result(m, "floor", t))
             if peak >= arm:
                 break
+        if r.trail is not None and peak >= r.trail[0] and m <= peak * (1.0 - r.trail[1]):
+            return Result(m, "trail", t)
     end = _last(path, HORIZON_S)
     return _with_buyback(path, r, Result(1.0 if end is None else end, "time", HORIZON_S))
 
@@ -172,6 +178,38 @@ def rule_grid() -> list[Rules]:
             floors.items(), stops.items(), steeps.items(), bbs.items()):
         label = " | ".join(p for p in (sn, fn, tn, bn) if p)
         out.append(Rules(stop=sv, floors=fv, steep=tv, buyback=bv, label=label))
+    return out
+
+
+def runner_grid() -> list[Rules]:
+    """No 2x bank: let winners run, protected only once they have shown 2x+.
+
+    'floor after 2x' = the profit floor arms only once the coin has reached 2x, and
+    then sells if it falls back to FLOOR. Below 2x the pre-2x floor is either off (the
+    new-lane finding) or today's tiers. Targets sell everything at 3x / 5x. Trails sell
+    at a fixed fraction below the running peak once the coin has passed the arm level.
+    The first row is today's rules, for reference.
+    """
+    now_floors = ((1.6, 1.30), (1.35, 1.15))
+    pre = {"pre-2x floor off": (), "pre-2x floor now": now_floors}
+    post = {
+        "bank 2x": dict(bank=2.0),
+        "floor after 2x @1.5": dict(bank=None, post_floor=(2.0, 1.5)),
+        "floor after 2x @1.5 + target 3x": dict(bank=None, post_floor=(2.0, 1.5), target=3.0),
+        "floor after 2x @1.5 + target 5x": dict(bank=None, post_floor=(2.0, 1.5), target=5.0),
+        "floor after 2x @1.3 + target 3x": dict(bank=None, post_floor=(2.0, 1.3), target=3.0),
+        "trail 30% after 2x": dict(bank=None, trail=(2.0, 0.30)),
+        "trail 40% after 2x": dict(bank=None, trail=(2.0, 0.40)),
+        "floor after 2x @1.5 + trail 25% after 3x": dict(bank=None, post_floor=(2.0, 1.5), trail=(3.0, 0.25)),
+        "target 3x, nothing else": dict(bank=None, target=3.0),
+    }
+    bbs = {"": None, "buyback 1.2x": (1.2, 0.8, 2.0, 6)}
+    out = [Rules(label="NOW: stop 0.80 | bank 2x | floor now")]
+    for (pn, pv), (qn, qv), (bn, bv) in itertools.product(pre.items(), post.items(), bbs.items()):
+        floors = tuple(pv) + ((qv["post_floor"],) if "post_floor" in qv else ())
+        out.append(Rules(stop=0.80, bank=qv.get("bank"), floors=floors, buyback=bv,
+                         target=qv.get("target"), trail=qv.get("trail"),
+                         label=" | ".join(x for x in (pn, qn, bn) if x)))
     return out
 
 
@@ -247,6 +285,8 @@ def main() -> None:
     ap.add_argument("--since", default="2026-10-15 06:50")
     ap.add_argument("--lane", default="none", choices=["none", "low_score"])
     ap.add_argument("--top", type=int, default=12)
+    ap.add_argument("--grid", default="exits", choices=["exits", "runner"],
+                    help="exits = stop/floor/steep/buy-back grid; runner = no-bank, let-it-run rules")
     a = ap.parse_args()
 
     allpos, _ = load(a.since, a.lane)
@@ -254,7 +294,7 @@ def main() -> None:
         "safe, 80-120k (live's filter)": [p for p in allpos if p["flag"] == "safe" and p["in_band"]],
         "all flags and sizes (cross-check)": allpos,
     }
-    grid = rule_grid()
+    grid = rule_grid() if a.grid == "exits" else runner_grid()
     base = grid[0]
     for gname, ps in groups.items():
         print(f"\n=== {a.lane} lane since {a.since} — {gname}: {len(ps)} trades ===")
