@@ -52,6 +52,10 @@ size            0.05 SOL, max 5 open                  LIVE_SIZE_SOL in .env over
                                                       (unset = lane table; refused above LIVE_SIZE_MAX_SOL=1.0)
                 LIVE_SIZE_SOL_YOUNG=<n> trades tokens under LIVE_YOUNG_AGE_MIN (10) minutes old
                 at that smaller size (unknown age = young; never above the normal size)
+steep hold      LIVE_STEEP_HOLD=on skips the 2x bank when qsim had the coin under 1.20x
+                3 min earlier; holds for LIVE_STEEP_TARGET (3x) / floor 1.2x / 6h.
+                OFF by default; needs database/migrate_v31.sql. qsim forward-tests it
+                (QSIM_STEEP_TRACK_HOURS=6); score with database/steep_hold_forward_test.sql
 entry gate      LIVE_MIN_ENTRY_EXEC_RATIO=<r> skips entries quoting below r x the call mcap
                 (off unless set; 1.00 recommended — below 1.00x: 1 bank in 27, 2026-10-14)
 risk cap        MAX_TOTAL_LOSS_SOL=0.35, MAX_DAILY_LOSS_SOL=0

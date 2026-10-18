@@ -523,6 +523,60 @@ print(f"[live] hard_stop in force: -{_LIVE_EXIT_CONFIG.hard_stop_pct*100:.0f}%"
       f"{'  (LIVE_HARD_STOP_PCT override)' if _hs_env else '  (config default — no override set)'}")
 
 
+# ── Steep hold: skip the 2x bank on coins that arrived at it steeply ───────────
+# Found 2026-10-17. A qsim bank whose real multiple was under 1.20x three minutes before
+# the 2x went on to 5x 42% of the time (38% / 44% across two periods), against 13% for
+# coins that drifted in from 1.60x or higher. Holding steep banks (target 3x or 5x,
+# floor 1.2x of ENTRY, 6h) beat banking on 18 Oct 8+ coins (+5.4 / +6.6 positions);
+# holding slow ones lost heavily. Those 18 are the coins the split was found on, so qsim
+# forward-tests it first (QSIM_STEEP_TRACK_HOURS) before this is switched on.
+#
+# When the bank overlay fires, live reads qsim's real multiple for the SAME call from
+# LIVE_STEEP_LOOKBACK_SECS earlier (same ruler as the finding). Under LIVE_STEEP_X3_MAX ->
+# the position is marked held in the database (both exit processes see it) and the bank
+# is skipped. A held position then exits ONLY on: target, floor, or the time limit. The
+# profit floor, runner window and overlay no longer apply to it; the raw hard stop is
+# below the floor so the floor always fires first. No qsim reading -> bank as usual.
+#   LIVE_STEEP_HOLD=on            enable (anything else = off, the default)
+#   LIVE_STEEP_X3_MAX=1.20        "steep" = under this, LOOKBACK seconds before the bank
+#   LIVE_STEEP_LOOKBACK_SECS=180
+#   LIVE_STEEP_TARGET=3.0         sell a held coin here (multiple of entry)
+#   LIVE_STEEP_FLOOR=1.2          ...or here
+#   LIVE_STEEP_HOURS=6            ...or after this long in hold
+# Needs database/migrate_v31.sql (column + exit reasons). Without it, it stays OFF.
+LIVE_STEEP_HOLD = os.getenv("LIVE_STEEP_HOLD", "off").strip().lower() == "on"
+LIVE_STEEP_X3_MAX        = entry_quality.env_float(os.getenv("LIVE_STEEP_X3_MAX"), 1.20)
+LIVE_STEEP_LOOKBACK_SECS = entry_quality.env_float(os.getenv("LIVE_STEEP_LOOKBACK_SECS"), 180.0)
+LIVE_STEEP_TARGET        = entry_quality.env_float(os.getenv("LIVE_STEEP_TARGET"), 3.0)
+LIVE_STEEP_FLOOR         = entry_quality.env_float(os.getenv("LIVE_STEEP_FLOOR"), 1.2)
+LIVE_STEEP_HOURS         = entry_quality.env_float(os.getenv("LIVE_STEEP_HOURS"), 6.0)
+if LIVE_STEEP_HOLD:
+    _bad = []
+    if not (0 < LIVE_STEEP_X3_MAX < 2.0):
+        _bad.append(f"LIVE_STEEP_X3_MAX={LIVE_STEEP_X3_MAX:g} not in (0, 2)")
+    if not (1.0 < LIVE_STEEP_FLOOR < 2.0):
+        _bad.append(f"LIVE_STEEP_FLOOR={LIVE_STEEP_FLOOR:g} not in (1, 2)")
+    if not (LIVE_STEEP_TARGET > 2.0):
+        _bad.append(f"LIVE_STEEP_TARGET={LIVE_STEEP_TARGET:g} must be above 2")
+    if LIVE_STEEP_HOURS <= 0 or LIVE_STEEP_LOOKBACK_SECS <= 0:
+        _bad.append("LIVE_STEEP_HOURS and LIVE_STEEP_LOOKBACK_SECS must be above 0")
+    if _bad:
+        print("[live] WARNING: steep hold settings invalid — steep hold OFF: " + "; ".join(_bad))
+        LIVE_STEEP_HOLD = False
+if LIVE_STEEP_HOLD:
+    try:
+        _ok, _why = db.live_steep_hold_schema_ok()
+    except Exception as _e:
+        _ok, _why = False, f"{type(_e).__name__}: {_e}"
+    if not _ok:
+        print(f"[live] WARNING: steep hold needs database/migrate_v31.sql ({_why}) — steep hold OFF")
+        LIVE_STEEP_HOLD = False
+print(f"[live] steep hold: ON — skip the bank when qsim had the coin under "
+      f"{LIVE_STEEP_X3_MAX:g}x {LIVE_STEEP_LOOKBACK_SECS:.0f}s earlier; then sell at "
+      f"{LIVE_STEEP_TARGET:g}x, at {LIVE_STEEP_FLOOR:g}x, or after {LIVE_STEEP_HOURS:g}h"
+      if LIVE_STEEP_HOLD else "[live] steep hold: off")
+
+
 def _apply_live_exit_overlay(
     call_id: int,
     current_mult: float,
@@ -1689,6 +1743,30 @@ async def close_live_position(
         return False
 
 
+def _steep_hold_instead_of_bank(call_id: int, bank_mult: float) -> bool:
+    """At the bank: hold instead if qsim had this coin under LIVE_STEEP_X3_MAX
+    LIVE_STEEP_LOOKBACK_SECS ago. True = position is now held (skip the bank). Any doubt —
+    no qsim reading, a database error, the other process already selling — returns False
+    and the bank goes ahead exactly as before."""
+    try:
+        x3 = db.get_qsim_mult_before(call_id, LIVE_STEEP_LOOKBACK_SECS)
+    except Exception as e:
+        db.safe_rollback()
+        print(f"[live] steep check failed call_id={call_id} ({type(e).__name__}: {e}) — banking")
+        return False
+    if x3 is None or x3 >= LIVE_STEEP_X3_MAX:
+        print(f"[live] call_id={call_id} bank at {bank_mult:.2f}x — not steep "
+              f"(qsim {'no reading' if x3 is None else f'{x3:.2f}x'} "
+              f"{LIVE_STEEP_LOOKBACK_SECS:.0f}s earlier)")
+        return False
+    if not db.mark_live_steep_hold(call_id):
+        return db.get_live_steep_hold_at(call_id) is not None
+    print(f"[live] STEEP HOLD call_id={call_id} at {bank_mult:.2f}x (qsim {x3:.2f}x "
+          f"{LIVE_STEEP_LOOKBACK_SECS:.0f}s earlier) — holding for {LIVE_STEEP_TARGET:g}x, "
+          f"floor {LIVE_STEEP_FLOOR:g}x, {LIVE_STEEP_HOURS:g}h")
+    return True
+
+
 def check_live_exits(
     call_id: int,
     current_mcap: float,
@@ -1745,6 +1823,20 @@ def check_live_exits(
     if current_mcap <= 0:
         return ExitResult(False)
 
+    # ── Steep hold: a held position exits ONLY on target / floor / time ───────────
+    if LIVE_STEEP_HOLD:
+        held_at = db.get_live_steep_hold_at(call_id)
+        if held_at is not None:
+            mult = raw_mult if (raw_mult is not None and raw_mult > 0) else current_mcap / entry_mcap
+            if mult >= LIVE_STEEP_TARGET:
+                return ExitResult(True, "steep_hold_target", exit_mcap=entry_mcap * mult)
+            if mult <= LIVE_STEEP_FLOOR:
+                return ExitResult(True, "steep_hold_floor", exit_mcap=entry_mcap * mult)
+            ref = held_at if held_at.tzinfo else held_at.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - ref).total_seconds() > LIVE_STEEP_HOURS * 3600.0:
+                return ExitResult(True, "steep_hold_time", exit_mcap=entry_mcap * mult)
+            return ExitResult(False)
+
     cfg = exit_config if exit_config is not None else _LIVE_EXIT_CONFIG
     is_vip_gamble = position.get("vip_tier") in ("gamble_risk", "gamble")
     channel_handle = (position.get("channel_handle") or "").lstrip("@")
@@ -1797,6 +1889,11 @@ def check_live_exits(
     overlay_result, overlay_suppresses_base = _apply_live_exit_overlay(
         call_id, overlay_mult, overlay_mcap
     )
+    if (overlay_result.should_exit and LIVE_STEEP_HOLD and _LIVE_EXIT_OVERLAY is not None
+            and _LIVE_EXIT_OVERLAY.kind == "bank" and overlay_result.reason == _LIVE_EXIT_OVERLAY.name
+            and overlay_mult < LIVE_STEEP_TARGET):
+        if _steep_hold_instead_of_bank(call_id, overlay_mult):
+            return ExitResult(False)
     if overlay_result.should_exit:
         return overlay_result
     if overlay_suppresses_base:

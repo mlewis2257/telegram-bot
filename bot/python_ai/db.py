@@ -1696,7 +1696,10 @@ def get_recent_closed_qsim_positions_for_post_exit(minutes: float, limit: int = 
 def get_qsim_fast_probe_candidates(dense_mins: float, bank_mins: float,
                                    extend_mins: float, extend_min_mult: float,
                                    limit: int = 50, recover_mins: float = 0.0,
-                                   recover_min_mult: float = 1.0) -> list[dict]:
+                                   recover_min_mult: float = 1.0,
+                                   steep_mins: float = 0.0, steep_lookback_secs: float = 180.0,
+                                   steep_x3_max: float = 1.20, steep_floor: float = 1.2,
+                                   steep_target: float = 5.0) -> list[dict]:
     """Closed qsim positions that belong to one of the FAST post-exit windows.
 
     Four ways in, decided here in SQL rather than by the caller:
@@ -1706,6 +1709,10 @@ def get_qsim_fast_probe_candidates(dense_mins: float, bank_mins: float,
         (the coin is still running — see qsim.QSIM_POST_EXIT_BANK_EXTEND_HOURS)
       * a NON-bank exit within `recover_mins` whose LATEST look is >= `recover_min_mult`
         (stopped or floored, now back above entry — QSIM_POST_EXIT_RECOVER_HOURS)
+      * a banked exit within `steep_mins` that arrived STEEPLY (`x3`, its multiple
+        `steep_lookback_secs` before the bank, under `steep_x3_max`) and whose latest look
+        is still between `steep_floor` and `steep_target` — the steep-hold forward test
+        (qsim.QSIM_STEEP_TRACK_HOURS). `x3` is returned for the tier decision.
 
     The filter lives in the query on purpose. The extended window reaches back hours, and
     a plain "everything closed in the last N hours ... LIMIT n" list, ordered
@@ -1721,7 +1728,7 @@ def get_qsim_fast_probe_candidates(dense_mins: float, bank_mins: float,
     conn = get_conn()
     safe_rollback()
     horizon = max(float(dense_mins), float(bank_mins), float(extend_mins),
-                  float(recover_mins), 0.0)
+                  float(recover_mins), float(steep_mins), 0.0)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1740,7 +1747,14 @@ def get_qsim_fast_probe_candidates(dense_mins: float, bank_mins: float,
                          WHERE qo.call_id = qp.call_id
                            AND (qo.real_mult IS NOT NULL OR coalesce(qo.no_route, false))
                          ORDER BY qo.observed_at DESC
-                         LIMIT 1) AS last_mult
+                         LIMIT 1) AS last_mult,
+                       (SELECT qo.real_mult
+                          FROM qsim_quote_observations qo
+                         WHERE qo.call_id = qp.call_id
+                           AND qo.real_mult IS NOT NULL
+                           AND qo.observed_at <= qp.exit_time - (%s || ' seconds')::interval
+                         ORDER BY qo.observed_at DESC
+                         LIMIT 1) AS x3
                 FROM qsim_positions qp
                 JOIN tokens t ON t.id = qp.token_id
                 WHERE qp.status = 'closed'
@@ -1756,11 +1770,15 @@ def get_qsim_fast_probe_candidates(dense_mins: float, bank_mins: float,
                OR (coalesce(x.exit_reason, '') NOT LIKE '%%bank%%' AND %s > 0
                    AND x.exit_time >= now() - (%s || ' minutes')::interval
                    AND x.last_mult >= %s)
+               OR (x.exit_reason LIKE '%%bank%%' AND %s > 0
+                   AND x.exit_time >= now() - (%s || ' minutes')::interval
+                   AND x.x3 < %s AND x.last_mult > %s AND x.last_mult < %s)
             ORDER BY x.last_probe_at ASC NULLS FIRST, x.exit_time DESC
             LIMIT %s
             """,
-            (horizon, dense_mins, bank_mins, extend_mins, extend_mins, extend_min_mult,
-             recover_mins, recover_mins, recover_min_mult, limit),
+            (steep_lookback_secs, horizon, dense_mins, bank_mins, extend_mins, extend_mins,
+             extend_min_mult, recover_mins, recover_mins, recover_min_mult,
+             steep_mins, steep_mins, steep_x3_max, steep_floor, steep_target, limit),
         )
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -3109,6 +3127,111 @@ def get_today_live_losses() -> float:
             """
         )
         return float(cur.fetchone()[0])
+
+
+def get_qsim_mult_before(call_id: int, seconds_before: float,
+                         max_extra_secs: float = 120.0) -> float | None:
+    """qsim's real multiple for call_id as it stood `seconds_before` seconds ago.
+
+    The latest real quote at or before (now - seconds_before), but no older than
+    max_extra_secs beyond that, so a coin qsim had stopped watching does not hand back a
+    stale reading. None when qsim has no such quote (it did not trade the coin, or the
+    position is younger than the lookback). Used by the steep-hold rule: a coin that was
+    under 1.20x three minutes before reaching 2x is a "steep arrival".
+    """
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT real_mult FROM qsim_quote_observations
+            WHERE call_id = %s AND real_mult IS NOT NULL
+              AND observed_at <= now() - (%s || ' seconds')::interval
+              AND observed_at >= now() - ((%s + %s) || ' seconds')::interval
+            ORDER BY observed_at DESC LIMIT 1
+            """,
+            (call_id, seconds_before, seconds_before, max_extra_secs),
+        )
+        row = cur.fetchone()
+    return float(row[0]) if row and row[0] is not None else None
+
+
+def get_live_steep_hold_at(call_id: int):
+    """When the open live position for call_id entered steep hold, or None.
+
+    Tolerates a database without the column (migrate_v31 not applied): returns None, so
+    the position is simply treated as not held.
+    """
+    conn = get_conn()
+    safe_rollback()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT steep_hold_at FROM trading_positions"
+                " WHERE call_id = %s AND is_simulation = FALSE AND status IN ('open','closing')"
+                " ORDER BY id DESC LIMIT 1",
+                (call_id,),
+            )
+            row = cur.fetchone()
+        return row[0] if row else None
+    except Exception:
+        safe_rollback()
+        return None
+
+
+def mark_live_steep_hold(call_id: int) -> bool:
+    """Put the open live position into steep hold. True only for the call that did it.
+
+    Guarded on steep_hold_at IS NULL so the two exit processes cannot both start it, and
+    on status = 'open' so a position already being sold is left alone.
+    """
+    conn = get_conn()
+    safe_rollback()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE trading_positions SET steep_hold_at = now(), updated_at = now()"
+                " WHERE call_id = %s AND is_simulation = FALSE AND status = 'open'"
+                "   AND steep_hold_at IS NULL RETURNING id",
+                (call_id,),
+            )
+            ok = cur.fetchone() is not None
+            conn.commit()
+        return ok
+    except Exception as e:
+        safe_rollback()
+        print(f"[db] mark_live_steep_hold failed (call_id={call_id}): {e}")
+        return False
+
+
+def live_steep_hold_schema_ok() -> tuple[bool, str]:
+    """(ready, why). Steep hold needs migrate_v31: the steep_hold_at column, and the three
+    steep_hold_* exit reasons in the exit_reason CHECK constraint. Without the second, the
+    close after a real on-chain sell would fail to record."""
+    conn = get_conn()
+    safe_rollback()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM information_schema.columns"
+                " WHERE table_name = 'trading_positions' AND column_name = 'steep_hold_at'"
+            )
+            if cur.fetchone() is None:
+                return False, "column trading_positions.steep_hold_at is missing"
+            cur.execute(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint"
+                " WHERE conname = 'trading_positions_exit_reason_check'"
+            )
+            row = cur.fetchone()
+        defn = row[0] if row else ""
+        missing = [r for r in ("steep_hold_target", "steep_hold_floor", "steep_hold_time")
+                   if r not in defn]
+        if missing:
+            return False, f"exit_reason constraint does not allow {', '.join(missing)}"
+        return True, "ok"
+    except Exception as e:
+        safe_rollback()
+        return False, f"schema check failed: {type(e).__name__}: {e}"
 
 
 def get_db_today() -> str:

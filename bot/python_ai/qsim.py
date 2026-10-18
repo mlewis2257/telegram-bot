@@ -220,6 +220,23 @@ QSIM_POST_EXIT_RECOVER_HOURS        = float(os.getenv("QSIM_POST_EXIT_RECOVER_HO
 QSIM_POST_EXIT_RECOVER_MIN_MULT     = float(os.getenv("QSIM_POST_EXIT_RECOVER_MIN_MULT", "1.0"))
 QSIM_POST_EXIT_RECOVER_CADENCE_SECS = float(os.getenv("QSIM_POST_EXIT_RECOVER_CADENCE_SECS", "60"))
 QSIM_POST_EXIT_RECOVER_MAX_PER_MIN  = int(os.getenv("QSIM_POST_EXIT_RECOVER_MAX_PER_MIN", "4"))
+# STEEP-HOLD FORWARD TEST (2026-10-17). A bank whose real multiple was under 1.20x three
+# minutes before the 2x reached 5x afterwards 42% of the time (both periods, 38% / 44%),
+# against 13% for coins that drifted in from 1.60x or higher; holding steep banks to 3x/5x
+# with a 1.2x-of-entry floor beat banking on 18 Oct 8+ coins, slow ones lost heavily.
+# Those 18 are the same coins the split was found on, so the honest test is FORWARD.
+# qsim still BANKS every coin (its results are untouched); this only keeps a steep bank on
+# 15s looks until it has reached STEEP_TARGET, fallen to STEEP_FLOOR (multiples of entry)
+# or STEEP_TRACK_HOURS have passed, so the hold can be scored exactly on new coins with
+# database/steep_hold_forward_test.sql. Own allowance, inside the global pacing. The
+# target is tracked to 5x so both a 3x and a 5x rule can be scored. 0 hours disables it.
+QSIM_STEEP_TRACK_HOURS    = float(os.getenv("QSIM_STEEP_TRACK_HOURS", "6"))
+QSIM_STEEP_X3_MAX         = float(os.getenv("QSIM_STEEP_X3_MAX", "1.20"))
+QSIM_STEEP_LOOKBACK_SECS  = float(os.getenv("QSIM_STEEP_LOOKBACK_SECS", "180"))
+QSIM_STEEP_FLOOR          = float(os.getenv("QSIM_STEEP_FLOOR", "1.2"))
+QSIM_STEEP_TARGET         = float(os.getenv("QSIM_STEEP_TARGET", "5.0"))
+QSIM_STEEP_CADENCE_SECS   = float(os.getenv("QSIM_STEEP_CADENCE_SECS", "15"))
+QSIM_STEEP_MAX_PER_MIN    = int(os.getenv("QSIM_STEEP_MAX_PER_MIN", "6"))
 # A close is STALE when the position went unobserved longer than this right before the quote
 # that closed it. Such a row is not the exit the strategy would have taken — the thresholds were
 # never evaluated during the gap — so it gets a 'stale_' exit_reason prefix and is excluded from
@@ -324,6 +341,7 @@ _shadow_fast_window: list[float] = []     # monotonic timestamps of recent fast-
 _dense_window: list[float] = []           # monotonic timestamps of recent dense post-exit quotes
 _bank_window: list[float] = []            # monotonic timestamps of recent bank-window quotes
 _recover_window: list[float] = []         # monotonic timestamps of recent recovery-window quotes
+_steep_window: list[float] = []           # monotonic timestamps of recent steep-hold-test quotes
 _backoff_until: float = 0.0               # monotonic time until which quoting is paused (429 backoff)
 _last_monitor_call: float = 0.0           # monotonic time of the monitor's last Jupiter call
 
@@ -931,13 +949,33 @@ def _recover_budget_ok() -> bool:
     return _window_budget_ok(_recover_window, QSIM_POST_EXIT_RECOVER_MAX_PER_MIN)
 
 
+def _steep_budget_ok() -> bool:
+    return _window_budget_ok(_steep_window, QSIM_STEEP_MAX_PER_MIN)
+
+
+def _steep_enabled() -> bool:
+    return (QSIM_STEEP_TRACK_HOURS > 0 and QSIM_STEEP_CADENCE_SECS > 0
+            and QSIM_STEEP_MAX_PER_MIN > 0 and QSIM_STEEP_X3_MAX > 0)
+
+
+def _steep_active(pos: dict, age_min: float) -> bool:
+    """A banked exit that arrived steeply and has not yet resolved the hold test."""
+    if not _steep_enabled() or "bank" not in (pos.get("exit_reason") or ""):
+        return False
+    x3, last = pos.get("x3"), pos.get("last_mult")
+    if x3 is None or last is None or float(x3) >= QSIM_STEEP_X3_MAX:
+        return False
+    return (age_min <= QSIM_STEEP_TRACK_HOURS * 60.0
+            and QSIM_STEEP_FLOOR < float(last) < QSIM_STEEP_TARGET)
+
+
 def _recover_enabled() -> bool:
     return (QSIM_POST_EXIT_RECOVER_HOURS > 0 and QSIM_POST_EXIT_RECOVER_CADENCE_SECS > 0
             and QSIM_POST_EXIT_RECOVER_MAX_PER_MIN > 0)
 
 
 def _post_exit_tier(pos: dict, now_utc: datetime) -> str | None:
-    """'bank', 'dense', 'recover', or None (leave it to the hourly probe).
+    """'bank', 'steep', 'dense', 'recover', or None (leave it to the hourly probe).
 
     A banked exit is in the bank window for BANK_MINS; any exit is in the dense window
     for DENSE_MINS. Bank wins where both apply. A NON-bank exit past the dense window is
@@ -956,6 +994,8 @@ def _post_exit_tier(pos: dict, now_utc: datetime) -> str | None:
             and "bank" in (pos.get("exit_reason") or "")):
         if age_min <= QSIM_POST_EXIT_BANK_MINS:
             return "bank"
+        if _steep_active(pos, age_min):
+            return "steep"
         # Still running: stay on the bank cadence while the latest look holds the line.
         # A missing last_mult (never seen, or only rate-limited looks) does NOT qualify —
         # "we do not know" must not keep a coin on the fast cadence for six hours.
@@ -965,6 +1005,8 @@ def _post_exit_tier(pos: dict, now_utc: datetime) -> str | None:
                 and last_mult is not None
                 and float(last_mult) >= QSIM_POST_EXIT_BANK_EXTEND_MIN_MULT):
             return "bank"
+    if _steep_active(pos, age_min):
+        return "steep"
     if (QSIM_POST_EXIT_DENSE_MINS > 0 and QSIM_POST_EXIT_DENSE_CADENCE_SECS > 0
             and age_min <= QSIM_POST_EXIT_DENSE_MINS):
         return "dense"
@@ -996,7 +1038,8 @@ async def _run_dense_post_exit() -> set[int]:
     recovering exits, which are rare; then the first-30-minute dense window.
     """
     recover_mins = QSIM_POST_EXIT_RECOVER_HOURS * 60.0 if _recover_enabled() else 0.0
-    horizon = max(QSIM_POST_EXIT_DENSE_MINS, QSIM_POST_EXIT_BANK_MINS, recover_mins)
+    steep_mins = QSIM_STEEP_TRACK_HOURS * 60.0 if _steep_enabled() else 0.0
+    horizon = max(QSIM_POST_EXIT_DENSE_MINS, QSIM_POST_EXIT_BANK_MINS, recover_mins, steep_mins)
     if horizon <= 0:
         return set()
     extend_mins = (QSIM_POST_EXIT_BANK_EXTEND_HOURS * 60.0
@@ -1004,20 +1047,25 @@ async def _run_dense_post_exit() -> set[int]:
     recent = db.get_qsim_fast_probe_candidates(
         QSIM_POST_EXIT_DENSE_MINS, QSIM_POST_EXIT_BANK_MINS,
         extend_mins, QSIM_POST_EXIT_BANK_EXTEND_MIN_MULT, QSIM_POST_EXIT_OBS_LIMIT,
-        recover_mins=recover_mins, recover_min_mult=QSIM_POST_EXIT_RECOVER_MIN_MULT)
+        recover_mins=recover_mins, recover_min_mult=QSIM_POST_EXIT_RECOVER_MIN_MULT,
+        steep_mins=steep_mins, steep_lookback_secs=QSIM_STEEP_LOOKBACK_SECS,
+        steep_x3_max=QSIM_STEEP_X3_MAX, steep_floor=QSIM_STEEP_FLOOR,
+        steep_target=QSIM_STEEP_TARGET)
     now_utc = datetime.now(timezone.utc)
     tiered = [(pos, _post_exit_tier(pos, now_utc)) for pos in recent]
     tiered = [(pos, tier) for pos, tier in tiered if tier]
     ids = {int(pos["call_id"]) for pos, _ in tiered}
-    order = {"bank": 0, "recover": 1, "dense": 2}
+    order = {"bank": 0, "steep": 1, "recover": 2, "dense": 3}
     tiered.sort(key=lambda pt: order[pt[1]])                     # stable: keeps overdue order
     cadences = {"bank": QSIM_POST_EXIT_BANK_CADENCE_SECS,
+                "steep": QSIM_STEEP_CADENCE_SECS,
                 "recover": QSIM_POST_EXIT_RECOVER_CADENCE_SECS,
                 "dense": QSIM_POST_EXIT_DENSE_CADENCE_SECS}
-    budgets = {"bank": _bank_budget_ok, "recover": _recover_budget_ok,
-               "dense": _dense_budget_ok}
-    windows = {"bank": _bank_window, "recover": _recover_window, "dense": _dense_window}
-    spent = {"bank": False, "recover": False, "dense": False}
+    budgets = {"bank": _bank_budget_ok, "steep": _steep_budget_ok,
+               "recover": _recover_budget_ok, "dense": _dense_budget_ok}
+    windows = {"bank": _bank_window, "steep": _steep_window,
+               "recover": _recover_window, "dense": _dense_window}
+    spent = {"bank": False, "steep": False, "recover": False, "dense": False}
     now_mono = time.monotonic()
     for pos, tier in tiered:
         if spent[tier]:
@@ -1207,6 +1255,18 @@ async def _qsim_tick(pos: dict) -> None:
         _cleanup(call_id)
         print(f"[qsim] CLOSE {symbol} call_id={call_id} {reason} "
               f"pnl={sol_out - sol_in:+.4f} ({real_mult:.2f}x) gap={gap_secs or 0:.0f}s")
+        if _steep_enabled() and "bank" in (reason or ""):
+            try:
+                _x3 = db.get_qsim_mult_before(call_id, QSIM_STEEP_LOOKBACK_SECS,
+                                              max_extra_secs=1e9)
+                if _x3 is not None and _x3 < QSIM_STEEP_X3_MAX:
+                    print(f"[qsim] STEEP {symbol} call_id={call_id} banked {real_mult:.2f}x "
+                          f"from {_x3:.2f}x {QSIM_STEEP_LOOKBACK_SECS:.0f}s earlier — "
+                          f"tracking the hold test (target {QSIM_STEEP_TARGET:g}x, floor "
+                          f"{QSIM_STEEP_FLOOR:g}x, {QSIM_STEEP_TRACK_HOURS:g}h)")
+            except Exception as _se:
+                db.safe_rollback()
+                print(f"[qsim] steep check failed call_id={call_id}: {_se}")
         return
 
     prior_peak  = float(pos.get("peak_mcap") or 0.0)
@@ -1475,6 +1535,12 @@ async def run_qsim_monitor() -> None:
           f"cap={QSIM_POST_EXIT_RECOVER_MAX_PER_MIN}/min"
           if QSIM_POST_EXIT_OBS_ENABLED and _recover_enabled() else
           "[qsim] post-exit RECOVERY window: OFF")
+    print(f"[qsim] steep-hold forward test: banks under {QSIM_STEEP_X3_MAX:g}x "
+          f"{QSIM_STEEP_LOOKBACK_SECS:.0f}s before the bank tracked every "
+          f"{QSIM_STEEP_CADENCE_SECS:g}s until {QSIM_STEEP_TARGET:g}x / {QSIM_STEEP_FLOOR:g}x / "
+          f"{QSIM_STEEP_TRACK_HOURS:g}h, cap={QSIM_STEEP_MAX_PER_MIN}/min"
+          if QSIM_POST_EXIT_OBS_ENABLED and _steep_enabled() else
+          "[qsim] steep-hold forward test: OFF")
     # Say whether the lane is actually RUNNING, not just how it is configured. This line
     # printed unconditionally, so it read identically with RATCHET_SHADOW_ENABLED=false
     # and gave a false all-clear when the lane had been turned off to free its 5/min.
