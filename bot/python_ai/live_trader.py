@@ -238,6 +238,46 @@ def _parse_young_size() -> tuple[float | None, float, str]:
 LIVE_SIZE_SOL_YOUNG, LIVE_YOUNG_AGE_MIN, _young_banner = _parse_young_size()
 print(_young_banner)
 
+# ── Entry filters for the UNLABELLED solwhaletrending lane ─────────────────────
+# 2026-10-19, qsim real-quote replay of the unlabelled lane (Oct 15-19, safe, 80-120k),
+# banks booked at live-like prices: the whole lane +0.72 positions on 104 trades (flat);
+# skipping coins with 700+ holders AND calls scoring under 70 kept 58 and made +4.48
+# (~+7.7%/trade), beating the whole lane in BOTH halves of the window. The holder cut is
+# the same rug gate the low_score lane has had since July (telegram_client high_holders)
+# — unlabelled calls never passed through it. No exit change beat today's exits on the
+# filtered coins. Applies ONLY to unlabelled (score 63+) solwhaletrending calls.
+#   LIVE_UNLABELLED_MAX_HOLDERS=700   skip at this many holders or more. 0/unset = off.
+#   LIVE_UNLABELLED_MIN_SCORE=70      skip calls scoring below this. 0/unset = off.
+# A missing holder count or score is NOT skipped (never gate on absent data).
+LIVE_UNLABELLED_MAX_HOLDERS = int(entry_quality.env_float(os.getenv("LIVE_UNLABELLED_MAX_HOLDERS"), 0.0))
+LIVE_UNLABELLED_MIN_SCORE = entry_quality.env_float(os.getenv("LIVE_UNLABELLED_MIN_SCORE"), 0.0)
+print("[live] unlabelled-lane filters: "
+      + (", ".join(([f"skip {LIVE_UNLABELLED_MAX_HOLDERS}+ holders"] if LIVE_UNLABELLED_MAX_HOLDERS > 0 else [])
+                   + ([f"skip score under {LIVE_UNLABELLED_MIN_SCORE:g}"] if LIVE_UNLABELLED_MIN_SCORE > 0 else []))
+         or "off"))
+
+
+def _unlabelled_filter(channel_handle: str, category, score_result: dict,
+                       token_data: dict) -> str | None:
+    """Reason to skip an unlabelled solwhaletrending call, or None to carry on."""
+    if channel_handle != "solwhaletrending" or (category or "none") != "none":
+        return None
+    if LIVE_UNLABELLED_MAX_HOLDERS > 0:
+        h = token_data.get("hodl_count")
+        try:
+            if h is not None and int(h) >= LIVE_UNLABELLED_MAX_HOLDERS:
+                return f"unlabelled_high_holders ({int(h)} >= {LIVE_UNLABELLED_MAX_HOLDERS})"
+        except (TypeError, ValueError):
+            pass
+    if LIVE_UNLABELLED_MIN_SCORE > 0:
+        sc = score_result.get("score")
+        try:
+            if sc is not None and float(sc) < LIVE_UNLABELLED_MIN_SCORE:
+                return f"unlabelled_low_score ({float(sc):g} < {LIVE_UNLABELLED_MIN_SCORE:g})"
+        except (TypeError, ValueError):
+            pass
+    return None
+
 
 # ── Per-channel mcap entry limits ──────────────────────────────────────────────
 
@@ -947,6 +987,11 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
                 print(f"[live] {symbol} skipped — lane_policy({LIVE_LANE_STRATEGY}) "
                       f"{_lane.get('reason', 'not_a_traded_lane')} "
                       f"[{channel_handle}/{token_data.get('vip_tier') or 'none'}/{_cat or 'none'}]")
+                return False
+            _uf = _unlabelled_filter(channel_handle, _cat, score_result, token_data)
+            if _uf:
+                print(f"[live] {symbol} skipped — {_uf}")
+                db.set_call_skip_reason(call_id, _uf.split(" ")[0])
                 return False
 
         # ── Guard 6: SOL balance ──
