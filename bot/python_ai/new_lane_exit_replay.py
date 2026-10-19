@@ -45,6 +45,16 @@ import db
 
 HORIZON_S = 24 * 3600
 STEEP_LOOKBACK_S = 180
+# qsim OVERSTATES upside exits: it looks every 15-90 s, so by the time it sees a coin past
+# 2x the coin is often at 2.3x and it books that. Live sells at the line (paired new-lane
+# banks 2026-10-19: live 2.09x vs qsim 2.34x). With FILL_CAP set, any exit triggered by
+# REACHING a level (bank, target, buy-back bank) is credited at no more than
+# level * (1 + FILL_CAP). Stops and floors are not capped: they already sell at the look.
+FILL_CAP: float | None = 0.05
+
+
+def _cap(m: float, level: float) -> float:
+    return m if FILL_CAP is None else min(m, level * (1.0 + FILL_CAP))
 
 
 @dataclass(frozen=True)
@@ -101,7 +111,7 @@ def simulate(path: list, r: Rules) -> Result:
         if hold_t is not None:
             x3max, target, sfloor, hours = r.steep
             if m >= target:
-                return _with_buyback(path, r, Result(m, "steep_target", t))
+                return _with_buyback(path, r, Result(_cap(m, target), "steep_target", t))
             if m <= sfloor:
                 return _with_buyback(path, r, Result(m, "steep_floor", t))
             if t - hold_t > hours * 3600:
@@ -111,14 +121,14 @@ def simulate(path: list, r: Rules) -> Result:
         if m <= r.stop:
             return _with_buyback(path, r, Result(m, "stop", t))
         if r.target is not None and m >= r.target:
-            return Result(m, "target", t)
+            return Result(_cap(m, r.target), "target", t)
         if r.bank is not None and m >= r.bank:
             if r.steep is not None:
                 x3 = _x3(path, t)
                 if x3 is not None and x3 < r.steep[0] and m < r.steep[1]:
                     hold_t = t
                     continue
-            return Result(m, "bank", t)
+            return Result(_cap(m, r.bank), "bank", t)
         for arm, fl in sorted(r.floors, key=lambda z: -z[0]):
             if peak >= arm and m <= fl:
                 return _with_buyback(path, r, Result(m, "floor", t))
@@ -153,8 +163,11 @@ def _with_buyback(path: list, r: Rules, res: Result) -> Result:
             break
         if m is None:
             continue
-        if m <= stop_frac * m0 or m >= bank_mult * m0:
+        if m <= stop_frac * m0:
             out = m / m0
+            break
+        if m >= bank_mult * m0:
+            out = _cap(m / m0, bank_mult)
             break
     if out is None:
         end = _last(path, t0 + hours * 3600)
@@ -222,7 +235,8 @@ def load(since: str, lane: str):
         cur.execute(
             f"""
             SELECT qp.call_id, left(t.symbol, 12), COALESCE(t.security_flag, '-'),
-                   c.mcap_at_call, qp.entry_time, qp.exit_reason, qp.sol_out / qp.sol_in
+                   c.mcap_at_call, qp.entry_time, qp.exit_reason, qp.sol_out / qp.sol_in,
+                   c.conviction_score, t.hodl_count, t.token_age_minutes
             FROM qsim_positions qp
             JOIN calls c ON c.id = qp.call_id
             JOIN tokens t ON t.id = qp.token_id
@@ -247,7 +261,7 @@ def load(since: str, lane: str):
         for cid, at, m, nr in cur.fetchall():
             obs[cid].append((at, None if nr else float(m)))
     positions = []
-    for cid, sym, flag, mcap, entry, q_reason, q_x in pos:
+    for cid, sym, flag, mcap, entry, q_reason, q_x, score, holders, age in pos:
         path = [((at - entry).total_seconds(), m) for at, m in obs.get(cid, []) if at >= entry]
         if not path:
             continue
@@ -255,6 +269,9 @@ def load(since: str, lane: str):
             "call_id": cid, "sym": sym, "flag": flag,
             "in_band": mcap is not None and 80000 <= float(mcap) <= 120000,
             "entry": entry, "q_reason": q_reason, "q_x": float(q_x or 0), "path": path,
+            "score": None if score is None else float(score),
+            "holders": None if holders is None else int(holders),
+            "age": None if age is None else float(age),
         })
     return positions, obs
 
@@ -281,15 +298,48 @@ def score(positions: list, r: Rules) -> dict:
 
 
 def main() -> None:
+    global FILL_CAP
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", default="2026-10-15 06:50")
     ap.add_argument("--lane", default="none", choices=["none", "low_score"])
     ap.add_argument("--top", type=int, default=12)
     ap.add_argument("--grid", default="exits", choices=["exits", "runner"],
                     help="exits = stop/floor/steep/buy-back grid; runner = no-bank, let-it-run rules")
+    ap.add_argument("--max-holders", type=int, default=0,
+                    help="skip coins with this many holders or more at the call (0 = no filter)")
+    ap.add_argument("--min-score", type=float, default=0,
+                    help="skip calls scoring below this (0 = no filter)")
+    ap.add_argument("--skip-age", default="",
+                    help="skip tokens whose age in minutes is in LO-HI, e.g. 5-30")
+    ap.add_argument("--no-fill-cap", action="store_true",
+                    help="book upside exits at qsim's look price (overstates banks)")
     a = ap.parse_args()
+    if a.no_fill_cap:
+        FILL_CAP = None
 
     allpos, _ = load(a.since, a.lane)
+    age_lo = age_hi = None
+    if a.skip_age:
+        age_lo, age_hi = (float(v) for v in a.skip_age.split("-"))
+
+    def keep(p) -> bool:
+        if a.max_holders and p["holders"] is not None and p["holders"] >= a.max_holders:
+            return False
+        if a.min_score and p["score"] is not None and p["score"] < a.min_score:
+            return False
+        if age_lo is not None and p["age"] is not None and age_lo <= p["age"] < age_hi:
+            return False
+        return True
+
+    filt = [f"holders < {a.max_holders}"] if a.max_holders else []
+    filt += [f"score >= {a.min_score:g}"] if a.min_score else []
+    filt += [f"age not in {a.skip_age} min"] if a.skip_age else []
+    if filt:
+        before = len(allpos)
+        allpos = [p for p in allpos if keep(p)]
+        print(f"entry filters: {', '.join(filt)} — {len(allpos)} of {before} trades kept")
+    print("upside fills: " + ("capped at the line + 5% (live-like)" if FILL_CAP is not None
+                              else "qsim's look price (overstates banks)"))
     groups = {
         "safe, 80-120k (live's filter)": [p for p in allpos if p["flag"] == "safe" and p["in_band"]],
         "all flags and sizes (cross-check)": allpos,
@@ -301,9 +351,15 @@ def main() -> None:
         if not ps:
             continue
         actual = sum(p["q_x"] - 1 for p in ps)
+        saved, FILL_CAP = FILL_CAP, None
+        raw = score(ps, base)
+        FILL_CAP = saved
         b = score(ps, base)
         print(f"calibration: qsim's actual result {actual:+.2f} positions; this replay of the "
-              f"current rules {b['net']:+.2f}  (should be close)")
+              f"current rules, uncapped, {raw['net']:+.2f}  (should be close)")
+        if FILL_CAP is not None:
+            print(f"current rules with live-like upside fills: {b['net']:+.2f}  "
+                  f"(all comparisons below use these fills)")
         rows = sorted(((r, score(ps, r)) for r in grid), key=lambda rs: -rs[1]["net"])
         print(f"\n{'rules':58s} {'net':>7s} {'vs now':>7s} {'1st half':>8s} {'2nd half':>8s} "
               f"{'w/o best':>8s} {'buybacks':>9s}  exits")
