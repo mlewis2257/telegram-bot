@@ -66,6 +66,9 @@ class Rules:
     buyback: tuple | None = None        # (trigger, stop_frac, bank_mult, hours)
     target: float | None = None         # sell everything at the first look >= target
     trail: tuple | None = None          # (arm, pct): once peak >= arm, sell at peak*(1-pct)
+    trail_tiers: tuple = ()             # ((arm, pct), ...): the highest arm reached sets the trail
+    split: float | None = None          # sell this fraction at the 2x bank; the rest runs on
+                                        # these rules (no bank). Result is the blend.
     label: str = ""
 
 
@@ -136,8 +139,30 @@ def simulate(path: list, r: Rules) -> Result:
                 break
         if r.trail is not None and peak >= r.trail[0] and m <= peak * (1.0 - r.trail[1]):
             return Result(m, "trail", t)
+        if r.trail_tiers:
+            pct = None
+            for arm, p in sorted(r.trail_tiers, key=lambda z: -z[0]):
+                if peak >= arm:
+                    pct = p
+                    break
+            if pct is not None and m <= peak * (1.0 - pct):
+                return Result(m, "trail", t)
     end = _last(path, HORIZON_S)
     return _with_buyback(path, r, Result(1.0 if end is None else end, "time", HORIZON_S))
+
+
+def simulate_split(path: list, r: Rules) -> Result:
+    """With r.split: that fraction is sold at the 2x bank (today's rules otherwise: same
+    stop and pre-2x floor), the rest runs on r. Without it, plain simulate()."""
+    if not r.split:
+        return simulate(path, r)
+    pre = tuple(f for f in r.floors if f[0] < 2.0)
+    banked = simulate(path, Rules(stop=r.stop, bank=2.0, floors=pre))
+    runner = simulate(path, Rules(stop=r.stop, bank=None, floors=r.floors, target=r.target,
+                                  trail=r.trail, trail_tiers=r.trail_tiers))
+    x = r.split * banked.x + (1.0 - r.split) * runner.x
+    reason = banked.reason if banked.reason != "bank" else f"half-bank+{runner.reason}"
+    return Result(x, reason, max(banked.t, runner.t))
 
 
 def _with_buyback(path: list, r: Rules, res: Result) -> Result:
@@ -226,6 +251,38 @@ def runner_grid() -> list[Rules]:
     return out
 
 
+def trail_grid() -> list[Rules]:
+    """Trailing stops instead of (or after part of) the 2x bank.
+
+    'always' trails are armed from entry: sell when the coin falls PCT below its highest
+    look so far (the 20% hard stop still applies). Tiered trails arm at 2x and tighten at
+    3x and 5x: 'trails 35/30/25' = 35% below the peak once past 2x, 30% past 3x, 25% past 5x.
+    'half at 2x' sells half the position at the 2x bank and trails the rest.
+    """
+    now_floors = ((1.6, 1.30), (1.35, 1.15))
+    pre = {"pre-2x floor now": now_floors, "pre-2x floor off": ()}
+    after2x = ((2.0, 1.5),)
+    tiers = {
+        "trails 25/20/15": ((2.0, 0.25), (3.0, 0.20), (5.0, 0.15)),
+        "trails 30/25/20": ((2.0, 0.30), (3.0, 0.25), (5.0, 0.20)),
+        "trails 35/30/25": ((2.0, 0.35), (3.0, 0.30), (5.0, 0.25)),
+        "trails 40/35/30": ((2.0, 0.40), (3.0, 0.35), (5.0, 0.30)),
+    }
+    out = [Rules(label="NOW: stop 0.80 | bank 2x | floor now")]
+    for pn, pv in pre.items():
+        for pct in (0.25, 0.35, 0.50):
+            out.append(Rules(bank=None, floors=pv, trail_tiers=((0.0, pct),),
+                             label=f"{pn} | no bank | trail {int(pct * 100)}% always"))
+        for tn, tv in tiers.items():
+            out.append(Rules(bank=None, floors=pv, trail_tiers=tv, label=f"{pn} | no bank | {tn}"))
+            out.append(Rules(bank=None, floors=pv + after2x, trail_tiers=tv,
+                             label=f"{pn} | no bank | {tn} + floor after 2x @1.5"))
+        for tn in ("trails 35/30/25", "trails 40/35/30"):
+            out.append(Rules(bank=None, floors=pv + after2x, trail_tiers=tiers[tn], split=0.5,
+                             label=f"{pn} | half at 2x, rest {tn} + floor after 2x @1.5"))
+    return out
+
+
 def load(since: str, lane: str):
     conn = db.get_conn()
     db.safe_rollback()
@@ -280,7 +337,7 @@ def score(positions: list, r: Rules) -> dict:
     nets, extras, reasons = [], [], defaultdict(int)
     per_pos = []
     for p in positions:
-        res = simulate(p["path"], r)
+        res = simulate_split(p["path"], r)
         reasons[res.reason] += 1
         net = res.x - 1.0 + sum(e - 1.0 for e in res.extra)
         nets.append(net)
@@ -303,8 +360,9 @@ def main() -> None:
     ap.add_argument("--since", default="2026-10-15 06:50")
     ap.add_argument("--lane", default="none", choices=["none", "low_score"])
     ap.add_argument("--top", type=int, default=12)
-    ap.add_argument("--grid", default="exits", choices=["exits", "runner"],
-                    help="exits = stop/floor/steep/buy-back grid; runner = no-bank, let-it-run rules")
+    ap.add_argument("--grid", default="exits", choices=["exits", "runner", "trail"],
+                    help="exits = stop/floor/steep/buy-back; runner = no-bank targets and floors; "
+                         "trail = trailing stops (always, or tiered at 2x/3x/5x, or after half at 2x)")
     ap.add_argument("--max-holders", type=int, default=0,
                     help="skip coins with this many holders or more at the call (0 = no filter)")
     ap.add_argument("--min-score", type=float, default=0,
@@ -344,7 +402,7 @@ def main() -> None:
         "safe, 80-120k (live's filter)": [p for p in allpos if p["flag"] == "safe" and p["in_band"]],
         "all flags and sizes (cross-check)": allpos,
     }
-    grid = rule_grid() if a.grid == "exits" else runner_grid()
+    grid = {"exits": rule_grid, "runner": runner_grid, "trail": trail_grid}[a.grid]()
     base = grid[0]
     for gname, ps in groups.items():
         print(f"\n=== {a.lane} lane since {a.since} — {gname}: {len(ps)} trades ===")
