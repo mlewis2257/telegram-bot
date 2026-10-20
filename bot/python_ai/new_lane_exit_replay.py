@@ -283,6 +283,26 @@ def trail_grid() -> list[Rules]:
     return out
 
 
+def slice_grid() -> list[Rules]:
+    """Bank most at 2x, keep a slice with a TIGHT floor (2026-10-19).
+
+    Banked new-lane coins barely dip after the bank (median low 1.95x) and peak fast
+    (median 11 min); 5 of 11 filtered banks went to 3x+. Earlier hold rules used a 1.5x
+    floor and gave a lot back on the banks that did not run. Here only a slice is kept,
+    and its floor sits just under 2x. 'keep 30%' = sell 70% at the 2x bank.
+    """
+    now_floors = ((1.6, 1.30), (1.35, 1.15))
+    out = [Rules(label="NOW: stop 0.80 | bank 2x | floor now")]
+    for keep in (0.30, 0.50):
+        for fl in (1.8, 1.6):
+            for tn, tgt, tr in (("target 4x", 4.0, ()), ("target 5x", 5.0, ()),
+                                ("trail 25% after 3x", None, ((3.0, 0.25),))):
+                out.append(Rules(bank=None, floors=now_floors + ((2.0, fl),), target=tgt,
+                                 trail_tiers=tr, split=1.0 - keep,
+                                 label=f"keep {int(keep * 100)}% after 2x | slice floor {fl}x | {tn}"))
+    return out
+
+
 def load(since: str, lane: str):
     conn = db.get_conn()
     db.safe_rollback()
@@ -360,7 +380,7 @@ def main() -> None:
     ap.add_argument("--since", default="2026-10-15 06:50")
     ap.add_argument("--lane", default="none", choices=["none", "low_score"])
     ap.add_argument("--top", type=int, default=12)
-    ap.add_argument("--grid", default="exits", choices=["exits", "runner", "trail"],
+    ap.add_argument("--grid", default="exits", choices=["exits", "runner", "trail", "slice"],
                     help="exits = stop/floor/steep/buy-back; runner = no-bank targets and floors; "
                          "trail = trailing stops (always, or tiered at 2x/3x/5x, or after half at 2x)")
     ap.add_argument("--max-holders", type=int, default=0,
@@ -402,7 +422,8 @@ def main() -> None:
         "safe, 80-120k (live's filter)": [p for p in allpos if p["flag"] == "safe" and p["in_band"]],
         "all flags and sizes (cross-check)": allpos,
     }
-    grid = {"exits": rule_grid, "runner": runner_grid, "trail": trail_grid}[a.grid]()
+    grid = {"exits": rule_grid, "runner": runner_grid, "trail": trail_grid,
+            "slice": slice_grid}[a.grid]()
     base = grid[0]
     for gname, ps in groups.items():
         print(f"\n=== {a.lane} lane since {a.since} — {gname}: {len(ps)} trades ===")
