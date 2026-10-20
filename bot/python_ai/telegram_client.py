@@ -41,6 +41,47 @@ import lane_policy
 # suppressed. Default off — no behaviour change until set.
 LANE_TESTBED_ENABLED = os.getenv("LANE_TESTBED_ENABLED", "false").lower() == "true"
 
+# ── Which score alerts reach Telegram ──────────────────────────────────────────
+# 2026-10-20: ~140 "⚡ ALERT" messages a day, ~80% from solhousesignal (free reposts after
+# the move; 3 in 4 of its calls are down 80% a day later), 19/day from solwhaletrending.
+#   ALERT_CHANNELS=solwhaletrending           only these channels (comma list). Unset = all.
+#   ALERT_LIVE_ELIGIBLE_ONLY=true             only calls live itself would buy: a live lane
+#       on its day, passing live's entry filter (flag, band) and the unlabelled-lane holder/
+#       score filters. Any check that errors lets the alert through.
+# Both off by default. Milestone, monitor and live trade alerts are not affected.
+ALERT_CHANNELS = {c.strip().lstrip("@").lower() for c in os.getenv("ALERT_CHANNELS", "").split(",") if c.strip()}
+ALERT_LIVE_ELIGIBLE_ONLY = os.getenv("ALERT_LIVE_ELIGIBLE_ONLY", "false").strip().lower() == "true"
+print("[listener] score alerts: "
+      + (f"channels {sorted(ALERT_CHANNELS)}" if ALERT_CHANNELS else "all channels")
+      + ("; only calls live would buy" if ALERT_LIVE_ELIGIBLE_ONLY else ""))
+
+
+def _alert_allowed(score_result: dict, extra: dict | None) -> tuple[bool, str]:
+    """(send?, why not). Applies ALERT_CHANNELS and ALERT_LIVE_ELIGIBLE_ONLY."""
+    extra = extra or {}
+    channel = (extra.get("channel_tag") or extra.get("channel_handle") or "").lstrip("@").lower()
+    if ALERT_CHANNELS and channel not in ALERT_CHANNELS:
+        return False, f"channel {channel or '?'} not in ALERT_CHANNELS"
+    if not ALERT_LIVE_ELIGIBLE_ONLY:
+        return True, ""
+    try:
+        import live_trader
+        import entry_filter
+        call_id = score_result.get("call_id")
+        category = db.get_call_skip_reason(call_id) if call_id else None
+        if not lane_policy.resolve_live(channel, extra.get("vip_tier"), category).get("trade"):
+            return False, "not a live lane today"
+        ok, why = entry_filter.check(extra.get("mint_address"), extra.get("mcap_at_call"))
+        if not ok:
+            return False, f"live entry filter: {why}"
+        uf = live_trader._unlabelled_filter(channel, category, score_result, extra)
+        if uf:
+            return False, uf
+        return True, ""
+    except Exception as e:
+        print(f"[listener] alert eligibility check failed ({type(e).__name__}: {e}) — sending")
+        return True, ""
+
 # Paper A/B opens can be paused WITHOUT disabling the testbed dispatch (which also drives
 # live + qsim, both of which we still rely on). Default on = unchanged behaviour. Set
 # PAPER_TESTBED_ENABLED=false to stop opening NEW paper positions — we no longer use paper
@@ -1454,7 +1495,10 @@ def run_listener() -> None:
 
             if score_result and score_result["label"] in ("alert", "strong_alert"):
                 # Alert delivery should not gate trade execution.
-                if await alert_bot.send_alert(score_result, extra):
+                _send, _why = _alert_allowed(score_result, extra)
+                if not _send:
+                    print(f"  [alert] {(extra or {}).get('symbol', '?')} not sent — {_why}")
+                elif await alert_bot.send_alert(score_result, extra):
                     db.mark_call_alert_sent(score_result.get("call_id"))
                 if extra:
                     channel_tag = (extra.get("channel_tag") or extra.get("channel_handle") or "")
