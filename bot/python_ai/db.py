@@ -241,6 +241,55 @@ def get_call_id_by_token_name(token_name: str) -> int | None:
         return row[0] if row else None
 
 
+def find_call_for_milestone(token_name: str, entry_mcap, channel_id: int,
+                            within_hours: float = 72.0, tolerance: float = 0.20) -> int | None:
+    """The call a channel's milestone post refers to, or None if it cannot be confirmed.
+
+    Milestone posts carry a NAME and an "Initial MC", never a contract. Copycat tokens
+    reuse trending names (2026-10-20: about a dozen different "SXSI" contracts in one hour),
+    so matching by name alone attached milestones — and the alert's link — to the wrong
+    coin. A call only matches when ALL of these hold:
+      * same name or symbol
+      * called by this channel's family within `within_hours` (solhousesignal's free
+        posts quote the VIP call's price as the entry, so the two are one family)
+      * mcap_at_call within `tolerance` of the post's Initial MC
+    The closest price wins, then the most recent. No Initial MC -> None.
+    """
+    if not token_name or not entry_mcap or float(entry_mcap) <= 0:
+        return None
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute("SELECT handle FROM channels WHERE id = %s", (channel_id,))
+        row = cur.fetchone()
+        handle = (row[0] if row else "") or ""
+        if handle.lstrip("@").startswith("solhousesignal"):
+            cur.execute("SELECT id FROM channels WHERE ltrim(handle, '@') IN "
+                        "('solhousesignal', 'solhousesignal_vip')")
+            family = [r[0] for r in cur.fetchall()] or [channel_id]
+        else:
+            family = [channel_id]
+        e = float(entry_mcap)
+        cur.execute(
+            """
+            SELECT c.id
+            FROM calls c
+            JOIN tokens t ON t.id = c.token_id
+            WHERE (LOWER(t.symbol) = LOWER(%s) OR LOWER(t.name) = LOWER(%s))
+              AND c.channel_id = ANY(%s)
+              AND c.created_at >= now() - (%s || ' hours')::interval
+              AND c.mcap_at_call BETWEEN %s AND %s
+              AND t.mint_address NOT LIKE 'INFERRED:%%'
+            ORDER BY abs(c.mcap_at_call - %s) / %s, c.created_at DESC
+            LIMIT 1
+            """,
+            (token_name, token_name, family, within_hours,
+             e * (1 - tolerance), e * (1 + tolerance), e, e),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
 def get_call_id_by_token_and_channel(token_name: str, channel_id: int) -> int | None:
     """
     Look up the most recent call_id for a token FROM A SPECIFIC CHANNEL.

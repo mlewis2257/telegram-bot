@@ -472,16 +472,22 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> tuple:
         if not milestone:
             return 'noise', None, None
 
-        call_id = db.get_call_id_by_token_and_channel(milestone["token_name"], channel_id)
+        # Match the post to the call it is about by name AND its Initial MC (and recency,
+        # within the channel family). Name alone attached milestones to copycats sharing
+        # a trending ticker — 2026-10-20 "SXSI hit 19x from $17.6k" linked a $37.9k
+        # copycat while the VIP call at exactly $17.6k was the real coin.
+        call_id = db.find_call_for_milestone(
+            milestone["token_name"], milestone.get("entry_mcap"), channel_id)
 
         if call_id is None:
-            # ── Orphan milestone: the initial call predates our scraper ──
-            token_id = db.get_token_id_by_symbol(milestone["token_name"])
-            if token_id is None:
-                token_id = db.upsert_token(
-                    mint_address=f"INFERRED:{milestone['token_name'].upper()}",
-                    symbol=milestone["token_name"],
-                )
+            # ── Unconfirmed milestone: no recent call of ours matches its entry ──
+            # Recorded against an INFERRED token, never against a real token found by
+            # name: with copycats that lookup returns an arbitrary coin and writes this
+            # post's result onto it.
+            token_id = db.upsert_token(
+                mint_address=f"INFERRED:{milestone['token_name'].upper()}",
+                symbol=milestone["token_name"],
+            )
             call_id = db.insert_call(
                 caller_id=caller_id,
                 token_id=token_id,
@@ -517,7 +523,7 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> tuple:
                 f"  [orphan_milestone] call_id={call_id} token={milestone['token_name']} "
                 f"entry={milestone['entry_mcap']} result={milestone['current_mcap']} "
                 f"stated={milestone['multiplier_stated']}x "
-                f"computed={milestone['multiplier_computed']}x"
+                f"computed={milestone['multiplier_computed']}x — no matching call, no alert"
             )
             return 'milestone', None, None
 
