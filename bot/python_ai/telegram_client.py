@@ -1454,7 +1454,8 @@ def run_listener() -> None:
 
             if score_result and score_result["label"] in ("alert", "strong_alert"):
                 # Alert delivery should not gate trade execution.
-                await alert_bot.send_alert(score_result, extra)
+                if await alert_bot.send_alert(score_result, extra):
+                    db.mark_call_alert_sent(score_result.get("call_id"))
                 if extra:
                     channel_tag = (extra.get("channel_tag") or extra.get("channel_handle") or "")
                     # VIP entries are already routed above; avoid double-open.

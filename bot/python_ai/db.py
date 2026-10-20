@@ -1161,6 +1161,26 @@ def update_peak_multiplier(
     return updated
 
 
+def mark_call_alert_sent(call_id: int) -> None:
+    """Record that a call's Telegram alert was delivered (calls.alert_sent / alert_sent_at).
+
+    The columns existed from the start but nothing ever set them, so "how many alerts did
+    each channel send" always read zero. Best-effort: never raises.
+    """
+    if not call_id:
+        return
+    try:
+        conn = get_conn()
+        safe_rollback()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE calls SET alert_sent = TRUE, alert_sent_at = now() WHERE id = %s",
+                        (call_id,))
+            conn.commit()
+    except Exception as e:
+        safe_rollback()
+        print(f"[db] mark_call_alert_sent failed (call_id={call_id}): {e}")
+
+
 def update_call_conviction_score(call_id: int, score: float) -> None:
     """Write the scorer output back to calls.conviction_score."""
     conn = get_conn()
