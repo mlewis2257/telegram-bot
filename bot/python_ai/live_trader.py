@@ -248,12 +248,18 @@ print(_young_banner)
 # filtered coins. Applies ONLY to unlabelled (score 63+) solwhaletrending calls.
 #   LIVE_UNLABELLED_MAX_HOLDERS=700   skip at this many holders or more. 0/unset = off.
 #   LIVE_UNLABELLED_MIN_SCORE=70      skip calls scoring below this. 0/unset = off.
+#   LIVE_UNLABELLED_MAX_SCORE=80      skip calls scoring at or above this. 0/unset = off.
+#     2026-10-21: score 80+ did worse than 70-79 in all three samples looked at (qsim
+#     Oct 15-21: -4.5% vs +15%/trade; shadow Sep 15-Oct 8 and Oct 9-15, capped at 2.1x:
+#     8-13 points below 70-79). Not yet confirmed on trades after 2026-10-21.
 # A missing holder count or score is NOT skipped (never gate on absent data).
 LIVE_UNLABELLED_MAX_HOLDERS = int(entry_quality.env_float(os.getenv("LIVE_UNLABELLED_MAX_HOLDERS"), 0.0))
 LIVE_UNLABELLED_MIN_SCORE = entry_quality.env_float(os.getenv("LIVE_UNLABELLED_MIN_SCORE"), 0.0)
+LIVE_UNLABELLED_MAX_SCORE = entry_quality.env_float(os.getenv("LIVE_UNLABELLED_MAX_SCORE"), 0.0)
 print("[live] unlabelled-lane filters: "
       + (", ".join(([f"skip {LIVE_UNLABELLED_MAX_HOLDERS}+ holders"] if LIVE_UNLABELLED_MAX_HOLDERS > 0 else [])
-                   + ([f"skip score under {LIVE_UNLABELLED_MIN_SCORE:g}"] if LIVE_UNLABELLED_MIN_SCORE > 0 else []))
+                   + ([f"skip score under {LIVE_UNLABELLED_MIN_SCORE:g}"] if LIVE_UNLABELLED_MIN_SCORE > 0 else [])
+                   + ([f"skip score {LIVE_UNLABELLED_MAX_SCORE:g}+"] if LIVE_UNLABELLED_MAX_SCORE > 0 else []))
          or "off"))
 
 
@@ -274,6 +280,13 @@ def _unlabelled_filter(channel_handle: str, category, score_result: dict,
         try:
             if sc is not None and float(sc) < LIVE_UNLABELLED_MIN_SCORE:
                 return f"unlabelled_low_score ({float(sc):g} < {LIVE_UNLABELLED_MIN_SCORE:g})"
+        except (TypeError, ValueError):
+            pass
+    if LIVE_UNLABELLED_MAX_SCORE > 0:
+        sc = score_result.get("score")
+        try:
+            if sc is not None and float(sc) >= LIVE_UNLABELLED_MAX_SCORE:
+                return f"unlabelled_high_score ({float(sc):g} >= {LIVE_UNLABELLED_MAX_SCORE:g})"
         except (TypeError, ValueError):
             pass
     return None

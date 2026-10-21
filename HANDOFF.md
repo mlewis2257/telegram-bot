@@ -40,6 +40,8 @@ lane            solwhaletrending / none / low_score   (LIVE_LANES in lane_policy
                   (calls scoring 63+, which get no label; see lane_policy.py)
                 LIVE_UNLABELLED_MAX_HOLDERS=700 / LIVE_UNLABELLED_MIN_SCORE=70 filter the
                   unlabelled lane (qsim replay 10-15..10-19: +4.48 on 58 vs +0.72 on 104)
+                LIVE_UNLABELLED_MAX_SCORE=80 also skips scores 80+ (off by default;
+                  80+ trailed 70-79 in qsim 10-15..10-21 and shadow Sep 15-Oct 15)
                 LIVE_TRADE_SWT_LOW_SCORE=false removes the low_score lane from live
                   (qsim keeps trading it)
                 LIVE_SWT_UNLABELLED_DAYS=Mon,...,Sun sets the unlabelled lane's own days
