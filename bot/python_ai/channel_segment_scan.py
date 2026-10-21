@@ -54,6 +54,12 @@ def bucket(name: str, v):
     return edges[-1][1]
 
 
+# Each shadow trade is capped at CAP (default 2.1x): live sells at the 2x bank, so a trade
+# cannot really make more, and on tiny coins the feed reports freak spikes (2026-10-20 scan:
+# "under 5K" +2,554% per trade on the VIP channel) that swamp every average. --no-cap turns
+# it off.
+CAP: float | None = 2.1
+
 FEATURES = ["security flag", "message type", "vip tier", "lane label", "call mcap", "score",
             "token age", "holders", "liquidity", "bundles left %", "snipers", "hour UTC"]
 
@@ -81,8 +87,11 @@ def load(days: float) -> list[dict]:
         rows = cur.fetchall()
     out = []
     for (ch, ent, x, flag, mtype, tier, lane, mcap, score, age, hodl, liq, bpr, snip) in rows:
+        x = float(x or 0)
+        if CAP is not None:
+            x = min(x, CAP)
         out.append({
-            "channel": ch, "entry": ent, "x": float(x or 0),
+            "channel": ch, "entry": ent, "x": x,
             "security flag": flag, "message type": mtype, "vip tier": tier, "lane label": lane,
             "call mcap": bucket("call mcap", mcap), "score": bucket("score", score),
             "token age": bucket("token age", age), "holders": bucket("holders", hodl),
@@ -105,7 +114,12 @@ def main() -> None:
     ap.add_argument("--min-trades", type=int, default=40)
     ap.add_argument("--min-gap", type=float, default=5.0,
                     help="points per trade a segment must beat (or trail) its channel by in BOTH halves")
+    ap.add_argument("--no-cap", action="store_true", help="use shadow's raw result (freak spikes included)")
     a = ap.parse_args()
+    global CAP
+    if a.no_cap:
+        CAP = None
+    print("shadow results " + (f"capped at {CAP:g}x per trade (like the 2x bank)" if CAP else "UNCAPPED"))
     rows = load(a.days)
     by_ch = defaultdict(list)
     for r in rows:
