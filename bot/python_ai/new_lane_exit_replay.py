@@ -69,6 +69,8 @@ class Rules:
     trail_tiers: tuple = ()             # ((arm, pct), ...): the highest arm reached sets the trail
     split: float | None = None          # sell this fraction at the 2x bank; the rest runs on
                                         # these rules (no bank). Result is the blend.
+    stall: tuple | None = None          # (minutes, line): from that age on, sell at any look
+                                        # below line (a stop that moves up with time)
     label: str = ""
 
 
@@ -123,6 +125,8 @@ def simulate(path: list, r: Rules) -> Result:
         peak = max(peak, m)
         if m <= r.stop:
             return _with_buyback(path, r, Result(m, "stop", t))
+        if r.stall is not None and t >= r.stall[0] * 60 and m < r.stall[1]:
+            return Result(m, "stall", t)
         if r.target is not None and m >= r.target:
             return Result(_cap(m, r.target), "target", t)
         if r.bank is not None and m >= r.bank:
@@ -303,6 +307,30 @@ def slice_grid() -> list[Rules]:
     return out
 
 
+def shape_grid() -> list[Rules]:
+    """Where to take the profit and how much room to give (2026-10-21).
+
+    Every earlier grid kept the bank at 2x, the level picked on the OLD lane. On the new
+    lane the coins shake 20% before running and only 7-13% reach 2x, so the question is
+    whether a nearer bank (1.3x-1.7x) that more coins reach, a tighter stop, or a stop that
+    rises with time ('after 10 min sell under 1.0x' = a coin that has not lifted by then is
+    sold at entry instead of waiting for the 0.80 stop) fits this lane better.
+    """
+    now_floors = ((1.6, 1.30), (1.35, 1.15))
+    out = [Rules(label="NOW: stop 0.80 | bank 2x | floor now")]
+    stalls = {"": None, "after 10m sell <1.0x": (10, 1.0), "after 30m sell <1.0x": (30, 1.0),
+              "after 5m sell <0.9x": (5, 0.9)}
+    for bank in (1.3, 1.5, 1.7, 2.0, 2.5):
+        floors = tuple(f for f in now_floors if f[0] < bank)
+        for stop in (0.90, 0.85, 0.80, 0.70):
+            for sn, sv in stalls.items():
+                if bank == 2.0 and stop == 0.80 and sv is None:
+                    continue                                   # that is NOW
+                out.append(Rules(stop=stop, bank=bank, floors=floors, stall=sv,
+                                 label=" | ".join(x for x in (f"stop {stop:.2f}", f"bank {bank:g}x", sn) if x)))
+    return out
+
+
 # ── Entry timing: buy the shakeout on purpose ──────────────────────────────────
 # 2026-10-21: the lane's coins still double after the call about as often as before, but
 # far fewer reach 2x from our entry before a 20%+ dip stops us out (bank rate 19-29% early
@@ -378,6 +406,80 @@ def print_entry_grid(positions: list) -> None:
               sum(x - 1 for x in now[:half]), sum(x - 1 for x in now[half:])))
 
 
+SEGMENTS = {
+    "token age": ("age", [(5, "under 5 min"), (10, "5-10 min"), (30, "10-30 min"),
+                          (120, "30 min-2 h"), (1e18, "2 h+")]),
+    "holders": ("holders", [(150, "under 150"), (300, "150-300"), (500, "300-500"), (1e18, "500+")]),
+    "score": ("score", [(70, "under 70"), (75, "70-74"), (80, "75-79"), (1e9, "80+")]),
+    "liquidity": ("liq", [(20e3, "under 20K"), (25e3, "20-25K"), (30e3, "25-30K"), (1e18, "30K+")]),
+    "bundles left %": ("bundles", [(1, "under 1%"), (5, "1-5%"), (15, "5-15%"), (1e9, "15%+")]),
+    "snipers": ("snipers", [(1, "0"), (3, "1-2"), (6, "3-5"), (1e9, "6+")]),
+    "entry vs call": ("ratio", [(1.0, "under 1.00x"), (1.10, "1.00-1.09x"), (1.25, "1.10-1.24x"),
+                                (1.5, "1.25-1.49x"), (1e9, "1.50x+")]),
+    "hour UTC": ("hour", [(6, "00-05"), (12, "06-11"), (18, "12-17"), (24, "18-23")]),
+}
+
+
+def _seg(p: dict, key: str, edges: list):
+    v = p["entry"].hour if key == "hour" else p.get(key)
+    if v is None:
+        return None
+    v = float(v)
+    for hi, label in edges:
+        if v < hi:
+            return label
+    return edges[-1][1]
+
+
+def print_segments(ps: list, min_n: int) -> None:
+    """Today's exits per kind of coin, plus the best shape rule for that kind alone.
+
+    Two questions: is there a kind of coin the filter should also drop (loses in both
+    halves), and does one kind want a different exit (best rule beats now in both halves)?
+    A 'best rule' picked from 80 on 15-40 trades is optimistic; believe it only if it
+    holds in both halves AND the same rule wins in neighbouring segments.
+    """
+    half_t = ps[len(ps) // 2]["entry"]
+    grid = shape_grid()
+    now = grid[0]
+    print(f"\nper kind of coin ({len(ps)} trades; halves split at {half_t:%m-%d %H:%M}; "
+          f"segments with fewer than {min_n} trades not shown)")
+    print(f"  {'feature':15s} {'value':13s} {'n':>3s} {'banks':>5s} {'now net':>7s} {'per tr':>7s} "
+          f"{'1st':>6s} {'2nd':>6s}   best rule for this kind alone              {'net':>6s} {'1st':>6s} {'2nd':>6s}")
+    for feat, (key, edges) in SEGMENTS.items():
+        groups = defaultdict(list)
+        for p in ps:
+            v = _seg(p, key, edges)
+            if v is not None:
+                groups[v].append(p)
+        order = [lbl for _, lbl in edges]
+        for val in order:
+            g = groups.get(val, [])
+            if len(g) < min_n:
+                continue
+
+            def nets(r):
+                out = []
+                for p in g:
+                    res = simulate_split(p["path"], r)
+                    out.append((p, res.x - 1.0 + sum(e - 1.0 for e in res.extra), res.reason))
+                return out
+            n0 = nets(now)
+            h1 = sum(n for p, n, _ in n0 if p["entry"] < half_t)
+            h2 = sum(n for p, n, _ in n0 if p["entry"] >= half_t)
+            tot = h1 + h2
+            banks = sum(1 for _, _, why in n0 if why == "bank")
+            best = max(grid[1:], key=lambda r: sum(n for _, n, _ in nets(r)))
+            nb = nets(best)
+            b1 = sum(n for p, n, _ in nb if p["entry"] < half_t)
+            b2 = sum(n for p, n, _ in nb if p["entry"] >= half_t)
+            flag = "  <- loses both halves" if h1 < 0 and h2 < 0 else ""
+            if b1 > h1 and b2 > h2:
+                flag += "  <- best rule beats now in both halves"
+            print(f"  {feat:15s} {val:13s} {len(g):3d} {banks:5d} {tot:+7.2f} {tot / len(g) * 100:+6.1f}% "
+                  f"{h1:+6.2f} {h2:+6.2f}   {best.label:42s} {b1 + b2:+6.2f} {b1:+6.2f} {b2:+6.2f}{flag}")
+
+
 def load(since: str, lane: str):
     conn = db.get_conn()
     db.safe_rollback()
@@ -388,7 +490,9 @@ def load(since: str, lane: str):
             f"""
             SELECT qp.call_id, left(t.symbol, 12), COALESCE(t.security_flag, '-'),
                    c.mcap_at_call, qp.entry_time, qp.exit_reason, qp.sol_out / qp.sol_in,
-                   c.conviction_score, t.hodl_count, t.token_age_minutes
+                   c.conviction_score, t.hodl_count, t.token_age_minutes,
+                   t.liq_at_detection, t.bundle_pct_remaining, t.sniper_count,
+                   qp.entry_price / NULLIF(c.mcap_at_call, 0)
             FROM qsim_positions qp
             JOIN calls c ON c.id = qp.call_id
             JOIN tokens t ON t.id = qp.token_id
@@ -413,7 +517,7 @@ def load(since: str, lane: str):
         for cid, at, m, nr in cur.fetchall():
             obs[cid].append((at, None if nr else float(m)))
     positions = []
-    for cid, sym, flag, mcap, entry, q_reason, q_x, score, holders, age in pos:
+    for cid, sym, flag, mcap, entry, q_reason, q_x, score, holders, age, liq, bundles, snipers, ratio in pos:
         path = [((at - entry).total_seconds(), m) for at, m in obs.get(cid, []) if at >= entry]
         if not path:
             continue
@@ -424,6 +528,8 @@ def load(since: str, lane: str):
             "score": None if score is None else float(score),
             "holders": None if holders is None else int(holders),
             "age": None if age is None else float(age),
+            "liq": liq, "bundles": bundles, "snipers": snipers,
+            "ratio": None if ratio is None else float(ratio),
         })
     return positions, obs
 
@@ -455,9 +561,13 @@ def main() -> None:
     ap.add_argument("--since", default="2026-10-15 06:50")
     ap.add_argument("--lane", default="none", choices=["none", "low_score"])
     ap.add_argument("--top", type=int, default=12)
-    ap.add_argument("--grid", default="exits", choices=["exits", "runner", "trail", "slice", "entry"],
+    ap.add_argument("--grid", default="exits",
+                    choices=["exits", "runner", "trail", "slice", "entry", "shape", "segments"],
                     help="exits = stop/floor/steep/buy-back; runner = no-bank targets and floors; "
-                         "trail = trailing stops (always, or tiered at 2x/3x/5x, or after half at 2x)")
+                         "trail = trailing stops (always, or tiered at 2x/3x/5x, or after half at 2x); "
+                         "shape = bank level x stop width x time stop; segments = today's exits and "
+                         "the best shape rule per kind of coin (age, holders, liquidity, ...)")
+    ap.add_argument("--min-seg", type=int, default=12, help="segments: smallest group shown")
     ap.add_argument("--max-holders", type=int, default=0,
                     help="skip coins with this many holders or more at the call (0 = no filter)")
     ap.add_argument("--min-score", type=float, default=0,
@@ -503,8 +613,14 @@ def main() -> None:
             if ps:
                 print_entry_grid(ps)
         return
+    if a.grid == "segments":
+        ps = groups["safe, 80-120k (live's filter)"]
+        print(f"\n=== {a.lane} lane since {a.since} — safe, 80-120k (live's filter): {len(ps)} trades ===")
+        if ps:
+            print_segments(ps, a.min_seg)
+        return
     grid = {"exits": rule_grid, "runner": runner_grid, "trail": trail_grid,
-            "slice": slice_grid}[a.grid]()
+            "slice": slice_grid, "shape": shape_grid}[a.grid]()
     base = grid[0]
     for gname, ps in groups.items():
         print(f"\n=== {a.lane} lane since {a.since} — {gname}: {len(ps)} trades ===")
