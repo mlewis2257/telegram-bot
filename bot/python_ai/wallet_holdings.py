@@ -191,7 +191,36 @@ def run_pass(wallets: list[str]) -> None:
         del _last[key]
 
 
+def check_one(mint: str) -> None:
+    """One-off: print every followed wallet's balance of `mint` (2 RPC calls at most).
+    Use a coin you know one of them holds to confirm the account lookup works."""
+    wallets = load_wallets(WALLETS_FILE)
+    if not wallets:
+        print(f"no wallets in {WALLETS_FILE}")
+        return
+    pairs = ata_addresses(wallets, mint)
+    accounts: list = []
+    for i in range(0, len(pairs), MAX_ACCOUNTS_PER_CALL):
+        chunk = pairs[i:i + MAX_ACCOUNTS_PER_CALL]
+        got = fetch_accounts([a for _, a in chunk])
+        if got is None or len(got) != len(chunk):
+            print("RPC call failed")
+            return
+        accounts.extend(got)
+    existing = sum(1 for a in accounts if a)
+    bal = parse_balances(pairs, accounts, mint)
+    holders = {w: b for w, b in bal.items() if b > 0}
+    print(f"{len(wallets)} wallets, {len(pairs)} token accounts checked, {existing} exist, "
+          f"{len(holders)} wallets hold {mint[:8]}...")
+    for w, b in sorted(holders.items(), key=lambda kv: -kv[1]):
+        print(f"  {w[:6]}...{w[-4:]}  {b:,.2f}")
+
+
 def main() -> None:
+    import sys
+    if len(sys.argv) == 3 and sys.argv[1] == "--check":
+        check_one(sys.argv[2])
+        return
     db.ensure_tracked_wallet_holdings_table()
     per_day = MAX_COINS * (86400.0 / PASS_SECS)
     print(f"[wallet_holdings] every {PASS_SECS:g}s, at most {MAX_COINS} coins per pass, "
