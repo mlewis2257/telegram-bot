@@ -572,6 +572,10 @@ def main() -> None:
                     help="skip coins with this many holders or more at the call (0 = no filter)")
     ap.add_argument("--min-score", type=float, default=0,
                     help="skip calls scoring below this (0 = no filter)")
+    ap.add_argument("--max-score", type=float, default=0,
+                    help="skip calls scoring at or above this (0 = no filter)")
+    ap.add_argument("--skip-hours", default="",
+                    help="skip entries whose UTC hour is in LO-HI (inclusive), e.g. 6-11")
     ap.add_argument("--skip-age", default="",
                     help="skip tokens whose age in minutes is in LO-HI, e.g. 5-30")
     ap.add_argument("--no-fill-cap", action="store_true",
@@ -584,6 +588,9 @@ def main() -> None:
     age_lo = age_hi = None
     if a.skip_age:
         age_lo, age_hi = (float(v) for v in a.skip_age.split("-"))
+    hr_lo = hr_hi = None
+    if a.skip_hours:
+        hr_lo, hr_hi = (int(v) for v in a.skip_hours.split("-"))
 
     def keep(p) -> bool:
         if a.max_holders and p["holders"] is not None and p["holders"] >= a.max_holders:
@@ -592,11 +599,17 @@ def main() -> None:
             return False
         if age_lo is not None and p["age"] is not None and age_lo <= p["age"] < age_hi:
             return False
+        if a.max_score and p["score"] is not None and p["score"] >= a.max_score:
+            return False
+        if hr_lo is not None and hr_lo <= p["entry"].hour <= hr_hi:
+            return False
         return True
 
     filt = [f"holders < {a.max_holders}"] if a.max_holders else []
     filt += [f"score >= {a.min_score:g}"] if a.min_score else []
     filt += [f"age not in {a.skip_age} min"] if a.skip_age else []
+    filt += [f"score < {a.max_score:g}"] if a.max_score else []
+    filt += [f"UTC hour not in {a.skip_hours}"] if a.skip_hours else []
     if filt:
         before = len(allpos)
         allpos = [p for p in allpos if keep(p)]
