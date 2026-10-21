@@ -303,6 +303,81 @@ def slice_grid() -> list[Rules]:
     return out
 
 
+# ── Entry timing: buy the shakeout on purpose ──────────────────────────────────
+# 2026-10-21: the lane's coins still double after the call about as often as before, but
+# far fewer reach 2x from our entry before a 20%+ dip stops us out (bank rate 19-29% early
+# October -> 7-13%). These rules enter the dip deliberately instead of being shaken out by it.
+
+def _rebase(path: list, t0: float, m0: float) -> list:
+    return [(t - t0, None if m is None else m / m0) for t, m in path if t >= t0]
+
+
+def _first_dip(path: list, level: float, within_s: float):
+    for t, m in path:
+        if t > within_s:
+            return None
+        if m is not None and m <= level:
+            return t, m
+    return None
+
+
+def sim_pullback(path: list, dip: float, within_min: float, base: Rules) -> float | None:
+    """Buy only at the first look at or below `dip` (x of call-time price) within the window;
+    then today's rules measured from THAT price. None = never dipped = no trade."""
+    hit = _first_dip(path, dip, within_min * 60)
+    if hit is None:
+        return None
+    t0, m0 = hit
+    return simulate(_rebase(path, t0, m0), base).x
+
+
+def sim_scale_in(path: list, dip: float, within_min: float, stop_frac: float, base: Rules) -> float:
+    """Half at the call; the other half at the first look <= `dip` within the window.
+    Before the dip fills, the first half has no stop above the dip (the dip IS the add).
+    Filled: the whole position is managed from its average price — bank at 2x of it, sell
+    if it falls `stop_frac` below it, today's profit floor measured from it. Not filled: the
+    first half runs on today's rules from the call. Returned as x of the full position."""
+    hit = _first_dip(path, dip, within_min * 60)
+    if hit is None:
+        return 0.5 * simulate(path, base).x + 0.5 * 1.0       # half never deployed: cash
+    t1, m1 = hit
+    avg = (1.0 + m1) / 2.0
+    rel = [(t, m) for t, m in _rebase(path, 0.0, avg) if t >= t1]
+    r = simulate(rel, Rules(stop=1.0 - stop_frac, bank=base.bank, floors=base.floors))
+    return r.x
+
+
+def entry_rows(positions: list) -> list[tuple[str, list]]:
+    base = Rules()
+    out = [("NOW: buy at the call, today's exits", [simulate(p["path"], base).x for p in positions])]
+    for dip, win in ((0.85, 15), (0.80, 15), (0.75, 15), (0.70, 30)):
+        out.append((f"wait for a dip to {dip:.2f}x within {win} min",
+                    [sim_pullback(p["path"], dip, win, base) for p in positions]))
+    for dip, win, sf in ((0.80, 15, 0.25), (0.75, 15, 0.25), (0.75, 15, 0.30), (0.70, 30, 0.25)):
+        out.append((f"scale in: half at call, half at {dip:.2f}x within {win} min, stop {int(sf * 100)}% below avg",
+                    [sim_scale_in(p["path"], dip, win, sf, base) for p in positions]))
+    return out
+
+
+def print_entry_grid(positions: list) -> None:
+    n = len(positions)
+    half = n // 2
+    rows = entry_rows(positions)
+    now = rows[0][1]
+    now_net = sum(x - 1 for x in now)
+    print(f"\n{'entry rule':76s} {'trades':>6s} {'net':>7s} {'vs now':>7s} {'1st half':>8s} "
+          f"{'2nd half':>8s} {'w/o best':>8s}")
+    for label, xs in rows:
+        nets = [0.0 if x is None else x - 1 for x in xs]
+        traded = sum(1 for x in xs if x is not None)
+        net = sum(nets)
+        print(f"{label:76s} {traded:6d} {net:+7.2f} {net - now_net:+7.2f} {sum(nets[:half]):+8.2f} "
+              f"{sum(nets[half:]):+8.2f} {net - max(nets):+8.2f}")
+    print("\nnow: 1st half {:+.2f}, 2nd half {:+.2f}. Units: full positions. 'wait for a dip' trades "
+          "only the coins that dipped; the rest count as no trade (0).".format(
+              sum(x - 1 for x in now[:half]), sum(x - 1 for x in now[half:])))
+
+
 def load(since: str, lane: str):
     conn = db.get_conn()
     db.safe_rollback()
@@ -380,7 +455,7 @@ def main() -> None:
     ap.add_argument("--since", default="2026-10-15 06:50")
     ap.add_argument("--lane", default="none", choices=["none", "low_score"])
     ap.add_argument("--top", type=int, default=12)
-    ap.add_argument("--grid", default="exits", choices=["exits", "runner", "trail", "slice"],
+    ap.add_argument("--grid", default="exits", choices=["exits", "runner", "trail", "slice", "entry"],
                     help="exits = stop/floor/steep/buy-back; runner = no-bank targets and floors; "
                          "trail = trailing stops (always, or tiered at 2x/3x/5x, or after half at 2x)")
     ap.add_argument("--max-holders", type=int, default=0,
@@ -422,6 +497,12 @@ def main() -> None:
         "safe, 80-120k (live's filter)": [p for p in allpos if p["flag"] == "safe" and p["in_band"]],
         "all flags and sizes (cross-check)": allpos,
     }
+    if a.grid == "entry":
+        for gname, ps in groups.items():
+            print(f"\n=== {a.lane} lane since {a.since} — {gname}: {len(ps)} trades ===")
+            if ps:
+                print_entry_grid(ps)
+        return
     grid = {"exits": rule_grid, "runner": runner_grid, "trail": trail_grid,
             "slice": slice_grid}[a.grid]()
     base = grid[0]
