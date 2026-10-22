@@ -214,6 +214,21 @@ def check_one(mint: str) -> None:
           f"{len(holders)} wallets hold {mint[:8]}...")
     for w, b in sorted(holders.items(), key=lambda kv: -kv[1]):
         print(f"  {w[:6]}...{w[-4:]}  {b:,.2f}")
+    n_wallets = len(wallets)
+    for i, ((w, addr), acc) in enumerate(zip(pairs, accounts)):
+        if not acc:
+            continue
+        prog = "classic" if i < n_wallets else "token-2022"
+        data = acc.get("data")
+        try:
+            info = data["parsed"]["info"]
+            ta = info.get("tokenAmount") or {}
+            print(f"  account {addr[:6]}... ({prog}) wallet {w[:6]}...{w[-4:]}: "
+                  f"mint matches={info.get('mint') == mint} owner matches={info.get('owner') == w} "
+                  f"amount={ta.get('uiAmountString', ta.get('amount'))} state={info.get('state')}")
+        except (KeyError, TypeError):
+            print(f"  account {addr[:6]}... ({prog}) wallet {w[:6]}...{w[-4:]}: NOT PARSED — "
+                  f"owner program {acc.get('owner')}, data type {type(data).__name__}: {str(data)[:120]}")
 
 
 def main() -> None:
