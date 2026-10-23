@@ -384,6 +384,17 @@ async def _dispatch_lane_testbed(score_result: dict, extra: dict) -> None:
         channel  = (extra.get("channel_tag") or extra.get("channel_handle") or "").lstrip("@")
         vip_tier = extra.get("vip_tier")
         category = db.get_call_skip_reason(call_id)  # the lane label; None -> "none"
+        # Followed wallets' holdings AT THE CALL, before any buy (research; off unless
+        # FOLLOWED_AT_CALL_ENABLED=true). Runs alongside, never delays the entries below.
+        try:
+            import followed_at_call
+            if followed_at_call.ENABLED:
+                _track_task(
+                    asyncio.create_task(followed_at_call.snapshot(call_id, extra.get("mint_address"), channel)),
+                    f"followed_at_call call_id={call_id}",
+                )
+        except Exception as fe:
+            print(f"[followed_at_call] dispatch failed call_id={call_id}: {fe}")
         # Resolve pa/pb unconditionally — live reuses them below — but only OPEN paper
         # positions when paper is enabled (PAPER_TESTBED_ENABLED). qsim/live are untouched.
         pa = lane_policy.resolve(channel, vip_tier, category, strategy="A")

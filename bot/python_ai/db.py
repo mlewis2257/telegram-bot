@@ -3063,6 +3063,46 @@ def ensure_tracked_wallet_holdings_table() -> None:
         conn.commit()
 
 
+def ensure_followed_at_call_table() -> None:
+    """Which followed wallets held a coin AT THE CALL, before any buy (followed_at_call.py).
+    One row per call. holders NULL with rpc_ok FALSE = the lookup failed. Idempotent."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS followed_at_call (
+                call_id         integer PRIMARY KEY,
+                mint            text NOT NULL,
+                channel         text,
+                n_holding       integer,          -- followed wallets with a balance > 0
+                holders         text[],           -- their addresses
+                wallets_checked integer NOT NULL,
+                rpc_ok          boolean NOT NULL,
+                observed_at     timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.commit()
+
+
+def insert_followed_at_call(call_id: int, mint: str, channel: str, holders: list[str] | None,
+                            wallets_checked: int) -> None:
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO followed_at_call (call_id, mint, channel, n_holding, holders,
+                                          wallets_checked, rpc_ok)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (call_id) DO NOTHING
+            """,
+            (call_id, mint, channel, None if holders is None else len(holders), holders,
+             wallets_checked, holders is not None))
+        conn.commit()
+
+
 def get_holdings_watch_coins(after_exit_mins: float, limit: int) -> list[dict]:
     """Coins to check: live positions open or closed within `after_exit_mins`, then
     solwhaletrending qsim positions on the same terms. Live first, then open before

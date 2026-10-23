@@ -65,6 +65,9 @@ wallet watch    wallet_holdings.py (pm2 wallet-holdings): every 2 min, for coins
                 all followed wallets' balances of that coin; changes go to
                 tracked_wallet_holdings. Ceiling ~10.8k calls/day. List: bot/python_ai/
                 tracked_wallets.txt (gitignored). Research only.
+                followed_at_call.py (inside sol-listener, FOLLOWED_AT_CALL_ENABLED=true):
+                the same lookup AT THE CALL, before any buy -> followed_at_call (one row
+                per swt call). Ceiling FOLLOWED_AT_CALL_MAX_PER_DAY=300. Research only.
 entry gate      LIVE_MIN_ENTRY_EXEC_RATIO=<r> skips entries quoting below r x the call mcap
                 (off unless set; 1.00 recommended — below 1.00x: 1 bank in 27, 2026-10-14)
 risk cap        MAX_TOTAL_LOSS_SOL=0.35, MAX_DAILY_LOSS_SOL=0
