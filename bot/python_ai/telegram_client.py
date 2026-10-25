@@ -427,9 +427,14 @@ async def _dispatch_lane_testbed(score_result: dict, extra: dict) -> None:
                     _live_lane = pb
                 else:
                     _live_lane = pa
-                if _live_lane.get("trade"):
+                # The followed-wallets lane (off unless LIVE_FOLLOWED_LANE=on) can take calls
+                # the regular lane does not; open_live_position checks the wallets and falls
+                # back to the regular rules when too few hold the coin.
+                _followed_ok = live_trader.followed_lane_eligible(channel, category)
+                if _live_lane.get("trade") or _followed_ok:
                     _track_task(
-                        asyncio.create_task(live_trader.open_live_position(score_result, extra)),
+                        asyncio.create_task(live_trader.open_live_position(
+                            score_result, extra, followed_eligible=_followed_ok)),
                         f"live call_id={call_id}",
                     )
         except Exception as le:

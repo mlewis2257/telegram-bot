@@ -292,6 +292,132 @@ def _unlabelled_filter(channel_handle: str, category, score_result: dict,
     return None
 
 
+# ── Followed-wallets lane ──────────────────────────────────────────────────────
+# 2026-10-24. solwhaletrending coins that 2+ of the operator's followed wallets already
+# held banked ~30-39% vs ~9% with none (qsim, Oct 21-24, every day; also when the
+# wallets were read AT THE CALL, followed_at_call.py). Their failures go to ~0 after
+# touching 1.3-1.8x, so with today's exits the money edge was small; replaying exits on
+# those coins, "stop 0.90, bank 2.5x" beat today's exits in both halves of both samples
+# (first look 65 trades: +16.1 vs +7.6 positions; at call 27: +1.8 vs -2.7). The banks
+# kept running past 2.5x and the rugs traded ~0.88x before collapsing.
+#
+# A SEPARATE lane: any solwhaletrending call in LIVE_FOLLOWED_CATEGORIES (every flag,
+# mcap and score, as measured), bought only if, at that moment, LIVE_FOLLOWED_MIN_WALLETS
+# followed wallets hold it (one getMultipleAccounts before the buy). It skips the
+# regular lane's entry filter (safe-only, 80-120k), unlabelled score/holder filters,
+# young-size and min-entry-ratio gates; every safety guard still applies (kill switch,
+# breakers, max positions, duplicate/cooldown, balance, blocked channels, mcap ceiling,
+# dev gate, max exec ratio, roundtrip). Its positions are marked in live_followed_positions
+# before the buy and exit on their own numbers (both exit processes read the mark):
+#   hard stop at LIVE_FOLLOWED_STOP of entry ('hard_stop'), bank at LIVE_FOLLOWED_BANK
+#   ('take_profit'), today's profit floor / time stop otherwise; optional stall stop
+#   ('stop_loss'): from LIVE_FOLLOWED_STALL_MINS on, sell under LIVE_FOLLOWED_STALL_LINE.
+# Steep hold never applies to these positions.
+#   LIVE_FOLLOWED_LANE=on                  off unless exactly 'on'
+#   LIVE_FOLLOWED_MIN_WALLETS=2
+#   LIVE_FOLLOWED_CATEGORIES=none,low_score   solwhaletrending lane labels it may take
+#   LIVE_FOLLOWED_DAYS=Mon,Tue,Wed,Thu,Fri,Sun   UTC weekdays (Saturday out by default)
+#   LIVE_FOLLOWED_SIZE_SOL=0.05            capped by LIVE_SIZE_MAX_SOL
+#   LIVE_FOLLOWED_STOP=0.90  LIVE_FOLLOWED_BANK=2.5
+#   LIVE_FOLLOWED_STALL_MINS=0 (off)  LIVE_FOLLOWED_STALL_LINE=0.90
+# Needs the followed wallet list (TRACKED_WALLETS_FILE / tracked_wallets.txt). The
+# exit rules apply to marked positions even if the lane is later switched off.
+_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+LIVE_FOLLOWED_LANE = os.getenv("LIVE_FOLLOWED_LANE", "off").strip().lower() == "on"
+LIVE_FOLLOWED_MIN_WALLETS = int(entry_quality.env_float(os.getenv("LIVE_FOLLOWED_MIN_WALLETS"), 2.0))
+LIVE_FOLLOWED_CHANNEL = "solwhaletrending"
+LIVE_FOLLOWED_CATEGORIES = {c.strip() for c in
+                            os.getenv("LIVE_FOLLOWED_CATEGORIES", "none,low_score").split(",") if c.strip()}
+LIVE_FOLLOWED_DAYS = {d.strip()[:3].title() for d in
+                      os.getenv("LIVE_FOLLOWED_DAYS", "Mon,Tue,Wed,Thu,Fri,Sun").split(",") if d.strip()}
+LIVE_FOLLOWED_SIZE_SOL = entry_quality.env_float(os.getenv("LIVE_FOLLOWED_SIZE_SOL"), 0.05)
+LIVE_FOLLOWED_STOP = entry_quality.env_float(os.getenv("LIVE_FOLLOWED_STOP"), 0.90)
+LIVE_FOLLOWED_BANK = entry_quality.env_float(os.getenv("LIVE_FOLLOWED_BANK"), 2.5)
+LIVE_FOLLOWED_STALL_MINS = entry_quality.env_float(os.getenv("LIVE_FOLLOWED_STALL_MINS"), 0.0)
+LIVE_FOLLOWED_STALL_LINE = entry_quality.env_float(os.getenv("LIVE_FOLLOWED_STALL_LINE"), 0.90)
+
+
+def _followed_settings_problems() -> list[str]:
+    bad = []
+    try:
+        size_cap = float(os.getenv("LIVE_SIZE_MAX_SOL", "1.0") or "1.0")
+    except ValueError:
+        size_cap = 1.0
+    if not (0.0 < LIVE_FOLLOWED_SIZE_SOL <= size_cap):
+        bad.append(f"LIVE_FOLLOWED_SIZE_SOL={LIVE_FOLLOWED_SIZE_SOL:g} not in (0, {size_cap:g}]")
+    if not (0.5 <= LIVE_FOLLOWED_STOP < 1.0):
+        bad.append(f"LIVE_FOLLOWED_STOP={LIVE_FOLLOWED_STOP:g} not in [0.5, 1)")
+    if not (LIVE_FOLLOWED_BANK > 1.0):
+        bad.append(f"LIVE_FOLLOWED_BANK={LIVE_FOLLOWED_BANK:g} must be above 1")
+    if LIVE_FOLLOWED_MIN_WALLETS < 1:
+        bad.append(f"LIVE_FOLLOWED_MIN_WALLETS={LIVE_FOLLOWED_MIN_WALLETS} must be 1+")
+    if LIVE_FOLLOWED_STALL_MINS > 0 and not (LIVE_FOLLOWED_STOP < LIVE_FOLLOWED_STALL_LINE <= 1.5):
+        bad.append(f"LIVE_FOLLOWED_STALL_LINE={LIVE_FOLLOWED_STALL_LINE:g} must be above the stop and <= 1.5")
+    unknown = LIVE_FOLLOWED_DAYS - set(_DAYS)
+    if unknown:
+        bad.append(f"LIVE_FOLLOWED_DAYS has unknown days {sorted(unknown)}")
+    return bad
+
+
+# Exit numbers are validated even with the lane off: already-marked positions use them.
+_followed_bad = _followed_settings_problems()
+if _followed_bad:
+    print("[live] WARNING: followed lane settings invalid — lane OFF and its positions use "
+          "the regular exits: " + "; ".join(_followed_bad))
+    LIVE_FOLLOWED_LANE = False
+_FOLLOWED_EXITS_OK = not _followed_bad
+print("[live] followed-wallets lane: "
+      + (f"ON — {LIVE_FOLLOWED_CHANNEL} {sorted(LIVE_FOLLOWED_CATEGORIES)} on "
+         f"{','.join(d for d in _DAYS if d in LIVE_FOLLOWED_DAYS)} (UTC) when "
+         f"{LIVE_FOLLOWED_MIN_WALLETS}+ followed wallets hold the coin at the call; "
+         f"{LIVE_FOLLOWED_SIZE_SOL:.4f} SOL; stop {LIVE_FOLLOWED_STOP:g}x, bank {LIVE_FOLLOWED_BANK:g}x"
+         + (f", after {LIVE_FOLLOWED_STALL_MINS:g}m sell under {LIVE_FOLLOWED_STALL_LINE:g}x"
+            if LIVE_FOLLOWED_STALL_MINS > 0 else "")
+         if LIVE_FOLLOWED_LANE else "off"))
+
+_followed_cache: dict[int, bool] = {}
+
+
+def followed_lane_eligible(channel_handle: str, category) -> bool:
+    """Could this call go to the followed lane (before looking at the wallets)?"""
+    if not LIVE_FOLLOWED_LANE or (channel_handle or "").lstrip("@") != LIVE_FOLLOWED_CHANNEL:
+        return False
+    if (category or "none") not in LIVE_FOLLOWED_CATEGORIES:
+        return False
+    return _DAYS[datetime.now(timezone.utc).weekday()] in LIVE_FOLLOWED_DAYS
+
+
+async def _followed_wallets_holding(mint: str) -> tuple[int | None, list[str]]:
+    """(followed wallets holding `mint` now, their addresses); (None, []) if the list is
+    missing or the RPC failed. One getMultipleAccounts call."""
+    import followed_at_call
+    wallets = followed_at_call._load_wallets()
+    if not wallets:
+        return None, []
+    holders = await asyncio.to_thread(followed_at_call._lookup, wallets, mint)
+    if holders is None:
+        return None, []
+    return len(holders), holders
+
+
+def _is_followed_position(call_id: int) -> bool:
+    """Was this live position opened by the followed lane? Cached for the process: the
+    mark is written before the buy, so it exists before any exit check sees the position."""
+    if call_id in _followed_cache:
+        return _followed_cache[call_id]
+    try:
+        val = db.is_live_followed(call_id)
+    except Exception as e:
+        db.safe_rollback()
+        print(f"[live] followed-lane lookup failed call_id={call_id} ({type(e).__name__}: {e}) "
+              f"— regular exits this tick")
+        return False
+    _followed_cache[call_id] = val
+    if len(_followed_cache) > 5000:
+        _followed_cache.clear()
+    return val
+
+
 # ── Per-channel mcap entry limits ──────────────────────────────────────────────
 
 # Per-channel ENTRY ceiling: reject a call whose market cap is already above this, because
@@ -550,6 +676,9 @@ def _resolve_live_exit_overlay() -> LiveExitOverlay | None:
 
 
 _LIVE_EXIT_OVERLAY = _resolve_live_exit_overlay()
+# The followed lane's bank ('take_profit' is an allowed exit_reason, so no migration).
+_FOLLOWED_OVERLAY = (LiveExitOverlay("take_profit", "bank", bank_mult=LIVE_FOLLOWED_BANK)
+                     if _FOLLOWED_EXITS_OK else None)
 print(f"[live] exit overlay: {_LIVE_EXIT_OVERLAY.name if _LIVE_EXIT_OVERLAY else 'none'}")
 print(f"[live] exit basis: quote={'ON' if LIVE_EXIT_USE_QUOTE else 'OFF'}"
       f"  require_quote={'ON' if LIVE_EXIT_REQUIRE_QUOTE else 'OFF (feed fallback)'}"
@@ -883,9 +1012,14 @@ async def _trip_circuit_breaker(loss: float, limit: float, kind: str = "daily") 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-async def open_live_position(score_result: dict, token_data: dict) -> bool:
+async def open_live_position(score_result: dict, token_data: dict,
+                             followed_eligible: bool = False) -> bool:
     """
     Execute a real buy via Jupiter and record the open position.
+
+    followed_eligible: the dispatcher found the call eligible for the followed-wallets
+    lane (followed_lane_eligible). The wallets are checked here, just before the buy; with
+    fewer than LIVE_FOLLOWED_MIN_WALLETS the call falls back to the regular lane rules.
 
     All 6 safety guards are checked in order before any trade is attempted.
     Every skip is logged with its reason — this is the audit trail.
@@ -983,13 +1117,31 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         local_now  = datetime.now(timezone.utc).astimezone(LOCAL_TZ)
         local_hour = local_now.hour
 
+        # ── Followed-wallets lane: read the wallets now, before anything else decides ──
+        _followed = False
+        _f_n, _f_holders = None, []
+        if (followed_eligible and LIVE_FOLLOWED_LANE
+                and followed_lane_eligible(channel_handle, db.get_call_skip_reason(call_id))):
+            try:
+                _f_n, _f_holders = await _followed_wallets_holding(mint)
+            except Exception as _fe:
+                print(f"[live] {symbol} followed-wallet check failed ({type(_fe).__name__}: {_fe})")
+            if _f_n is not None and _f_n >= LIVE_FOLLOWED_MIN_WALLETS:
+                _followed = True
+                print(f"[live] {symbol} FOLLOWED LANE — {_f_n} followed wallets hold it "
+                      f"(min {LIVE_FOLLOWED_MIN_WALLETS}) call_id={call_id}")
+            else:
+                print(f"[live] {symbol} followed lane: "
+                      f"{'check failed' if _f_n is None else f'{_f_n} followed wallets'} "
+                      f"(need {LIVE_FOLLOWED_MIN_WALLETS}) — regular lane rules")
+
         # ── Lane-policy gate — resolved BEFORE size so a LIVE-allowlist lane sets its own size ──
         # LIVE_LANE_STRATEGY "A"/"B" mirror the paper testbed bench (research-wide); "LIVE" uses
         # lane_policy.resolve_live() — a NARROW live-only allowlist (LIVE_LANES) so live trades a
         # realized-CONFIRMED subset while paper stays wide. Both handle day-gates + Sunday opt-in.
         # Does NOT mutate the call's skip_reason (shared lane label the paper dispatch also reads).
         _lane: dict = {"trade": True}
-        if LIVE_USE_LANE_POLICY:
+        if LIVE_USE_LANE_POLICY and not _followed:
             _cat  = db.get_call_skip_reason(call_id)
             if LIVE_LANE_STRATEGY == "LIVE":
                 _lane = lane_policy.resolve_live(channel_handle, token_data.get("vip_tier"), _cat)
@@ -1011,7 +1163,9 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         # Size: LIVE_SIZE_SOL from .env if set, else the allowlist lane's own size, else
         # the legacy LIVE_POSITION_SIZE_SOL default.
         size = float(LIVE_SIZE_SOL or _lane.get("size") or _position_size(label))
-        if LIVE_SIZE_SOL_YOUNG and mint and LIVE_SIZE_SOL_YOUNG < size:
+        if _followed:
+            size = LIVE_FOLLOWED_SIZE_SOL
+        if LIVE_SIZE_SOL_YOUNG and mint and LIVE_SIZE_SOL_YOUNG < size and not _followed:
             _yage = None
             try:
                 _yage = _entry_token_age(mint)
@@ -1173,7 +1327,8 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
         # action rather than the merely cautious one.
         try:
             import entry_filter
-            _ok, _why = entry_filter.check(mint, msg_mcap)
+            # The followed lane was measured on every flag and mcap: no band/flag filter.
+            _ok, _why = (True, "followed lane") if _followed else entry_filter.check(mint, msg_mcap)
             if not _ok:
                 print(f"[live] {symbol} skipped — entry filter: {_why}")
                 db.set_call_skip_reason(call_id, "entry_filter")
@@ -1238,7 +1393,7 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
                 )
                 db.set_call_skip_reason(call_id, gate.reason)
                 return False
-            if LIVE_MIN_ENTRY_EXEC_RATIO > 0:
+            if LIVE_MIN_ENTRY_EXEC_RATIO > 0 and not _followed:
                 _age = None
                 _min_applies = True
                 if LIVE_MIN_ENTRY_EXEC_RATIO_MAX_AGE_MIN > 0:
@@ -1294,10 +1449,23 @@ async def open_live_position(score_result: dict, token_data: dict) -> bool:
                     db.set_call_skip_reason(call_id, roundtrip.reason)
                     return False
 
+        # ── Followed lane: mark BEFORE the buy so no exit check can see the position
+        # without it (it would get the regular 0.80 stop / 2x bank). No mark, no buy.
+        if _followed:
+            try:
+                db.mark_live_followed(call_id, int(_f_n), _f_holders)
+                _followed_cache[call_id] = True
+            except Exception as _me:
+                db.safe_rollback()
+                print(f"[live] {symbol} skipped — could not mark followed-lane position "
+                      f"({type(_me).__name__}: {_me}) call_id={call_id}")
+                return False
+
         # ── Execute buy ────────────────────────────────────────────────────────
         print(
             f"[live] BUY {symbol}  call_id={call_id}"
             f"  size={size:.4f} SOL  mint={mint[:8]}..."
+            + (f"  [followed lane: {_f_n} wallets]" if _followed else "")
         )
         result = await jupiter.buy_token(mint, size)
 
@@ -1882,7 +2050,7 @@ def check_live_exits(
         return ExitResult(False)
 
     # ── Steep hold: a held position exits ONLY on target / floor / time ───────────
-    if LIVE_STEEP_HOLD:
+    if LIVE_STEEP_HOLD and not (_FOLLOWED_EXITS_OK and _is_followed_position(call_id)):
         held_at = db.get_live_steep_hold_at(call_id)
         if held_at is not None:
             mult = raw_mult if (raw_mult is not None and raw_mult > 0) else current_mcap / entry_mcap
@@ -1900,6 +2068,14 @@ def check_live_exits(
     channel_handle = (position.get("channel_handle") or "").lstrip("@")
     entry_time = position.get("entry_time")
 
+    # ── Followed-wallets lane: its own stop and bank (see LIVE_FOLLOWED_LANE) ──────
+    followed = _FOLLOWED_EXITS_OK and _is_followed_position(call_id)
+    position_overlay = None
+    if followed:
+        cfg = _replace(cfg, hard_stop_pct=round(1.0 - LIVE_FOLLOWED_STOP, 6),
+                       vip_gamble_hard_stop_pct=round(1.0 - LIVE_FOLLOWED_STOP, 6))
+        position_overlay = _FOLLOWED_OVERLAY
+
     # ── RAW executable hard stop (mirrors qsim e81d4d7) ──────────────────────────
     # A real sell quote already below the stop is not a phantom — it is the price the bag
     # would actually fetch. guard_trough exists to survive a bad FEED tick, but on the quote
@@ -1909,6 +2085,14 @@ def check_live_exits(
         raw_stop_pct = cfg.vip_gamble_hard_stop_pct if is_vip_gamble else cfg.hard_stop_pct
         if raw_stop_pct > 0 and raw_mult <= (1.0 - raw_stop_pct):
             return ExitResult(True, "hard_stop", exit_mcap=entry_mcap * raw_mult)
+
+    # Followed lane stall stop: from N minutes after entry, sell under the stall line.
+    if followed and LIVE_FOLLOWED_STALL_MINS > 0 and entry_time is not None:
+        _et = entry_time if entry_time.tzinfo else entry_time.replace(tzinfo=timezone.utc)
+        _mins = (datetime.now(timezone.utc) - _et).total_seconds() / 60.0
+        _m = raw_mult if (raw_mult is not None and raw_mult > 0) else current_mcap / entry_mcap
+        if _mins >= LIVE_FOLLOWED_STALL_MINS and _m < LIVE_FOLLOWED_STALL_LINE:
+            return ExitResult(True, "stop_loss", exit_mcap=entry_mcap * _m)
 
     # Low-side corroboration: hold a single uncorroborated crater for one reading so one
     # phantom low tick can't trigger a real stop-sell (mirror of guard_peak on the high
@@ -1945,9 +2129,9 @@ def check_live_exits(
     overlay_mult = raw_mult if (raw_mult is not None and raw_mult > 0) else current_mult
     overlay_mcap = (entry_mcap * raw_mult) if (raw_mult is not None and raw_mult > 0) else current_mcap
     overlay_result, overlay_suppresses_base = _apply_live_exit_overlay(
-        call_id, overlay_mult, overlay_mcap
+        call_id, overlay_mult, overlay_mcap, overlay=position_overlay
     )
-    if (overlay_result.should_exit and LIVE_STEEP_HOLD and _LIVE_EXIT_OVERLAY is not None
+    if (overlay_result.should_exit and LIVE_STEEP_HOLD and not followed and _LIVE_EXIT_OVERLAY is not None
             and _LIVE_EXIT_OVERLAY.kind == "bank" and overlay_result.reason == _LIVE_EXIT_OVERLAY.name
             and overlay_mult < LIVE_STEEP_TARGET):
         if _steep_hold_instead_of_bank(call_id, overlay_mult):

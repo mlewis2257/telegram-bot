@@ -40,6 +40,11 @@ lane            solwhaletrending / none / low_score   (LIVE_LANES in lane_policy
                   (calls scoring 63+, which get no label; see lane_policy.py)
                 LIVE_UNLABELLED_MAX_HOLDERS=700 / LIVE_UNLABELLED_MIN_SCORE=70 filter the
                   unlabelled lane (qsim replay 10-15..10-19: +4.48 on 58 vs +0.72 on 104)
+                LIVE_FOLLOWED_LANE=on adds the followed-wallets lane (off by default): any
+                  swt none/low_score call that 2+ followed wallets hold at the call, every
+                  flag/mcap/score, 0.05 SOL, stop 0.90x / bank 2.5x ('take_profit'), no
+                  Saturday. Marked in live_followed_positions before the buy. Settings and
+                  evidence: live_trader.py "Followed-wallets lane".
                 LIVE_UNLABELLED_MAX_SCORE=80 also skips scores 80+ (off by default;
                   80+ trailed 70-79 in qsim 10-15..10-21 and shadow Sep 15-Oct 15)
                 LIVE_TRADE_SWT_LOW_SCORE=false removes the low_score lane from live

@@ -3103,6 +3103,54 @@ def insert_followed_at_call(call_id: int, mint: str, channel: str, holders: list
         conn.commit()
 
 
+def ensure_live_followed_table() -> None:
+    """Live positions opened by the followed-wallets lane (live_trader LIVE_FOLLOWED_LANE).
+    Written BEFORE the buy, so an exit process never sees such a position without its
+    row; a row whose buy then failed is harmless (exits only read rows for open
+    positions). Idempotent."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_followed_positions (
+                call_id     integer PRIMARY KEY,
+                n_wallets   integer NOT NULL,
+                holders     text[],
+                marked_at   timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.commit()
+
+
+def mark_live_followed(call_id: int, n_wallets: int, holders: list[str]) -> None:
+    ensure_live_followed_table()
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO live_followed_positions (call_id, n_wallets, holders)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (call_id) DO UPDATE SET n_wallets = EXCLUDED.n_wallets,
+                                                holders = EXCLUDED.holders
+            """, (call_id, n_wallets, holders))
+        conn.commit()
+
+
+def is_live_followed(call_id: int) -> bool:
+    """True if call_id's live position was opened by the followed-wallets lane. A missing
+    table means no such position was ever opened."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('live_followed_positions')")
+        if cur.fetchone()[0] is None:
+            return False
+        cur.execute("SELECT 1 FROM live_followed_positions WHERE call_id = %s", (call_id,))
+        return cur.fetchone() is not None
+
+
 def get_holdings_watch_coins(after_exit_mins: float, limit: int) -> list[dict]:
     """Coins to check: live positions open or closed within `after_exit_mins`, then
     solwhaletrending qsim positions on the same terms. Live first, then open before
