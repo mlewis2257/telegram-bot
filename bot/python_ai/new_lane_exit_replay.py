@@ -480,11 +480,38 @@ def print_segments(ps: list, min_n: int) -> None:
                   f"{h1:+6.2f} {h2:+6.2f}   {best.label:42s} {b1 + b2:+6.2f} {b1:+6.2f} {b2:+6.2f}{flag}")
 
 
+def _followed_counts(cur, ids):
+    """({call_id: followed wallets at wallet_holdings' first look}, {call_id: at the call}).
+    A call missing from a dict was not looked at (data not collected yet)."""
+    first, at_call = {}, {}
+    try:
+        cur.execute("SELECT min(observed_at) FROM tracked_wallet_holdings")
+        start = cur.fetchone()[0]
+        cur.execute(
+            """
+            SELECT qp.call_id, count(DISTINCT h.wallet) FILTER (
+                       WHERE h.prev_balance IS NULL AND h.observed_at <= qp.entry_time + interval '4 minutes')
+            FROM qsim_positions qp
+            LEFT JOIN tracked_wallet_holdings h ON h.call_id = qp.call_id
+            WHERE qp.call_id = ANY(%s) AND qp.entry_time >= %s::timestamptz - interval '4 minutes'
+            GROUP BY qp.call_id
+            """, (ids, start))
+        first = {cid: n for cid, n in cur.fetchall()} if start else {}
+    except Exception:
+        db.safe_rollback()
+    try:
+        cur.execute("SELECT call_id, n_holding FROM followed_at_call WHERE call_id = ANY(%s) AND rpc_ok", (ids,))
+        at_call = {cid: n for cid, n in cur.fetchall()}
+    except Exception:
+        db.safe_rollback()
+    return first, at_call
+
+
 def load(since: str, lane: str):
     conn = db.get_conn()
     db.safe_rollback()
-    lane_sql = "c.skip_reason IS NULL" if lane == "none" else "c.skip_reason = %s"
-    params = [since] + ([] if lane == "none" else [lane])
+    lane_sql = {"none": "c.skip_reason IS NULL", "all": "TRUE"}.get(lane, "c.skip_reason = %s")
+    params = [since] + ([] if lane in ("none", "all") else [lane])
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -516,6 +543,7 @@ def load(since: str, lane: str):
         obs = defaultdict(list)
         for cid, at, m, nr in cur.fetchall():
             obs[cid].append((at, None if nr else float(m)))
+        followed = _followed_counts(cur, ids)
     positions = []
     for cid, sym, flag, mcap, entry, q_reason, q_x, score, holders, age, liq, bundles, snipers, ratio in pos:
         path = [((at - entry).total_seconds(), m) for at, m in obs.get(cid, []) if at >= entry]
@@ -530,6 +558,7 @@ def load(since: str, lane: str):
             "age": None if age is None else float(age),
             "liq": liq, "bundles": bundles, "snipers": snipers,
             "ratio": None if ratio is None else float(ratio),
+            "f_first": followed[0].get(cid), "f_call": followed[1].get(cid),
         })
     return positions, obs
 
@@ -559,7 +588,11 @@ def main() -> None:
     global FILL_CAP
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", default="2026-10-15 06:50")
-    ap.add_argument("--lane", default="none", choices=["none", "low_score"])
+    ap.add_argument("--lane", default="none", choices=["none", "low_score", "all"])
+    ap.add_argument("--followed-min", type=int, default=0,
+                    help="keep only coins at least this many followed wallets held (0 = no filter)")
+    ap.add_argument("--followed-source", default="call", choices=["call", "first"],
+                    help="call = followed_at_call (before the buy); first = wallet_holdings' first look")
     ap.add_argument("--top", type=int, default=12)
     ap.add_argument("--grid", default="exits",
                     choices=["exits", "runner", "trail", "slice", "entry", "shape", "segments"],
@@ -599,6 +632,10 @@ def main() -> None:
             return False
         if age_lo is not None and p["age"] is not None and age_lo <= p["age"] < age_hi:
             return False
+        if a.followed_min:
+            n = p["f_call"] if a.followed_source == "call" else p["f_first"]
+            if n is None or n < a.followed_min:
+                return False
         if a.max_score and p["score"] is not None and p["score"] >= a.max_score:
             return False
         if hr_lo is not None and hr_lo <= p["entry"].hour <= hr_hi:
@@ -610,6 +647,8 @@ def main() -> None:
     filt += [f"age not in {a.skip_age} min"] if a.skip_age else []
     filt += [f"score < {a.max_score:g}"] if a.max_score else []
     filt += [f"UTC hour not in {a.skip_hours}"] if a.skip_hours else []
+    filt += [f"{a.followed_min}+ followed wallets ({'at call' if a.followed_source == 'call' else 'first look'})"] \
+        if a.followed_min else []
     if filt:
         before = len(allpos)
         allpos = [p for p in allpos if keep(p)]
