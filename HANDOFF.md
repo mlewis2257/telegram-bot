@@ -73,6 +73,10 @@ wallet watch    wallet_holdings.py (pm2 wallet-holdings): every 2 min, for coins
                 followed_at_call.py (inside sol-listener, FOLLOWED_AT_CALL_ENABLED=true):
                 the same lookup AT THE CALL, before any buy -> followed_at_call (one row
                 per swt call). Ceiling FOLLOWED_AT_CALL_MAX_PER_DAY=300. Research only.
+holder snaps    holder_snapshots.py (pm2 holder-snapshots): top-20 holders of every swt
+                qsim coin at entry, exit and exit+10 min -> holder_snapshots (wallets vs
+                pools tagged on_curve). Ceiling HOLDER_SNAP_MAX_CALLS_PER_DAY=2000.
+                --report: do stopped coins whose big holders sold into the drop come back?
 entry gate      LIVE_MIN_ENTRY_EXEC_RATIO=<r> skips entries quoting below r x the call mcap
                 (off unless set; 1.00 recommended — below 1.00x: 1 bank in 27, 2026-10-14)
 risk cap        MAX_TOTAL_LOSS_SOL=0.35, MAX_DAILY_LOSS_SOL=0
