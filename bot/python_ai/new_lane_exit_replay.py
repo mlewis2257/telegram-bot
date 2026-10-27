@@ -331,6 +331,35 @@ def shape_grid() -> list[Rules]:
     return out
 
 
+def live_grid() -> list[Rules]:
+    """Live's ACTUAL exits (2026-10-28), with the bank level / stop varied.
+
+    Live's base config (EXIT_STRATEGY=paper_a, exit_config.EXIT_A_PAPER) also has, under
+    every bank level: a trailing stop armed at 2x (25% below the peak; 22% past 3x, 15%
+    past 5x, 12% past 10x), a profit floor at 1.55x once the peak reached 2x (plus the
+    1.6->1.30 and 1.35->1.15 tiers), and a take-profit at 5x. With a 2x bank those never
+    act; with a later bank they decide what happens between 2x and the bank. The other
+    grids leave them out. First row = the wallet lane as it runs now (stop 0.90, bank 2.5x).
+    'no 2x trail' rows drop the trail and keep only a floor after 2x, for comparison with
+    the runner grid's 'floor after 2x @1.5 + target 3x'.
+    """
+    floors = ((2.0, 1.55), (1.6, 1.30), (1.35, 1.15))
+    trail = ((2.0, 0.25), (3.0, 0.22), (5.0, 0.15), (10.0, 0.12))
+    out = [Rules(stop=0.90, bank=2.5, floors=floors, trail_tiers=trail,
+                 label="LIVE NOW: stop 0.90 | bank 2.5x (+ live trail/floor)")]
+    for stop in (0.90, 0.80):
+        for bank in (2.0, 2.5, 3.0, 4.0, None):
+            for tn, tv in (("live trail", trail), ("no 2x trail", ())):
+                if stop == 0.90 and bank == 2.5 and tv:
+                    continue
+                fl = floors if tv else ((2.0, 1.5), (1.6, 1.30), (1.35, 1.15))
+                bank_lbl = f"bank {bank:g}x" if bank else "no bank (5x take-profit)"
+                out.append(Rules(stop=stop, bank=bank, floors=fl, trail_tiers=tv,
+                                 target=None if bank else 5.0,
+                                 label=f"stop {stop:.2f} | {bank_lbl} | {tn}"))
+    return out
+
+
 # ── Entry timing: buy the shakeout on purpose ──────────────────────────────────
 # 2026-10-21: the lane's coins still double after the call about as often as before, but
 # far fewer reach 2x from our entry before a 20%+ dip stops us out (bank rate 19-29% early
@@ -595,7 +624,7 @@ def main() -> None:
                     help="call = followed_at_call (before the buy); first = wallet_holdings' first look")
     ap.add_argument("--top", type=int, default=12)
     ap.add_argument("--grid", default="exits",
-                    choices=["exits", "runner", "trail", "slice", "entry", "shape", "segments"],
+                    choices=["exits", "runner", "trail", "slice", "entry", "shape", "segments", "live"],
                     help="exits = stop/floor/steep/buy-back; runner = no-bank targets and floors; "
                          "trail = trailing stops (always, or tiered at 2x/3x/5x, or after half at 2x); "
                          "shape = bank level x stop width x time stop; segments = today's exits and "
@@ -672,7 +701,7 @@ def main() -> None:
             print_segments(ps, a.min_seg)
         return
     grid = {"exits": rule_grid, "runner": runner_grid, "trail": trail_grid,
-            "slice": slice_grid, "shape": shape_grid}[a.grid]()
+            "slice": slice_grid, "shape": shape_grid, "live": live_grid}[a.grid]()
     base = grid[0]
     for gname, ps in groups.items():
         print(f"\n=== {a.lane} lane since {a.since} — {gname}: {len(ps)} trades ===")
