@@ -259,8 +259,96 @@ def report(since: str) -> None:
           f"of stops — and it needs ~25-30% to make holding (or buying back) pay.")
 
 
+def _clones(values: list[float], tol: float = 0.10, floor: float = 0.001) -> int:
+    """Largest group of holdings (each >= floor of supply) within +-tol of each other —
+    many wallets holding near-identical amounts is how one operator's wallets look."""
+    vals = sorted(v for v in values if v >= floor)
+    best = 0
+    j = 0
+    for i in range(len(vals)):
+        while vals[i] > vals[j] * (1 + 2 * tol):
+            j += 1
+        best = max(best, i - j + 1)
+    return best
+
+
+def entry_report(since: str) -> None:
+    """2026-10-28, WANSULEK: at our entry one wallet held 89% of supply; 8 minutes later it
+    was spread over ~15 wallets (2-5.6% each) and 10 minutes after that consolidated into one
+    seller (35%) who dripped it out and dumped. This splits EVERY qsim trade by what the ENTRY
+    snapshot showed (real wallets only; pools/programs excluded): the largest wallet's share,
+    how many wallets held 2%+, and the largest group of near-identical holdings."""
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT qp.entry_time, h.supply_ui, h.holders,
+                   qp.exit_reason LIKE '%%bank%%',
+                   CASE WHEN qp.exit_reason LIKE '%%bank%%' THEN LEAST(qp.sol_out / qp.sol_in, 2.1)
+                        ELSE qp.sol_out / qp.sol_in END,
+                   (SELECT ob.real_mult FROM qsim_quote_observations ob
+                     WHERE ob.call_id = qp.call_id AND ob.real_mult IS NOT NULL AND NOT ob.rate_limited
+                       AND ob.observed_at <= qp.exit_time + interval '24 hours'
+                     ORDER BY ob.observed_at DESC LIMIT 1)
+            FROM qsim_positions qp
+            JOIN holder_snapshots h ON h.call_id = qp.call_id AND h.phase = 'entry' AND h.ok
+            WHERE qp.status = 'closed' AND qp.channel_handle = 'solwhaletrending'
+              AND qp.sol_in > 0 AND qp.entry_time >= %s
+            ORDER BY qp.entry_time
+            """, (since,))
+        rows = cur.fetchall()
+    trades = []
+    for entry, supply, holders, bank, x, last in rows:
+        if not supply:
+            continue
+        shares = [float(hd["ui_amount"]) / float(supply) for hd in (holders or [])
+                  if hd.get("on_curve") and hd.get("ui_amount") is not None]
+        trades.append({"entry": entry, "bank": bool(bank), "x": float(x),
+                       "dead": last is not None and float(last) < 0.10,
+                       "top1": max(shares) * 100 if shares else 0.0,
+                       "n2": sum(1 for s in shares if s >= 0.02),
+                       "clones": _clones(shares)})
+    if not trades:
+        print("no closed qsim trades with an entry holder snapshot yet")
+        return
+    mid = trades[len(trades) // 2]["entry"]
+
+    def show(title, key, edges):
+        print(f"\n{title}")
+        print(f"  {'value':14s} {'trades':>6s} {'banks':>5s} {'bank %':>6s} {'per tr':>7s} {'1st half':>8s} "
+              f"{'2nd half':>8s} {'dead in 24h':>11s}")
+        groups = defaultdict(list)
+        for t in trades:
+            for hi, label in edges:
+                if t[key] < hi:
+                    groups[label].append(t)
+                    break
+        for _, label in edges:
+            g = groups.get(label, [])
+            if not g:
+                continue
+            net = sum(t["x"] - 1 for t in g)
+            h1 = sum(t["x"] - 1 for t in g if t["entry"] < mid)
+            banks = sum(t["bank"] for t in g)
+            print(f"  {label:14s} {len(g):6d} {banks:5d} {banks / len(g) * 100:5.1f}% {net / len(g) * 100:+6.1f}% "
+                  f"{h1:+8.2f} {net - h1:+8.2f} {sum(t['dead'] for t in g) / len(g) * 100:10.0f}%")
+
+    print(f"solwhaletrending qsim trades since {since} with an entry holder snapshot: {len(trades)} "
+          f"(banks capped at 2.1x; 'dead' = last look within 24h of exit under 0.10x of entry)")
+    show("LARGEST single wallet at our entry, % of supply:", "top1",
+         [(5, "under 5%"), (10, "5-10%"), (20, "10-20%"), (50, "20-50%"), (101, "50%+")])
+    show("WALLETS holding 2%+ of supply at our entry:", "n2",
+         [(1, "0"), (2, "1"), (4, "2-3"), (7, "4-6"), (1e9, "7+")])
+    show("CLONES: largest group of wallets (0.1%+) holding within +-10% of each other:", "clones",
+         [(3, "under 3"), (5, "3-4"), (8, "5-7"), (1e9, "8+")])
+
+
 if __name__ == "__main__":
-    if "--report" in sys.argv:
+    if "--entry-report" in sys.argv:
+        i = sys.argv.index("--since") if "--since" in sys.argv else -1
+        entry_report(sys.argv[i + 1] if i > 0 else "2026-10-27")
+    elif "--report" in sys.argv:
         i = sys.argv.index("--since") if "--since" in sys.argv else -1
         report(sys.argv[i + 1] if i > 0 else "2026-10-28")
     else:
