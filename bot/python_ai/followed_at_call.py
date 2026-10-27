@@ -94,6 +94,10 @@ async def snapshot(call_id, mint, channel: str) -> None:
             db.ensure_followed_at_call_table()
             _table_ok = True
         db.insert_followed_at_call(int(call_id), mint, channel, holders, len(wallets))
+        # When enough followed wallets hold it: when did each of them get in / last trade it?
+        import followed_recency
+        if followed_recency.ENABLED and holders:
+            await followed_recency.record(call_id, mint, holders)
     except Exception as e:
         try:
             db.safe_rollback()

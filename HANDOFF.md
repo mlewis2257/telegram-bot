@@ -77,6 +77,10 @@ holder snaps    holder_snapshots.py (pm2 holder-snapshots): top-20 holders of ev
                 qsim coin at entry, exit and exit+10 min -> holder_snapshots (wallets vs
                 pools tagged on_curve). Ceiling HOLDER_SNAP_MAX_CALLS_PER_DAY=2000.
                 --report: do stopped coins whose big holders sold into the drop come back?
+recency         followed_recency.py (inside sol-listener, FOLLOWED_RECENCY_ENABLED=true): for
+                calls 3+ followed wallets hold, when each first / last traded the coin
+                before the call -> followed_recency. Ceiling 1500 calls/day. --backfill
+                (past calls, history is permanent), --report (fresh buyers vs old bags).
 entry gate      LIVE_MIN_ENTRY_EXEC_RATIO=<r> skips entries quoting below r x the call mcap
                 (off unless set; 1.00 recommended — below 1.00x: 1 bank in 27, 2026-10-14)
 risk cap        MAX_TOTAL_LOSS_SOL=0.35, MAX_DAILY_LOSS_SOL=0
