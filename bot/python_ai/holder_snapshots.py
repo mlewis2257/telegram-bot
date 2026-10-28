@@ -273,7 +273,11 @@ def _clones(values: list[float], tol: float = 0.10, floor: float = 0.001) -> int
 
 
 def entry_report(since: str) -> None:
-    """2026-10-28, WANSULEK: at our entry one wallet held 89% of supply; 8 minutes later it
+    """NOTJAK (2026-10-28): at entry 11 wallets held 1.1-2.2% each (~17% together, no single
+    big holder); six minutes later the pool held 97.6% of supply — they sold together, 1.2x ->
+    0.11x. Hence the top-10 combined share and the 1%+ count next to the single-wallet ones.
+
+    2026-10-28, WANSULEK: at our entry one wallet held 89% of supply; 8 minutes later it
     was spread over ~15 wallets (2-5.6% each) and 10 minutes after that consolidated into one
     seller (35%) who dripped it out and dumped. This splits EVERY qsim trade by what the ENTRY
     snapshot showed (real wallets only; pools/programs excluded): the largest wallet's share,
@@ -307,6 +311,8 @@ def entry_report(since: str) -> None:
         trades.append({"entry": entry, "bank": bool(bank), "x": float(x),
                        "dead": last is not None and float(last) < 0.10,
                        "top1": max(shares) * 100 if shares else 0.0,
+                       "top10": sum(sorted(shares, reverse=True)[:10]) * 100,
+                       "n1": sum(1 for s in shares if s >= 0.01),
                        "n2": sum(1 for s in shares if s >= 0.02),
                        "clones": _clones(shares)})
     if not trades:
@@ -338,6 +344,10 @@ def entry_report(since: str) -> None:
           f"(banks capped at 2.1x; 'dead' = last look within 24h of exit under 0.10x of entry)")
     show("LARGEST single wallet at our entry, % of supply:", "top1",
          [(5, "under 5%"), (10, "5-10%"), (20, "10-20%"), (50, "20-50%"), (101, "50%+")])
+    show("TOP-10 real wallets COMBINED at our entry, % of supply (NOTJAK: ~17% across 11 wallets of 1-2%):",
+         "top10", [(5, "under 5%"), (10, "5-10%"), (20, "10-20%"), (40, "20-40%"), (101, "40%+")])
+    show("WALLETS holding 1%+ of supply at our entry:", "n1",
+         [(1, "0"), (3, "1-2"), (6, "3-5"), (10, "6-9"), (1e9, "10+")])
     show("WALLETS holding 2%+ of supply at our entry:", "n2",
          [(1, "0"), (2, "1"), (4, "2-3"), (7, "4-6"), (1e9, "7+")])
     show("CLONES: largest group of wallets (0.1%+) holding within +-10% of each other:", "clones",
