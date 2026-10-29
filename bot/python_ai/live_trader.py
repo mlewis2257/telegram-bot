@@ -1383,7 +1383,14 @@ async def open_live_position(score_result: dict, token_data: dict,
                 token_data=token_data,
                 market=market,
             )
-            if not gate.allowed:
+            if not gate.allowed and _followed and gate.reason == "missing_executable_entry":
+                # 2026-10-29: JONSTON (10 followed wallets) was skipped here because the
+                # executable mcap could not be computed (SOL/USD price outage), not because
+                # it had run up. The quote above already proved it is buyable; for the
+                # followed lane an UNKNOWN ratio is not a reason to skip, a high one is.
+                print(f"[live] {symbol} entry exec/ref ratio unknown (no executable mcap) — "
+                      f"followed lane proceeds call_id={call_id}")
+            elif not gate.allowed:
                 print(
                     f"[live] {symbol} skipped — entry exec/ref ratio "
                     f"{(gate.ratio or 0):.2f}x > {gate.max_ratio:.2f}x "

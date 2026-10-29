@@ -136,8 +136,43 @@ def _last_good_mcap_get(mint: str, max_age: float = HELIUS_TX_LAST_GOOD_TTL) -> 
 # entry gate, whose thresholds are tens of percent. A price that is a few minutes old is
 # worth far more than no price.
 SOL_PRICE_TTL_SECONDS   = float(os.getenv("SOL_PRICE_TTL_SECONDS", "60"))
-SOL_PRICE_STALE_MAX_SECONDS = float(os.getenv("SOL_PRICE_STALE_MAX_SECONDS", "1800"))
+SOL_PRICE_STALE_MAX_SECONDS = float(os.getenv("SOL_PRICE_STALE_MAX_SECONDS", "7200"))
 _sol_stale_logged = 0.0
+_sol_jup_fail_logged = 0.0
+_sol_backup_logged = 0.0
+
+# 2026-10-29: Jupiter's price endpoint failed for over 30 minutes at a time; with no other
+# source every live and qsim entry failed ("no SOL/USD price" -> qsim "entry mcap calc
+# failed" x32, live skipped JONSTON, a 10-wallet call). Public exchange tickers (no key)
+# are tried after Jupiter. A backup price only has to be within a few percent.
+SOL_USD_BACKUP_URLS = (
+    ("coinbase", "https://api.coinbase.com/v2/prices/SOL-USD/spot"),
+    ("kraken", "https://api.kraken.com/0/public/Ticker?pair=SOLUSD"),
+)
+
+
+def _fetch_sol_usd_backup() -> tuple[Optional[float], str]:
+    """(price, source) from a public exchange ticker, or (None, reasons)."""
+    reasons = []
+    for name, url in SOL_USD_BACKUP_URLS:
+        try:
+            resp = requests.get(url, timeout=4)
+            if resp.status_code != 200:
+                reasons.append(f"{name} HTTP {resp.status_code}")
+                continue
+            data = resp.json()
+            if name == "coinbase":
+                price = float(((data.get("data") or {}).get("amount")) or 0)
+            else:
+                result = data.get("result") or {}
+                pair = next(iter(result.values()), {}) if result else {}
+                price = float((pair.get("c") or [0])[0])
+            if 1.0 < price < 100_000.0:
+                return price, name
+            reasons.append(f"{name} bad value {price}")
+        except Exception as e:
+            reasons.append(f"{name} {type(e).__name__}")
+    return None, "; ".join(reasons)
 
 
 def _sol_price_cache_get(max_age: float | None = None) -> Optional[float]:
@@ -164,6 +199,7 @@ def get_sol_price_usd() -> Optional[float]:
     cached = _sol_price_cache_get()
     if cached:
         return cached
+    global _sol_backup_logged
     try:
         price = _fetch_jupiter_simple_price_usd(WSOL_MINT)
         if price:
@@ -171,7 +207,15 @@ def get_sol_price_usd() -> Optional[float]:
             return price
     except Exception:
         pass
-    # Refetch failed. Use the last known price if it is recent enough rather than
+    price, source = _fetch_sol_usd_backup()
+    if price:
+        _sol_price_cache_set(price)
+        now = time.monotonic()
+        if now - _sol_backup_logged >= 600:
+            _sol_backup_logged = now
+            print(f"[fetcher] SOL/USD from backup {source}: ${price:.2f} (Jupiter price failed)", flush=True)
+        return price
+    # Every source failed. Use the last known price if it is recent enough rather than
     # returning None and costing the caller a trade.
     stale = _sol_price_cache_get(max_age=SOL_PRICE_STALE_MAX_SECONDS)
     if stale:
@@ -182,6 +226,10 @@ def get_sol_price_usd() -> Optional[float]:
             print(f"[fetcher] SOL/USD refetch failed — using last known ${stale:.2f} "
                   f"({age:.0f}s old)", flush=True)
         return stale
+    now = time.monotonic()
+    if now - _sol_stale_logged >= 60:
+        _sol_stale_logged = now
+        print(f"[fetcher] NO SOL/USD price from any source ({source}) — entries will fail", flush=True)
     return None
 
 
@@ -857,6 +905,13 @@ def _fetch_jupiter_simple_price_usd(mint: str) -> Optional[float]:
             timeout=REQUEST_TIMEOUT,
         )
         if resp.status_code != 200:
+            if mint == WSOL_MINT:
+                global _sol_jup_fail_logged
+                now = time.monotonic()
+                if now - _sol_jup_fail_logged >= 600:
+                    _sol_jup_fail_logged = now
+                    print(f"[fetcher] Jupiter price for SOL: HTTP {resp.status_code} "
+                          f"{resp.text[:120]!r}", flush=True)
             return None
         data = resp.json()
         price_data = data.get(mint)
