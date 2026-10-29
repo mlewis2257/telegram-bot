@@ -69,6 +69,8 @@ class Rules:
     trail_tiers: tuple = ()             # ((arm, pct), ...): the highest arm reached sets the trail
     split: float | None = None          # sell this fraction at the 2x bank; the rest runs on
                                         # these rules (no bank). Result is the blend.
+    ladder: tuple | None = None         # ((fraction, Rules), ...): the position is split into
+                                        # tranches, each run on its own Rules; result = blend
     stall: tuple | None = None          # (minutes, line): from that age on, sell at any look
                                         # below line (a stop that moves up with time)
     label: str = ""
@@ -158,6 +160,12 @@ def simulate(path: list, r: Rules) -> Result:
 def simulate_split(path: list, r: Rules) -> Result:
     """With r.split: that fraction is sold at the 2x bank (today's rules otherwise: same
     stop and pre-2x floor), the rest runs on r. Without it, plain simulate()."""
+    if r.ladder:
+        parts = [(f, simulate(path, sub)) for f, sub in r.ladder]
+        x = sum(f * res.x for f, res in parts)
+        hit = sum(1 for _, res in parts if res.reason in ("target", "bank"))
+        reason = parts[0][1].reason if hit == 0 else f"ladder{hit}of{len(parts)}"
+        return Result(x, reason, max(res.t for _, res in parts))
     if not r.split:
         return simulate(path, r)
     pre = tuple(f for f in r.floors if f[0] < 2.0)
@@ -357,6 +365,44 @@ def live_grid() -> list[Rules]:
                 out.append(Rules(stop=stop, bank=bank, floors=fl, trail_tiers=tv,
                                  target=None if bank else 5.0,
                                  label=f"stop {stop:.2f} | {bank_lbl} | {tn}"))
+    return out
+
+
+def ladder_grid() -> list[Rules]:
+    """Sell in pieces on the way up instead of all at once (2026-10-28).
+
+    Top traders on a coin that went ~15x (bought at $84-266K, like our entries) sold in 7-31
+    chunks up to $1.5M. Earlier keep-a-slice tests sold half at 2x and lost — most coins stop
+    soon after 2x. These ladders start at 3x, on coins that already proved they run.
+
+    Every tranche shares live's protection until it is sold: the stop, the floors (2x->1.55,
+    1.6->1.30, 1.35->1.15) and, unless noted, live's trail from 2x (25%, 22% past 3x). After
+    3x the remaining tranches also get a floor at FLOOR3 (default 2.0x). The last tranche has
+    no target: it rides on a wider trail once past 5x, or the 24h limit.
+    The first two rows are the current 3x bank, for comparison (live trail / no 2x trail).
+    """
+    base_floors = ((2.0, 1.55), (1.6, 1.30), (1.35, 1.15))
+    live_trail = ((2.0, 0.25), (3.0, 0.22), (5.0, 0.15), (10.0, 0.12))
+    out = [Rules(stop=0.80, bank=3.0, floors=base_floors, trail_tiers=live_trail,
+                 label="NOW: stop 0.80 | bank 3x | live trail"),
+           Rules(stop=0.80, bank=3.0, floors=((2.0, 1.5), (1.6, 1.30), (1.35, 1.15)),
+                 label="stop 0.80 | bank 3x | no 2x trail")]
+    for stop in (0.80, 0.90):
+        for fr_name, fr in (("thirds", (1 / 3, 1 / 3, 1 / 3)), ("half/quarter/quarter", (0.5, 0.25, 0.25))):
+            for floor3 in (2.0, 2.5):
+                for rt_name, rt in (("runner trail 30% past 5x", 0.30), ("runner trail 40% past 5x", 0.40)):
+                    for keep_trail in (True, False):
+                        pre_trail = live_trail if keep_trail else ()
+                        fl = base_floors + ((3.0, floor3),)
+                        a = Rules(stop=stop, bank=3.0, floors=base_floors, trail_tiers=pre_trail)
+                        b = Rules(stop=stop, bank=None, target=5.0, floors=fl,
+                                  trail_tiers=pre_trail)
+                        runner_trail = tuple(t for t in pre_trail if t[0] < 5.0) + ((5.0, rt),)
+                        c = Rules(stop=stop, bank=None, floors=fl, trail_tiers=runner_trail)
+                        out.append(Rules(stop=stop, ladder=((fr[0], a), (fr[1], b), (fr[2], c)),
+                                         label=(f"stop {stop:.2f} | ladder {fr_name} 3x/5x/ride | "
+                                                f"floor {floor3:g}x after 3x | {rt_name}"
+                                                + ("" if keep_trail else " | no 2x trail"))))
     return out
 
 
@@ -624,7 +670,7 @@ def main() -> None:
                     help="call = followed_at_call (before the buy); first = wallet_holdings' first look")
     ap.add_argument("--top", type=int, default=12)
     ap.add_argument("--grid", default="exits",
-                    choices=["exits", "runner", "trail", "slice", "entry", "shape", "segments", "live"],
+                    choices=["exits", "runner", "trail", "slice", "entry", "shape", "segments", "live", "ladder"],
                     help="exits = stop/floor/steep/buy-back; runner = no-bank targets and floors; "
                          "trail = trailing stops (always, or tiered at 2x/3x/5x, or after half at 2x); "
                          "shape = bank level x stop width x time stop; segments = today's exits and "
@@ -701,7 +747,8 @@ def main() -> None:
             print_segments(ps, a.min_seg)
         return
     grid = {"exits": rule_grid, "runner": runner_grid, "trail": trail_grid,
-            "slice": slice_grid, "shape": shape_grid, "live": live_grid}[a.grid]()
+            "slice": slice_grid, "shape": shape_grid, "live": live_grid,
+            "ladder": ladder_grid}[a.grid]()
     base = grid[0]
     for gname, ps in groups.items():
         print(f"\n=== {a.lane} lane since {a.since} — {gname}: {len(ps)} trades ===")
