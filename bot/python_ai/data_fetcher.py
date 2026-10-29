@@ -191,8 +191,9 @@ def _sol_price_cache_set(price_usd: float) -> None:
 
 def get_sol_price_usd() -> Optional[float]:
     """
-    Public SOL/USD accessor — fresh cache, then Jupiter, then the last known price if it
-    is under SOL_PRICE_STALE_MAX_SECONDS old. None only when there is nothing recent.
+    Public SOL/USD accessor — fresh cache, then Coinbase / Kraken, then Jupiter, then the
+    last known price if it is under SOL_PRICE_STALE_MAX_SECONDS old. None only when there
+    is nothing recent.
     Used to convert real SOL fills into a USD mcap for fill-price recording.
     """
     global _sol_stale_logged
@@ -200,21 +201,26 @@ def get_sol_price_usd() -> Optional[float]:
     if cached:
         return cached
     global _sol_backup_logged
+    # Exchange tickers FIRST: SOL/USD is the same everywhere, and Jupiter's price quota
+    # (~10 req / 10 s, shared with every token price poll) is better spent on coins only
+    # Jupiter/DexScreener can price. Jupiter is the last resort.
+    price, source = _fetch_sol_usd_backup()
+    if price:
+        _sol_price_cache_set(price)
+        return price
     try:
         price = _fetch_jupiter_simple_price_usd(WSOL_MINT)
         if price:
             _sol_price_cache_set(price)
+            now = time.monotonic()
+            if now - _sol_backup_logged >= 600:
+                _sol_backup_logged = now
+                print(f"[fetcher] SOL/USD from Jupiter: ${price:.2f} (exchange tickers failed: {source})",
+                      flush=True)
             return price
     except Exception:
         pass
-    price, source = _fetch_sol_usd_backup()
-    if price:
-        _sol_price_cache_set(price)
-        now = time.monotonic()
-        if now - _sol_backup_logged >= 600:
-            _sol_backup_logged = now
-            print(f"[fetcher] SOL/USD from backup {source}: ${price:.2f} (Jupiter price failed)", flush=True)
-        return price
+    source = f"{source}; jupiter failed"
     # Every source failed. Use the last known price if it is recent enough rather than
     # returning None and costing the caller a trade.
     stale = _sol_price_cache_get(max_age=SOL_PRICE_STALE_MAX_SECONDS)
