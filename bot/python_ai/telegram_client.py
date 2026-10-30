@@ -1102,6 +1102,52 @@ async def _handle_exit_log(msg) -> None:
 
 # ── Catchup ───────────────────────────────────────────────────────────────────
 
+# ── Stall watchdog ──────────────────────────────────────────────────────────────
+# 2026-10-30: Telegram had a server-side outage ("RPCError -500: No workers running");
+# Telethon gave up fetching the missed updates for ONE channel ("ending getting difference
+# prematurely") and that channel's updates never came back while the others kept flowing.
+# solwhaletrending — the only channel live trades — was silent for 6+ hours with every
+# process online and no error the bot acted on. The watchdog asks Telegram for each
+# channel's newest message id; if the listener has not seen it for STALL_RESTART_SECS, the
+# process exits so pm2 restarts it, and _catchup records what was missed.
+WATCHDOG_SECS = float(os.getenv("LISTENER_WATCHDOG_SECS", "120"))
+STALL_RESTART_SECS = float(os.getenv("LISTENER_STALL_RESTART_SECS", "420"))
+
+
+async def stall_watchdog(client, entity_map: dict, seen: dict, every: float = WATCHDOG_SECS,
+                         stall: float = STALL_RESTART_SECS, exit_fn=None) -> None:
+    """seen: normalized chat id -> highest message id the listener has handled."""
+    exit_fn = exit_fn or (lambda code: os._exit(code))
+    behind_since: dict[int, float] = {}
+    while True:
+        await asyncio.sleep(every)
+        for nid, info in list(entity_map.items()):
+            try:
+                msgs = await client.get_messages(info["entity"], limit=1)
+            except Exception as e:
+                print(f"[watchdog] {info['handle']}: check failed ({type(e).__name__}: {e})", flush=True)
+                continue
+            if not msgs:
+                continue
+            latest = msgs[0]
+            if getattr(latest, "action", None) is not None:      # service message: no event
+                seen[nid] = max(seen.get(nid, 0), latest.id)
+                behind_since.pop(nid, None)
+                continue
+            if latest.id <= seen.get(nid, 0):
+                behind_since.pop(nid, None)
+                continue
+            first = behind_since.setdefault(nid, time.monotonic())
+            waited = time.monotonic() - first
+            if waited >= stall:
+                print(f"[watchdog] {info['handle']}: channel is at message {latest.id} but the listener "
+                      f"last handled {seen.get(nid, 0)} — updates stalled for {waited / 60:.0f} min. "
+                      f"Exiting so pm2 restarts the listener (catch-up records the missed messages).",
+                      flush=True)
+                exit_fn(3)
+                return
+
+
 def _catchup(client, entity, channel_cfg: dict, caller_id: int) -> int:
     """
     Scan messages since the last run for a single channel.
@@ -1211,6 +1257,7 @@ def run_listener() -> None:
     # ── Resolve entities, run catchup, build routing map ──────────────────────
     # entity_map: chat_id (int) → {cfg, caller_id, handle}
     entity_map: dict[int, dict] = {}
+    seen_ids: dict[int, int] = {}          # for the stall watchdog
 
     for channel_cfg in channels:
         handle    = channel_cfg["handle"]
@@ -1239,6 +1286,7 @@ def run_listener() -> None:
         if highest_id:
             _write_last_message_id(tg_handle, highest_id)
 
+        seen_ids[normalize_chat_id(entity.id)] = highest_id or 0
         entity_map[normalize_chat_id(entity.id)] = {
             "cfg":       channel_cfg,
             "caller_id": caller_id,
@@ -1271,6 +1319,7 @@ def run_listener() -> None:
             if vip_highest:
                 _write_last_message_id(vip_handle, vip_highest)
 
+            seen_ids[normalize_chat_id(vip_entity.id)] = vip_highest or 0
             entity_map[normalize_chat_id(vip_entity.id)] = {
                 "cfg":       vip_cfg,
                 "caller_id": vip_caller_id,
@@ -1298,6 +1347,7 @@ def run_listener() -> None:
         info    = entity_map.get(norm_id)
         if info is None:
             return
+        seen_ids[norm_id] = max(seen_ids.get(norm_id, 0), event.message.id)
 
         cfg      = info["cfg"]
         handle   = info["handle"]
@@ -1633,6 +1683,11 @@ def run_listener() -> None:
     )
     print(f"\n[listener] Live monitoring {len(entity_map)} channel(s): {channel_summary}")
     print("[listener] Press Ctrl+C to stop.\n")
+
+    if WATCHDOG_SECS > 0:
+        client.loop.create_task(stall_watchdog(client, entity_map, seen_ids))
+        print(f"[listener] stall watchdog: every {WATCHDOG_SECS:.0f}s, restart if a channel is "
+              f"behind for {STALL_RESTART_SECS / 60:.0f} min")
 
     # ── Reconnect loop ────────────────────────────────────────────────────────
 
