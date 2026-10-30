@@ -88,15 +88,40 @@ def classify(tx: dict, dev: str) -> dict | None:
     i = pubkeys.index(dev)
     signer = isinstance(keys[i], dict) and keys[i].get("signer")
     sol = (meta["postBalances"][i] - meta["preBalances"][i]) / LAMPORTS
+    # Wrapped SOL is SOL too: a buy paid from the dev's WSOL account barely moves its native
+    # balance (the jeff dev showed 0.016 SOL in, 3.7 SOL out without this).
+    wsol = "So11111111111111111111111111111111111111112"
+    wpre = sum(float(b["uiTokenAmount"]["uiAmount"] or 0) for b in meta.get("preTokenBalances") or []
+               if b.get("owner") == dev and b["mint"] == wsol)
+    wpost = sum(float(b["uiTokenAmount"]["uiAmount"] or 0) for b in meta.get("postTokenBalances") or []
+                if b.get("owner") == dev and b["mint"] == wsol)
+    sol += wpost - wpre
     pre = {(b["mint"]): float(b["uiTokenAmount"]["uiAmount"] or 0)
            for b in meta.get("preTokenBalances") or [] if b.get("owner") == dev}
     post = {(b["mint"]): float(b["uiTokenAmount"]["uiAmount"] or 0)
             for b in meta.get("postTokenBalances") or [] if b.get("owner") == dev}
     mint, dtok = None, 0.0
-    for m in set(pre) | set(post):
+    for m in (set(pre) | set(post)) - {"So11111111111111111111111111111111111111112"}:
         d = post.get(m, 0.0) - pre.get(m, 0.0)
         if abs(d) > abs(dtok):
             mint, dtok = m, d
+    other_mint = False
+    if mint is None and signer:
+        # The dev signed (and paid) but its OWN token balance did not move: buys into other
+        # wallets, transfers, bundles. Attribute to the coin whose balance moved most for
+        # anyone, so the cost is not lost (it was: the jeff dev showed 0.01 SOL in, 5 SOL out).
+        allpre = defaultdict(float)
+        allpost = defaultdict(float)
+        for b in meta.get("preTokenBalances") or []:
+            allpre[b["mint"]] += float(b["uiTokenAmount"]["uiAmount"] or 0)
+        for b in meta.get("postTokenBalances") or []:
+            allpost[b["mint"]] += float(b["uiTokenAmount"]["uiAmount"] or 0)
+        moved = {m: abs(allpost.get(m, 0.0) - allpre.get(m, 0.0)) for m in set(allpre) | set(allpost)}
+        moved = {m: v for m, v in moved.items()
+                 if v > 0 and m != "So11111111111111111111111111111111111111112"}
+        if moved:
+            mint = max(moved, key=moved.get)
+            other_mint = True
     logs = " ".join(meta.get("logMessages") or [])
     if "DistributeFeeToHolders" in logs:
         action = "fee_payout"          # the dev sharing creator fees with holders (costs SOL)
@@ -108,10 +133,14 @@ def classify(tx: dict, dev: str) -> dict | None:
         action = "buy"
     elif dtok < 0:
         action = "sell"
+    elif other_mint:
+        action = "for_others"          # dev paid; tokens moved in other wallets (bundles/transfers)
     else:
         action = "other"
+    toks = {m: post.get(m, 0.0) - pre.get(m, 0.0) for m in (set(pre) | set(post))
+            if m != "So11111111111111111111111111111111111111112" and abs(post.get(m, 0.0) - pre.get(m, 0.0)) > 0}
     return {"sig": tx["transaction"]["signatures"][0], "t": tx.get("blockTime"), "sol": sol,
-            "mint": mint, "dtok": dtok, "action": action, "signer": bool(signer)}
+            "mint": mint, "dtok": dtok, "action": action, "signer": bool(signer), "toks": toks}
 
 
 def coin_buyers(mint: str, t_create: int, t_until: int, dev: str, limit_txs: int) -> tuple[int, int, float]:
@@ -167,8 +196,9 @@ def main() -> None:
     sol_usd = data_fetcher.get_sol_price_usd() or 0.0
 
     rows, launches, before = [], [], None
+    extra = 15
     try:
-        while len(launches) < a.launches:
+        while len(launches) < a.launches or extra >= 0:
             opts = {"limit": 200}
             if before:
                 opts["before"] = before
@@ -184,15 +214,55 @@ def main() -> None:
                 c = classify(tx, dev)
                 if c:
                     rows.append(c)
-                    if c["action"] == "create" and c["mint"] and c["mint"] not in launches:
+                    if c["action"] == "create" and c["mint"] and c["mint"] not in launches \
+                            and len(launches) < a.launches:
                         launches.append(c["mint"])
+                        if len(launches) == a.launches:
+                            extra = 15          # the oldest launch's quote-token purchase can
+                                                # sit just past it (same second, listed later)
                 if len(launches) >= a.launches:
-                    break
+                    extra -= 1
+                    if extra < 0:
+                        break
             before = sigs[-1]["signature"]
             if len(sigs) < 200:
                 break
     except Ceiling:
         print(f"[audit] stopped at the {_max_calls}-call ceiling")
+
+    # Quote tokens. Some devs launch coins paired with another token (the jeff dev: HYPE):
+    # SOL -> HYPE, HYPE buys the launch, the coin is sold back for SOL. Every non-launch token
+    # the dev acquires with SOL gets a running SOL cost basis; when a launch transaction spends
+    # (or returns) it, that SOL value is charged to (or credited to) the launch.
+    launched = set(launches)
+    basis = defaultdict(lambda: [0.0, 0.0])          # quote mint -> [sol spent, units]
+    unpriced = 0
+    # Pass 1: average SOL cost of each quote token over everything read (a purchase and the
+    # launch that spends it often land in the same second, so order cannot be relied on).
+    for r in rows:
+        if not any(m in launched for m in r["toks"]):
+            for q, v in r["toks"].items():
+                if v > 0 and r["sol"] < 0:
+                    basis[q][0] += -r["sol"]
+                    basis[q][1] += v
+    # Pass 2: charge / credit launch transactions at that cost.
+    for r in rows:
+        coin_toks = {m: v for m, v in r["toks"].items() if m in launched}
+        quote_toks = {m: v for m, v in r["toks"].items() if m not in launched}
+        r["sol_adj"] = r["sol"]
+        if not coin_toks:
+            continue
+        for q, v in quote_toks.items():               # a launch tx paid or paid out in a quote token
+            spent, units = basis[q]
+            if units <= 0:
+                unpriced += 1
+                continue
+            r["sol_adj"] += v * (spent / units)       # v<0 spent: cost; v>0 received: value
+        if r["mint"] not in launched:
+            r["mint"] = max(coin_toks, key=lambda m: abs(coin_toks[m]))
+    if unpriced:
+        print(f"[audit] {unpriced} launch transaction(s) used a quote token with no SOL purchase seen "
+              f"in the history read — those launches are UNDER-costed; read further back (--max-calls)")
 
     by_mint = defaultdict(list)
     fee_claims, fee_payouts = [], []
@@ -210,9 +280,11 @@ def main() -> None:
         if not created:
             continue
         sells = [r for r in txs if r["action"] == "sell"]
-        dev_in = -sum(r["sol"] for r in txs if r["sol"] < 0)
-        dev_out = sum(r["sol"] for r in txs if r["sol"] > 0)
+        dev_in = -sum(r["sol_adj"] for r in txs if r["sol_adj"] < 0)
+        dev_out = sum(r["sol_adj"] for r in txs if r["sol_adj"] > 0)
+        n_others = sum(1 for r in txs if r["action"] == "for_others")
         res = {"mint": mint, "t": created["t"], "in": dev_in, "out": dev_out, "net": dev_out - dev_in,
+               "for_others": n_others,
                "n_tx": len(txs), "sold_after": (sells[0]["t"] - created["t"]) if sells else None,
                "open": not sells, "buyers": None}
         if a.buyers and sells:
@@ -240,7 +312,8 @@ def main() -> None:
         when = datetime.fromtimestamp(r["t"], timezone.utc).strftime("%m-%d %H:%M:%S")
         sold = "still held" if r["open"] else f"{r['sold_after']:.0f}s"
         line = (f"  {when:16s} {r['mint'][:8] + '..':10s} {r['in']:9.4f} {r['out']:9.4f} {r['net']:+9.4f} "
-                f"{r['net'] * sol_usd:+8.2f} {sold:>10s}")
+                f"{r['net'] * sol_usd:+8.2f} {sold:>10s}" + (f"  [{r['for_others']} tx for other wallets]"
+                                                            if r.get('for_others') else ""))
         if a.buyers and r["buyers"]:
             line += f" {r['buyers'][0]:7d} {r['buyers'][2]:9.3f}"
         print(line)
