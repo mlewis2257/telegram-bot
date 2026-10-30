@@ -20,7 +20,9 @@ cap closes the connection until the next UTC day.
     FOLLOWED_DETECT_MIN_WALLETS=3
     FOLLOWED_DETECT_WINDOW_MIN=60            distinct buyers counted within this window
     FOLLOWED_DETECT_MIN_SOL=0.05             ignore smaller buys (dust / tests)
-    FOLLOWED_DETECT_MAX_MSGS_PER_DAY=20000   ~0.02 SOL/day at most at the published rate
+    FOLLOWED_DETECT_MAX_MSGS_PER_DAY=5000    ~0.005 SOL/day at most at the published rate
+                                             (measured 2026-10-31: the 43 wallets made ~2,850 txs
+                                             of all kinds in 24 h -> ~$10/month expected)
 
 Run:     pm2 start followed_buy_detector.py --name wallet-detector --interpreter <venv python>
 Report:  python3 followed_buy_detector.py --report [--since '2026-11-01']
@@ -49,7 +51,7 @@ API_KEY = os.getenv("PUMPPORTAL_API_KEY", "").strip()
 MIN_WALLETS = int(os.getenv("FOLLOWED_DETECT_MIN_WALLETS", "3"))
 WINDOW_MIN = float(os.getenv("FOLLOWED_DETECT_WINDOW_MIN", "60"))
 MIN_SOL = float(os.getenv("FOLLOWED_DETECT_MIN_SOL", "0.05"))
-MAX_MSGS_PER_DAY = int(os.getenv("FOLLOWED_DETECT_MAX_MSGS_PER_DAY", "20000"))
+MAX_MSGS_PER_DAY = int(os.getenv("FOLLOWED_DETECT_MAX_MSGS_PER_DAY", "5000"))
 RECONNECT_MIN_S = 60
 RAW_LOG_FIRST = 5          # print the first raw trade messages so the format can be checked
 

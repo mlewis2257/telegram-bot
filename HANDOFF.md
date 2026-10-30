@@ -79,7 +79,7 @@ holder snaps    holder_snapshots.py (pm2 holder-snapshots): top-20 holders of ev
                 --report: do stopped coins whose big holders sold into the drop come back?
 detector        followed_buy_detector.py (pm2 wallet-detector): our own signals — 3+ followed
                 wallets buying the same coin within 60 min (PumpPortal subscribeAccountTrade,
-                metered ~0.01 SOL/10k msgs, PUMPPORTAL_API_KEY in .env; idle without it; daily
+                metered ~0.01 SOL/10k msgs (~$10/month measured), cap 5000/day, PUMPPORTAL_API_KEY in .env; idle without it; daily
                 cap FOLLOWED_DETECT_MAX_MSGS_PER_DAY). RECORD-ONLY -> followed_trades,
                 followed_signals. --report: same coins as the channel? earlier?
 recency         followed_recency.py (inside sol-listener, FOLLOWED_RECENCY_ENABLED=true): for
