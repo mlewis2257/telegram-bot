@@ -42,8 +42,10 @@ def strip_markdown_links(text: str) -> str:
 
 # Matches the Soul_Sniper_Bot hyperlink that wraps the token name in entry signals:
 # "[**\u200eToken Name**](https://t.me/Soul_Sniper_Bot?start=...)"
+# 2026-10-30 format: the name link is telegram.me/Soul_Sniper_Bot or soulterminal.ai/token/.
 _NAME_LINK_RE = re.compile(
-    r'\[([^\]]+)\]\(https://t\.me/Soul_Sniper_Bot',
+    r'\[([^\]]+)\]\(https://(?:t\.me|telegram\.me)/Soul_Sniper_Bot'
+    r'|\[([^\]]+)\]\(https://soulterminal\.ai/token/',
     re.IGNORECASE,
 )
 
@@ -59,7 +61,7 @@ def strip_entry_name(text: str) -> str | None:
         return None
     # Strip bold markers (**), LRM (\u200e), RLM (\u200f), and whitespace
     name = (
-        m.group(1)
+        (m.group(1) or m.group(2) or "")
         .replace('**', '')
         .replace('\u200e', '')
         .replace('\u200f', '')
@@ -155,6 +157,8 @@ def _parse_age_minutes(value: str, unit: str) -> int | None:
 MINT_SNIPER_RE = re.compile(
     r'start=(?:56_wtb_|15_etb_)([1-9A-HJ-NP-Za-km-z]{32,44})'
 )
+# Priority 1b — Soul Terminal token page (2026-10-30 format)
+MINT_SOULTERM_RE = re.compile(r'soulterminal\.ai/token/([1-9A-HJ-NP-Za-km-z]{32,44})')
 # Priority 2 — GeckoTerminal token page
 MINT_GECKO_RE  = re.compile(
     r'geckoterminal\.com/solana/tokens/([1-9A-HJ-NP-Za-km-z]{32,44})'
@@ -174,7 +178,7 @@ MINT_START_RE  = re.compile(r'start=(?:[A-Za-z0-9-]*_)*([1-9A-HJ-NP-Za-km-z]{32,
 
 def _extract_mint(text: str) -> str | None:
     """Return the first mint address found via the priority chain, or None."""
-    for pattern in (MINT_SNIPER_RE, MINT_GECKO_RE, MINT_DEX_RE, MINT_PUMP_RE, MINT_START_RE):
+    for pattern in (MINT_SNIPER_RE, MINT_SOULTERM_RE, MINT_GECKO_RE, MINT_DEX_RE, MINT_PUMP_RE, MINT_START_RE):
         m = pattern.search(text)
         if m:
             return m.group(1)
@@ -266,6 +270,10 @@ def _parse_entry_fields(text: str, is_whale: bool) -> dict | None:
     m = SYMBOL_RE.search(clean)
     if m:
         symbol = m.group(1).strip()
+    if not symbol and name:
+        # 2026-10-30 format: some calls carry no $TICKER. Derive one from the name rather
+        # than dropping the call (the mint, when found, identifies the coin anyway).
+        symbol = re.sub(r'[^A-Za-z0-9]', '', name).upper()[:12] or None
     if not symbol:
         return None
 
@@ -542,6 +550,8 @@ def parse_price_update(text: str) -> dict | None:
     Returns {symbol, pct_change, multiplier, entry_mcap, current_mcap}
     or None if symbol is missing.
     """
+    # 2026-10-30 format: the symbol is a link, '📈 [**JEFF**](https://soulterminal.ai/...) is up'
+    text = strip_markdown_links(text).replace('**', '')
     m = UPDATE_SYMBOL_RE.search(text)
     if not m:
         return None
