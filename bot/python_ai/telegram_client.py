@@ -866,6 +866,10 @@ def handle_realtime(message, caller_id: int, channel_id: int, channel_handle: st
         )
 
         if call_id is None:
+            # 2026-10-30: dupes were dropped with no trace; a cross-channel message-id
+            # collision hid most solwhaletrending calls this way. Always say so.
+            print(f"[realtime:dupe] {channel_handle or '?'} msg={message.id} ${symbol} mint={str(mint)[:12]} "
+                  f"— not stored: a call with this message id already exists")
             return 'dupe', None, None
 
         if mint_resolved:
