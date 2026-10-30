@@ -448,6 +448,18 @@ MCAP_LIMITS = {
 }
 DEFAULT_MCAP_LIMIT = 75_000  # fallback for unknown channels
 
+# Per-channel override from the .env: MCAP_LIMIT_<CHANNEL>=<usd>, 0 = no ceiling, e.g.
+# MCAP_LIMIT_SOLEARLYTRENDING=0 (2026-10-31: qsim mirrors these ceilings, and the 75k one would
+# have hidden most solearlytrending calls from the channel's first qsim tracking).
+for _ch in list(MCAP_LIMITS):
+    _ov = os.getenv(f"MCAP_LIMIT_{_ch.upper()}", "").strip()
+    if _ov:
+        try:
+            MCAP_LIMITS[_ch] = int(float(_ov))
+            print(f"[live] mcap ceiling for {_ch}: {MCAP_LIMITS[_ch]:,} (MCAP_LIMIT_{_ch.upper()})")
+        except ValueError:
+            print(f"[live] WARNING: MCAP_LIMIT_{_ch.upper()}={_ov!r} is not a number — ignored")
+
 
 # ── Config helpers ─────────────────────────────────────────────────────────────
 
