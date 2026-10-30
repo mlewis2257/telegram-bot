@@ -286,6 +286,7 @@ _STAT_KEYS = [
 ]
 
 _stats: dict[str, dict] = {}
+_unrecognised_count: dict = {}       # per-hour cap for [realtime:unrecognised] lines
 
 # ── VIP gamble confirmation queue ─────────────────────────────────────────────
 # VIP gamble_risk/gamble signals are held here until solhousesignal independently
@@ -1363,6 +1364,9 @@ def run_listener() -> None:
             return
 
         if not msg.text or not is_candidate(msg.text):
+            if cfg["channel_type"] == "realtime" and msg.text:
+                print(f"[realtime:unrecognised] {handle} msg={msg.id} status=not_candidate: "
+                      f"{' '.join(msg.text.split())[:110]}")
             return
 
         try:
@@ -1377,6 +1381,19 @@ def run_listener() -> None:
                 return
 
             _bump(handle, status)
+            # 2026-10-30: solwhaletrending volume fell to a few calls a day with no error. If a
+            # channel changes its message format, every message becomes 'noise'/'skipped' and
+            # was dropped silently. Print the start of each unrecognised realtime message
+            # (capped per hour) so a format change shows in the log.
+            if cfg["channel_type"] == "realtime" and status in ("noise", "skipped"):
+                _hour = int(time.time() // 3600)
+                if _unrecognised_count.get("hour") != _hour:
+                    _unrecognised_count.clear()
+                    _unrecognised_count["hour"] = _hour
+                _unrecognised_count[handle] = _unrecognised_count.get(handle, 0) + 1
+                if _unrecognised_count[handle] <= 30:
+                    _snip = " ".join(msg.text.split())[:110]
+                    print(f"[realtime:unrecognised] {handle} msg={msg.id} status={status}: {_snip}")
 
             # Circuit breaker check — AFTER parsing so every signal is logged to the DB
             if _monitor._dex_circuit_open:
