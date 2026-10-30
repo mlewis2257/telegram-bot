@@ -186,9 +186,10 @@ CREATE INDEX IF NOT EXISTS idx_calls_channel_id
 CREATE INDEX IF NOT EXISTS idx_calls_message_type
     ON calls (message_type);
 
--- Partial unique index: only deduplicate when source_message_id is present
-CREATE UNIQUE INDEX IF NOT EXISTS idx_calls_source_dedup
-    ON calls (source_platform, source_message_id)
+-- Partial unique index: only deduplicate when source_message_id is present.
+-- Per CHANNEL: Telegram numbers messages per channel (migrate_v32.sql).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_calls_source_dedup_v2
+    ON calls (source_platform, COALESCE(channel_id, 0), source_message_id)
     WHERE source_message_id IS NOT NULL;
 
 

@@ -176,7 +176,8 @@ def insert_call(
 ) -> int | None:
     """
     Insert a call event. Returns the new call id, or None if the message
-    was already logged (dedup on source_platform + source_message_id).
+    was already logged (dedup on source_platform + channel + source_message_id — see
+    database/migrate_v32.sql; Telegram numbers messages PER CHANNEL).
     """
     conn = get_conn()
     safe_rollback()
@@ -189,9 +190,7 @@ def insert_call(
                  message_type, channel_id, mcap_at_call, narrative_tags,
                  vip_tier, vip_message_type)
             VALUES (%s, %s, 'reactive', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (source_platform, source_message_id)
-            WHERE source_message_id IS NOT NULL
-            DO NOTHING
+            ON CONFLICT DO NOTHING
             RETURNING id
             """,
             (
