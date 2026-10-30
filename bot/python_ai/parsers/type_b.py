@@ -472,6 +472,9 @@ def parse_another_whale(text: str) -> dict | None:
     """
     m = ANOTHER_WHALE_SYMBOL_RE.search(text)
     if not m:
+        # 2026-10-30 format: '**🌊🐳 Another Whale Aped **[**$TOT**](https://telegram.me/c/...)**!**'
+        m = ANOTHER_WHALE_SYMBOL_RE.search(strip_markdown_links(text).replace('**', ''))
+    if not m:
         return None
     symbol = m.group(1).strip()
 

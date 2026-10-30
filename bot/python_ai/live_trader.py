@@ -315,7 +315,8 @@ def _unlabelled_filter(channel_handle: str, category, score_result: dict,
 # Steep hold never applies to these positions.
 #   LIVE_FOLLOWED_LANE=on                  off unless exactly 'on'
 #   LIVE_FOLLOWED_MIN_WALLETS=2
-#   LIVE_FOLLOWED_CATEGORIES=none,low_score   solwhaletrending lane labels it may take
+#   LIVE_FOLLOWED_CHANNELS=solwhaletrending   channels whose calls it may take (comma list)
+#   LIVE_FOLLOWED_CATEGORIES=none,low_score   lane labels it may take
 #   LIVE_FOLLOWED_DAYS=Mon,Tue,Wed,Thu,Fri,Sun   UTC weekdays (Saturday out by default)
 #   LIVE_FOLLOWED_SIZE_SOL=0.05            capped by LIVE_SIZE_MAX_SOL
 #   LIVE_FOLLOWED_STOP=0.90  LIVE_FOLLOWED_BANK=2.5
@@ -325,7 +326,12 @@ def _unlabelled_filter(channel_handle: str, category, score_result: dict,
 _DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 LIVE_FOLLOWED_LANE = os.getenv("LIVE_FOLLOWED_LANE", "off").strip().lower() == "on"
 LIVE_FOLLOWED_MIN_WALLETS = int(entry_quality.env_float(os.getenv("LIVE_FOLLOWED_MIN_WALLETS"), 2.0))
-LIVE_FOLLOWED_CHANNEL = "solwhaletrending"
+# 2026-10-30: solwhaletrending nearly stopped posting NEW calls (follow-ups only); the same
+# operator's solearlytrending still posts ~8/h. LIVE_FOLLOWED_CHANNELS lists the channels whose
+# calls the lane may take (default solwhaletrending only).
+LIVE_FOLLOWED_CHANNELS = {c.strip().lstrip("@") for c in
+                          os.getenv("LIVE_FOLLOWED_CHANNELS", "solwhaletrending").split(",") if c.strip()}
+LIVE_FOLLOWED_CHANNEL = ",".join(sorted(LIVE_FOLLOWED_CHANNELS))      # for the startup line
 LIVE_FOLLOWED_CATEGORIES = {c.strip() for c in
                             os.getenv("LIVE_FOLLOWED_CATEGORIES", "none,low_score").split(",") if c.strip()}
 LIVE_FOLLOWED_DAYS = {d.strip()[:3].title() for d in
@@ -380,7 +386,7 @@ _followed_cache: dict[int, bool] = {}
 
 def followed_lane_eligible(channel_handle: str, category) -> bool:
     """Could this call go to the followed lane (before looking at the wallets)?"""
-    if not LIVE_FOLLOWED_LANE or (channel_handle or "").lstrip("@") != LIVE_FOLLOWED_CHANNEL:
+    if not LIVE_FOLLOWED_LANE or (channel_handle or "").lstrip("@") not in LIVE_FOLLOWED_CHANNELS:
         return False
     if (category or "none") not in LIVE_FOLLOWED_CATEGORIES:
         return False
