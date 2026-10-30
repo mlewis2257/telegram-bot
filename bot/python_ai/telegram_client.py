@@ -709,6 +709,21 @@ def handle_lagging(message, caller_id: int, channel_id: int) -> tuple:
     return "logged", score_result, token_data
 
 
+def button_urls(message) -> list[str]:
+    """URLs of a message's inline buttons (Buy / Track / Scan / CA). 2026-10-29 the realtime
+    channels moved links (and with them the contract address) into the buttons."""
+    out = []
+    try:
+        for row in (getattr(message, "buttons", None) or []):
+            for b in row:
+                url = getattr(b, "url", None) or getattr(getattr(b, "button", None), "url", None)
+                if url:
+                    out.append(url)
+    except Exception:
+        pass
+    return out
+
+
 def handle_realtime(message, caller_id: int, channel_id: int, channel_handle: str = None) -> tuple:
     """
     Process one message from a realtime channel (@solwhaletrending, @solearlytrending).
@@ -722,6 +737,10 @@ def handle_realtime(message, caller_id: int, channel_id: int, channel_handle: st
     Alert sending (await) must happen in the async _handler, not here.
     """
     text = message.text.strip()
+    _btn = button_urls(message)
+    if _btn:
+        # appended for the mint search only; the field regexes target labelled lines
+        text = text + "\n" + "\n".join(_btn)
     kind = type_b.classify_b(text)
 
     if kind == 'noise':
@@ -1393,7 +1412,9 @@ def run_listener() -> None:
                 _unrecognised_count[handle] = _unrecognised_count.get(handle, 0) + 1
                 if _unrecognised_count[handle] <= 30:
                     _snip = " ".join(msg.text.split())[:110]
-                    print(f"[realtime:unrecognised] {handle} msg={msg.id} status={status}: {_snip}")
+                    _b = button_urls(msg)
+                    print(f"[realtime:unrecognised] {handle} msg={msg.id} status={status} "
+                          f"buttons={len(_b)}{(' first=' + _b[0][:90]) if _b else ''}: {_snip}")
 
             # Circuit breaker check — AFTER parsing so every signal is logged to the DB
             if _monitor._dex_circuit_open:

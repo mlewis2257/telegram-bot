@@ -165,9 +165,16 @@ MINT_DEX_RE    = re.compile(
 )
 
 
+# Priority 4/5 (2026-10-30, links moved into buttons and may use other bots/sites): any
+# pump.fun-style address ('...pump'), then any bot deep link whose start parameter ends in
+# an address. Every link in a call message points at the same coin.
+MINT_PUMP_RE   = re.compile(r'(?<![1-9A-HJ-NP-Za-km-z])([1-9A-HJ-NP-Za-km-z]{28,40}pump)(?![1-9A-HJ-NP-Za-km-z])')
+MINT_START_RE  = re.compile(r'start=[A-Za-z0-9_-]*?_([1-9A-HJ-NP-Za-km-z]{32,44})(?![1-9A-HJ-NP-Za-km-z])')
+
+
 def _extract_mint(text: str) -> str | None:
     """Return the first mint address found via the priority chain, or None."""
-    for pattern in (MINT_SNIPER_RE, MINT_GECKO_RE, MINT_DEX_RE):
+    for pattern in (MINT_SNIPER_RE, MINT_GECKO_RE, MINT_DEX_RE, MINT_PUMP_RE, MINT_START_RE):
         m = pattern.search(text)
         if m:
             return m.group(1)
@@ -185,7 +192,7 @@ SYMBOL_RE        = re.compile(r'\$([A-Za-z][A-Za-z0-9]{0,14})')
 AGE_RE           = re.compile(r'Age\*{0,2}:\s*(\d+)([smhd])', re.IGNORECASE)
 
 # Security: "Security: ✅" or "**Security**: ✅" (solearlytrending uses bold markers)
-SECURITY_RE      = re.compile(r'Security\*{0,2}:\s*([✅⚠️⚠]+)', re.UNICODE)
+SECURITY_RE      = re.compile(r'Security\*{0,2}:\s*([✅⚠️⚠🚨]+)', re.UNICODE)  # 🚨 = warning (new format, 2026-10-29)
 
 # Whale wallet size (whale entry signals only): "Wallet: 184 SOL"
 WALLET_RE        = re.compile(r'Wallet:\s*\*{0,2}([\d,.]+)\s*SOL', re.IGNORECASE)
