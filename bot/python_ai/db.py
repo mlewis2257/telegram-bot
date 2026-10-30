@@ -3103,6 +3103,62 @@ def insert_followed_at_call(call_id: int, mint: str, channel: str, holders: list
         conn.commit()
 
 
+def ensure_news_tables() -> None:
+    """News posts (Telegram news channels + RSS) and every new pump.fun coin, for matching
+    stories to the coins launched about them (news_recorder.py / launcher/news_report.py)."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_posts (
+                id           bigserial PRIMARY KEY,
+                source       text NOT NULL,          -- 'telegram' | 'rss'
+                channel      text NOT NULL,          -- @handle or feed name
+                external_id  text NOT NULL,          -- message id / article link
+                title        text,
+                body         text,
+                url          text,
+                published_at timestamptz,
+                seen_at      timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (source, channel, external_id)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_news_seen ON news_posts (seen_at)")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS new_tokens (
+                mint         text PRIMARY KEY,
+                name         text,
+                symbol       text,
+                uri          text,
+                dev          text,
+                dev_buy_sol  numeric,
+                mcap_sol     numeric,
+                created_at   timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_new_tokens_created ON new_tokens (created_at)")
+        conn.commit()
+
+
+def insert_news_post(source: str, channel: str, external_id: str, title: str | None,
+                     body: str | None, url: str | None, published_at=None) -> bool:
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO news_posts (source, channel, external_id, title, body, url, published_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (source, channel, external_id) DO NOTHING
+            """, (source, channel, str(external_id), title, body, url, published_at))
+        new = cur.rowcount == 1
+        conn.commit()
+    return new
+
+
 def ensure_live_followed_table() -> None:
     """Live positions opened by the followed-wallets lane (live_trader LIVE_FOLLOWED_LANE).
     Written BEFORE the buy, so an exit process never sees such a position without its

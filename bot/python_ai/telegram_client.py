@@ -153,6 +153,10 @@ api_id   = int(os.environ["API_ID"])
 api_hash = os.environ["API_HASH"]
 
 VIP_CHANNEL = int(os.getenv("SOLHOUSE_VIP_CHANNEL", 0)) or None
+# News channels (2026-10-31): posts are only RECORDED (news_posts) for matching stories to the
+# coins launched about them; never parsed as calls. NEWS_CHANNELS=@WatcherGuru,@TreeNewsFeed,...
+NEWS_CHANNELS = [h.strip() if h.strip().startswith("@") else "@" + h.strip()
+                 for h in os.getenv("NEWS_CHANNELS", "").split(",") if h.strip()]
 
 # ── Single-process guard ──────────────────────────────────────────────────────
 
@@ -1337,6 +1341,24 @@ def run_listener() -> None:
 
     # ── Optional: SolHouse VIP channel (env-var, not in DB channels table) ──────
 
+    # ── News channels (record only) ─────────────────────────────────────────────
+    if NEWS_CHANNELS:
+        try:
+            db.ensure_news_tables()
+        except Exception as e:
+            print(f"[listener] news tables: {e}")
+        for nh in NEWS_CHANNELS:
+            try:
+                ne = client.get_entity(nh)
+                latest = client.get_messages(ne, limit=1)
+                nid = normalize_chat_id(ne.id)
+                seen_ids[nid] = latest[0].id if latest else 0
+                entity_map[nid] = {"cfg": {"id": None, "channel_type": "news", "handle": nh},
+                                   "caller_id": None, "handle": nh, "entity": ne}
+                print(f"[listener] news channel: {nh} (record only)")
+            except Exception as e:
+                print(f"[listener] news channel {nh}: could not resolve ({e}) — is the bot's account a member?")
+
     if VIP_CHANNEL:
         try:
             vip_entity = client.get_entity(PeerChannel(normalize_chat_id(VIP_CHANNEL)))
@@ -1396,6 +1418,17 @@ def run_listener() -> None:
 
         # Exit-log channel: operator's manual "sell here" ticker. Record + return; never
         # runs the call-parsing pipeline (a bare ticker wouldn't pass is_candidate anyway).
+        if cfg.get("channel_type") == "news":
+            try:
+                text = msg.text or ""
+                first = text.strip().split("\n", 1)[0][:300] if text else None
+                db.insert_news_post("telegram", handle, msg.id, first, text[:4000] or None,
+                                    f"https://t.me/{handle.lstrip('@')}/{msg.id}", msg.date)
+            except Exception as e:
+                db.safe_rollback()
+                print(f"[news] record failed ({handle} msg={msg.id}): {e}")
+            return
+
         if cfg.get("channel_type") == "exit_log":
             try:
                 await _handle_exit_log(msg)

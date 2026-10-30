@@ -77,6 +77,11 @@ holder snaps    holder_snapshots.py (pm2 holder-snapshots): top-20 holders of ev
                 qsim coin at entry, exit and exit+10 min -> holder_snapshots (wallets vs
                 pools tagged on_curve). Ceiling HOLDER_SNAP_MAX_CALLS_PER_DAY=2000.
                 --report: do stopped coins whose big holders sold into the drop come back?
+news            NEWS_CHANNELS=@WatcherGuru,... in .env: the listener RECORDS those channels' posts
+                (news_posts). news_recorder.py (pm2 news-recorder): RSS feeds every 60 s +
+                every new pump.fun coin via PumpPortal's FREE new-token feed (new_tokens).
+                bot/launcher/news_report.py: minutes from story to first coin, first vs later
+                coins' inflow. Research for the launcher only.
 detector        followed_buy_detector.py (pm2 wallet-detector): our own signals — 3+ followed
                 wallets buying the same coin within 60 min (PumpPortal subscribeAccountTrade,
                 metered ~0.01 SOL/10k msgs (~$10/month measured), cap 5000/day, PUMPPORTAL_API_KEY in .env; idle without it; daily
