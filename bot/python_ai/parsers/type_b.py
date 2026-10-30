@@ -169,7 +169,7 @@ MINT_DEX_RE    = re.compile(
 # pump.fun-style address ('...pump'), then any bot deep link whose start parameter ends in
 # an address. Every link in a call message points at the same coin.
 MINT_PUMP_RE   = re.compile(r'(?<![1-9A-HJ-NP-Za-km-z])([1-9A-HJ-NP-Za-km-z]{28,40}pump)(?![1-9A-HJ-NP-Za-km-z])')
-MINT_START_RE  = re.compile(r'start=[A-Za-z0-9_-]*?_([1-9A-HJ-NP-Za-km-z]{32,44})(?![1-9A-HJ-NP-Za-km-z])')
+MINT_START_RE  = re.compile(r'start=(?:[A-Za-z0-9-]*_)?([1-9A-HJ-NP-Za-km-z]{32,44})(?![1-9A-HJ-NP-Za-km-z])')
 
 
 def _extract_mint(text: str) -> str | None:
