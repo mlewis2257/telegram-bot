@@ -77,6 +77,11 @@ holder snaps    holder_snapshots.py (pm2 holder-snapshots): top-20 holders of ev
                 qsim coin at entry, exit and exit+10 min -> holder_snapshots (wallets vs
                 pools tagged on_curve). Ceiling HOLDER_SNAP_MAX_CALLS_PER_DAY=2000.
                 --report: do stopped coins whose big holders sold into the drop come back?
+detector        followed_buy_detector.py (pm2 wallet-detector): our own signals — 3+ followed
+                wallets buying the same coin within 60 min (PumpPortal subscribeAccountTrade,
+                metered ~0.01 SOL/10k msgs, PUMPPORTAL_API_KEY in .env; idle without it; daily
+                cap FOLLOWED_DETECT_MAX_MSGS_PER_DAY). RECORD-ONLY -> followed_trades,
+                followed_signals. --report: same coins as the channel? earlier?
 recency         followed_recency.py (inside sol-listener, FOLLOWED_RECENCY_ENABLED=true): for
                 calls 3+ followed wallets hold, when each first / last traded the coin
                 before the call -> followed_recency. Ceiling 1500 calls/day. --backfill
