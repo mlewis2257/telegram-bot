@@ -724,6 +724,24 @@ def button_urls(message) -> list[str]:
     return out
 
 
+def button_dump(message) -> str:
+    """Every inline button with its kind and target (URL, callback data, inline query) —
+    for diagnosing where a channel hides the contract address."""
+    parts = []
+    try:
+        for row in (getattr(message, "buttons", None) or []):
+            for b in row:
+                raw = getattr(b, "button", None)
+                kind = type(raw).__name__ if raw is not None else "?"
+                target = (getattr(b, "url", None) or getattr(raw, "url", None)
+                          or (repr(getattr(b, "data", None)) if getattr(b, "data", None) else None)
+                          or getattr(raw, "query", None) or "")
+                parts.append(f"[{(getattr(b, 'text', '') or '').strip()[:14]}|{kind}|{str(target)[:120]}]")
+    except Exception as e:
+        parts.append(f"[button read failed: {type(e).__name__}]")
+    return " ".join(parts) if parts else "(no buttons)"
+
+
 def handle_realtime(message, caller_id: int, channel_id: int, channel_handle: str = None) -> tuple:
     """
     Process one message from a realtime channel (@solwhaletrending, @solearlytrending).
@@ -788,6 +806,9 @@ def handle_realtime(message, caller_id: int, channel_id: int, channel_handle: st
         mint_resolved = mint is not None
         if not mint_resolved:
             mint = f"UNKNOWN:{symbol.upper()}" if symbol else f"UNKNOWN:msg{message.id}"
+            # 2026-10-30: the channel moved its links into buttons; show what they hold.
+            print(f"[realtime:no_address] {channel_handle or '?'} msg={message.id} ${symbol}: "
+                  f"{button_dump(message)}")
 
         token_id = db.upsert_token(
             mint_address=mint,
