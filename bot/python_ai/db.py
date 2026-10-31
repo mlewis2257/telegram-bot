@@ -3206,9 +3206,10 @@ def is_live_followed(call_id: int) -> bool:
         return cur.fetchone() is not None
 
 
-def get_holdings_watch_coins(after_exit_mins: float, limit: int) -> list[dict]:
+def get_holdings_watch_coins(after_exit_mins: float, limit: int,
+                              channels: list[str] | None = None) -> list[dict]:
     """Coins to check: live positions open or closed within `after_exit_mins`, then
-    solwhaletrending qsim positions on the same terms. Live first, then open before
+    qsim positions in `channels` (default solwhaletrending) on the same terms. Live first, then open before
     recently closed, newest first. One row per mint."""
     conn = get_conn()
     safe_rollback()
@@ -3229,14 +3230,14 @@ def get_holdings_watch_coins(after_exit_mins: float, limit: int) -> list[dict]:
                        CASE WHEN qp.status = 'open' THEN 2 ELSE 3 END,
                        COALESCE(qp.exit_time, qp.entry_time)
                 FROM qsim_positions qp JOIN tokens t ON t.id = qp.token_id
-                WHERE qp.channel_handle = 'solwhaletrending'
+                WHERE qp.channel_handle = ANY(%s)
                   AND (qp.status = 'open'
                        OR qp.exit_time >= now() - (%s || ' minutes')::interval)
             ) x
             WHERE mint IS NOT NULL AND mint NOT LIKE 'INFERRED:%%' AND mint NOT LIKE 'UNKNOWN:%%'
             ORDER BY mint, prio, t DESC
             """,
-            (after_exit_mins, after_exit_mins),
+            (after_exit_mins, list(channels or ["solwhaletrending"]), after_exit_mins),
         )
         rows = [dict(zip(("mint", "call_id", "source", "prio", "t"), r)) for r in cur.fetchall()]
     rows.sort(key=lambda r: (r["prio"], -(r["t"].timestamp() if r["t"] else 0)))

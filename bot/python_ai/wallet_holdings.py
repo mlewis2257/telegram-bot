@@ -48,6 +48,10 @@ PASS_SECS = float(os.getenv("WALLET_HOLDINGS_PASS_SECS", "120"))
 MAX_COINS = int(os.getenv("WALLET_HOLDINGS_MAX_COINS", "15"))
 AFTER_EXIT_MINS = float(os.getenv("WALLET_HOLDINGS_AFTER_EXIT_MINS", "60"))
 TALLY_SECS = float(os.getenv("WALLET_HOLDINGS_TALLY_SECS", "1800"))
+# qsim channels whose coins are watched (live positions always are). 2026-10-31: was hard-coded
+# to solwhaletrending; solearlytrending / solhousesignal can be added for their qsim tracking.
+CHANNELS = [c.strip().lstrip("@") for c in
+            os.getenv("WALLET_HOLDINGS_CHANNELS", "solwhaletrending").split(",") if c.strip()]
 MAX_ACCOUNTS_PER_CALL = 100
 
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
@@ -158,7 +162,7 @@ def changes(mint: str, balances: dict[str, float], call_id, source) -> list[dict
 
 
 def run_pass(wallets: list[str]) -> None:
-    coins = db.get_holdings_watch_coins(AFTER_EXIT_MINS, MAX_COINS)
+    coins = db.get_holdings_watch_coins(AFTER_EXIT_MINS, MAX_COINS, CHANNELS)
     _tally["passes"] += 1
     active = set()
     for c in coins:
@@ -239,7 +243,7 @@ def main() -> None:
     db.ensure_tracked_wallet_holdings_table()
     per_day = MAX_COINS * (86400.0 / PASS_SECS)
     print(f"[wallet_holdings] every {PASS_SECS:g}s, at most {MAX_COINS} coins per pass, "
-          f"coins watched until {AFTER_EXIT_MINS:g} min after exit — ceiling "
+          f"coins watched until {AFTER_EXIT_MINS:g} min after exit (live + qsim {','.join(CHANNELS)}) — ceiling "
           f"{per_day:,.0f} calls/day (~{per_day * 30:,.0f}/month), 1 call per coin per pass")
     last_tally = time.monotonic()
     while True:

@@ -50,6 +50,8 @@ ENTRY_WINDOW_S = 180
 EXIT_WINDOW_S = 180
 AFTER_EXIT_S = (600, 840)
 TOP_N = 20
+CHANNELS = [c.strip().lstrip("@") for c in
+            os.getenv("HOLDER_SNAP_CHANNELS", "solwhaletrending").split(",") if c.strip()]
 
 _day = None
 _calls_today = 0
@@ -94,13 +96,13 @@ def due_snapshots() -> list[tuple[int, str, str]]:
                            AND qp.exit_time <= now() - make_interval(secs => %s)
                            AND qp.exit_time >= now() - make_interval(secs => %s))
             ) AS x(phase, due)
-            WHERE qp.channel_handle = 'solwhaletrending'
+            WHERE qp.channel_handle = ANY(%s)
               AND x.due
               AND t.mint_address NOT LIKE 'UNKNOWN:%%' AND t.mint_address NOT LIKE 'INFERRED:%%'
               AND NOT EXISTS (SELECT 1 FROM holder_snapshots h
                               WHERE h.call_id = qp.call_id AND h.phase = x.phase)
             ORDER BY CASE x.phase WHEN 'exit' THEN 0 WHEN 'entry' THEN 1 ELSE 2 END
-            """, (ENTRY_WINDOW_S, EXIT_WINDOW_S, AFTER_EXIT_S[0], AFTER_EXIT_S[1]))
+            """, (ENTRY_WINDOW_S, EXIT_WINDOW_S, AFTER_EXIT_S[0], AFTER_EXIT_S[1], CHANNELS))
         return cur.fetchall()
 
 
@@ -142,7 +144,7 @@ def take(call_id: int, mint: str, phase: str) -> int:
 def run() -> None:
     global _day, _calls_today, _capped_noted
     ensure_table()
-    print(f"[holder_snapshots] every {PASS_SECS:g}s: top {TOP_N} holders of each solwhaletrending "
+    print(f"[holder_snapshots] every {PASS_SECS:g}s: top {TOP_N} holders of each {','.join(CHANNELS)} "
           f"qsim coin at entry, exit and 10 min after exit — ceiling {MAX_CALLS_PER_DAY:,} RPC "
           f"calls/day (~{MAX_CALLS_PER_DAY * 30:,}/month), 2-3 calls per snapshot", flush=True)
     tally = defaultdict(int)
@@ -189,7 +191,7 @@ def _wallets(snap) -> dict[str, float]:
     return out
 
 
-def report(since: str) -> None:
+def report(since: str, channel: str = "solwhaletrending") -> None:
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor() as cur:
@@ -204,11 +206,11 @@ def report(since: str) -> None:
                        AND NOT ob.rate_limited AND ob.real_mult IS NOT NULL) AS post_peak
             FROM qsim_positions qp
             JOIN holder_snapshots h ON h.call_id = qp.call_id AND h.ok
-            WHERE qp.status = 'closed' AND qp.channel_handle = 'solwhaletrending'
+            WHERE qp.status = 'closed' AND qp.channel_handle = %s
               AND qp.exit_reason = 'hard_stop' AND qp.entry_time >= %s
               AND qp.exit_time < now() - interval '24 hours'
             GROUP BY qp.call_id, qp.exit_time, qp.exit_reason
-            """, (since,))
+            """, (channel, since))
         rows = cur.fetchall()
     stops = []
     for call_id, _exit, _reason, supply, snaps, post_peak in rows:
@@ -272,7 +274,7 @@ def _clones(values: list[float], tol: float = 0.10, floor: float = 0.001) -> int
     return best
 
 
-def entry_report(since: str) -> None:
+def entry_report(since: str, channel: str = "solwhaletrending") -> None:
     """NOTJAK (2026-10-28): at entry 11 wallets held 1.1-2.2% each (~17% together, no single
     big holder); six minutes later the pool held 97.6% of supply — they sold together, 1.2x ->
     0.11x. Hence the top-10 combined share and the 1%+ count next to the single-wallet ones.
@@ -297,10 +299,10 @@ def entry_report(since: str) -> None:
                      ORDER BY ob.observed_at DESC LIMIT 1)
             FROM qsim_positions qp
             JOIN holder_snapshots h ON h.call_id = qp.call_id AND h.phase = 'entry' AND h.ok
-            WHERE qp.status = 'closed' AND qp.channel_handle = 'solwhaletrending'
+            WHERE qp.status = 'closed' AND qp.channel_handle = %s
               AND qp.sol_in > 0 AND qp.entry_time >= %s
             ORDER BY qp.entry_time
-            """, (since,))
+            """, (channel, since))
         rows = cur.fetchall()
     trades = []
     for entry, supply, holders, bank, x, last in rows:
@@ -340,7 +342,7 @@ def entry_report(since: str) -> None:
             print(f"  {label:14s} {len(g):6d} {banks:5d} {banks / len(g) * 100:5.1f}% {net / len(g) * 100:+6.1f}% "
                   f"{h1:+8.2f} {net - h1:+8.2f} {sum(t['dead'] for t in g) / len(g) * 100:10.0f}%")
 
-    print(f"solwhaletrending qsim trades since {since} with an entry holder snapshot: {len(trades)} "
+    print(f"{channel} qsim trades since {since} with an entry holder snapshot: {len(trades)} "
           f"(banks capped at 2.1x; 'dead' = last look within 24h of exit under 0.10x of entry)")
     show("LARGEST single wallet at our entry, % of supply:", "top1",
          [(5, "under 5%"), (10, "5-10%"), (20, "10-20%"), (50, "20-50%"), (101, "50%+")])
@@ -355,11 +357,13 @@ def entry_report(since: str) -> None:
 
 
 if __name__ == "__main__":
+    c = sys.argv.index("--channel") if "--channel" in sys.argv else -1
+    chan = sys.argv[c + 1].lstrip("@") if c > 0 else "solwhaletrending"
     if "--entry-report" in sys.argv:
         i = sys.argv.index("--since") if "--since" in sys.argv else -1
-        entry_report(sys.argv[i + 1] if i > 0 else "2026-10-27")
+        entry_report(sys.argv[i + 1] if i > 0 else "2026-10-27", chan)
     elif "--report" in sys.argv:
         i = sys.argv.index("--since") if "--since" in sys.argv else -1
-        report(sys.argv[i + 1] if i > 0 else "2026-10-28")
+        report(sys.argv[i + 1] if i > 0 else "2026-10-28", chan)
     else:
         run()
