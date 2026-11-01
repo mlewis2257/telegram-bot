@@ -333,6 +333,11 @@ _last_quote_ts: dict[int, float] = {}     # call_id -> monotonic time of last se
 _last_mult: dict[int, float] = {}         # call_id -> last observed real_mult (drives cadence)
 _last_post_exit_quote_ts: dict[int, float] = {}  # call_id -> monotonic time of last post-exit quote
 _runner_window_until: dict[int, float] = {}  # call_id -> monotonic expiry for temporary loose-runner mode
+# Mints with an open in progress. The open-position check below only sees rows already
+# written, and qsim_open awaits several quotes before writing — so when a channel posts the
+# same coin 2-3 times in one second (solwhaletrending did on 2026-10-31: Lumi x3, NVIDIA x2,
+# consecutive message ids) every copy passed the check and opened. Live has had this guard.
+_inflight_mints: set[str] = set()
 _qsim_exit_state: dict[int, dict] = {}       # call_id -> named overlay state
 _noroute_streak: dict[int, int] = {}      # call_id -> consecutive no-route sell quotes
 _quote_window: list[float] = []           # monotonic timestamps of recent quotes (budget window)
@@ -764,10 +769,25 @@ async def qsim_open(score_result: dict, token_data: dict) -> None:
         symbol = token_data.get("symbol", "?")
         if not mint:
             return
-        # First-call-per-mint dedup (mirror live): skip if a qsim position for this mint is open.
+        # First-call-per-mint dedup (mirror live): skip if a qsim position for this mint is
+        # open or being opened. Checked and claimed with no await in between.
+        if mint in _inflight_mints:
+            print(f"[qsim] {symbol} skipped — open already in progress for this mint call_id={call_id}")
+            return
         if any(p.get("mint_address") == mint for p in db.get_open_qsim_positions()):
             return
+        _inflight_mints.add(mint)
+        try:
+            await _qsim_open_claimed(call_id, channel, vip_tier, cat, spec, mint, symbol, token_data)
+        finally:
+            _inflight_mints.discard(mint)
+    except Exception as e:
+        print(f"[qsim] open error call_id={score_result.get('call_id')}: {e}")
 
+
+async def _qsim_open_claimed(call_id, channel, vip_tier, cat, spec, mint, symbol, token_data) -> None:
+    """The rest of qsim_open, run while this mint is claimed in _inflight_mints. Never raises."""
+    try:
         _ensure_table()
 
         # ── Channel mcap ceiling — MIRROR of live's outer safety net ──────────────
@@ -906,7 +926,7 @@ async def qsim_open(score_result: dict, token_data: dict) -> None:
             print(f"[qsim] OPEN {symbol} call_id={call_id} entry=${entry_mcap/1000:.1f}k "
                   f"size={size} variant={spec['exit']}")
     except Exception as e:
-        print(f"[qsim] open error call_id={score_result.get('call_id')}: {e}")
+        print(f"[qsim] open error call_id={call_id}: {e}")
 
 
 def _budget_ok() -> bool:
