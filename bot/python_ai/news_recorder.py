@@ -137,6 +137,22 @@ def store_new_token(msg: dict) -> bool:
     return new
 
 
+def store_migration(msg: dict) -> bool:
+    """Mark a recorded coin as graduated. False when its creation was never recorded (made
+    before the recorder ran, or during a disconnect) — those are counted, not stored."""
+    conn = db.get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE new_tokens SET migrated_at = COALESCE(migrated_at, now()),
+                                  migrate_pool = COALESCE(migrate_pool, %s)
+            WHERE mint = %s
+            """, (str(msg.get("pool") or "")[:40] or None, msg.get("mint")))
+        hit = cur.rowcount == 1
+        conn.commit()
+    return hit
+
+
 async def new_token_loop(stats: dict) -> None:
     import websockets
     while True:
@@ -144,12 +160,28 @@ async def new_token_loop(stats: dict) -> None:
         try:
             async with websockets.connect(NEW_TOKEN_WS, ping_interval=30, ping_timeout=30) as ws:
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                # same connection (PumpPortal allows one) — graduations, the launch outcome label
+                await ws.send(json.dumps({"method": "subscribeMigration"}))
                 async for raw in ws:
                     try:
                         msg = json.loads(raw)
                     except ValueError:
                         continue
-                    if msg.get("txType") != "create" or not msg.get("mint"):
+                    if not isinstance(msg, dict) or not msg.get("mint"):
+                        continue
+                    if msg.get("txType") != "create":
+                        if msg.get("txType") == "migrate" or "pool" in msg:
+                            if not stats.get("_migration_keys_shown"):
+                                print(f"[news] first migration message keys: {sorted(msg)}", flush=True)
+                                stats["_migration_keys_shown"] = 1
+                            try:
+                                k = "migrations" if store_migration(msg) else "migrations_unknown_coin"
+                                stats[k] = stats.get(k, 0) + 1
+                            except Exception as e:
+                                db.safe_rollback()
+                                stats["migration_store_error"] = stats.get("migration_store_error", 0) + 1
+                                if stats["migration_store_error"] == 1:
+                                    print(f"[news] migration store failed: {e}", flush=True)
                         continue
                     try:
                         if store_new_token(msg):
@@ -167,8 +199,12 @@ async def new_token_loop(stats: dict) -> None:
 async def tally_loop(stats: dict) -> None:
     while True:
         await asyncio.sleep(1800)
-        print("[news] 30m: " + " ".join(f"{k}={v}" for k, v in sorted(stats.items())), flush=True)
+        print("[news] 30m: " + " ".join(f"{k}={v}" for k, v in sorted(stats.items())
+                                        if not k.startswith("_")), flush=True)
+        shown = stats.get("_migration_keys_shown")
         stats.clear()
+        if shown:
+            stats["_migration_keys_shown"] = shown
 
 
 async def main() -> None:

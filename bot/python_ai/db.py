@@ -3157,6 +3157,10 @@ def ensure_news_tables() -> None:
             """
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_new_tokens_created ON new_tokens (created_at)")
+        # 2026-11-02: graduation (pump.fun -> AMM migration) from the same free feed — the
+        # outcome label for launch analysis. NULL = not migrated (yet).
+        cur.execute("ALTER TABLE new_tokens ADD COLUMN IF NOT EXISTS migrated_at timestamptz")
+        cur.execute("ALTER TABLE new_tokens ADD COLUMN IF NOT EXISTS migrate_pool text")
         conn.commit()
 
 
