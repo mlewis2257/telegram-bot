@@ -215,6 +215,23 @@ def insert_call(
 
 # ── Token / call lookups ──────────────────────────────────────────────────────
 
+def get_call_id_by_mint(mint: str) -> int | None:
+    """Most recent call_id for this exact contract address (any channel)."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT c.id FROM calls c JOIN tokens t ON t.id = c.token_id
+            WHERE t.mint_address = %s
+            ORDER BY c.created_at DESC LIMIT 1
+            """,
+            (mint,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
 def get_call_id_by_token_name(token_name: str) -> int | None:
     """
     Look up the most recent call_id whose token symbol or name matches

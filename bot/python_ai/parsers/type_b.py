@@ -80,6 +80,7 @@ IS_ENTRY_WHALE_RE        = re.compile(r'New\s+\*{0,2}\[?\*{0,2}Whale Buy',   re.
 IS_ENTRY_TRENDING_RE     = re.compile(r'New\s+\*{0,2}\[?\*{0,2}Trending',     re.IGNORECASE)
 IS_PRICE_UPDATE_RE       = re.compile(r'📈.*is up.*from.*Entry Signal',
                                        re.IGNORECASE | re.DOTALL)
+IS_UPDATE_LEAD_RE        = re.compile(r'\bis up\b|\d+(?:\.\d+)?\s*[xX]\b', re.IGNORECASE)
 IS_DAILY_STATS_RE        = re.compile(r'24hr Whale Trending Stats', re.IGNORECASE)
 IS_LEADERBOARD_RE        = re.compile(r'Top (?:Early |Whale )?Trending',
                                        re.IGNORECASE)
@@ -96,6 +97,11 @@ def classify_b(text: str) -> str:
     # another_whale / whale_accumulating checked first — both map to same handler
     if IS_ANOTHER_WHALE_RE.search(text) or IS_WHALE_ACCUMULATING_RE.search(text):
         return 'another_whale'
+    # 2026-11-02: '📈 SYMBOL is up' updates were coming back 'skipped' on both channels (BARRON
+    # x11 on solearlytrending, once on solwhaletrending) — the update can carry words the
+    # entry patterns match, so a leading 📈 is decided here, before them.
+    if text.lstrip().startswith('📈') and IS_UPDATE_LEAD_RE.search(text):
+        return 'price_update'
     if IS_ENTRY_WHALE_RE.search(text):
         return 'entry_signal_whale'
     if IS_ENTRY_TRENDING_RE.search(text):
@@ -538,6 +544,10 @@ def parse_another_whale(text: str) -> dict | None:
 # Symbol is the first non-whitespace token after the leading 📈
 UPDATE_SYMBOL_RE = re.compile(r'📈\s*(\S+)\s+is up')
 UPDATE_MULT_RE   = re.compile(r'is up\s+([\d.]+)X',  re.IGNORECASE)
+# Fallbacks for a 📈 line that drops 'is up' ('📈 BARRON 5.2X'); used only after classify_b
+# has already decided the message is an update.
+UPDATE_SYMBOL_LOOSE_RE = re.compile(r'📈\s*(\S+)')
+UPDATE_MULT_LOOSE_RE   = re.compile(r'(?<![\w.])(\d+(?:\.\d+)?)\s*X\b', re.IGNORECASE)
 UPDATE_PCT_RE    = re.compile(r'is up\s+([\d.]+)%',  re.IGNORECASE)
 # "$12K —> $25.4K" — handles em-dash, en-dash, double-hyphen, plain arrow
 UPDATE_MCAP_RE   = re.compile(
@@ -554,14 +564,15 @@ def parse_price_update(text: str) -> dict | None:
     or None if symbol is missing.
     """
     # 2026-10-30 format: the symbol is a link, '📈 [**JEFF**](https://soulterminal.ai/...) is up'
+    raw = text
     text = strip_markdown_links(text).replace('**', '')
-    m = UPDATE_SYMBOL_RE.search(text)
+    m = UPDATE_SYMBOL_RE.search(text) or UPDATE_SYMBOL_LOOSE_RE.search(text)
     if not m:
         return None
-    symbol = m.group(1).strip()
+    symbol = m.group(1).strip().lstrip('$')
 
     multiplier = None
-    m = UPDATE_MULT_RE.search(text)
+    m = UPDATE_MULT_RE.search(text) or UPDATE_MULT_LOOSE_RE.search(text)
     if m:
         try:
             multiplier = float(m.group(1))
@@ -586,7 +597,17 @@ def parse_price_update(text: str) -> dict | None:
     if multiplier is None and entry_mcap and current_mcap and entry_mcap > 0:
         multiplier = round(current_mcap / entry_mcap, 2)
 
+    # The contract is in the symbol link / buttons on the 2026-10-29 format. Many coins share a
+    # ticker (five BARRONs in two days), so the caller matches on this before the name.
+    mint = None
+    for rx in (MINT_SOULTERM_RE, MINT_START_RE, MINT_PUMP_RE):
+        mm = rx.search(raw)
+        if mm:
+            mint = mm.group(1)
+            break
+
     return {
+        "mint":         mint,
         "symbol":       symbol,
         "pct_change":   pct_change,
         "multiplier":   multiplier,

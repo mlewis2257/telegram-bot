@@ -925,8 +925,12 @@ def handle_realtime(message, caller_id: int, channel_id: int, channel_handle: st
         update = type_b.parse_price_update(text)
         if not update:
             return 'skipped', None, None
-        call_id = db.get_call_id_by_token_name(update["symbol"])
+        call_id = db.get_call_id_by_mint(update["mint"]) if update.get("mint") else None
         if not call_id:
+            call_id = db.get_call_id_by_token_name(update["symbol"])
+        if not call_id:
+            print(f"  [price_update] no call for {update['symbol']} mint={str(update.get('mint'))[:12]} "
+                  f"{update.get('multiplier')}x")
             return 'skipped', None, None
         _new_mult  = update.get("multiplier")
         _peak_info = db.get_call_peak_info(call_id)
@@ -1469,7 +1473,8 @@ def run_listener() -> None:
                     _unrecognised_count["hour"] = _hour
                 _unrecognised_count[handle] = _unrecognised_count.get(handle, 0) + 1
                 if _unrecognised_count[handle] <= 30:
-                    _snip = " ".join(msg.text.split())[:110]
+                    # links stripped so the words show (the URLs ate the whole snippet)
+                    _snip = " ".join(type_b.strip_markdown_links(msg.text).split())[:220]
                     _b = button_urls(msg)
                     print(f"[realtime:unrecognised] {handle} msg={msg.id} status={status} "
                           f"buttons={len(_b)}{(' first=' + _b[0][:90]) if _b else ''}: {_snip}")
