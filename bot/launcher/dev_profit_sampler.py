@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import statistics
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -49,12 +50,12 @@ def get_tx(sig: str):
                                           "commitment": "confirmed"}])
 
 
-def sample(since: str, min_age_h: float, per_cell: int) -> list[dict]:
+def sample(since: str, min_age_h: float, per_cell: int, only: bool | None = None) -> list[dict]:
     conn = db.get_conn()
     out = []
     with conn.cursor() as cur:
         for name, lo, hi in BUCKETS:
-            for called in (True, False):
+            for called in ((True, False) if only is None else (only,)):
                 cur.execute(
                     """
                     WITH fresh AS (
@@ -78,9 +79,16 @@ def sample(since: str, min_age_h: float, per_cell: int) -> list[dict]:
 def read_launch(c: dict, window_h: float, max_tx: int) -> dict:
     t0 = int(c["t"].timestamp()) - 120
     t1 = int(c["t"].timestamp() + window_h * 3600)
-    sigs = d.rpc("getSignaturesForAddress", [c["dev"], {"limit": 1000}]) or []
+    # A wallet that created a coin always has history: an empty/None answer is an RPC error or
+    # rate limit (the first run lost 35 of 120 launches to it). Retry twice, spaced out.
+    sigs = None
+    for attempt in range(3):
+        sigs = d.rpc("getSignaturesForAddress", [c["dev"], {"limit": 1000}])
+        if sigs:
+            break
+        time.sleep(1.5 * (attempt + 1))
     if not sigs:
-        return {"status": "no history"}
+        return {"status": "rpc error"}
     if len(sigs) == 1000 and (sigs[-1].get("blockTime") or 0) > t0:
         return {"status": "busy"}                  # launch is further back than one page
     mine = [s for s in sigs if s.get("err") is None and s.get("blockTime") and t0 <= s["blockTime"] <= t1]
@@ -119,14 +127,17 @@ def main() -> None:
     ap.add_argument("--per-cell", type=int, default=15)
     ap.add_argument("--max-calls", type=int, default=1500)
     ap.add_argument("--max-tx", type=int, default=12, help="skip a dev with more txs than this in the window")
+    ap.add_argument("--only", choices=("called", "not-called"),
+                    help="sample one side only (the called cells need a higher --max-tx: those devs trade more)")
     ap.add_argument("--window-hours", type=float, default=24.0)
     ap.add_argument("--min-age-hours", type=float, default=24.0)
     a = ap.parse_args()
     d._max_calls = a.max_calls
 
-    launches = sample(a.since, a.min_age_hours, a.per_cell)
+    only = None if a.only is None else (a.only == "called")
+    launches = sample(a.since, a.min_age_hours, a.per_cell, only)
     worst = len(launches) * (1 + a.max_tx)
-    print(f"[sampler] {len(launches)} launches ({a.per_cell} per cell x {len(BUCKETS) * 2} cells). "
+    print(f"[sampler] {len(launches)} launches ({a.per_cell} per cell x {len(BUCKETS) * (1 if a.only else 2)} cells). "
           f"RPC ceiling {a.max_calls:,} calls (worst case for this sample {worst:,}; "
           f"typical ~{len(launches) * 5:,}). Stops cleanly at the ceiling.", flush=True)
 
