@@ -21,7 +21,7 @@ COMMANDS (run on the VPS from bot/launcher/):
   python3 launcher.py report
 
 EXIT RULES (env, defaults in brackets):
-  LAUNCH_NO_TRACTION_SECS [120]  if others have put in < LAUNCH_TRACTION_SOL [0.5] by then: sell all
+  LAUNCH_NO_TRACTION_SECS [1800] if others have put in < LAUNCH_TRACTION_SOL [0.5] by then: sell all
   LAUNCH_STOP_MULT [0.6]         bag worth < 0.6x of what we paid, before any step sold: sell all
   LAUNCH_SELL_STEPS ["2:0.5,3:0.3"]  at 2x bag value sell 50% of the original bag, at 3x 30% more
   LAUNCH_TRAIL_PCT [0.40]        after the first step: remaining bag sold if value drops 40% from peak
@@ -31,8 +31,9 @@ EXIT RULES (env, defaults in brackets):
 CAPS (live only): LAUNCH_ENABLED=true required; LAUNCH_DEV_BUY_SOL [0.12]; LAUNCH_MIN_WALLET_SOL
 [0.15] (refuse to launch below it); LAUNCH_MAX_PER_DAY [3]; LAUNCH_MAX_TOTAL [20].
 
-RPC: one getAccountInfo per poll — every 3 s for 2 min, 10 s to 30 min, 60 s after — about
-300 per launch, hard ceiling LAUNCH_MAX_RPC_PER_LAUNCH [400], printed at start. With 3 launches a
+RPC: one getAccountInfo per poll — every 3 s for 2 min, then every 20 s while nobody is buying
+(~125 for a 30-min dud), 10 s while busy to 30 min, 60 s after. Hard ceiling
+LAUNCH_MAX_RPC_PER_LAUNCH [400] per launch, printed at start. With 3 launches a
 day: <= 1,200/day, ~8,400/week, ~36,000/month. Dry-run: 2 calls. Paper: same as a launch.
 Fees: PumpPortal 0.5% per trade (create's dev buy and each sell), pump.fun ~1%, network + tips.
 """
@@ -78,7 +79,11 @@ DEV_BUY = env_f("LAUNCH_DEV_BUY_SOL", 0.12)
 MIN_WALLET = env_f("LAUNCH_MIN_WALLET_SOL", 0.15)
 MAX_PER_DAY = int(env_f("LAUNCH_MAX_PER_DAY", 3))
 MAX_TOTAL = int(env_f("LAUNCH_MAX_TOTAL", 20))
-NO_TRACTION_S = env_f("LAUNCH_NO_TRACTION_SECS", 120)
+# 2026-11-03: 1800, was 120. Of 515 called coins with a < 0.5 SOL dev buy (Oct 31-Nov 3),
+# only 42% were called within 2 min of creation; 26% at 2-10 min, 26% at 10-30, 5% at
+# 30-120. As the FIRST buyer a dud costs ~0.003 SOL however long it is held, so waiting
+# 30 min instead of 2 keeps ~94% of the eventual winners instead of ~42%.
+NO_TRACTION_S = env_f("LAUNCH_NO_TRACTION_SECS", 1800)
 TRACTION_SOL = env_f("LAUNCH_TRACTION_SOL", 0.5)
 STOP_MULT = env_f("LAUNCH_STOP_MULT", 0.6)
 TRAIL = env_f("LAUNCH_TRAIL_PCT", 0.40)
@@ -362,7 +367,10 @@ def run_exits(row: dict, mint: str, tokens0: int, cost: float, sell_fn, paper_sh
             save(row)
             if frac >= 1.0:
                 break
-        time.sleep(3 if age < 120 else 10 if age < 1800 else 60)
+        quiet = sold_steps == 0 and others < TRACTION_SOL
+        # quiet coin: one look every 20 s is plenty (a dud costs nothing to hold); busy coin:
+        # close watch for the steps and the trail
+        time.sleep(3 if age < 120 else 20 if quiet else 10 if age < 1800 else 60)
     row["sol_out"] = round(got, 6)
     row["status"] = "closed"
     save(row)
