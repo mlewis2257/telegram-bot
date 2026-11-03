@@ -9,7 +9,18 @@ distinct wallets have bought the same coin within WINDOW_MIN minutes. RECORD-ONL
 are stored and compared with the channel's calls (same coins? earlier? coins it never
 called?); nothing trades on them yet.
 
-SOURCE. PumpPortal's data websocket, subscribeAccountTrade (pump.fun + PumpSwap trades by
+SOURCES. FOLLOWED_DETECT_SOURCE = auto (default: pumpportal if PUMPPORTAL_API_KEY is set, else
+helius) | helius | pumpportal.
+
+  helius (FREE in money, 2026-11-03): one logsSubscribe per wallet on the pooled Helius websocket.
+  pump.fun emits a TradeEvent ("Program data:" log line) with mint, SOL, tokens, buy/sell, user
+  and reserves, so a buy is read straight from the log notification — no getTransaction calls.
+  Only pump.fun bonding-curve trades are decoded (PumpSwap/other DEX trades are counted, not
+  read). Helius bills websockets by data: 2 credits per 0.1 MB. Hard daily cap
+  FOLLOWED_DETECT_MAX_MB_PER_DAY [40] MB -> at most ~800 credits/day (~24,000/month), printed at
+  start; when reached the socket closes until the next UTC day.
+
+  pumpportal: PumpPortal's data websocket, subscribeAccountTrade (pump.fun + PumpSwap trades by
 the listed wallets). Metered by PumpPortal (0.01 SOL per 10,000 messages at the time of
 writing) and needs an API key linked to a funded wallet — create it yourself on pumpportal.fun,
 put it ONLY in the VPS .env, never in chat or git. ONE connection; reconnects wait at least
@@ -52,6 +63,9 @@ MIN_WALLETS = int(os.getenv("FOLLOWED_DETECT_MIN_WALLETS", "3"))
 WINDOW_MIN = float(os.getenv("FOLLOWED_DETECT_WINDOW_MIN", "60"))
 MIN_SOL = float(os.getenv("FOLLOWED_DETECT_MIN_SOL", "0.05"))
 MAX_MSGS_PER_DAY = int(os.getenv("FOLLOWED_DETECT_MAX_MSGS_PER_DAY", "5000"))
+SOURCE = os.getenv("FOLLOWED_DETECT_SOURCE", "auto").strip().lower()
+MAX_MB_PER_DAY = float(os.getenv("FOLLOWED_DETECT_MAX_MB_PER_DAY", "40"))
+PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 RECONNECT_MIN_S = 60
 RAW_LOG_FIRST = 5          # print the first raw trade messages so the format can be checked
 
@@ -138,6 +152,43 @@ def parse_trade(msg: dict, followed: set[str]) -> dict | None:
             "mcap_sol": num("marketCapSol"), "pool": msg.get("pool")}
 
 
+def _trade_event_disc() -> bytes:
+    import hashlib
+    return hashlib.sha256(b"event:TradeEvent").digest()[:8]
+
+
+TRADE_EVENT = _trade_event_disc()
+
+
+def parse_pump_logs(logs: list[str], wallet: str, signature: str) -> list[dict]:
+    """pump.fun TradeEvents in a transaction's logs whose user is `wallet` -> normalized trades.
+    Layout (verified 2026-11-03 on a real buy): disc(8) mint(32) sol_amount u64 token_amount u64
+    is_buy u8 user(32) timestamp i64 virtual_sol u64 virtual_token u64 ..."""
+    import base64
+    from solders.pubkey import Pubkey
+    out = []
+    for line in logs or []:
+        if not line.startswith("Program data: "):
+            continue
+        try:
+            b = base64.b64decode(line[14:])
+        except Exception:
+            continue
+        if len(b) < 8 + 32 + 17 + 32 + 24 or b[:8] != TRADE_EVENT:
+            continue
+        u = lambda a: int.from_bytes(b[a:a + 8], "little")
+        mint = str(Pubkey.from_bytes(b[8:40]))
+        sol, tok, is_buy = u(40), u(48), b[56]
+        user = str(Pubkey.from_bytes(b[57:89]))
+        vsol, vtok = u(97), u(105)
+        if user != wallet:
+            continue
+        out.append({"sig": f"{signature}:{len(out)}" if out else signature, "wallet": wallet, "mint": mint,
+                    "side": "buy" if is_buy else "sell", "sol": sol / 1e9, "tokens": tok / 1e6,
+                    "mcap_sol": (vsol * 1e6 / vtok) if vtok else None, "pool": "pump"})
+    return out
+
+
 class Detector:
     """Distinct followed wallets buying each coin within a sliding window."""
 
@@ -169,8 +220,111 @@ class Detector:
 
 # ── Websocket loop ──────────────────────────────────────────────────────────────
 
+async def run_helius() -> None:
+    """Free source: logsSubscribe(mentions=wallet) per followed wallet on the Helius websocket."""
+    import websockets
+    import rpc_pool
+    ensure_tables()
+    det = Detector(MIN_WALLETS, WINDOW_MIN, MIN_SOL)
+    day, nbytes = None, 0
+    stats: dict = defaultdict(int)
+    last_tally = time.monotonic()
+    cap_bytes = MAX_MB_PER_DAY * 1_000_000
+    print(f"[detector] FREE source (Helius logsSubscribe): signal at {MIN_WALLETS}+ distinct followed buyers "
+          f"within {WINDOW_MIN:g} min (buys >= {MIN_SOL:g} SOL). Websocket billed by data: cap "
+          f"{MAX_MB_PER_DAY:g} MB/day = at most ~{MAX_MB_PER_DAY * 20:,.0f} credits/day "
+          f"(~{MAX_MB_PER_DAY * 20 * 30:,.0f}/month). No getTransaction calls. RECORD-ONLY.", flush=True)
+    while True:
+        wallets = wh.load_wallets(wh.WALLETS_FILE)
+        if not wallets:
+            print(f"[detector] no wallets in {wh.WALLETS_FILE}; retrying in 10 min", flush=True)
+            await asyncio.sleep(600)
+            continue
+        url = rpc_pool.ws_url()
+        if not url:
+            print("[detector] no Helius websocket endpoint configured; retrying in 10 min", flush=True)
+            await asyncio.sleep(600)
+            continue
+        started = time.monotonic()
+        capped = False
+        try:
+            async with websockets.connect(url, ping_interval=30, ping_timeout=30, max_size=2 ** 22) as ws:
+                req_wallet, sub_wallet = {}, {}
+                for i, w in enumerate(wallets, 1):
+                    req_wallet[i] = w
+                    await ws.send(json.dumps({"jsonrpc": "2.0", "id": i, "method": "logsSubscribe",
+                                              "params": [{"mentions": [w]}, {"commitment": "confirmed"}]}))
+                print(f"[detector] connected; subscribing to {len(wallets)} wallets", flush=True)
+                async for raw in ws:
+                    now = datetime.now(timezone.utc)
+                    if now.date() != day:
+                        day, nbytes = now.date(), 0
+                    nbytes += len(raw)
+                    if nbytes > cap_bytes:
+                        print(f"[detector] daily data cap {MAX_MB_PER_DAY:g} MB reached — closing until the "
+                              f"next UTC day", flush=True)
+                        capped = True
+                        break
+                    msg = json.loads(raw)
+                    if "id" in msg and msg.get("id") in req_wallet:
+                        if "result" in msg:
+                            sub_wallet[msg["result"]] = req_wallet[msg["id"]]
+                            if len(sub_wallet) == len(wallets):
+                                print(f"[detector] subscribed to all {len(wallets)} wallets", flush=True)
+                        else:
+                            print(f"[detector] subscribe failed for {req_wallet[msg['id']][:8]}: "
+                                  f"{str(msg.get('error'))[:150]}", flush=True)
+                            if rpc_pool.is_quota_error(None, json.dumps(msg.get("error"))):
+                                rpc_pool.penalize(url)
+                        continue
+                    if msg.get("method") != "logsNotification":
+                        continue
+                    p = msg.get("params") or {}
+                    wallet = sub_wallet.get(p.get("subscription"))
+                    val = ((p.get("result") or {}).get("value")) or {}
+                    stats["txs"] += 1
+                    if not wallet or val.get("err") is not None:
+                        continue
+                    logs = val.get("logs") or []
+                    trades = parse_pump_logs(logs, wallet, val.get("signature") or "")
+                    if not trades:
+                        stats["non_pump_or_other"] += 1 if not any(PUMP_PROGRAM in l for l in logs) else 0
+                        continue
+                    for t in trades:
+                        stats[t["side"] + "s"] += 1
+                        try:
+                            store_trade(t)
+                            sig = det.add(t, now)
+                            if sig and store_signal(sig["mint"], sig["first_at"], sig["wallets"],
+                                                    sig["total_sol"], sig["mcap_sol"]):
+                                stats["signals"] += 1
+                                print(f"[detector] SIGNAL {sig['mint']} — {len(sig['wallets'])} followed wallets "
+                                      f"bought within {(now - sig['first_at']).total_seconds() / 60:.0f} min, "
+                                      f"{sig['total_sol']:.2f} SOL, mcap {sig['mcap_sol'] or 0:.0f} SOL", flush=True)
+                        except Exception as e:
+                            db.safe_rollback()
+                            print(f"[detector] store failed: {type(e).__name__}: {e}", flush=True)
+                    if stats["txs"] % 500 == 0:
+                        det.prune(now)
+                    if time.monotonic() - last_tally > 1800:
+                        last_tally = time.monotonic()
+                        print(f"[detector] 30m: " + " ".join(f"{k}={v}" for k, v in sorted(stats.items()))
+                              + f" | today {nbytes / 1e6:.1f} MB (~{nbytes / 1e6 * 20:.0f} credits)", flush=True)
+                        stats.clear()
+        except Exception as e:
+            print(f"[detector] connection ended: {type(e).__name__}: {e}", flush=True)
+        if capped:
+            tomorrow = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+            await asyncio.sleep(max(60.0, (tomorrow - datetime.now(timezone.utc)).total_seconds()))
+            continue
+        await asyncio.sleep(max(RECONNECT_MIN_S, RECONNECT_MIN_S * 3 - (time.monotonic() - started)))
+
+
 async def run() -> None:
     import websockets
+    if SOURCE == "helius" or (SOURCE == "auto" and not API_KEY):
+        await run_helius()
+        return
     if not API_KEY:
         print("[detector] PUMPPORTAL_API_KEY not set — detector idle (set it in the .env and restart)", flush=True)
         while True:
