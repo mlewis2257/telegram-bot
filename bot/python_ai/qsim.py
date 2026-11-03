@@ -307,6 +307,16 @@ QSIM_RUNNER_TARGET_MULT    = float(os.getenv("QSIM_RUNNER_TARGET_MULT", "0"))   
 # +69.42 per 1 SOL (+3.47 SOL) on 4 trades, 30x is +83.80 (+4.19) on 3, against a
 # book of -8.86 SOL. 20x is preferred over the larger 30x number for resting on
 # four coins rather than three.
+# STOP CONFIRMATION (2026-11-03). A hard stop on ONE quote sold coins that were back above the
+# stop seconds later and then ran: CAPY (solearly) stopped at 0.67x, never traded below 1.46x
+# after, went 6.2x; MEOWNERO 0.76x -> never below 0.97x -> 5.0x; MARUTARO 0.75x -> >= 1.03x ->
+# 2.4x (3-4 such wick stops in two days). A first stop reading now waits CONFIRM_SECS for a
+# second quote; the close happens only if that one is also through the stop, at THAT price.
+# Readings under MIN_MULT are not waited on — a coin at 0.05x is a rug, not a wick.
+QSIM_STOP_CONFIRM_SECS     = float(os.getenv("QSIM_STOP_CONFIRM_SECS", "5"))      # 0 = off
+QSIM_STOP_CONFIRM_MIN_MULT = float(os.getenv("QSIM_STOP_CONFIRM_MIN_MULT", "0.5"))
+_stop_pending: dict[int, float] = {}       # call_id -> monotonic time of the first stop reading
+
 # Skip an entry whose executable price is below this fraction of the call's mcap (the coin
 # was already dumped). 0 = off. See qsim_open.
 QSIM_MIN_ENTRY_CALL_RATIO  = float(os.getenv("QSIM_MIN_ENTRY_CALL_RATIO", "0.25"))
@@ -647,6 +657,8 @@ def _target_cadence_secs(pos: dict) -> float:
     clamped to half of QSIM_STALE_DECISION_SECS so a deliberately stretched cadence can never
     be the reason a close gets labelled stale — the label must only ever mean starvation.
     """
+    if pos["call_id"] in _stop_pending:
+        return QSIM_STOP_CONFIRM_SECS      # the confirming quote, as soon as it is due
     if not QSIM_ADAPTIVE_CADENCE:
         return QSIM_TICK_SECS
 
@@ -1265,6 +1277,29 @@ async def _qsim_tick(pos: dict) -> None:
     cfg = _qsim_exit_config(pos.get("variant") or "early")
     raw_hard_stop_pct = _qsim_hard_stop_pct(pos, cfg)
     raw_hard_stop = raw_hard_stop_pct > 0 and real_mult <= (1.0 - raw_hard_stop_pct)
+    if QSIM_STOP_CONFIRM_SECS > 0:
+        first = _stop_pending.get(call_id)
+        if raw_hard_stop and first is None and real_mult >= QSIM_STOP_CONFIRM_MIN_MULT:
+            _stop_pending[call_id] = time.monotonic()
+            db.insert_qsim_quote_observation(
+                call_id=call_id, sol_out=sol_out, real_mult=real_mult, synth_mcap=synth_cur,
+                eff_mcap=synth_cur, exit_reason="hard_stop_pending", should_exit=False,
+                noroute_streak=0, note="stop_confirm_pending",
+            )
+            print(f"[qsim] STOP? {symbol} call_id={call_id} {real_mult:.2f}x — confirming with a "
+                  f"second quote in {QSIM_STOP_CONFIRM_SECS:g}s")
+            return
+        if first is not None:
+            _stop_pending.pop(call_id, None)
+            if not raw_hard_stop:
+                waited = time.monotonic() - first
+                print(f"[qsim] STOP NOT CONFIRMED {symbol} call_id={call_id} back at {real_mult:.2f}x "
+                      f"after {waited:.0f}s — holding (wick)")
+                db.insert_qsim_quote_observation(
+                    call_id=call_id, sol_out=sol_out, real_mult=real_mult, synth_mcap=synth_cur,
+                    eff_mcap=synth_cur, exit_reason="stop_unconfirmed", should_exit=False,
+                    noroute_streak=0, note=f"stop_unconfirmed;waited={waited:.0f}s",
+                )
     if raw_hard_stop:
         db.insert_qsim_quote_observation(
             call_id=call_id,
@@ -1494,6 +1529,7 @@ async def _qsim_post_exit_tick(pos: dict, slow_budget: bool = True) -> None:
 
 
 def _cleanup(call_id: int) -> None:
+    _stop_pending.pop(call_id, None)
     _last_quote_ts.pop(call_id, None)
     _last_mult.pop(call_id, None)
     _noroute_streak.pop(call_id, None)
@@ -1611,6 +1647,9 @@ async def run_qsim_monitor() -> None:
               f"stall={QSIM_RUNNER_STALL_MINS:g}m")
     else:
         print("[qsim] partial bank: disabled (overlay closes the whole position)")
+    print(f"[qsim] stop confirmation: second quote after {QSIM_STOP_CONFIRM_SECS:g}s for readings "
+          f">= {QSIM_STOP_CONFIRM_MIN_MULT:g}x" if QSIM_STOP_CONFIRM_SECS > 0
+          else "[qsim] stop confirmation: off")
     print(f"[qsim] stale-decision threshold: {QSIM_STALE_DECISION_SECS:g}s "
           f"(closes decided on an older quote are labelled stale_*)"
           if QSIM_STALE_DECISION_SECS > 0 else
