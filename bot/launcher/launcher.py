@@ -86,6 +86,7 @@ MAX_HOLD_MIN = env_f("LAUNCH_MAX_HOLD_MIN", 120)
 STEPS = sorted((float(a), float(b)) for a, b in
                (s.split(":") for s in os.getenv("LAUNCH_SELL_STEPS", "2:0.5,3:0.3").split(",") if s))
 MAX_RPC = int(env_f("LAUNCH_MAX_RPC_PER_LAUNCH", 400))
+PAPER_MAX_DEV_BUY = env_f("LAUNCH_PAPER_MAX_DEV_BUY", 0.6)
 PRIORITY_FEE = env_f("LAUNCH_PRIORITY_FEE_SOL", 0.0005)
 
 _rpc_calls = 0
@@ -329,7 +330,7 @@ def run_exits(row: dict, mint: str, tokens0: int, cost: float, sell_fn, paper_sh
             bag_mult = sell_value(tokens0, c) / cost if cost else 0   # price move vs our entry
             last = (value, bag_mult)
         # live: the curve's real SOL includes our own buy; paper: it does not (our buy is pretend)
-        others = max(0.0, c["real_sol"] - (0.0 if paper_shift else cost * (1 - FEE)))
+        others = max(0.0, c["real_sol"] - (paper_shift[1] if paper_shift else cost * (1 - FEE)))
         peak = max(peak, bag_mult)
         reason = None
         frac = 0.0
@@ -487,6 +488,11 @@ def cmd_launch(a) -> None:
 
 def cmd_paper(a) -> None:
     ensure_table()
+    conn0 = db.get_conn()
+    with conn0.cursor() as cur:   # paper runs interrupted with Ctrl+C never closed their row
+        cur.execute("UPDATE launches SET status = 'aborted' WHERE mode = 'paper' AND status = 'open' "
+                    "AND created_at < now() - interval '3 hours'")
+        conn0.commit()
     mint = a.mint
     if not mint:
         conn = db.get_conn()
@@ -536,9 +542,13 @@ def cmd_paper(a) -> None:
     print(f"[launcher] paper: curve at first look v_sol={c0['v_sol'] / LAMPORTS:.3f} "
           f"v_tok={c0['v_tok'] / 1e12:.1f}M real_sol={c0['real_sol']:.3f} -> start state "
           f"v_sol={vs0 / LAMPORTS:.3f}; our bag at entry {start_x:.2f}x", flush=True)
-    if not 0.9 < start_x < 1.1:
-        print(f"[launcher] paper: curve maths for {mint} gives a {start_x:.2f}x bag at entry — "
-              f"unexpected curve layout, skipped")
+    # The real dev's own creation buy is NOT an outside buyer for our rehearsal (we are the
+    # dev; our dev buy is LAUNCH_DEV_BUY_SOL). A coin whose creator bought big at creation
+    # would hand our pretend bag a free 1.6-2.8x at second 0 (2026-11-03: 21 SOL / 9 SOL dev
+    # buys) — rehearse only on coins with a dev buy comparable to ours.
+    if c0["real_sol"] > PAPER_MAX_DEV_BUY:
+        print(f"[launcher] paper: {mint} creator bought {c0['real_sol']:.2f} SOL at creation "
+              f"(> {PAPER_MAX_DEV_BUY} SOL, not comparable to our {DEV_BUY} SOL launch) — skipped")
         return
     row = {"mode": "paper", "name": None, "symbol": None, "note": "paper", "mint": mint,
            "dev_buy_sol": DEV_BUY, "status": "open", "sol_in": DEV_BUY, "events": []}
@@ -546,7 +556,7 @@ def cmd_paper(a) -> None:
     print(f"[launcher] PAPER: as if we bought {DEV_BUY} SOL at curve start ({toks / 1e12:.1f}M tokens). "
           f"RPC ceiling {MAX_RPC}. Nothing is sent.")
     run_exits(row, mint, toks, DEV_BUY, lambda frac, reason, est: est or 0.0,
-              paper_shift=(our, None))
+              paper_shift=(our, c0["real_sol"]))
 
 
 def cmd_report(_a) -> None:
