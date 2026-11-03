@@ -328,6 +328,8 @@ def run_exits(row: dict, mint: str, tokens0: int, cost: float, sell_fn, paper_sh
             out = sell_fn(frac, reason, value * frac)
             got += out
             held = int(held * (1 - frac))
+            print(f"[launcher]        curve now v_sol={c['v_sol'] / LAMPORTS:.3f} "
+                  f"v_tok={c['v_tok'] / 1e12:.1f}M real_sol={c['real_sol']:.3f}", flush=True)
             row["events"].append({"t": round(age), "reason": reason, "bag_x": round(bag_mult, 2),
                                   "sold_frac_of_held": round(frac, 3), "sol_out": round(out, 4),
                                   "others_sol": round(others, 2)})
@@ -504,7 +506,10 @@ def cmd_paper(a) -> None:
     our = int(DEV_BUY * (1 - FEE) * LAMPORTS)
     vs1 = c0["v_sol"] + our
     start_x = sell_value(toks, {**c0, "v_sol": vs1, "v_tok": k0 // vs1}) / DEV_BUY
-    if not 0.8 < start_x < 1.5:
+    print(f"[launcher] paper: curve at first look v_sol={c0['v_sol'] / LAMPORTS:.3f} "
+          f"v_tok={c0['v_tok'] / 1e12:.1f}M real_sol={c0['real_sol']:.3f} -> start state "
+          f"v_sol={vs0 / LAMPORTS:.3f}; our bag at entry {start_x:.2f}x", flush=True)
+    if not 0.9 < start_x < 1.1:
         print(f"[launcher] paper: curve maths for {mint} gives a {start_x:.2f}x bag at entry — "
               f"unexpected curve layout, skipped")
         return
