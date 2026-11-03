@@ -149,12 +149,18 @@ print(f"[live] entry roundtrip min: {LIVE_ENTRY_ROUNDTRIP_MIN_MULT:g}x"
 # on. Fails open on a missing price. qsim keeps trading everything, so what this skips
 # stays measurable: WHERE calls.live_skip_reason = 'entry_below_call'.
 LIVE_MIN_ENTRY_EXEC_RATIO = entry_quality.env_float(os.getenv("LIVE_MIN_ENTRY_EXEC_RATIO"), 0.0)
+# Dead-coin floor for the FOLLOWED lane, which is exempt from the gate above (2026-11-03).
+# A quote under this fraction of the call means the coin was dumped before we got there.
+# 0 = off. Fails open (no executable mcap or no reference -> trade proceeds).
+LIVE_FOLLOWED_MIN_ENTRY_RATIO = entry_quality.env_float(os.getenv("LIVE_FOLLOWED_MIN_ENTRY_RATIO"), 0.25)
 LIVE_MIN_ENTRY_EXEC_RATIO_MAX_AGE_MIN = entry_quality.env_float(
     os.getenv("LIVE_MIN_ENTRY_EXEC_RATIO_MAX_AGE_MIN"), 0.0)
 if LIVE_MIN_ENTRY_EXEC_RATIO < 0 or LIVE_MIN_ENTRY_EXEC_RATIO > 2.0:
     print(f"[live] WARNING: LIVE_MIN_ENTRY_EXEC_RATIO={LIVE_MIN_ENTRY_EXEC_RATIO:g} is outside "
           f"[0, 2] — IGNORED (a minimum that high would skip nearly every trade)")
     LIVE_MIN_ENTRY_EXEC_RATIO = 0.0
+print(f"[live] followed lane dead-coin floor: entry >= {LIVE_FOLLOWED_MIN_ENTRY_RATIO:g}x of the call"
+      if LIVE_FOLLOWED_MIN_ENTRY_RATIO > 0 else "[live] followed lane dead-coin floor: off")
 print(f"[live] min entry exec/ref ratio: {LIVE_MIN_ENTRY_EXEC_RATIO:g}x"
       + (f", tokens under {LIVE_MIN_ENTRY_EXEC_RATIO_MAX_AGE_MIN:g} min old only"
          if LIVE_MIN_ENTRY_EXEC_RATIO_MAX_AGE_MIN > 0 else ", all tokens")
@@ -1378,7 +1384,8 @@ async def open_live_position(score_result: dict, token_data: dict,
 
         if (
             (LIVE_MAX_ENTRY_EXEC_RATIO > 0 or LIVE_ENTRY_ROUNDTRIP_MIN_MULT > 0
-             or LIVE_MIN_ENTRY_EXEC_RATIO > 0)
+             or LIVE_MIN_ENTRY_EXEC_RATIO > 0
+             or (_followed and LIVE_FOLLOWED_MIN_ENTRY_RATIO > 0))
             and mint
             and not mint.startswith(("INFERRED:", "UNKNOWN:"))
         ):
@@ -1418,6 +1425,21 @@ async def open_live_position(score_result: dict, token_data: dict,
                 )
                 db.set_call_skip_reason(call_id, gate.reason)
                 return False
+            if _followed and LIVE_FOLLOWED_MIN_ENTRY_RATIO > 0:
+                dead = entry_quality.check_entry_min_ratio(
+                    min_ratio=LIVE_FOLLOWED_MIN_ENTRY_RATIO,
+                    executable_mcap=quote_entry,
+                    token_data=token_data,
+                    market=market,
+                )
+                if not dead.allowed:
+                    print(f"[live] {symbol} skipped — entry {(dead.ratio or 0):.2f}x of the call "
+                          f"< {LIVE_FOLLOWED_MIN_ENTRY_RATIO:.2f}x (already dumped) "
+                          f"exec=${(dead.executable_mcap or 0)/1000:.1f}k "
+                          f"ref=${(dead.reference_mcap or 0)/1000:.1f}k call_id={call_id}")
+                    # an allowed value of calls_skip_reason_check (entry_below_call is not)
+                    db.set_call_skip_reason(call_id, "entry_exec_ratio")
+                    return False
             if LIVE_MIN_ENTRY_EXEC_RATIO > 0 and not _followed:
                 _age = None
                 _min_applies = True

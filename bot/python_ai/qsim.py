@@ -307,6 +307,9 @@ QSIM_RUNNER_TARGET_MULT    = float(os.getenv("QSIM_RUNNER_TARGET_MULT", "0"))   
 # +69.42 per 1 SOL (+3.47 SOL) on 4 trades, 30x is +83.80 (+4.19) on 3, against a
 # book of -8.86 SOL. 20x is preferred over the larger 30x number for resting on
 # four coins rather than three.
+# Skip an entry whose executable price is below this fraction of the call's mcap (the coin
+# was already dumped). 0 = off. See qsim_open.
+QSIM_MIN_ENTRY_CALL_RATIO  = float(os.getenv("QSIM_MIN_ENTRY_CALL_RATIO", "0.25"))
 QSIM_CEILING_MULT          = float(os.getenv("QSIM_CEILING_MULT", "0"))             # 0 = none
 QSIM_RUNNER_FLOOR_MULT     = float(os.getenv("QSIM_RUNNER_FLOOR_MULT", "1.10"))
 QSIM_RUNNER_TRAIL_PCT      = float(os.getenv("QSIM_RUNNER_TRAIL_PCT", "0.30"))
@@ -890,6 +893,22 @@ async def _qsim_open_claimed(call_id, channel, vip_tier, cat, spec, mint, symbol
                 f"source={gate.reference_source or '?'} call_id={call_id}"
             )
             return
+        # Dead-coin floor (2026-11-03). Entries quoting at 0.01-0.20x of the call are coins
+        # already dumped to the bottom of the curve before we got there (CAPYUS 0.03x, KOBE
+        # 0.01x, 13 on Nov 2): nothing trades, the stop never fires, they sit open ~24h and
+        # close at ~0.97. Fails open when either side is missing.
+        if QSIM_MIN_ENTRY_CALL_RATIO > 0:
+            low = entry_quality.check_entry_min_ratio(
+                min_ratio=QSIM_MIN_ENTRY_CALL_RATIO,
+                executable_mcap=entry_mcap,
+                token_data=ref_token_data,
+            )
+            if not low.allowed:
+                print(f"[qsim] {symbol} skipped — entry {(low.ratio or 0):.2f}x of the call "
+                      f"< {QSIM_MIN_ENTRY_CALL_RATIO:.2f}x (already dumped) "
+                      f"exec=${entry_mcap/1000:.1f}k ref=${(low.reference_mcap or 0)/1000:.1f}k "
+                      f"call_id={call_id}")
+                return
         if QSIM_ENTRY_ROUNDTRIP_MIN_MULT > 0:
             # Second budgeted call on the open path — see the buy quote above.
             if not _budget_ok():
