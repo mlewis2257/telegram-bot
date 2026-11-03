@@ -11,13 +11,13 @@ Coins measured (created since --since, older than --min-age-h so they had time t
   Rates are WEIGHTED back to the full population (each sampled "rest" coin counts rest/sampled).
 Link classes: tweet (status link), community (x.com/i/communities), profile (x.com/<account>), none.
 From the tweet id (a snowflake) we also get the tweet's own time -> minutes from tweet to coin,
-and whether a coin was the FIRST coin on that tweet among those measured.
+(A first-coin-vs-later comparison was removed: with sampled duds it favours hits.)
 
 Cost: one HTTP GET per coin to the coin's own metadata host / public IPFS gateways (no Helius, no
 X). Hard cap --max-fetch per run, printed. Results cached in coin_metadata, so re-runs only fetch
 new coins. Read-only apart from that cache table.
 
-Run:  python3 bot/launcher/tweet_source_report.py [--since 2026-11-01] [--sample 800] [--max-fetch 2500]
+Run:  python3 bot/launcher/tweet_source_report.py [--since 2026-11-01] [--sample 4000] [--max-fetch 3000]
 """
 
 from __future__ import annotations
@@ -27,6 +27,9 @@ import json
 import random
 import re
 import sys
+import time
+from collections import Counter
+from urllib.parse import urlparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -39,7 +42,8 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python_ai"))
 import db  # noqa: E402
 
-GATEWAYS = ("https://ipfs.io/ipfs/", "https://dweb.link/ipfs/")
+GATEWAYS = ("https://ipfs.io/ipfs/", "https://dweb.link/ipfs/", "https://w3s.link/ipfs/",
+            "https://4everland.io/ipfs/", "https://gateway.pinata.cloud/ipfs/")
 _CID_RE = re.compile(r"/ipfs/([A-Za-z0-9]+)")
 _X_RE = re.compile(r"(?:twitter\.com|x\.com)/([A-Za-z0-9_]{1,15})(?:/(status|communities)/(\d+))?", re.I)
 _TWITTER_EPOCH_MS = 1288834974657
@@ -56,25 +60,38 @@ def ensure_cache() -> None:
                 website     text,
                 fetched_at  timestamptz NOT NULL DEFAULT now()
             )""")
+        cur.execute("ALTER TABLE coin_metadata ADD COLUMN IF NOT EXISTS err text")
     conn.commit()
 
 
-def fetch_meta(uri: str | None) -> dict | None:
-    """The coin's metadata JSON, or None. Tries the uri itself, then public gateways for its CID."""
+def fetch_meta(uri: str | None) -> tuple[dict | None, str | None]:
+    """(metadata JSON, None) or (None, why). Tries the uri itself, then public gateways for its CID;
+    one retry after a pause on 429/5xx. `why` = '<host>:<status|error>' of the LAST attempt."""
     if not uri:
-        return None
+        return None, "no-uri"
     urls = [uri]
     m = _CID_RE.search(uri)
     if m:
         urls += [g + m.group(1) for g in GATEWAYS if not uri.startswith(g)]
+    why = None
     for u in urls:
-        try:
-            r = requests.get(u, timeout=8)
-            if r.status_code == 200:
-                return r.json()
-        except (requests.RequestException, ValueError):
-            continue
-    return None
+        host = urlparse(u).netloc or "?"
+        for attempt in (0, 1):
+            try:
+                r = requests.get(u, timeout=10)
+                if r.status_code == 200:
+                    j = r.json()
+                    return (j, None) if isinstance(j, dict) else (None, f"{host}:not-object")
+                why = f"{host}:{r.status_code}"
+                if r.status_code == 429 or r.status_code >= 500:
+                    time.sleep(2.0)
+                    continue
+            except ValueError:
+                why = f"{host}:not-json"
+            except requests.RequestException as e:
+                why = f"{host}:{type(e).__name__}"
+            break
+    return None, why
 
 
 def classify(twitter: str | None, website: str | None) -> tuple[str, str | None, int | None]:
@@ -100,9 +117,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", default="2026-11-01")
     ap.add_argument("--min-age-h", type=float, default=6)
-    ap.add_argument("--sample", type=int, default=800, help="random non-called, non-graduated coins")
-    ap.add_argument("--max-fetch", type=int, default=2500, help="hard cap on metadata GETs this run")
-    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--sample", type=int, default=4000, help="random non-called, non-graduated coins")
+    ap.add_argument("--max-fetch", type=int, default=3000, help="hard cap on metadata GETs this run")
+    ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--accounts", type=int, default=30, help="rows in the account table")
     ap.add_argument("--seed", type=int, default=7)
     a = ap.parse_args()
@@ -114,11 +131,11 @@ def main() -> None:
             SELECT nt.mint, nt.symbol, nt.uri, nt.created_at, nt.migrated_at IS NOT NULL,
                    EXISTS (SELECT 1 FROM tokens t JOIN calls c ON c.token_id = t.id
                            WHERE t.mint_address = nt.mint),
-                   cm.ok, cm.twitter, cm.website
+                   cm.ok, cm.twitter, cm.website, cm.err
             FROM new_tokens nt LEFT JOIN coin_metadata cm ON cm.mint = nt.mint
             WHERE nt.created_at >= %s AND nt.created_at < now() - (%s || ' hours')::interval
             ORDER BY nt.created_at""", (a.since, a.min_age_h))
-        rows = [dict(zip(("mint", "symbol", "uri", "t", "grad", "called", "ok", "twitter", "website"), r))
+        rows = [dict(zip(("mint", "symbol", "uri", "t", "grad", "called", "ok", "twitter", "website", "err"), r))
                 for r in cur.fetchall()]
     if not rows:
         print("no new_tokens rows in the window — is news_recorder.py running?")
@@ -127,38 +144,58 @@ def main() -> None:
     rest = [r for r in rows if not (r["grad"] or r["called"])]
     random.Random(a.seed).shuffle(rest)
     sample = rest[:a.sample]
-    weight = len(rest) / len(sample) if sample else 0.0
     for r in hits:
-        r["w"] = 1.0
+        r["hit"] = True
     for r in sample:
-        r["w"] = weight
+        r["hit"] = False
     measured = hits + sample
 
-    todo = [r for r in measured if r["ok"] is None]
+    # Uncached first, then earlier failures (retried every run — a failure is usually a gateway
+    # rate limit, not a missing file). Both count toward the ceiling.
+    todo = [r for r in measured if r["ok"] is None] + [r for r in measured if r["ok"] is False]
     if len(todo) > a.max_fetch:
-        print(f"[tweets] FETCH CEILING: {len(todo)} uncached coins, fetching {a.max_fetch} "
-              f"(re-run to continue — cached rows are not fetched again)")
+        print(f"[tweets] FETCH CEILING: {len(todo)} to fetch/retry, doing {a.max_fetch} "
+              f"(re-run to continue — readable rows are cached and never fetched again)")
         todo = todo[:a.max_fetch]
     print(f"[tweets] window {a.since} -> now-{a.min_age_h:g}h: {len(rows)} coins, {len(hits)} graduated/called "
-          f"(all measured), {len(sample)} of {len(rest)} others sampled (weight {weight:.1f}); "
-          f"fetching {len(todo)} uncached metadata files (cap {a.max_fetch})")
+          f"(all measured), {len(sample)} of {len(rest)} others sampled; "
+          f"fetching {len(todo)} metadata files (cap {a.max_fetch}, {a.workers} workers)")
     if todo:
         with ThreadPoolExecutor(a.workers) as ex:
-            metas = list(ex.map(lambda r: fetch_meta(r["uri"]), todo))
+            res = list(ex.map(lambda r: fetch_meta(r["uri"]), todo))
         with conn.cursor() as cur:
-            for r, m in zip(todo, metas):
+            for r, (m, why) in zip(todo, res):
                 r["ok"] = m is not None
-                r["twitter"] = str(m.get("twitter") or "")[:300] if isinstance(m, dict) else None
-                r["website"] = str(m.get("website") or "")[:300] if isinstance(m, dict) else None
-                cur.execute("INSERT INTO coin_metadata (mint, ok, twitter, website) VALUES (%s,%s,%s,%s) "
+                r["err"] = why
+                r["twitter"] = str(m.get("twitter") or "")[:300] if m else None
+                r["website"] = str(m.get("website") or "")[:300] if m else None
+                cur.execute("INSERT INTO coin_metadata (mint, ok, twitter, website, err) VALUES (%s,%s,%s,%s,%s) "
                             "ON CONFLICT (mint) DO UPDATE SET ok=EXCLUDED.ok, twitter=EXCLUDED.twitter, "
-                            "website=EXCLUDED.website, fetched_at=now()",
-                            (r["mint"], r["ok"], r["twitter"], r["website"]))
+                            "website=EXCLUDED.website, err=EXCLUDED.err, fetched_at=now()",
+                            (r["mint"], r["ok"], r["twitter"], r["website"], r["err"]))
         conn.commit()
 
+    bad = [r for r in measured if r["ok"] is False]
+    n_hit_ok = sum(1 for r in hits if r["ok"])
+    n_smp_ok = sum(1 for r in sample if r["ok"])
+    print(f"[tweets] readable: graduated/called {n_hit_ok}/{len(hits)} "
+          f"({n_hit_ok / len(hits) * 100 if hits else 0:.0f}%), sampled others {n_smp_ok}/{len(sample)} "
+          f"({n_smp_ok / len(sample) * 100 if sample else 0:.0f}%); not yet tried "
+          f"{sum(1 for r in measured if r['ok'] is None)}")
+    if bad:
+        print("  unreadable, last error: " + ", ".join(f"{k} x{v}" for k, v in
+                                                      Counter(r["err"] or "?" for r in bad).most_common(8)))
+        print("  unreadable, uri host:   " + ", ".join(f"{k} x{v}" for k, v in Counter(
+            urlparse(r["uri"] or "").netloc or "none" for r in bad).most_common(6)))
+    # Weights from READABLE coins, separately per stratum, so unreadable files do not tilt the mix.
+    # Rates are still biased if readability differs by class — compare the two readable %s above.
+    w_hit = (len(hits) / n_hit_ok) if n_hit_ok else 0.0
+    w_smp = (len(rest) / n_smp_ok) if n_smp_ok else 0.0
+    for r in measured:
+        r["w"] = w_hit if r["hit"] else w_smp
+    print(f"  weights: graduated/called x{w_hit:.2f}, sampled others x{w_smp:.1f} "
+          f"(an account's dud count moves in steps of {w_smp:.0f})\n")
     got = sorted((r for r in measured if r["ok"]), key=lambda r: r["t"])
-    failed = sum(1 for r in measured if r["ok"] is False)
-    print(f"[tweets] metadata read for {len(got)} coins ({failed} unreadable, skipped)\n")
     if not got:
         return
     for r in got:
@@ -198,24 +235,13 @@ def main() -> None:
             if g:
                 w, gr, ca = rates(g)
                 print(f"  {lab:14s} est. {w:7.0f}  grad {gr:6.2f}%  called {ca:6.2f}%")
-        by_tweet = defaultdict(list)
-        for r in tw:
-            by_tweet[r["tid"]].append(r)
-        multi = [sorted(v, key=lambda r: r["t"]) for v in by_tweet.values() if len(v) >= 2]
-        if multi:
-            firsts = [v[0] for v in multi]
-            laters = [r for v in multi for r in v[1:]]
-            print(f"\n  tweets with 2+ measured coins: {len(multi)}. FIRST coin called "
-                  f"{rates(firsts)[2]:.2f}% / graduated {rates(firsts)[1]:.2f}%; later coins called "
-                  f"{rates(laters)[2]:.2f}% / graduated {rates(laters)[1]:.2f}% (measured coins only)")
-
         acc = defaultdict(list)
         for r in tw:
             acc[r["acc"]].append(r)
         print(f"\nACCOUNTS whose tweets coins were built on (top {a.accounts} by graduated+called; "
               f"est. = weighted coin count, duds included):")
-        print(f"  {'account':16s} {'est. coins':>10s} {'tweets':>6s} {'grad':>5s} {'called':>6s} {'hit %':>6s}  "
-              f"examples")
+        print(f"  {'account':16s} {'est. coins':>10s} {'duds seen':>9s} {'tweets':>6s} {'grad':>5s} {'called':>6s} "
+              f"{'hit %':>6s}  examples")
         ranked = sorted(acc.items(), key=lambda kv: (-sum(1 for r in kv[1] if r["grad"] or r["called"]),
                                                      -sum(r["w"] for r in kv[1])))
         for name, g in ranked[:a.accounts]:
@@ -224,11 +250,12 @@ def main() -> None:
             nc = sum(1 for r in g if r["called"])
             nh = sum(1 for r in g if r["grad"] or r["called"])
             ex = ", ".join(sorted({r["symbol"] or "?" for r in g if r["grad"] or r["called"]})[:4])
-            print(f"  {name[:16]:16s} {w:10.0f} {len({r['tid'] for r in g}):6d} {ng:5d} {nc:6d} "
+            nd = sum(1 for r in g if not r["hit"])
+            print(f"  {name[:16]:16s} {w:10.0f} {nd:9d} {len({r['tid'] for r in g}):6d} {ng:5d} {nc:6d} "
                   f"{nh / w * 100:5.1f}%  {ex}")
     print("\nA link class or account matters only if its rate is well above the base rate AND holds in both "
           "halves. Small accounts (est. < 20) are anecdotes. called = any of our channels called it; hit = graduated "
-          "or called. first/later coin uses measured coins only (sampled duds can be missing).")
+          "or called. An account needs 5+ 'duds seen' before its hit % means anything.")
 
 
 if __name__ == "__main__":
