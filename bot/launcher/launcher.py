@@ -266,7 +266,7 @@ def upload_metadata(a) -> str:
 
 # ── exit rules (shared by live and paper) ─────────────────────────────────────
 
-def run_exits(row: dict, mint: str, tokens0: int, cost: float, sell_fn) -> None:
+def run_exits(row: dict, mint: str, tokens0: int, cost: float, sell_fn, paper_shift=None) -> None:
     """Poll the curve and sell per the rules. sell_fn(fraction_of_current, reason, value) -> SOL got."""
     t0 = time.time()
     held = tokens0
@@ -289,6 +289,10 @@ def run_exits(row: dict, mint: str, tokens0: int, cost: float, sell_fn) -> None:
         if not c:
             time.sleep(5)
             continue
+        if paper_shift and not c["complete"]:
+            # paper: our pretend buy is not in the real curve — add it, so selling our bag
+            # meets the price impact our own buy would have created
+            c = {**c, "v_sol": c["v_sol"] + paper_shift[0], "v_tok": c["v_tok"] - paper_shift[1]}
         if c["complete"]:
             # graduated: the curve is closed (live sells go to the AMM via pool=auto); for the
             # estimate use the last curve reading — at graduation that is the curve's top
@@ -297,7 +301,8 @@ def run_exits(row: dict, mint: str, tokens0: int, cost: float, sell_fn) -> None:
             value = sell_value(held, c)
             bag_mult = sell_value(tokens0, c) / cost if cost else 0   # price move vs our entry
             last = (value, bag_mult)
-        others = max(0.0, c["real_sol"] - cost * (1 - FEE))
+        # live: the curve's real SOL includes our own buy; paper: it does not (our buy is pretend)
+        others = max(0.0, c["real_sol"] - (0.0 if paper_shift else cost * (1 - FEE)))
         peak = max(peak, bag_mult)
         reason = None
         frac = 0.0
@@ -469,13 +474,33 @@ def cmd_paper(a) -> None:
                 print(f"[launcher] paper: following {r[1]} {mint}")
             else:
                 time.sleep(2)
-    toks = buy_tokens(DEV_BUY)
+    # Price our pretend buy off the coin's REAL curve, not the textbook starting reserves:
+    # 2026-11-03 the first paper run valued the bag at 26.6x at second 0 (nobody else in) and
+    # "sold" it, because this coin's curve did not start at 30 SOL / 1.073B tokens.
+    c0 = None
+    for _ in range(10):
+        c0 = curve(mint)
+        if c0 and c0["v_sol"] > 0 and c0["v_tok"] > 0 and not c0["complete"]:
+            break
+        time.sleep(1)
+    if not c0 or c0["v_sol"] <= 0 or c0["v_tok"] <= 0 or c0["complete"]:
+        print(f"[launcher] paper: no usable bonding curve for {mint} (not a pump.fun curve, or already "
+              f"graduated) — skipped")
+        return
+    toks = buy_tokens(DEV_BUY, c0["v_sol"], c0["v_tok"])
+    start_x = sell_value(toks, {**c0, "v_sol": c0["v_sol"] + int(DEV_BUY * (1 - FEE) * LAMPORTS),
+                                "v_tok": c0["v_tok"] - toks}) / DEV_BUY
+    if not 0.8 < start_x < 1.05:
+        print(f"[launcher] paper: curve maths for {mint} gives a {start_x:.2f}x bag at entry — "
+              f"unexpected curve layout, skipped")
+        return
     row = {"mode": "paper", "name": None, "symbol": None, "note": "paper", "mint": mint,
            "dev_buy_sol": DEV_BUY, "status": "open", "sol_in": DEV_BUY, "events": []}
     save(row)
     print(f"[launcher] PAPER: as if we bought {DEV_BUY} SOL at curve start ({toks / 1e12:.1f}M tokens). "
           f"RPC ceiling {MAX_RPC}. Nothing is sent.")
-    run_exits(row, mint, toks, DEV_BUY, lambda frac, reason, est: est or 0.0)
+    run_exits(row, mint, toks, DEV_BUY, lambda frac, reason, est: est or 0.0,
+              paper_shift=(int(DEV_BUY * (1 - FEE) * LAMPORTS), toks))
 
 
 def cmd_report(_a) -> None:
