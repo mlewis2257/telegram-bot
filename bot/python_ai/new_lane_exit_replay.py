@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -347,18 +348,22 @@ def live_grid() -> list[Rules]:
     past 5x, 12% past 10x), a profit floor at 1.55x once the peak reached 2x (plus the
     1.6->1.30 and 1.35->1.15 tiers), and a take-profit at 5x. With a 2x bank those never
     act; with a later bank they decide what happens between 2x and the bank. The other
-    grids leave them out. First row = the wallet lane as it runs now (stop 0.90, bank 2.5x).
+    grids leave them out. First row = the wallet lane as it runs now (LIVE_FOLLOWED_STOP / LIVE_FOLLOWED_BANK).
     'no 2x trail' rows drop the trail and keep only a floor after 2x, for comparison with
     the runner grid's 'floor after 2x @1.5 + target 3x'.
     """
     floors = ((2.0, 1.55), (1.6, 1.30), (1.35, 1.15))
     trail = ((2.0, 0.25), (3.0, 0.22), (5.0, 0.15), (10.0, 0.12))
-    out = [Rules(stop=0.90, bank=2.5, floors=floors, trail_tiers=trail,
-                 label="LIVE NOW: stop 0.90 | bank 2.5x (+ live trail/floor)")]
+    # The live wallet lane's settings, read from the same env live_trader reads (2026-11-03:
+    # this row was hard-coded to the Oct 26 setup 0.90 / 2.5x after live moved to 0.80 / 3x).
+    live_stop = float(os.getenv("LIVE_FOLLOWED_STOP", "0.80"))
+    live_bank = float(os.getenv("LIVE_FOLLOWED_BANK", "3.0"))
+    out = [Rules(stop=live_stop, bank=live_bank, floors=floors, trail_tiers=trail,
+                 label=f"LIVE NOW: stop {live_stop:.2f} | bank {live_bank:g}x (+ live trail/floor)")]
     for stop in (0.90, 0.80):
         for bank in (2.0, 2.5, 3.0, 4.0, None):
             for tn, tv in (("live trail", trail), ("no 2x trail", ())):
-                if stop == 0.90 and bank == 2.5 and tv:
+                if abs(stop - live_stop) < 1e-9 and bank == live_bank and tv:
                     continue
                 fl = floors if tv else ((2.0, 1.5), (1.6, 1.30), (1.35, 1.15))
                 bank_lbl = f"bank {bank:g}x" if bank else "no bank (5x take-profit)"
