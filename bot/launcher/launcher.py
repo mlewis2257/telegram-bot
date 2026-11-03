@@ -292,7 +292,11 @@ def run_exits(row: dict, mint: str, tokens0: int, cost: float, sell_fn, paper_sh
         if paper_shift and not c["complete"]:
             # paper: our pretend buy is not in the real curve — add it, so selling our bag
             # meets the price impact our own buy would have created
-            c = {**c, "v_sol": c["v_sol"] + paper_shift[0], "v_tok": c["v_tok"] - paper_shift[1]}
+            # constant product: the curve after every buy is the same whatever the order, so
+            # "real curve + our SOL" = the state where we bought FIRST (as the dev would)
+            k = c["v_sol"] * c["v_tok"]
+            vs = c["v_sol"] + paper_shift[0]
+            c = {**c, "v_sol": vs, "v_tok": k // vs}
         if c["complete"]:
             # graduated: the curve is closed (live sells go to the AMM via pool=auto); for the
             # estimate use the last curve reading — at graduation that is the curve's top
@@ -487,10 +491,20 @@ def cmd_paper(a) -> None:
         print(f"[launcher] paper: no usable bonding curve for {mint} (not a pump.fun curve, or already "
               f"graduated) — skipped")
         return
-    toks = buy_tokens(DEV_BUY, c0["v_sol"], c0["v_tok"])
-    start_x = sell_value(toks, {**c0, "v_sol": c0["v_sol"] + int(DEV_BUY * (1 - FEE) * LAMPORTS),
-                                "v_tok": c0["v_tok"] - toks}) / DEV_BUY
-    if not 0.8 < start_x < 1.05:
+    # We are the DEV in this rehearsal: our buy goes in first, at the curve's starting state
+    # (before the real dev's buy, which then counts as an outside buyer). The second paper run
+    # bought on top of the real dev instead and lost 0.015-0.064 SOL per dud when that dev sold:
+    # a sniper's downside, not a dev's (a first buyer gets ~cost minus fees back).
+    k0 = c0["v_sol"] * c0["v_tok"]
+    vs0 = c0["v_sol"] - int(round(c0["real_sol"] * LAMPORTS))
+    if vs0 <= 0:
+        print(f"[launcher] paper: curve for {mint} has no starting state — skipped")
+        return
+    toks = buy_tokens(DEV_BUY, vs0, k0 // vs0)
+    our = int(DEV_BUY * (1 - FEE) * LAMPORTS)
+    vs1 = c0["v_sol"] + our
+    start_x = sell_value(toks, {**c0, "v_sol": vs1, "v_tok": k0 // vs1}) / DEV_BUY
+    if not 0.8 < start_x < 1.5:
         print(f"[launcher] paper: curve maths for {mint} gives a {start_x:.2f}x bag at entry — "
               f"unexpected curve layout, skipped")
         return
@@ -500,7 +514,7 @@ def cmd_paper(a) -> None:
     print(f"[launcher] PAPER: as if we bought {DEV_BUY} SOL at curve start ({toks / 1e12:.1f}M tokens). "
           f"RPC ceiling {MAX_RPC}. Nothing is sent.")
     run_exits(row, mint, toks, DEV_BUY, lambda frac, reason, est: est or 0.0,
-              paper_shift=(int(DEV_BUY * (1 - FEE) * LAMPORTS), toks))
+              paper_shift=(our, None))
 
 
 def cmd_report(_a) -> None:
