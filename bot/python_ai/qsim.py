@@ -1689,12 +1689,17 @@ async def run_qsim_monitor() -> None:
                     target = _target_cadence_secs(pos)
                     last = _last_quote_ts.get(cid)
                     overdue = float("inf") if last is None else (now - last) / max(target, 1e-6)
+                    # A pending stop confirmation jumps the queue: its second quote is the exit
+                    # decision, and waiting behind the rest turned 5s into 22s (AMD, 2026-11-03).
+                    if cid in _stop_pending and overdue >= 1.0:
+                        overdue = float("inf")
                     if overdue >= 1.0:
                         due.append((overdue, cid, pos))
                 due.sort(key=lambda item: (-item[0], item[1]))
                 worst_overdue = due[0][0] if due else 0.0
                 for _overdue, _cid, pos in due:
-                    if not _budget_ok():
+                    # One confirmation quote may exceed the minute's budget (they sort first).
+                    if pos["call_id"] not in _stop_pending and not _budget_ok():
                         break   # over budget this minute — the rest wait for the next pass
                     await _qsim_tick(pos)
                     if time.monotonic() < _backoff_until:
