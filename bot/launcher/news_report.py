@@ -141,11 +141,16 @@ def main() -> None:
           f"(after-story only: median {statistics.median(after) if after else float('nan'):.1f}, "
           f"under 5 min: {sum(1 for x in after if x < 5)}/{len(after)})")
     judged = [s for s in stories if len([x for x in s.get("drew", []) if x is not None]) >= 2]
-    if judged:
-        first_best = sum(1 for s in judged if s["drew"][0] is not None
+    # 2026-11-03: a story where every coin drew ~0 used to count as "the first coin won" (a
+    # tie at zero) — 82% on the first real run was mostly that. Only stories where some coin
+    # drew real money (>= 0.1 SOL) can say anything about first vs later.
+    live = [s for s in judged if max(x for x in s["drew"] if x is not None) >= 0.1]
+    print(f"stories with 2+ coins measured: {len(judged)}; any coin drew >= 0.1 SOL from others in "
+          f"{len(live)} ({len(live) / len(judged) * 100 if judged else 0:.0f}%)")
+    if live:
+        first_best = sum(1 for s in live if s["drew"][0] is not None
                          and s["drew"][0] >= max(x for x in s["drew"] if x is not None))
-        print(f"stories with 2+ coins measured: {len(judged)}; the FIRST coin drew the most in {first_best} "
-              f"({first_best / len(judged) * 100:.0f}%)")
+        print(f"  of those, the FIRST coin drew the most in {first_best} ({first_best / len(live) * 100:.0f}%)")
     print(f"\n  {'story time':11s} {'keyword':14s} {'first':>6s} {'1h':>3s} {'all':>4s}  drew (first..)        headline")
     for s in sorted(stories, key=lambda s: s["at"])[-a.list:]:
         drew = " ".join("?" if x is None else f"{x:.1f}" for x in s.get("drew", [])) or "-"
