@@ -125,6 +125,19 @@ def curve(mint: str) -> dict | None:
             "complete": bool(raw[48]) if len(raw) > 48 else False}
 
 
+def curve_ok(c: dict) -> bool:
+    """The standard pump.fun curve, whose maths every exit decision here relies on:
+    virtual SOL = 30 SOL + real SOL, and virtual SOL x virtual tokens = the starting product.
+    2026-11-03: a 166-byte curve (BINANCE HACK, AqWoQPZ…) read v_sol 71.97 with real_sol
+    1 lamport and a product 2.3x the standard — a value read off it is meaningless (paper
+    'sold' a 2.08x bag with 0.95 SOL of outside buying)."""
+    if not c or c["v_sol"] <= 0 or c["v_tok"] <= 0:
+        return False
+    base_ok = abs(c["v_sol"] - round(c["real_sol"] * LAMPORTS) - V_SOL0) < 0.05 * LAMPORTS
+    k_ok = abs(c["v_sol"] * c["v_tok"] / (V_SOL0 * V_TOK0) - 1) < 0.02
+    return base_ok and k_ok
+
+
 def buy_tokens(sol: float, v_sol=V_SOL0, v_tok=V_TOK0) -> int:
     x = int(sol * (1 - FEE) * LAMPORTS)
     return v_tok - (v_sol * v_tok) // (v_sol + x)
@@ -289,6 +302,16 @@ def run_exits(row: dict, mint: str, tokens0: int, cost: float, sell_fn, paper_sh
         if not c:
             time.sleep(5)
             continue
+        if not c["complete"] and not curve_ok(c):
+            reason = "curve anomaly (not the standard pump.fun curve) — selling, no valuation possible"
+            out = sell_fn(1.0, reason, last[0] or None)
+            got += out
+            row["events"].append({"t": round(age), "reason": "curve anomaly", "sol_out": round(out, 4),
+                                  "v_sol": c["v_sol"], "v_tok": c["v_tok"], "real_sol": c["real_sol"]})
+            print(f"[launcher] {round(age):5d}s {reason}: v_sol={c['v_sol'] / LAMPORTS:.3f} "
+                  f"real_sol={c['real_sol']:.3f}", flush=True)
+            save(row)
+            break
         if paper_shift and not c["complete"]:
             # paper: our pretend buy is not in the real curve — add it, so selling our bag
             # meets the price impact our own buy would have created
@@ -497,6 +520,10 @@ def cmd_paper(a) -> None:
     # (before the real dev's buy, which then counts as an outside buyer). The second paper run
     # bought on top of the real dev instead and lost 0.015-0.064 SOL per dud when that dev sold:
     # a sniper's downside, not a dev's (a first buyer gets ~cost minus fees back).
+    if not curve_ok(c0):
+        print(f"[launcher] paper: {mint} is not on the standard pump.fun curve "
+              f"(v_sol={c0['v_sol'] / LAMPORTS:.3f}, real_sol={c0['real_sol']:.3f}) — skipped")
+        return
     k0 = c0["v_sol"] * c0["v_tok"]
     vs0 = c0["v_sol"] - int(round(c0["real_sol"] * LAMPORTS))
     if vs0 <= 0:
