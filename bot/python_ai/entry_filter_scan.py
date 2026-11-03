@@ -122,12 +122,52 @@ def per_sol(g):
     return sum(o["pnl"] for o in g) / s * 100 if s else None
 
 
+def combined_score_test(items, min_n: int, margin: float) -> None:
+    """Walk-forward test of a COMBINED filter: learn which feature values were good (+1) or bad
+    (-1) on one half, score every trade of the OTHER half by adding them up, and show how the
+    other half did per score. Done both ways. A real combined signal shows higher scores doing
+    better in BOTH directions; a pattern that only exists in-sample falls flat here."""
+    halves = ([x for x in items if x[2]], [x for x in items if not x[2]])
+    for name, train, test in (("learn 1st half -> test 2nd", halves[0], halves[1]),
+                              ("learn 2nd half -> test 1st", halves[1], halves[0])):
+        base = per_sol([o for _, o, _ in train]) or 0.0
+        weights = {}
+        for feat in train[0][0]:
+            groups = defaultdict(list)
+            for f, o, _ in train:
+                groups[f[feat]].append(o)
+            for val, g in groups.items():
+                if val in ("n/a", "not checked") or len(g) < min_n:
+                    continue
+                p = per_sol(g)
+                if p is not None and p > base + margin:
+                    weights[(feat, val)] = 1
+                elif p is not None and p < base - margin:
+                    weights[(feat, val)] = -1
+        by = defaultdict(list)
+        for f, o, _ in test:
+            sc = sum(weights.get((k, v), 0) for k, v in f.items())
+            by[max(-3, min(3, sc))].append(o)
+        good = ", ".join(f"{k}={v}" for (k, v), w in sorted(weights.items()) if w > 0)
+        bad = ", ".join(f"{k}={v}" for (k, v), w in sorted(weights.items()) if w < 0)
+        print(f"\n  COMBINED SCORE, {name} (learned: +1 for [{good}]; -1 for [{bad}])")
+        print(f"    {'score':>6s} {'n':>4s} {'bank%':>6s} {'rug%':>5s} {'run%':>5s} {'P&L/SOL':>8s}")
+        for sc in sorted(by):
+            n, bank, rug, run, pnl = stats(by[sc])
+            lab = ("<=-3" if sc == -3 else ">=+3" if sc == 3 else f"{sc:+d}")
+            print(f"    {lab:>6s} {n:4d} {bank:6.1f} {rug:5.1f} {run:5.1f} {pnl:+8.1f}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--channel", default="", help="one channel (default: each of the three in turn)")
     ap.add_argument("--since", default="2026-10-31")
     ap.add_argument("--min-n", type=int, default=15, help="smallest group shown")
     ap.add_argument("--pairs", action="store_true", help="also scan two-feature combinations")
+    ap.add_argument("--combined", action="store_true",
+                    help="walk-forward test of an added-up score over all features (learn one half, test the other)")
+    ap.add_argument("--margin", type=float, default=10.0,
+                    help="combined: a value counts as good/bad if its P&L/SOL beats/trails the half by this")
     a = ap.parse_args()
 
     conn = db.get_conn()
@@ -179,6 +219,8 @@ def main() -> None:
                       f"{(h1 if h1 is not None else 0):+7.1f} {(h2 if h2 is not None else 0):+7.1f}{mark}")
                 if mark:
                     keep.append((feat, val))
+        if a.combined:
+            combined_score_test(items, max(8, a.min_n // 2), a.margin)
         if a.pairs and keep:
             print(f"\n  PAIRS of the marked groups (n >= {a.min_n}, both halves above the channel):")
             found = []
