@@ -19,6 +19,7 @@ pair found here is a hypothesis for forward testing, not a result.
 
 Read-only, no RPC. Duplicate entries (same channel + mint within 2 min) are counted once.
 Run:  python3 entry_filter_scan.py [--channel solearlytrending] [--since 2026-10-31] [--pairs]
+      python3 entry_filter_scan.py --frozen --since 2026-11-04     (forward test of the frozen rules)
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ SELECT qp.call_id, qp.channel_handle, qp.entry_time, t.mint_address, t.symbol,
        t.security_flag, c.conviction_score, c.mcap_at_call, qp.entry_price,
        t.token_age_minutes, t.bundle_pct_remaining, t.sniper_count, f.n_holding,
        hs.supply_ui, top.top1, top.top10, top.n2,
+       nt.mint IS NOT NULL AS in_feed, nt.dev_buy_sol,
        (SELECT max(o.real_mult) FROM qsim_quote_observations o
          WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time
            AND NOT o.rate_limited AND o.real_mult IS NOT NULL) AS post_max
@@ -50,6 +52,7 @@ FROM qsim_positions qp
 JOIN tokens t ON t.id = qp.token_id
 JOIN calls  c ON c.id = qp.call_id
 LEFT JOIN followed_at_call f ON f.call_id = qp.call_id
+LEFT JOIN new_tokens nt ON nt.mint = t.mint_address
 LEFT JOIN holder_snapshots hs ON hs.call_id = qp.call_id AND hs.phase = 'entry' AND hs.ok
 LEFT JOIN LATERAL (
     SELECT max(x.amt) AS top1,
@@ -99,7 +102,50 @@ def features(r: dict) -> dict:
         "2%+ wallets": bucket(r["n2"] if r["supply_ui"] else None, [1, 4, 8, 1e9], ["0", "1-3", "4-7", "8+"]),
         "hour UTC": f"{r['entry_time'].hour // 6 * 6:02d}-{r['entry_time'].hour // 6 * 6 + 5:02d}",
         "big name": "yes" if BIG_NAMES.search((r["symbol"] or "").lower()) else "no",
+        # creation seen by news_recorder's free feed (only meaningful while the recorder was up)
+        "in feed": "yes" if r["in_feed"] else "no",
+        "dev buy SOL": bucket(r["dev_buy_sol"], [0.05, 0.5, 3, 1e9], ["<0.05", "0.05-0.5", "0.5-3", "3+"],
+                              none="no record"),
     }
+
+
+def _pct(r, key):
+    sup = float(r["supply_ui"] or 0)
+    return float(r[key]) / sup * 100 if (r[key] is not None and sup > 0) else None
+
+
+# Rules FROZEN before their forward window (2026-11-03). Each returns True (pass), False (fail) or
+# None (data missing). Scored with --frozen on trades since --since; never re-tuned on that data.
+FROZEN = [
+    ("solearlytrending", "2%+ wallets >= 4 & top10 >= 20% & bundle < 75%",
+     lambda r: None if (r["supply_ui"] is None or r["bundle_pct_remaining"] is None)
+     else (r["n2"] or 0) >= 4 and (_pct(r, "top10") or 0) >= 20 and float(r["bundle_pct_remaining"]) < 75),
+    ("solwhaletrending", "top10 10-20%",
+     lambda r: None if _pct(r, "top10") is None else 10 <= _pct(r, "top10") < 20),
+    ("solwhaletrending", "security flag = safe",
+     lambda r: None if not r["security_flag"] else r["security_flag"] == "safe"),
+    ("solwhaletrending", "followed wallets 3+ (the live lane)",
+     lambda r: None if r["n_holding"] is None else r["n_holding"] >= 3),
+]
+
+
+def frozen_report(clean) -> None:
+    print("\nFROZEN RULES — forward test (rules fixed 2026-11-03; pass vs fail on this window):")
+    print(f"  {'rule':60s} {'group':5s} {'n':>4s} {'bank%':>6s} {'rug%':>5s} {'P&L/SOL':>8s}  days")
+    for ch, name, rule in FROZEN:
+        rs = [r for r in clean if r["channel_handle"] == ch]
+        verdicts = [(rule(r), r) for r in rs]
+        for lab, want in (("pass", True), ("fail", False)):
+            g = [r for v, r in verdicts if v is want]
+            if not g:
+                print(f"  {ch.replace('trending', '') + ': ' + name:60s} {lab:5s}    0")
+                continue
+            n, bank, rug, _, pnl = stats([outcome(r) for r in g])
+            days = len({r["entry_time"].date() for r in g})
+            print(f"  {ch.replace('trending', '') + ': ' + name:60s} {lab:5s} {n:4d} {bank:6.1f} {rug:5.1f} {pnl:+8.1f}  {days}")
+        miss = sum(1 for v, _ in verdicts if v is None)
+        if miss:
+            print(f"  {'':60s} {'n/a':5s} {miss:4d}  (data missing — not scored)")
 
 
 def outcome(r: dict) -> dict:
@@ -166,6 +212,7 @@ def main() -> None:
     ap.add_argument("--pairs", action="store_true", help="also scan two-feature combinations")
     ap.add_argument("--combined", action="store_true",
                     help="walk-forward test of an added-up score over all features (learn one half, test the other)")
+    ap.add_argument("--frozen", action="store_true", help="forward test of the rules frozen on 2026-11-03")
     ap.add_argument("--margin", type=float, default=10.0,
                     help="combined: a value counts as good/bad if its P&L/SOL beats/trails the half by this")
     a = ap.parse_args()
@@ -186,6 +233,10 @@ def main() -> None:
         clean.append(r)
     print(f"{len(clean)} closed qsim trades since {a.since} ({len(rows) - len(clean)} duplicate opens dropped). "
           f"bank = qsim 2x bank; rug = stop filled < 0.30x; runner = peak or after-exit high >= 5x.")
+
+    if a.frozen:
+        frozen_report(clean)
+        return
 
     channels = [a.channel.lstrip("@")] if a.channel else \
         ["solwhaletrending", "solearlytrending", "solhousesignal"]
