@@ -31,7 +31,7 @@ import time
 from collections import Counter
 from urllib.parse import urlparse
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,6 +47,7 @@ GATEWAYS = ("https://ipfs.io/ipfs/", "https://dweb.link/ipfs/", "https://w3s.lin
 _CID_RE = re.compile(r"/ipfs/([A-Za-z0-9]+)")
 _X_RE = re.compile(r"(?:twitter\.com|x\.com)/([A-Za-z0-9_]{1,15})(?:/(status|communities)/(\d+))?", re.I)
 _TWITTER_EPOCH_MS = 1288834974657
+PER_COIN_SECS = 25.0     # all gateways + retries for one coin; a dead file must not stall the run
 
 
 def ensure_cache() -> None:
@@ -74,11 +75,15 @@ def fetch_meta(uri: str | None) -> tuple[dict | None, str | None]:
     if m:
         urls += [g + m.group(1) for g in GATEWAYS if not uri.startswith(g)]
     why = None
+    deadline = time.monotonic() + PER_COIN_SECS
     for u in urls:
         host = urlparse(u).netloc or "?"
         for attempt in (0, 1):
+            left = deadline - time.monotonic()
+            if left < 1:
+                return None, why or f"{host}:deadline"
             try:
-                r = requests.get(u, timeout=10)
+                r = requests.get(u, timeout=min(8.0, left))
                 if r.status_code == 200:
                     j = r.json()
                     return (j, None) if isinstance(j, dict) else (None, f"{host}:not-object")
@@ -161,10 +166,15 @@ def main() -> None:
           f"(all measured), {len(sample)} of {len(rest)} others sampled; "
           f"fetching {len(todo)} metadata files (cap {a.max_fetch}, {a.workers} workers)")
     if todo:
-        with ThreadPoolExecutor(a.workers) as ex:
-            res = list(ex.map(lambda r: fetch_meta(r["uri"]), todo))
-        with conn.cursor() as cur:
-            for r, (m, why) in zip(todo, res):
+        # Saved as each file finishes and committed every 100, so Ctrl+C keeps what was fetched.
+        t0, done, n_ok = time.monotonic(), 0, 0
+        with ThreadPoolExecutor(a.workers) as ex, conn.cursor() as cur:
+            futs = {ex.submit(fetch_meta, r["uri"]): r for r in todo}
+            for f in as_completed(futs):
+                r = futs[f]
+                m, why = f.result()
+                done += 1
+                n_ok += m is not None
                 r["ok"] = m is not None
                 r["err"] = why
                 r["twitter"] = str(m.get("twitter") or "")[:300] if m else None
@@ -173,7 +183,11 @@ def main() -> None:
                             "ON CONFLICT (mint) DO UPDATE SET ok=EXCLUDED.ok, twitter=EXCLUDED.twitter, "
                             "website=EXCLUDED.website, err=EXCLUDED.err, fetched_at=now()",
                             (r["mint"], r["ok"], r["twitter"], r["website"], r["err"]))
-        conn.commit()
+                if done % 100 == 0 or done == len(todo):
+                    conn.commit()
+                    el = time.monotonic() - t0
+                    print(f"  [{done}/{len(todo)}] readable {n_ok} — {el / 60:.1f} min, "
+                          f"~{el / done * (len(todo) - done) / 60:.0f} min left", flush=True)
 
     bad = [r for r in measured if r["ok"] is False]
     n_hit_ok = sum(1 for r in hits if r["ok"])
