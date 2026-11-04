@@ -212,6 +212,8 @@ def main() -> None:
     ap.add_argument("--pairs", action="store_true", help="also scan two-feature combinations")
     ap.add_argument("--combined", action="store_true",
                     help="walk-forward test of an added-up score over all features (learn one half, test the other)")
+    ap.add_argument("--only", default="",
+                    help='restrict to one group first, e.g. "wallets=3+" (then scan features within it)')
     ap.add_argument("--frozen", action="store_true", help="forward test of the rules frozen on 2026-11-03")
     ap.add_argument("--margin", type=float, default=10.0,
                     help="combined: a value counts as good/bad if its P&L/SOL beats/trails the half by this")
@@ -246,6 +248,12 @@ def main() -> None:
             continue
         mid = rs[len(rs) // 2]["entry_time"]
         items = [(features(r), outcome(r), r["entry_time"] < mid) for r in rs]
+        if a.only:
+            fk, fv = a.only.split("=", 1)
+            items = [x for x in items if x[0].get(fk.strip()) == fv.strip()]
+            print(f"\n[only {fk.strip()}={fv.strip()}: {len(items)} of {len(rs)} {ch} trades]")
+            if not items:
+                continue
         base = stats([o for _, o, _ in items])
         b1 = per_sol([o for _, o, h in items if h])
         b2 = per_sol([o for _, o, h in items if not h])
