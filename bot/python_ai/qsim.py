@@ -350,7 +350,7 @@ _runner_window_until: dict[int, float] = {}  # call_id -> monotonic expiry for t
 # written, and qsim_open awaits several quotes before writing — so when a channel posts the
 # same coin 2-3 times in one second (solwhaletrending did on 2026-10-31: Lumi x3, NVIDIA x2,
 # consecutive message ids) every copy passed the check and opened. Live has had this guard.
-_inflight_mints: set[str] = set()
+_inflight_mints: set[tuple[str, str]] = set()   # (channel, mint) being opened
 _qsim_exit_state: dict[int, dict] = {}       # call_id -> named overlay state
 _noroute_streak: dict[int, int] = {}      # call_id -> consecutive no-route sell quotes
 _quote_window: list[float] = []           # monotonic timestamps of recent quotes (budget window)
@@ -784,18 +784,25 @@ async def qsim_open(score_result: dict, token_data: dict) -> None:
         symbol = token_data.get("symbol", "?")
         if not mint:
             return
-        # First-call-per-mint dedup (mirror live): skip if a qsim position for this mint is
-        # open or being opened. Checked and claimed with no await in between.
-        if mint in _inflight_mints:
-            print(f"[qsim] {symbol} skipped — open already in progress for this mint call_id={call_id}")
+        # First-call-per-mint dedup, PER CHANNEL: skip if this channel already has a qsim
+        # position on the mint open or being opened. Checked and claimed with no await between.
+        # 2026-11-04: this used to be across ALL channels (mirroring live's one-position-per-coin),
+        # so an open solearlytrending position silently swallowed the later solwhaletrending
+        # call — ~70 swt trades Oct 31-Nov 4 never measured (incl. AMD 44x). Live only trades
+        # one channel, so per-channel is the faithful mirror for each lane.
+        key = (channel, mint)
+        if key in _inflight_mints:
+            print(f"[qsim] {symbol} skipped — open already in progress for this mint on {channel} "
+                  f"call_id={call_id}")
             return
-        if any(p.get("mint_address") == mint for p in db.get_open_qsim_positions()):
+        if any(p.get("mint_address") == mint and (p.get("channel_handle") or "") == channel
+               for p in db.get_open_qsim_positions()):
             return
-        _inflight_mints.add(mint)
+        _inflight_mints.add(key)
         try:
             await _qsim_open_claimed(call_id, channel, vip_tier, cat, spec, mint, symbol, token_data)
         finally:
-            _inflight_mints.discard(mint)
+            _inflight_mints.discard(key)
     except Exception as e:
         print(f"[qsim] open error call_id={score_result.get('call_id')}: {e}")
 
