@@ -52,6 +52,10 @@ AFTER_EXIT_S = (600, 840)
 TOP_N = 20
 CHANNELS = [c.strip().lstrip("@") for c in
             os.getenv("HOLDER_SNAP_CHANNELS", "solwhaletrending").split(",") if c.strip()]
+# 2026-11-04: the stop study (exit / exit10) found no holder signal on any channel (best bucket
+# ~17% came back vs the 25-30% holding needs), so "entry" alone keeps the entry features at a
+# third of the Helius calls.
+PHASES = [p.strip() for p in os.getenv("HOLDER_SNAP_PHASES", "entry,exit,exit10").split(",") if p.strip()]
 
 _day = None
 _calls_today = 0
@@ -97,12 +101,13 @@ def due_snapshots() -> list[tuple[int, str, str]]:
                            AND qp.exit_time >= now() - make_interval(secs => %s))
             ) AS x(phase, due)
             WHERE qp.channel_handle = ANY(%s)
+              AND x.phase = ANY(%s)
               AND x.due
               AND t.mint_address NOT LIKE 'UNKNOWN:%%' AND t.mint_address NOT LIKE 'INFERRED:%%'
               AND NOT EXISTS (SELECT 1 FROM holder_snapshots h
                               WHERE h.call_id = qp.call_id AND h.phase = x.phase)
             ORDER BY CASE x.phase WHEN 'exit' THEN 0 WHEN 'entry' THEN 1 ELSE 2 END
-            """, (ENTRY_WINDOW_S, EXIT_WINDOW_S, AFTER_EXIT_S[0], AFTER_EXIT_S[1], CHANNELS))
+            """, (ENTRY_WINDOW_S, EXIT_WINDOW_S, AFTER_EXIT_S[0], AFTER_EXIT_S[1], CHANNELS, PHASES))
         return cur.fetchall()
 
 
@@ -145,7 +150,7 @@ def run() -> None:
     global _day, _calls_today, _capped_noted
     ensure_table()
     print(f"[holder_snapshots] every {PASS_SECS:g}s: top {TOP_N} holders of each {','.join(CHANNELS)} "
-          f"qsim coin at entry, exit and 10 min after exit — ceiling {MAX_CALLS_PER_DAY:,} RPC "
+          f"qsim coin, phases {','.join(PHASES)} — ceiling {MAX_CALLS_PER_DAY:,} RPC "
           f"calls/day (~{MAX_CALLS_PER_DAY * 30:,}/month), 2-3 calls per snapshot", flush=True)
     tally = defaultdict(int)
     last_tally = time.monotonic()
