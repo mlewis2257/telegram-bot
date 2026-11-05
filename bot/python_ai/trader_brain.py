@@ -383,7 +383,7 @@ def report(since: str) -> None:
     conn = db.get_conn()
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT b.plan, b.story, b.meme, b.flow, b.risk, b.copycat, b.confidence, b.attention,
+            SELECT qp.channel_handle, b.plan, b.story, b.meme, b.flow, b.risk, b.copycat, b.confidence, b.attention,
                    b.ctx_ms, b.api_ms,
                    qp.sol_in, qp.sol_out, qp.exit_reason, qp.peak_multiplier, b.judged_at, qp.exit_time,
                    (SELECT max(o.real_mult) FROM qsim_quote_observations o
@@ -397,13 +397,13 @@ def report(since: str) -> None:
         return
     items = []
     speed = []
-    for (plan, story, meme, flow, risk, copycat, conf, attention, ctx_ms, api_ms,
+    for (channel, plan, story, meme, flow, risk, copycat, conf, attention, ctx_ms, api_ms,
          s_in, s_out, reason, peak, judged, exit_t, post) in rows:
         if ctx_ms is not None and api_ms is not None:
             speed.append((ctx_ms, api_ms))
         x = float(s_out or 0) / float(s_in)
         hi = max(float(peak or 0), float(post or 0))
-        items.append({"plan": plan, "attention": attention, "story": story, "meme": meme, "flow": flow, "risk": risk,
+        items.append({"channel": channel, "plan": plan, "attention": attention, "story": story, "meme": meme, "flow": flow, "risk": risk,
                       "copycat": "yes" if copycat else "no", "confidence": conf,
                       "pnl": float(s_out or 0) - float(s_in), "s_in": float(s_in),
                       "bank": "bank" in (reason or ""), "rug": x < 0.30, "hi": hi,
@@ -427,6 +427,15 @@ def report(since: str) -> None:
         g = [i for i in items if i["plan"] == p]
         if g:
             line(p, g)
+    chans = sorted({i["channel"] for i in items})
+    if len(chans) > 1:
+        for ch in chans:
+            print(f"\n  -- {ch} --")
+            line("ALL", [i for i in items if i["channel"] == ch])
+            for p in PLANS:
+                g = [i for i in items if i["channel"] == ch and i["plan"] == p]
+                if g:
+                    line(p, g)
     if speed:
         cs, ap = sorted(x[0] for x in speed), sorted(x[1] for x in speed)
         tot = sorted(a + b for a, b in speed)
