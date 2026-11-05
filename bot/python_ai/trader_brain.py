@@ -74,11 +74,16 @@ Judge ONLY from the data given. Answer with one JSON object and nothing else:
 {"story": 0-3, "story_note": "<what the story is, or 'none'>",
  "meme": 0-3, "meme_note": "<originality/humour in a few words>",
  "copycat": true/false,
- "flow": 0-3, "risk": 0-3, "risk_note": "<biggest danger in a few words>",
+ "flow": 0-3, "attention": "early" | "peaking" | "late",
+ "risk": 0-3, "risk_note": "<biggest danger in a few words>",
+ "win_condition": "<what has to happen for this trade to work>",
+ "invalidated_if": "<what would prove it wrong>",
  "plan": "hold_longer" | "normal" | "exit_early" | "skip",
  "confidence": 1-5,
  "reason": "<one sentence>"}
 story/meme/flow: 0 = none/bad, 3 = strong. risk: 0 = clean, 3 = likely rug/dump.
+attention: early = the story/coin is just starting to get noticed; late = already obvious and run up.
+Missing a coin costs nothing; a forced bad trade does — use skip/exit_early freely.
 plan: hold_longer = could be a runner, worth holding past the usual 2x take-profit;
 normal = take the usual 2x / stop; exit_early = weak, take a small profit or get out soon;
 skip = should not have been bought."""
@@ -112,6 +117,9 @@ def ensure_table() -> None:
                 in_tokens   integer,
                 out_tokens  integer
             )""")
+        cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS attention text")
+        cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS ctx_ms integer")   # gathering the data
+        cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS api_ms integer")   # the model's answer
         conn.commit()
 
 
@@ -317,13 +325,17 @@ def run() -> None:
                               f"none until UTC midnight", flush=True)
                         _capped_noted = True
                     break
+                t0 = time.monotonic()
                 ctx = build_context(call_id)
+                ctx_ms = int((time.monotonic() - t0) * 1000)
                 if not ctx:
                     continue
+                t1 = time.monotonic()
                 try:
                     v, tin, tout, err = judge(ctx)
                 except requests.RequestException as e:
                     v, tin, tout, err = None, 0, 0, f"{type(e).__name__}: {e}"
+                api_ms = int((time.monotonic() - t1) * 1000)
                 _usd_today += tin / 1e6 * PRICE_IN + tout / 1e6 * PRICE_OUT
                 if v is None:
                     _failed[call_id] = _failed.get(call_id, 0) + 1
@@ -335,16 +347,19 @@ def run() -> None:
                 conn = db.get_conn()
                 with conn.cursor() as cur:
                     cur.execute("""INSERT INTO trader_brain (call_id, model, delay_secs, context, plan, story, meme,
-                                   flow, risk, copycat, confidence, verdict, in_tokens, out_tokens)
-                                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                                   flow, risk, copycat, confidence, verdict, in_tokens, out_tokens,
+                                   attention, ctx_ms, api_ms)
+                                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
                                 (call_id, MODEL, ctx["our_entry"]["secs_since_entry"], json.dumps(ctx, default=str),
                                  v["plan"], _int(v.get("story")), _int(v.get("meme")), _int(v.get("flow")),
                                  _int(v.get("risk")), bool(v.get("copycat")), _int(v.get("confidence")),
-                                 json.dumps(v), tin, tout))
+                                 json.dumps(v), tin, tout, str(v.get("attention") or "")[:10] or None,
+                                 ctx_ms, api_ms))
                 conn.commit()
                 print(f"[trader_brain] {ctx.get('symbol')} call_id={call_id}: {v['plan'].upper()} "
                       f"(story {v.get('story')}, meme {v.get('meme')}, flow {v.get('flow')}, risk {v.get('risk')}, "
-                      f"conf {v.get('confidence')}) — {str(v.get('reason'))[:140]}", flush=True)
+                      f"conf {v.get('confidence')}, {v.get('attention')}) — {str(v.get('reason'))[:140]} "
+                      f"[data {ctx_ms} ms, model {api_ms} ms]", flush=True)
         except Exception as e:
             db.safe_rollback()
             print(f"[trader_brain] pass failed: {type(e).__name__}: {e}", flush=True)
@@ -362,7 +377,8 @@ def report(since: str) -> None:
     conn = db.get_conn()
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT b.plan, b.story, b.meme, b.flow, b.risk, b.copycat, b.confidence,
+            SELECT b.plan, b.story, b.meme, b.flow, b.risk, b.copycat, b.confidence, b.attention,
+                   b.ctx_ms, b.api_ms,
                    qp.sol_in, qp.sol_out, qp.exit_reason, qp.peak_multiplier, b.judged_at, qp.exit_time,
                    (SELECT max(o.real_mult) FROM qsim_quote_observations o
                      WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time
@@ -374,10 +390,14 @@ def report(since: str) -> None:
         print(f"no closed, judged trades since {since}")
         return
     items = []
-    for plan, story, meme, flow, risk, copycat, conf, s_in, s_out, reason, peak, judged, exit_t, post in rows:
+    speed = []
+    for (plan, story, meme, flow, risk, copycat, conf, attention, ctx_ms, api_ms,
+         s_in, s_out, reason, peak, judged, exit_t, post) in rows:
+        if ctx_ms is not None and api_ms is not None:
+            speed.append((ctx_ms, api_ms))
         x = float(s_out or 0) / float(s_in)
         hi = max(float(peak or 0), float(post or 0))
-        items.append({"plan": plan, "story": story, "meme": meme, "flow": flow, "risk": risk,
+        items.append({"plan": plan, "attention": attention, "story": story, "meme": meme, "flow": flow, "risk": risk,
                       "copycat": "yes" if copycat else "no", "confidence": conf,
                       "pnl": float(s_out or 0) - float(s_in), "s_in": float(s_in),
                       "bank": "bank" in (reason or ""), "rug": x < 0.30, "hi": hi,
@@ -401,7 +421,14 @@ def report(since: str) -> None:
         g = [i for i in items if i["plan"] == p]
         if g:
             line(p, g)
-    for key in ("story", "meme", "flow", "risk", "copycat", "confidence"):
+    if speed:
+        cs, ap = sorted(x[0] for x in speed), sorted(x[1] for x in speed)
+        tot = sorted(a + b for a, b in speed)
+        q = lambda xs, f: xs[min(len(xs) - 1, int(len(xs) * f))] / 1000
+        print(f"SPEED (could it decide BEFORE a buy?): data median {q(cs, .5):.1f}s / 90% {q(cs, .9):.1f}s, "
+              f"model median {q(ap, .5):.1f}s / 90% {q(ap, .9):.1f}s, total median {q(tot, .5):.1f}s / "
+              f"90% {q(tot, .9):.1f}s\n")
+    for key in ("attention", "story", "meme", "flow", "risk", "copycat", "confidence"):
         print(f"\nBY {key.upper()}")
         groups = defaultdict(list)
         for i in items:
