@@ -68,7 +68,10 @@ PRICE_OUT = float(os.getenv("TRADER_BRAIN_PRICE_OUT", "5.0"))
 PASS_SECS = 10
 
 PLANS = ("hold_longer", "normal", "exit_early", "skip")
-PROMPT_V = 4
+PROMPT_V = 5
+# v5 (2026-11-04): v4 still said PASS / EXIT_EARLY on every coin with p_2x ~12% on all of them
+# (no ranking), misread a below-median bundle % as a red flag, and exited on first-minute dips.
+# Adds vs_typical 1-10 (5 = ordinary for the channel, ~a third at 6+); BUY = vs_typical >= 6.
 # v4 (2026-11-04): v3 rated every coin ~70% rug / PASS / EXIT_EARLY, calling bundles, snipers, dev
 # selling and thin liquidity red flags — but nearly every called coin has them. Each coin now
 # carries "channel_typical" (7-day medians of those stats on that channel + its real bank and rug
@@ -92,21 +95,25 @@ coins really bank 2x and rug. Nearly every called coin has bundles, snipers, som
 thin liquidity — on their own those are NOT red flags. Judge this coin RELATIVE to the typical one:
 your p_2x and p_rug should average close to the channel's real rates across coins; BUY / hold
 coins that are clearly better than typical, PASS / exit coins that are clearly worse, and treat
-the ones in between as ordinary. If a "market_today" section is present it lists what ran, what rugged and
+the ones in between as ordinary. A stat BETTER than the channel median (fewer bundles, fewer
+snipers, more liquidity, less fake volume, less dev selling) is a GOOD sign, not a red flag.
+If a "market_today" section is present it lists what ran, what rugged and
 what got copied to death in the last 24 h, plus top news: use it to tell a fresh story from a
 tired one. Judge ONLY from the data given. Give honest, spread-out probabilities:
 p_2x and p_rug should differ from coin to coin, not repeat the same number."""
 
 ENTRY_SYSTEM = """You are an experienced Solana meme-coin trader. A Telegram call channel just called the
 coin below. Decide whether YOU would buy it now, at about the entry price shown. You see only what
-is known at the call: there is no price movement after it yet. Passing costs nothing; a bad buy
-does. """ + _GUIDE + """
+is known at the call: there is no price movement after it yet. """ + _GUIDE + """
 
 Answer with one JSON object and nothing else:
-{"buy": true/false, "p_2x": 0-100, "p_rug": 0-100,
+{"vs_typical": 1-10, "buy": true/false, "p_2x": 0-100, "p_rug": 0-100,
  "story": 0-3, "meme": 0-3, "attention": "early" | "peaking" | "late",
  "reason": "<one sentence>"}
-p_2x = chance it reaches 2x of the entry price; p_rug = chance it collapses below 0.3x."""
+p_2x = chance it reaches 2x of the entry price; p_rug = chance it collapses below 0.3x.
+vs_typical: 5 = an ordinary coin for this channel; 1 = far worse; 10 = far better. Use the WHOLE
+range: across many coins roughly a third should be 6 or higher and a third 4 or lower.
+buy = true exactly when vs_typical >= 6."""
 
 SYSTEM = """You are an experienced Solana meme-coin trader managing a small position bought when a
 Telegram call channel called the coin below; the price path since the buy is included.
@@ -120,6 +127,7 @@ Answer with one JSON object and nothing else:
  "risk": 0-3, "risk_note": "<biggest danger in a few words>",
  "win_condition": "<what has to happen for this trade to work>",
  "invalidated_if": "<what would prove it wrong>",
+ "vs_typical": 1-10,
  "plan": "hold_longer" | "normal" | "exit_early" | "skip",
  "p_2x": 0-100, "p_rug": 0-100,
  "confidence": 1-5,
@@ -129,8 +137,12 @@ attention: early = the story/coin is just starting to get noticed; late = alread
 p_2x = chance it reaches 2x of the entry price; p_rug = chance it collapses below 0.3x.
 plan: hold_longer = could be a runner, worth holding past the usual 2x take-profit;
 normal = the default for an ordinary coin: take the usual 2x take-profit or the stop;
+(a dip in the first minute is common, also for coins that later reach 2x — a dip alone is not a
+reason to exit early; the stop already handles real dumps)
 exit_early = several warning signs line up: take a small profit or get out soon;
-skip = clearly should not have been bought: sell now."""
+skip = clearly should not have been bought: sell now.
+vs_typical: 5 = an ordinary coin for this channel at this point; use the whole 1-10 range (about a
+third 6+ and a third 4 or lower across coins)."""
 
 _day = None
 _n_today = 0
@@ -168,6 +180,7 @@ def ensure_table() -> None:
         cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS p_rug integer")
         cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS prompt_v integer")
         cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS has_brief boolean")
+        cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS vs_typical integer")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS trader_brain_entry (
                 call_id     integer PRIMARY KEY,
@@ -188,6 +201,7 @@ def ensure_table() -> None:
                 out_tokens  integer
             )""")
         cur.execute("ALTER TABLE trader_brain_entry ADD COLUMN IF NOT EXISTS has_brief boolean")
+        cur.execute("ALTER TABLE trader_brain_entry ADD COLUMN IF NOT EXISTS vs_typical integer")
         conn.commit()
 
 
@@ -506,34 +520,34 @@ def _one(kind: str, call_id: int, tally) -> None:
         if kind == "entry":
             tally["buy" if v["buy"] else "pass"] += 1
             cur.execute("""INSERT INTO trader_brain_entry (call_id, model, prompt_v, buy, p_2x, p_rug, story, meme,
-                           attention, verdict, context, ctx_ms, api_ms, in_tokens, out_tokens, has_brief)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                           attention, verdict, context, ctx_ms, api_ms, in_tokens, out_tokens, has_brief, vs_typical)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
                         (call_id, MODEL, PROMPT_V, v["buy"], _int(v.get("p_2x")), _int(v.get("p_rug")),
                          _int(v.get("story")), _int(v.get("meme")), str(v.get("attention") or "")[:10] or None,
                          json.dumps(v), json.dumps(ctx, default=str), ctx_ms, api_ms, tin, tout,
-                         "market_today" in ctx))
+                         "market_today" in ctx, _int(v.get("vs_typical"))))
         else:
             tally[v["plan"]] += 1
             cur.execute("""INSERT INTO trader_brain (call_id, model, delay_secs, context, plan, story, meme,
                            flow, risk, copycat, confidence, verdict, in_tokens, out_tokens,
-                           attention, ctx_ms, api_ms, p_2x, p_rug, prompt_v, has_brief)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           attention, ctx_ms, api_ms, p_2x, p_rug, prompt_v, has_brief, vs_typical)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                            ON CONFLICT DO NOTHING""",
                         (call_id, MODEL, ctx["our_entry"]["secs_since_entry"], json.dumps(ctx, default=str),
                          v["plan"], _int(v.get("story")), _int(v.get("meme")), _int(v.get("flow")),
                          _int(v.get("risk")), bool(v.get("copycat")), _int(v.get("confidence")),
                          json.dumps(v), tin, tout, str(v.get("attention") or "")[:10] or None,
                          ctx_ms, api_ms, _int(v.get("p_2x")), _int(v.get("p_rug")), PROMPT_V,
-                         "market_today" in ctx))
+                         "market_today" in ctx, _int(v.get("vs_typical"))))
     conn.commit()
     if kind == "entry":
         print(f"[trader_brain] {ctx.get('symbol')} ({ctx.get('channel')}) call_id={call_id} AT CALL: "
-              f"{'BUY' if v['buy'] else 'PASS'} (2x {v.get('p_2x')}%, rug {v.get('p_rug')}%, story {v.get('story')}, "
+              f"{'BUY' if v['buy'] else 'PASS'} (vs typical {v.get('vs_typical')}/10, 2x {v.get('p_2x')}%, rug {v.get('p_rug')}%, story {v.get('story')}, "
               f"meme {v.get('meme')}, {v.get('attention')}) — {str(v.get('reason'))[:140]} "
               f"[data {ctx_ms} ms, model {api_ms} ms]", flush=True)
     else:
         print(f"[trader_brain] {ctx.get('symbol')} ({ctx.get('channel')}) call_id={call_id} AT "
-              f"{ctx['our_entry']['secs_since_entry']}s: {v['plan'].upper()} (2x {v.get('p_2x')}%, rug {v.get('p_rug')}%, "
+              f"{ctx['our_entry']['secs_since_entry']}s: {v['plan'].upper()} (vs typical {v.get('vs_typical')}/10, 2x {v.get('p_2x')}%, rug {v.get('p_rug')}%, "
               f"story {v.get('story')}, meme {v.get('meme')}, flow {v.get('flow')}, risk {v.get('risk')}, "
               f"{v.get('attention')}) — {str(v.get('reason'))[:140]} [data {ctx_ms} ms, model {api_ms} ms]",
               flush=True)
@@ -590,7 +604,7 @@ def report(since: str) -> None:
         cur.execute("""
             SELECT qp.channel_handle, b.plan, b.story, b.meme, b.flow, b.risk, b.copycat, b.confidence, b.attention,
                    b.ctx_ms, b.api_ms, b.p_2x, b.p_rug, coalesce(b.has_brief, false), t.symbol,
-                   b.verdict->>'reason',
+                   b.verdict->>'reason', b.vs_typical,
                    qp.sol_in, qp.sol_out, qp.exit_reason, qp.peak_multiplier, b.judged_at, qp.exit_time,
                    (SELECT max(o.real_mult) FROM qsim_quote_observations o
                      WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time
@@ -602,7 +616,7 @@ def report(since: str) -> None:
         rows = cur.fetchall()
         cur.execute("""
             SELECT qp.channel_handle, e.buy, e.p_2x, e.p_rug, e.ctx_ms, e.api_ms,
-                   coalesce(e.has_brief, false), t.symbol, e.verdict->>'reason',
+                   coalesce(e.has_brief, false), t.symbol, e.verdict->>'reason', e.vs_typical,
                    qp.sol_in, qp.sol_out, qp.exit_reason, qp.peak_multiplier,
                    (SELECT max(o.real_mult) FROM qsim_quote_observations o
                      WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time
@@ -618,7 +632,7 @@ def report(since: str) -> None:
     items = []
     speed = []
     for (channel, plan, story, meme, flow, risk, copycat, conf, attention, ctx_ms, api_ms, p2, pr,
-         brief, sym, why, s_in, s_out, reason, peak, judged, exit_t, post) in rows:
+         brief, sym, why, vt, s_in, s_out, reason, peak, judged, exit_t, post) in rows:
         if ctx_ms is not None and api_ms is not None:
             speed.append((ctx_ms, api_ms))
         x = float(s_out or 0) / float(s_in)
@@ -629,7 +643,8 @@ def report(since: str) -> None:
                       "bank": "bank" in (reason or ""), "rug": x < 0.30, "hi": hi,
                       "closed_before_judged": exit_t is not None and exit_t <= judged,
                       "p2": p2, "pr": pr, "p2n": p2, "brief": "with brief" if brief else "no brief",
-                      "sym": sym, "why": why, "x": x})
+                      "sym": sym, "why": why, "x": x,
+                      "vt": "n/a" if vt is None else ("1-3" if vt <= 3 else "4-5" if vt <= 5 else "6-7" if vt <= 7 else "8-10")})
 
     def line(label, g):
         n = len(g)
@@ -668,10 +683,11 @@ def report(since: str) -> None:
     if erows:
         ent = []
         espeed = []
-        for channel, buy, p2, pr, cms, ams, brief, sym, why, s_in, s_out, reason, peak, post in erows:
+        for channel, buy, p2, pr, cms, ams, brief, sym, why, vt, s_in, s_out, reason, peak, post in erows:
             x = float(s_out or 0) / float(s_in)
             ent.append({"channel": channel, "buy": "BUY" if buy else "PASS", "p2": bucket(p2), "pr": bucket(pr),
                         "p2n": p2, "brief": "with brief" if brief else "no brief", "sym": sym, "why": why, "x": x,
+                        "vt": "n/a" if vt is None else ("1-3" if vt <= 3 else "4-5" if vt <= 5 else "6-7" if vt <= 7 else "8-10"),
                         "pnl": float(s_out or 0) - float(s_in), "s_in": float(s_in),
                         "bank": "bank" in (reason or ""), "rug": x < 0.30,
                         "hi": max(float(peak or 0), float(post or 0))})
@@ -684,9 +700,9 @@ def report(since: str) -> None:
             g = [i for i in ent if i["buy"] == lab]
             if g:
                 line(lab, g)
-        for key, title in (("p2", "its chance of 2x"), ("pr", "its chance of a rug")):
+        for key, title in (("vt", "vs typical (1-10)"), ("p2", "its chance of 2x"), ("pr", "its chance of a rug")):
             print(f"  by {title}:")
-            for val in ("<15%", "15-29%", "30-49%", "50%+", "n/a"):
+            for val in ("1-3", "4-5", "6-7", "8-10", "<15%", "15-29%", "30-49%", "50%+", "n/a"):
                 g = [i for i in ent if i[key] == val]
                 if g:
                     line("  " + val, g)
@@ -743,7 +759,7 @@ def report(since: str) -> None:
     misses(items, "at the plan")
     for i in items:
         i["p2"], i["pr"] = bucket(i["p2"]), bucket(i["pr"])
-    for key in ("p2", "pr", "attention", "story", "meme", "flow", "risk", "copycat", "confidence"):
+    for key in ("vt", "p2", "pr", "attention", "story", "meme", "flow", "risk", "copycat", "confidence"):
         print(f"\nBY {key.upper()}")
         groups = defaultdict(list)
         for i in items:
