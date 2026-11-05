@@ -68,7 +68,11 @@ PRICE_OUT = float(os.getenv("TRADER_BRAIN_PRICE_OUT", "5.0"))
 PASS_SECS = 10
 
 PLANS = ("hold_longer", "normal", "exit_early", "skip")
-PROMPT_V = 2
+PROMPT_V = 3
+# v3 (2026-11-04): a "market_today" brief (what ran / rugged / got copied in the last 24 h, top
+# news) is added for EVEN call_ids only — a built-in A/B, so the report can tell whether the
+# brief helps instead of guessing. has_brief is stored on every row.
+BRIEF_ON = os.getenv("TRADER_BRAIN_BRIEF", "1") != "0"
 ENTRY_ON = os.getenv("TRADER_BRAIN_ENTRY", "1") != "0"
 
 _GUIDE = """Most called coins fail; a few run 5-50x. Typically 10-25% of called coins reach 2x and
@@ -77,7 +81,9 @@ story (news, a viral moment, a culture reference people get), an ORIGINAL meme (
 the 30th copy of the same ticker), real buying (volume, many holders, not one bundle), and holders
 who are not about to dump. Copycats of a story that already ran, lazy tickers, heavy
 bundles/snipers, a dev who launches dozens of coins, or a coin already far above the call price
-are the usual losers. Judge ONLY from the data given. Give honest, spread-out probabilities:
+are the usual losers. If a "market_today" section is present it lists what ran, what rugged and
+what got copied to death in the last 24 h, plus top news: use it to tell a fresh story from a
+tired one. Judge ONLY from the data given. Give honest, spread-out probabilities:
 p_2x and p_rug should differ from coin to coin, not repeat the same number."""
 
 ENTRY_SYSTEM = """You are an experienced Solana meme-coin trader. A Telegram call channel just called the
@@ -150,6 +156,7 @@ def ensure_table() -> None:
         cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS p_2x integer")
         cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS p_rug integer")
         cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS prompt_v integer")
+        cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS has_brief boolean")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS trader_brain_entry (
                 call_id     integer PRIMARY KEY,
@@ -169,6 +176,7 @@ def ensure_table() -> None:
                 in_tokens   integer,
                 out_tokens  integer
             )""")
+        cur.execute("ALTER TABLE trader_brain_entry ADD COLUMN IF NOT EXISTS has_brief boolean")
         conn.commit()
 
 
@@ -192,6 +200,49 @@ def _jsonable(v):
 def _words(s: str) -> list[str]:
     stop = {"the", "coin", "token", "inu", "sol", "solana", "pump", "meme", "official", "and"}
     return [w for w in re.findall(r"[a-z0-9]{3,}", (s or "").lower()) if w not in stop][:4]
+
+
+_brief_cache: tuple[float, dict] | None = None
+
+
+def market_brief() -> dict:
+    """What ran / rugged / got copied in the last 24 h + top news. Cached 30 min."""
+    global _brief_cache
+    if _brief_cache and time.monotonic() - _brief_cache[0] < 1800:
+        return _brief_cache[1]
+    conn = db.get_conn()
+    db.safe_rollback()
+    out = {}
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT t.symbol, t.name, qp.channel_handle,
+                   greatest(coalesce(qp.peak_multiplier, 0),
+                            coalesce((SELECT max(o.real_mult) FROM qsim_quote_observations o
+                                      WHERE o.call_id = qp.call_id AND o.real_mult IS NOT NULL), 0)) AS hi,
+                   qp.sol_out / nullif(qp.sol_in, 0) AS x
+            FROM qsim_positions qp JOIN tokens t ON t.id = qp.token_id
+            WHERE qp.entry_time >= now() - interval '24 hours' AND qp.status = 'closed'""")
+        rows = cur.fetchall()
+        ran = sorted((r for r in rows if r[3] and float(r[3]) >= 3), key=lambda r: -float(r[3]))[:15]
+        out["ran_3x_plus_24h"] = [f"{r[0]} ({r[1]}) {float(r[3]):.1f}x" for r in ran]
+        rugged = [r for r in rows if r[4] is not None and float(r[4]) < 0.3][:15]
+        out["rugged_24h"] = [f"{r[0]} ({r[1]})" for r in rugged]
+        cur.execute("""
+            SELECT regexp_replace(lower(symbol), '[^a-z0-9]', '', 'g') AS k, count(*)
+            FROM new_tokens WHERE created_at >= now() - interval '24 hours' AND symbol IS NOT NULL
+            GROUP BY 1 HAVING count(*) >= 15 ORDER BY 2 DESC LIMIT 12""")
+        out["most_copied_tickers_24h"] = [f"{k} x{n}" for k, n in cur.fetchall() if k]
+        cur.execute("""
+            SELECT DISTINCT ON (left(coalesce(title, body), 60)) coalesce(title, left(body, 160))
+            FROM news_posts WHERE seen_at >= now() - interval '12 hours'
+            ORDER BY left(coalesce(title, body), 60), seen_at DESC LIMIT 12""")
+        out["news_12h"] = [_URL_RE.sub("", t or "")[:160] for (t,) in cur.fetchall()]
+    _brief_cache = (time.monotonic(), out)
+    return out
+
+
+def has_brief(call_id: int) -> bool:
+    return BRIEF_ON and call_id % 2 == 0
 
 
 def build_context(call_id: int, with_path: bool = True) -> dict | None:
@@ -303,6 +354,11 @@ def build_context(call_id: int, with_path: bool = True) -> dict | None:
     if not with_path:
         ctx.pop("price_path_since_entry")
         ctx["our_entry"].pop("secs_since_entry")
+    if has_brief(call_id):
+        try:
+            ctx["market_today"] = market_brief()
+        except Exception:
+            db.safe_rollback()
     return ctx
 
 
@@ -400,23 +456,25 @@ def _one(kind: str, call_id: int, tally) -> None:
         if kind == "entry":
             tally["buy" if v["buy"] else "pass"] += 1
             cur.execute("""INSERT INTO trader_brain_entry (call_id, model, prompt_v, buy, p_2x, p_rug, story, meme,
-                           attention, verdict, context, ctx_ms, api_ms, in_tokens, out_tokens)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                           attention, verdict, context, ctx_ms, api_ms, in_tokens, out_tokens, has_brief)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
                         (call_id, MODEL, PROMPT_V, v["buy"], _int(v.get("p_2x")), _int(v.get("p_rug")),
                          _int(v.get("story")), _int(v.get("meme")), str(v.get("attention") or "")[:10] or None,
-                         json.dumps(v), json.dumps(ctx, default=str), ctx_ms, api_ms, tin, tout))
+                         json.dumps(v), json.dumps(ctx, default=str), ctx_ms, api_ms, tin, tout,
+                         "market_today" in ctx))
         else:
             tally[v["plan"]] += 1
             cur.execute("""INSERT INTO trader_brain (call_id, model, delay_secs, context, plan, story, meme,
                            flow, risk, copycat, confidence, verdict, in_tokens, out_tokens,
-                           attention, ctx_ms, api_ms, p_2x, p_rug, prompt_v)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           attention, ctx_ms, api_ms, p_2x, p_rug, prompt_v, has_brief)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                            ON CONFLICT DO NOTHING""",
                         (call_id, MODEL, ctx["our_entry"]["secs_since_entry"], json.dumps(ctx, default=str),
                          v["plan"], _int(v.get("story")), _int(v.get("meme")), _int(v.get("flow")),
                          _int(v.get("risk")), bool(v.get("copycat")), _int(v.get("confidence")),
                          json.dumps(v), tin, tout, str(v.get("attention") or "")[:10] or None,
-                         ctx_ms, api_ms, _int(v.get("p_2x")), _int(v.get("p_rug")), PROMPT_V))
+                         ctx_ms, api_ms, _int(v.get("p_2x")), _int(v.get("p_rug")), PROMPT_V,
+                         "market_today" in ctx))
     conn.commit()
     if kind == "entry":
         print(f"[trader_brain] {ctx.get('symbol')} ({ctx.get('channel')}) call_id={call_id} AT CALL: "
@@ -445,7 +503,7 @@ def run() -> None:
     ensure_table()
     print(f"[trader_brain] RECORD-ONLY v{PROMPT_V}. model={MODEL}, channels={','.join(CHANNELS)}. Per trade: "
           f"{'a buy/pass verdict at the call (no price data) + ' if ENTRY_ON else ''}a plan {DELAY_SECS:g}s after "
-          f"entry. Ceilings: {MAX_PER_DAY} judgements/day and ${MAX_USD_PER_DAY:.2f}/day "
+          f"entry; market brief {'on even call_ids (A/B)' if BRIEF_ON else 'off'}. Ceilings: {MAX_PER_DAY} judgements/day and ${MAX_USD_PER_DAY:.2f}/day "
           f"(~${MAX_USD_PER_DAY * 30:.0f}/month max) at ${PRICE_IN:g}/${PRICE_OUT:g} per M tokens.", flush=True)
     last_tally = time.monotonic()
     tally = defaultdict(int)
@@ -481,22 +539,26 @@ def report(since: str) -> None:
     with conn.cursor() as cur:
         cur.execute("""
             SELECT qp.channel_handle, b.plan, b.story, b.meme, b.flow, b.risk, b.copycat, b.confidence, b.attention,
-                   b.ctx_ms, b.api_ms, b.p_2x, b.p_rug,
+                   b.ctx_ms, b.api_ms, b.p_2x, b.p_rug, coalesce(b.has_brief, false), t.symbol,
+                   b.verdict->>'reason',
                    qp.sol_in, qp.sol_out, qp.exit_reason, qp.peak_multiplier, b.judged_at, qp.exit_time,
                    (SELECT max(o.real_mult) FROM qsim_quote_observations o
                      WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time
                        AND o.real_mult IS NOT NULL) AS post_max
             FROM trader_brain b JOIN qsim_positions qp ON qp.call_id = b.call_id
+            JOIN tokens t ON t.id = qp.token_id
             WHERE qp.status = 'closed' AND qp.sol_in > 0 AND b.judged_at >= %s
               AND coalesce(b.prompt_v, 1) = %s""", (since, PROMPT_V))
         rows = cur.fetchall()
         cur.execute("""
             SELECT qp.channel_handle, e.buy, e.p_2x, e.p_rug, e.ctx_ms, e.api_ms,
+                   coalesce(e.has_brief, false), t.symbol, e.verdict->>'reason',
                    qp.sol_in, qp.sol_out, qp.exit_reason, qp.peak_multiplier,
                    (SELECT max(o.real_mult) FROM qsim_quote_observations o
                      WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time
                        AND o.real_mult IS NOT NULL) AS post_max
             FROM trader_brain_entry e JOIN qsim_positions qp ON qp.call_id = e.call_id
+            JOIN tokens t ON t.id = qp.token_id
             WHERE qp.status = 'closed' AND qp.sol_in > 0 AND e.judged_at >= %s AND e.prompt_v = %s""",
                     (since, PROMPT_V))
         erows = cur.fetchall()
@@ -506,7 +568,7 @@ def report(since: str) -> None:
     items = []
     speed = []
     for (channel, plan, story, meme, flow, risk, copycat, conf, attention, ctx_ms, api_ms, p2, pr,
-         s_in, s_out, reason, peak, judged, exit_t, post) in rows:
+         brief, sym, why, s_in, s_out, reason, peak, judged, exit_t, post) in rows:
         if ctx_ms is not None and api_ms is not None:
             speed.append((ctx_ms, api_ms))
         x = float(s_out or 0) / float(s_in)
@@ -516,7 +578,8 @@ def report(since: str) -> None:
                       "pnl": float(s_out or 0) - float(s_in), "s_in": float(s_in),
                       "bank": "bank" in (reason or ""), "rug": x < 0.30, "hi": hi,
                       "closed_before_judged": exit_t is not None and exit_t <= judged,
-                      "p2": p2, "pr": pr})
+                      "p2": p2, "pr": pr, "p2n": p2, "brief": "with brief" if brief else "no brief",
+                      "sym": sym, "why": why, "x": x})
 
     def line(label, g):
         n = len(g)
@@ -527,15 +590,38 @@ def report(since: str) -> None:
               f"5x {sum(i['hi'] >= 5 for i in g) / n * 100:5.1f}%  median high {statistics.median(his):5.2f}x  "
               f"P&L {sum(i['pnl'] for i in g) / s_in * 100:+6.1f}%/SOL")
 
+    def misses(g, when):
+        """The judgements to read by hand: confident calls that went the other way."""
+        bad_buy = sorted((i for i in g if i["rug"] and (i.get("buy") == "BUY" or (i.get("p2n") or 0) >= 30)),
+                         key=lambda i: -(i.get("p2n") or 0))[:10]
+        bad_pass = sorted((i for i in g if i["hi"] >= 5 and (i.get("buy") == "PASS" or i.get("plan") in
+                                                             ("skip", "exit_early"))),
+                          key=lambda i: -i["hi"])[:10]
+        print(f"\n  WORST MISSES {when} — read these to see WHY it was wrong:")
+        print("   liked it, it rugged:")
+        for i in bad_buy:
+            print(f"    {str(i['sym'])[:12]:12s} {i['channel'][:14]:14s} {i.get('buy') or i.get('plan'):11s} "
+                  f"2x {i.get('p2n')}%  exit {i['x']:.2f}x  — {str(i['why'])[:110]}")
+        if not bad_buy:
+            print("    none")
+        print("   passed / wanted out, it ran 5x+:")
+        for i in bad_pass:
+            print(f"    {str(i['sym'])[:12]:12s} {i['channel'][:14]:14s} {i.get('buy') or i.get('plan'):11s} "
+                  f"2x {i.get('p2n')}%  high {i['hi']:.1f}x  — {str(i['why'])[:110]}")
+        if not bad_pass:
+            print("    none")
+        print()
+
     def bucket(v):
         return "n/a" if v is None else ("<15%" if v < 15 else "15-29%" if v < 30 else "30-49%" if v < 50 else "50%+")
 
     if erows:
         ent = []
         espeed = []
-        for channel, buy, p2, pr, cms, ams, s_in, s_out, reason, peak, post in erows:
+        for channel, buy, p2, pr, cms, ams, brief, sym, why, s_in, s_out, reason, peak, post in erows:
             x = float(s_out or 0) / float(s_in)
             ent.append({"channel": channel, "buy": "BUY" if buy else "PASS", "p2": bucket(p2), "pr": bucket(pr),
+                        "p2n": p2, "brief": "with brief" if brief else "no brief", "sym": sym, "why": why, "x": x,
                         "pnl": float(s_out or 0) - float(s_in), "s_in": float(s_in),
                         "bank": "bank" in (reason or ""), "rug": x < 0.30,
                         "hi": max(float(peak or 0), float(post or 0))})
@@ -560,6 +646,13 @@ def report(since: str) -> None:
                 g = [i for i in ent if i["channel"] == ch and i["buy"] == lab]
                 if g:
                     line(lab, g)
+        print("  A/B — the market_today brief (even call_ids only):")
+        for b in ("with brief", "no brief"):
+            for lab in ("BUY", "PASS"):
+                g = [i for i in ent if i["brief"] == b and i["buy"] == lab]
+                if g:
+                    line(f"{b.split()[0]}-brief {lab}", g)
+        misses(ent, "at the call")
         if espeed:
             es = sorted(espeed)
             print(f"  SPEED at the call: median {es[len(es) // 2] / 1000:.1f}s, "
@@ -591,6 +684,13 @@ def report(since: str) -> None:
         print(f"SPEED (could it decide BEFORE a buy?): data median {q(cs, .5):.1f}s / 90% {q(cs, .9):.1f}s, "
               f"model median {q(ap, .5):.1f}s / 90% {q(ap, .9):.1f}s, total median {q(tot, .5):.1f}s / "
               f"90% {q(tot, .9):.1f}s\n")
+    print("A/B — the market_today brief (even call_ids only):")
+    for b in ("with brief", "no brief"):
+        for p in PLANS:
+            g = [i for i in items if i["brief"] == b and i["plan"] == p]
+            if g:
+                line(f"{b.split()[0]}-brief {p}"[:16], g)
+    misses(items, "at the plan")
     for i in items:
         i["p2"], i["pr"] = bucket(i["p2"]), bucket(i["pr"])
     for key in ("p2", "pr", "attention", "story", "meme", "flow", "risk", "copycat", "confidence"):
