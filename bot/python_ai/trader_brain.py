@@ -68,7 +68,11 @@ PRICE_OUT = float(os.getenv("TRADER_BRAIN_PRICE_OUT", "5.0"))
 PASS_SECS = 10
 
 PLANS = ("hold_longer", "normal", "exit_early", "skip")
-PROMPT_V = 3
+PROMPT_V = 4
+# v4 (2026-11-04): v3 rated every coin ~70% rug / PASS / EXIT_EARLY, calling bundles, snipers, dev
+# selling and thin liquidity red flags — but nearly every called coin has them. Each coin now
+# carries "channel_typical" (7-day medians of those stats on that channel + its real bank and rug
+# rates), and the model judges RELATIVE to the typical coin.
 # v3 (2026-11-04): a "market_today" brief (what ran / rugged / got copied in the last 24 h, top
 # news) is added for EVEN call_ids only — a built-in A/B, so the report can tell whether the
 # brief helps instead of guessing. has_brief is stored on every row.
@@ -81,7 +85,14 @@ story (news, a viral moment, a culture reference people get), an ORIGINAL meme (
 the 30th copy of the same ticker), real buying (volume, many holders, not one bundle), and holders
 who are not about to dump. Copycats of a story that already ran, lazy tickers, heavy
 bundles/snipers, a dev who launches dozens of coins, or a coin already far above the call price
-are the usual losers. If a "market_today" section is present it lists what ran, what rugged and
+are the usual losers.
+IMPORTANT: "channel_typical" shows what an ORDINARY called coin on this channel looks like (median
+bundle %, snipers, liquidity, fake volume, dev selling over the last 7 days) and how often those
+coins really bank 2x and rug. Nearly every called coin has bundles, snipers, some dev selling and
+thin liquidity — on their own those are NOT red flags. Judge this coin RELATIVE to the typical one:
+your p_2x and p_rug should average close to the channel's real rates across coins; BUY / hold
+coins that are clearly better than typical, PASS / exit coins that are clearly worse, and treat
+the ones in between as ordinary. If a "market_today" section is present it lists what ran, what rugged and
 what got copied to death in the last 24 h, plus top news: use it to tell a fresh story from a
 tired one. Judge ONLY from the data given. Give honest, spread-out probabilities:
 p_2x and p_rug should differ from coin to coin, not repeat the same number."""
@@ -241,6 +252,41 @@ def market_brief() -> dict:
     return out
 
 
+_norms_cache: dict[str, tuple[float, dict]] = {}
+
+
+def channel_norms(channel: str) -> dict:
+    """7-day medians of key stats for this channel's qsim coins + real bank/rug rates. Cached 1 h."""
+    hit = _norms_cache.get(channel)
+    if hit and time.monotonic() - hit[0] < 3600:
+        return hit[1]
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT count(*),
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY t.bundle_pct_remaining),
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY t.bundle_pct_initial),
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY t.sniper_count),
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY t.liq_at_detection),
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY t.fake_vol_pct),
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY t.dev_sold_pct),
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY t.vol_1h_at_detection),
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY t.token_age_minutes),
+                   avg((qp.exit_reason LIKE '%%bank%%')::int) FILTER (WHERE qp.status = 'closed'),
+                   avg((qp.sol_out / nullif(qp.sol_in, 0) < 0.3)::int) FILTER (WHERE qp.status = 'closed')
+            FROM qsim_positions qp JOIN tokens t ON t.id = qp.token_id
+            WHERE qp.channel_handle = %s AND qp.entry_time >= now() - interval '7 days'""", (channel,))
+        r = cur.fetchone()
+    f = lambda v, d=1: None if v is None else round(float(v), d)
+    out = {"coins_last_7d": r[0], "median_bundle_pct_remaining": f(r[1]), "median_bundle_pct_initial": f(r[2]),
+           "median_sniper_count": f(r[3], 0), "median_liquidity_usd": f(r[4], 0), "median_fake_vol_pct": f(r[5]),
+           "median_dev_sold_pct": f(r[6]), "median_vol_1h_usd": f(r[7], 0), "median_age_min": f(r[8], 0),
+           "real_bank_2x_rate_pct": f((r[9] or 0) * 100), "real_rug_rate_pct": f((r[10] or 0) * 100)}
+    _norms_cache[channel] = (time.monotonic(), out)
+    return out
+
+
 def has_brief(call_id: int) -> bool:
     return BRIEF_ON and call_id % 2 == 0
 
@@ -354,6 +400,10 @@ def build_context(call_id: int, with_path: bool = True) -> dict | None:
     if not with_path:
         ctx.pop("price_path_since_entry")
         ctx["our_entry"].pop("secs_since_entry")
+    try:
+        ctx["channel_typical"] = channel_norms(channel)
+    except Exception:
+        db.safe_rollback()
     if has_brief(call_id):
         try:
             ctx["market_today"] = market_brief()
