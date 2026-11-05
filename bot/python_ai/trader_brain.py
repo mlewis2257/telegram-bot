@@ -304,9 +304,15 @@ def _int(v):
 
 def run() -> None:
     global _day, _n_today, _usd_today, _capped_noted
+    global API_KEY
     if not API_KEY:
-        print("[trader_brain] ANTHROPIC_API_KEY is not set in .env — nothing to do. Exiting.", flush=True)
-        return
+        # Wait instead of exiting: an exit makes pm2 restart it in a tight loop.
+        print("[trader_brain] ANTHROPIC_API_KEY is not set in .env — waiting (re-checking every 10 min).",
+              flush=True)
+        while not API_KEY:
+            time.sleep(600)
+            load_dotenv(Path(__file__).with_name(".env"), override=True)
+            API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
     ensure_table()
     print(f"[trader_brain] RECORD-ONLY. model={MODEL}, channels={','.join(CHANNELS)}, judges each qsim trade "
           f"{DELAY_SECS:g}s after entry. Ceilings: {MAX_PER_DAY} judgements/day and ${MAX_USD_PER_DAY:.2f}/day "
