@@ -40,6 +40,7 @@ import jupiter
 import peak_guard
 import lane_policy
 import ratchet_shadow
+import alt_exits                         # shadow: early-exit rules on real quotes (never affects exits)
 import live_trader                       # reuse the PURE _effective_fill_mcap only
 from exit_config import EXIT_A_PAPER, EXIT_RIDE, ExitResult, apply_exit_config
 
@@ -1280,6 +1281,7 @@ async def _qsim_tick(pos: dict) -> None:
     # Shadow only: records what a ratcheting trail WOULD have done on this
     # quote stream. Swallows everything; cannot affect the exit below.
     ratchet_shadow.observe(call_id, real_mult)
+    alt_exits.observe(pos, real_mult, sol_out)      # shadow only; swallows its own errors
     synth_cur   = entry * real_mult
     cfg = _qsim_exit_config(pos.get("variant") or "early")
     raw_hard_stop_pct = _qsim_hard_stop_pct(pos, cfg)
@@ -1542,6 +1544,7 @@ def _cleanup(call_id: int) -> None:
     _noroute_streak.pop(call_id, None)
     _runner_window_until.pop(call_id, None)
     _qsim_exit_state.pop(call_id, None)
+    alt_exits.forget(call_id)
 
 
 async def run_qsim_monitor() -> None:
