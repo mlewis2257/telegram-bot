@@ -237,7 +237,8 @@ def _words(s: str) -> list[str]:
 LEARN_NOTE = """
 
 "similar_past_coins" lists closed coins on this channel from the last 7 days whose setup (bundle
-at launch, bundle left, dev selling, snipers, liquidity, fake volume) was most like this one, and
+at launch, bundle left, the dev's bundled share and how much of it was sold, snipers, liquidity,
+fake volume) was most like this one, and
 how each actually ended: "rugged", "stopped", "banked 2x then collapsed" (the 2x bank still paid)
 or "banked 2x and kept running". "similar_summary" counts them. Treat this as hard evidence about
 what this kind of setup does right now: if setups like this mostly rugged, be skeptical even if the
@@ -262,7 +263,8 @@ def _candidates(channel: str) -> list[dict]:
         cur.execute("""
             SELECT qp.call_id, t.symbol, t.mint_address, qp.exit_time, qp.exit_reason,
                    qp.sol_out / nullif(qp.sol_in, 0),
-                   t.bundle_pct_initial, t.bundle_pct_remaining, t.dev_sold_pct, t.sniper_count,
+                   t.bundle_pct_initial, t.bundle_pct_remaining, t.bundled_pct, t.bundled_sold_pct,
+                   t.sniper_count,
                    t.liq_at_detection, t.fake_vol_pct,
                    (SELECT max(o.real_mult) FROM qsim_quote_observations o
                      WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time AND o.real_mult > 0),
@@ -274,7 +276,7 @@ def _candidates(channel: str) -> list[dict]:
               AND qp.entry_time >= now() - interval '7 days' AND qp.exit_time < now()""", (channel,))
         rows = cur.fetchall()
     out = []
-    for (cid, sym, mint, ex_t, reason, x, b0, b1, dev, sn, liq, fake, pmax, plast) in rows:
+    for (cid, sym, mint, ex_t, reason, x, b0, b1, devb, devs, sn, liq, fake, pmax, plast) in rows:
         x = float(x or 0)
         pmax = float(pmax) if pmax is not None else None
         plast = float(plast) if plast is not None else None
@@ -294,7 +296,8 @@ def _candidates(channel: str) -> list[dict]:
         f = lambda v: float(v) if v is not None else None
         out.append({"call_id": cid, "symbol": sym, "mint": mint, "outcome": lab,
                     "kind": "bank" if "bank" in (reason or "") else "rug" if x < 0.30 else "other",
-                    "bundle_launch": f(b0), "bundle_left": f(b1), "dev_sold": f(dev), "snipers": f(sn),
+                    "bundle_launch": f(b0), "bundle_left": f(b1), "dev_bundled": f(devb),
+                    "dev_bundle_sold": f(devs), "snipers": f(sn),
                     "liq": f(liq), "fake_vol": f(fake)})
     _cand_cache[channel] = (time.monotonic(), out)
     return out
@@ -303,9 +306,13 @@ def _candidates(channel: str) -> list[dict]:
 def similar_coins(channel: str, mint: str, tok: dict) -> tuple[list, dict] | None:
     """The SIMILAR_K closed coins with the nearest setup (normalised distance over the stats both have)."""
     import math
-    scale = {"bundle_launch": 30.0, "bundle_left": 8.0, "dev_sold": 20.0, "snipers": 15.0, "fake_vol": 5.0}
+    # dev_bundled / dev_bundle_sold come from the call's "Bundled: X% | Sold: Y%" line (tokens.bundled_pct /
+    # bundled_sold_pct). tokens.dev_sold_pct is a legacy column nothing writes — never use it.
+    scale = {"bundle_launch": 30.0, "bundle_left": 8.0, "dev_bundled": 15.0, "dev_bundle_sold": 15.0,
+             "snipers": 15.0, "fake_vol": 5.0}
     me = {"bundle_launch": tok.get("bundle_pct_initial"), "bundle_left": tok.get("bundle_pct_remaining"),
-          "dev_sold": tok.get("dev_sold_pct"), "snipers": tok.get("sniper_count"),
+          "dev_bundled": tok.get("bundled_pct"), "dev_bundle_sold": tok.get("bundled_sold_pct"),
+          "snipers": tok.get("sniper_count"),
           "liq": tok.get("liq_at_detection"), "fake_vol": tok.get("fake_vol_pct")}
     me = {k: (float(v) if v is not None else None) for k, v in me.items()}
     if sum(v is not None for v in me.values()) < 3:
@@ -329,7 +336,8 @@ def similar_coins(channel: str, mint: str, tok: dict) -> tuple[list, dict] | Non
     scored.sort(key=lambda x: x[0])
     near = [c for _, c in scored[:SIMILAR_K]]
     lst = [{"symbol": c["symbol"], "bundle_launch_pct": c["bundle_launch"], "bundle_left_pct": c["bundle_left"],
-            "dev_sold_pct": c["dev_sold"], "snipers": c["snipers"], "liq_usd": c["liq"], "outcome": c["outcome"]}
+            "dev_bundled_pct": c["dev_bundled"], "dev_bundle_sold_pct": c["dev_bundle_sold"],
+            "snipers": c["snipers"], "liq_usd": c["liq"], "outcome": c["outcome"]}
            for c in near]
     summ = {"of": len(near), "banked": sum(c["kind"] == "bank" for c in near),
             "rugged": sum(c["kind"] == "rug" for c in near),
@@ -394,7 +402,7 @@ def channel_norms(channel: str) -> dict:
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY t.sniper_count),
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY t.liq_at_detection),
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY t.fake_vol_pct),
-                   percentile_cont(0.5) WITHIN GROUP (ORDER BY t.dev_sold_pct),
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY t.bundled_sold_pct),
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY t.vol_1h_at_detection),
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY t.token_age_minutes),
                    avg((qp.exit_reason LIKE '%%bank%%')::int) FILTER (WHERE qp.status = 'closed'),
@@ -405,7 +413,7 @@ def channel_norms(channel: str) -> dict:
     f = lambda v, d=1: None if v is None else round(float(v), d)
     out = {"coins_last_7d": r[0], "median_bundle_pct_remaining": f(r[1]), "median_bundle_pct_initial": f(r[2]),
            "median_sniper_count": f(r[3], 0), "median_liquidity_usd": f(r[4], 0), "median_fake_vol_pct": f(r[5]),
-           "median_dev_sold_pct": f(r[6]), "median_vol_1h_usd": f(r[7], 0), "median_age_min": f(r[8], 0),
+           "median_dev_bundle_sold_pct": f(r[6]), "median_vol_1h_usd": f(r[7], 0), "median_age_min": f(r[8], 0),
            "real_bank_2x_rate_pct": f((r[9] or 0) * 100), "real_rug_rate_pct": f((r[10] or 0) * 100)}
     _norms_cache[channel] = (time.monotonic(), out)
     return out
