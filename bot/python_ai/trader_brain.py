@@ -69,6 +69,13 @@ PASS_SECS = 10
 
 PLANS = ("hold_longer", "normal", "exit_early", "skip")
 PROMPT_V = 5
+# v6 (2026-11-06): LEARNING arm. Same as v5 plus "similar_past_coins": the closed coins on the same
+# channel (last 7 days) whose setup was most like this one, and how each ended. Even call_ids get
+# v6, odd call_ids stay v5 — a live A/B on the same days. The market_today brief is off (it showed
+# no effect over Nov 5-6), so the split is free for this test.
+LEARN_V = 6
+LEARN_ON = os.getenv("TRADER_BRAIN_LEARN", "1") != "0"
+SIMILAR_K = 8
 # v5 (2026-11-04): v4 still said PASS / EXIT_EARLY on every coin with p_2x ~12% on all of them
 # (no ranking), misread a below-median bundle % as a red flag, and exited on first-minute dips.
 # Adds vs_typical 1-10 (5 = ordinary for the channel, ~a third at 6+); BUY = vs_typical >= 6.
@@ -79,7 +86,7 @@ PROMPT_V = 5
 # v3 (2026-11-04): a "market_today" brief (what ran / rugged / got copied in the last 24 h, top
 # news) is added for EVEN call_ids only — a built-in A/B, so the report can tell whether the
 # brief helps instead of guessing. has_brief is stored on every row.
-BRIEF_ON = os.getenv("TRADER_BRAIN_BRIEF", "1") != "0"
+BRIEF_ON = os.getenv("TRADER_BRAIN_BRIEF", "0") != "0"     # off since v6 (no effect Nov 5-6)
 ENTRY_ON = os.getenv("TRADER_BRAIN_ENTRY", "1") != "0"
 
 _GUIDE = """Most called coins fail; a few run 5-50x. Typically 10-25% of called coins reach 2x and
@@ -227,6 +234,109 @@ def _words(s: str) -> list[str]:
     return [w for w in re.findall(r"[a-z0-9]{3,}", (s or "").lower()) if w not in stop][:4]
 
 
+LEARN_NOTE = """
+
+"similar_past_coins" lists closed coins on this channel from the last 7 days whose setup (bundle
+at launch, bundle left, dev selling, snipers, liquidity, fake volume) was most like this one, and
+how each actually ended: "rugged", "stopped", "banked 2x then collapsed" (the 2x bank still paid)
+or "banked 2x and kept running". "similar_summary" counts them. Treat this as hard evidence about
+what this kind of setup does right now: if setups like this mostly rugged, be skeptical even if the
+coin looks clean; if they mostly banked, lean positive. Weigh it together with everything else."""
+
+
+def version_for(call_id: int) -> int:
+    return LEARN_V if (LEARN_ON and call_id % 2 == 0) else PROMPT_V
+
+
+_cand_cache: dict[str, tuple[float, list]] = {}
+
+
+def _candidates(channel: str) -> list[dict]:
+    """Closed qsim coins on this channel, last 7 days, with setup + outcome. Cached 10 min."""
+    hit = _cand_cache.get(channel)
+    if hit and time.monotonic() - hit[0] < 600:
+        return hit[1]
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT qp.call_id, t.symbol, t.mint_address, qp.exit_time, qp.exit_reason,
+                   qp.sol_out / nullif(qp.sol_in, 0),
+                   t.bundle_pct_initial, t.bundle_pct_remaining, t.dev_sold_pct, t.sniper_count,
+                   t.liq_at_detection, t.fake_vol_pct,
+                   (SELECT max(o.real_mult) FROM qsim_quote_observations o
+                     WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time AND o.real_mult > 0),
+                   (SELECT o.real_mult FROM qsim_quote_observations o
+                     WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time AND o.real_mult > 0
+                     ORDER BY o.observed_at DESC LIMIT 1)
+            FROM qsim_positions qp JOIN tokens t ON t.id = qp.token_id
+            WHERE qp.channel_handle = %s AND qp.status = 'closed' AND qp.sol_in > 0
+              AND qp.entry_time >= now() - interval '7 days' AND qp.exit_time < now()""", (channel,))
+        rows = cur.fetchall()
+    out = []
+    for (cid, sym, mint, ex_t, reason, x, b0, b1, dev, sn, liq, fake, pmax, plast) in rows:
+        x = float(x or 0)
+        pmax = float(pmax) if pmax is not None else None
+        plast = float(plast) if plast is not None else None
+        if "bank" in (reason or ""):
+            if plast is not None and plast >= 1.5:
+                lab = f"banked 2x and kept running (high {pmax or x:.1f}x, still {plast:.1f}x)"
+            elif pmax is not None and pmax >= 3:
+                lab = f"banked 2x, ran to {pmax:.1f}x, then collapsed to {plast or 0:.2f}x"
+            else:
+                lab = f"banked 2x then collapsed to {plast if plast is not None else 0:.2f}x"
+        elif x < 0.30:
+            lab = f"rugged ({x:.2f}x)"
+        elif x >= 1.0:
+            lab = f"small win ({x:.2f}x)"
+        else:
+            lab = f"stopped ({x:.2f}x)" + (f", later ran to {pmax:.1f}x" if pmax and pmax >= 2 else "")
+        f = lambda v: float(v) if v is not None else None
+        out.append({"call_id": cid, "symbol": sym, "mint": mint, "outcome": lab,
+                    "kind": "bank" if "bank" in (reason or "") else "rug" if x < 0.30 else "other",
+                    "bundle_launch": f(b0), "bundle_left": f(b1), "dev_sold": f(dev), "snipers": f(sn),
+                    "liq": f(liq), "fake_vol": f(fake)})
+    _cand_cache[channel] = (time.monotonic(), out)
+    return out
+
+
+def similar_coins(channel: str, mint: str, tok: dict) -> tuple[list, dict] | None:
+    """The SIMILAR_K closed coins with the nearest setup (normalised distance over the stats both have)."""
+    import math
+    scale = {"bundle_launch": 30.0, "bundle_left": 8.0, "dev_sold": 20.0, "snipers": 15.0, "fake_vol": 5.0}
+    me = {"bundle_launch": tok.get("bundle_pct_initial"), "bundle_left": tok.get("bundle_pct_remaining"),
+          "dev_sold": tok.get("dev_sold_pct"), "snipers": tok.get("sniper_count"),
+          "liq": tok.get("liq_at_detection"), "fake_vol": tok.get("fake_vol_pct")}
+    me = {k: (float(v) if v is not None else None) for k, v in me.items()}
+    if sum(v is not None for v in me.values()) < 3:
+        return None
+    scored = []
+    for c in _candidates(channel):
+        if c["mint"] == mint:
+            continue
+        d, n = 0.0, 0
+        for k, sc in scale.items():
+            if me[k] is not None and c[k] is not None:
+                d += abs(me[k] - c[k]) / sc
+                n += 1
+        if me["liq"] and c["liq"] and me["liq"] > 0 and c["liq"] > 0:
+            d += abs(math.log(me["liq"] / c["liq"])) / 0.5
+            n += 1
+        if n >= 3:
+            scored.append((d / n, c))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: x[0])
+    near = [c for _, c in scored[:SIMILAR_K]]
+    lst = [{"symbol": c["symbol"], "bundle_launch_pct": c["bundle_launch"], "bundle_left_pct": c["bundle_left"],
+            "dev_sold_pct": c["dev_sold"], "snipers": c["snipers"], "liq_usd": c["liq"], "outcome": c["outcome"]}
+           for c in near]
+    summ = {"of": len(near), "banked": sum(c["kind"] == "bank" for c in near),
+            "rugged": sum(c["kind"] == "rug" for c in near),
+            "stopped_or_other": sum(c["kind"] == "other" for c in near)}
+    return lst, summ
+
+
 _brief_cache: tuple[float, dict] | None = None
 
 
@@ -305,7 +415,7 @@ def has_brief(call_id: int) -> bool:
     return BRIEF_ON and call_id % 2 == 0
 
 
-def build_context(call_id: int, with_path: bool = True) -> dict | None:
+def build_context(call_id: int, with_path: bool = True, learn: bool = False) -> dict | None:
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor() as cur:
@@ -423,6 +533,13 @@ def build_context(call_id: int, with_path: bool = True) -> dict | None:
             ctx["market_today"] = market_brief()
         except Exception:
             db.safe_rollback()
+    if learn:
+        try:
+            sim = similar_coins(channel, mint, tok)
+            if sim:
+                ctx["similar_past_coins"], ctx["similar_summary"] = sim
+        except Exception:
+            db.safe_rollback()
     return ctx
 
 
@@ -497,13 +614,17 @@ def _one(kind: str, call_id: int, tally) -> None:
     """Judge one trade (kind 'entry' or 'plan') and store it."""
     global _n_today, _usd_today
     t0 = time.monotonic()
-    ctx = build_context(call_id, with_path=(kind == "plan"))
+    ver = version_for(call_id)
+    ctx = build_context(call_id, with_path=(kind == "plan"), learn=(ver == LEARN_V))
     ctx_ms = int((time.monotonic() - t0) * 1000)
     if not ctx:
         return
     t1 = time.monotonic()
     try:
-        v, tin, tout, err = judge(ctx, ENTRY_SYSTEM if kind == "entry" else SYSTEM, kind)
+        system = ENTRY_SYSTEM if kind == "entry" else SYSTEM
+        if ver == LEARN_V:
+            system = system + LEARN_NOTE
+        v, tin, tout, err = judge(ctx, system, kind)
     except requests.RequestException as e:
         v, tin, tout, err = None, 0, 0, f"{type(e).__name__}: {e}"
     api_ms = int((time.monotonic() - t1) * 1000)
@@ -522,7 +643,7 @@ def _one(kind: str, call_id: int, tally) -> None:
             cur.execute("""INSERT INTO trader_brain_entry (call_id, model, prompt_v, buy, p_2x, p_rug, story, meme,
                            attention, verdict, context, ctx_ms, api_ms, in_tokens, out_tokens, has_brief, vs_typical)
                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
-                        (call_id, MODEL, PROMPT_V, v["buy"], _int(v.get("p_2x")), _int(v.get("p_rug")),
+                        (call_id, MODEL, ver, v["buy"], _int(v.get("p_2x")), _int(v.get("p_rug")),
                          _int(v.get("story")), _int(v.get("meme")), str(v.get("attention") or "")[:10] or None,
                          json.dumps(v), json.dumps(ctx, default=str), ctx_ms, api_ms, tin, tout,
                          "market_today" in ctx, _int(v.get("vs_typical"))))
@@ -537,7 +658,7 @@ def _one(kind: str, call_id: int, tally) -> None:
                          v["plan"], _int(v.get("story")), _int(v.get("meme")), _int(v.get("flow")),
                          _int(v.get("risk")), bool(v.get("copycat")), _int(v.get("confidence")),
                          json.dumps(v), tin, tout, str(v.get("attention") or "")[:10] or None,
-                         ctx_ms, api_ms, _int(v.get("p_2x")), _int(v.get("p_rug")), PROMPT_V,
+                         ctx_ms, api_ms, _int(v.get("p_2x")), _int(v.get("p_rug")), ver,
                          "market_today" in ctx, _int(v.get("vs_typical"))))
     conn.commit()
     if kind == "entry":
@@ -565,7 +686,8 @@ def run() -> None:
             load_dotenv(Path(__file__).with_name(".env"), override=True)
             API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
     ensure_table()
-    print(f"[trader_brain] RECORD-ONLY v{PROMPT_V}. model={MODEL}, channels={','.join(CHANNELS)}. Per trade: "
+    print(f"[trader_brain] RECORD-ONLY v{PROMPT_V}"
+          f"{f' + v{LEARN_V} learning arm (similar past coins) on even call_ids' if LEARN_ON else ''}. model={MODEL}, channels={','.join(CHANNELS)}. Per trade: "
           f"{'a buy/pass verdict at the call (no price data) + ' if ENTRY_ON else ''}a plan {DELAY_SECS:g}s after "
           f"entry; market brief {'on even call_ids (A/B)' if BRIEF_ON else 'off'}. Ceilings: {MAX_PER_DAY} judgements/day and ${MAX_USD_PER_DAY:.2f}/day "
           f"(~${MAX_USD_PER_DAY * 30:.0f}/month max) at ${PRICE_IN:g}/${PRICE_OUT:g} per M tokens.", flush=True)
@@ -598,7 +720,7 @@ def run() -> None:
 
 # ── Report ──────────────────────────────────────────────────────────────────────
 
-def report(since: str) -> None:
+def report(since: str, PROMPT_V: int = PROMPT_V) -> None:
     conn = db.get_conn()
     with conn.cursor() as cur:
         cur.execute("""
@@ -774,7 +896,14 @@ def report(since: str) -> None:
 if __name__ == "__main__":
     if "--report" in sys.argv:
         i = sys.argv.index("--since") if "--since" in sys.argv else -1
-        report(sys.argv[i + 1] if i > 0 else "2026-11-05")
+        since = sys.argv[i + 1] if i > 0 else "2026-11-05"
+        j = sys.argv.index("--v") if "--v" in sys.argv else -1
+        if j > 0:
+            report(since, int(sys.argv[j + 1]))
+        else:
+            for ver in (PROMPT_V, LEARN_V):
+                print(f"\n{'=' * 30} PROMPT v{ver} {'(learning: similar past coins)' if ver == LEARN_V else ''} {'=' * 30}")
+                report(since, ver)
     elif "--dry" in sys.argv:
         # print the context the model would see for one call_id, without calling the API
         i = sys.argv.index("--dry")
