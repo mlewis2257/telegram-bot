@@ -134,11 +134,22 @@ FROZEN = [
      lambda r: None if not r["security_flag"] else r["security_flag"] == "safe"),
     ("solwhaletrending", "followed wallets 3+ (the live lane)",
      lambda r: None if r["n_holding"] is None else r["n_holding"] >= 3),
+    # ── frozen 2026-11-07 (Nov 1-6 by-day scan + farm-fingerprint + 24h-survival checks). pass = KEEP. ──
+    ("solwhaletrending", "[11-07] keep dev bundled <40% (skip 40%+)",
+     lambda r: None if r["bundled_pct"] is None else float(r["bundled_pct"]) < 40),
+    ("solwhaletrending", "[11-07] keep dev bundled <10% only",
+     lambda r: None if r["bundled_pct"] is None else float(r["bundled_pct"]) < 10),
+    ("solearlytrending", "[11-07] keep vol/mcap outside 0.25-0.5",
+     lambda r: None if not (r["vol_1h_at_detection"] and r["mcap_at_call"])
+     else not (0.25 <= float(r["vol_1h_at_detection"]) / float(r["mcap_at_call"]) < 0.5)),
+    ("solearlytrending", "[11-07] keep dev bundled <40% (skip 40%+)",
+     lambda r: None if r["bundled_pct"] is None else float(r["bundled_pct"]) < 40),
 ]
 
 
 def frozen_report(clean) -> None:
-    print("\nFROZEN RULES — forward test (rules fixed 2026-11-03; pass vs fail on this window):")
+    print("\nFROZEN RULES — forward test (pass = the coins the rule KEEPS, fail = the ones it SKIPS).\n"
+          "Score each rule only on days after the date in its name — earlier days are where it was found.")
     print(f"  {'rule':60s} {'group':5s} {'n':>4s} {'bank%':>6s} {'rug%':>5s} {'P&L/SOL':>8s}  days")
     for ch, name, rule in FROZEN:
         rs = [r for r in clean if r["channel_handle"] == ch]
