@@ -43,6 +43,7 @@ SELECT qp.call_id, qp.channel_handle, qp.entry_time, t.mint_address, t.symbol,
        qp.sol_in, qp.sol_out, qp.status, qp.exit_reason, qp.peak_multiplier,
        t.security_flag, c.conviction_score, c.mcap_at_call, qp.entry_price,
        t.token_age_minutes, t.bundle_pct_remaining, t.sniper_count, f.n_holding,
+       t.vol_1h_at_detection, t.fake_vol_pct, t.bundled_pct, t.bundled_sold_pct,
        hs.supply_ui, top.top1, top.top10, top.n2,
        nt.mint IS NOT NULL AS in_feed, nt.dev_buy_sol,
        (SELECT max(o.real_mult) FROM qsim_quote_observations o
@@ -102,6 +103,13 @@ def features(r: dict) -> dict:
         "2%+ wallets": bucket(r["n2"] if r["supply_ui"] else None, [1, 4, 8, 1e9], ["0", "1-3", "4-7", "8+"]),
         "hour UTC": f"{r['entry_time'].hour // 6 * 6:02d}-{r['entry_time'].hour // 6 * 6 + 5:02d}",
         "big name": "yes" if BIG_NAMES.search((r["symbol"] or "").lower()) else "no",
+        # 2026-11-06: 1h volume at the call / call mcap (a common "is the volume real" screen)
+        "vol/mcap": bucket(float(r["vol_1h_at_detection"]) / float(r["mcap_at_call"])
+                           if r["vol_1h_at_detection"] and r["mcap_at_call"] else None,
+                           [0.25, 0.5, 1.0, 2.0, 1e9], ["<0.25", "0.25-0.5", "0.5-1", "1-2", "2+"]),
+        "fake vol %": bucket(r["fake_vol_pct"], [1, 3, 10, 1e9], ["<1", "1-3", "3-10", "10+"]),
+        # the call's "Bundled: X% | Sold: Y%" line (tokens.dev_sold_pct is a dead column)
+        "dev bundled": bucket(r["bundled_pct"], [10, 40, 1e9], ["<10", "10-40", "40+"]),
         # creation seen by news_recorder's free feed (only meaningful while the recorder was up)
         "in feed": "yes" if r["in_feed"] else "no",
         "dev buy SOL": bucket(r["dev_buy_sol"], [0.05, 0.5, 3, 1e9], ["<0.05", "0.05-0.5", "0.5-3", "3+"],
@@ -212,6 +220,8 @@ def main() -> None:
     ap.add_argument("--pairs", action="store_true", help="also scan two-feature combinations")
     ap.add_argument("--combined", action="store_true",
                     help="walk-forward test of an added-up score over all features (learn one half, test the other)")
+    ap.add_argument("--feature", default="",
+                    help='per-DAY table for one feature, e.g. "vol/mcap" (a group only counts if it holds day after day)')
     ap.add_argument("--only", default="",
                     help='restrict to one group first, e.g. "wallets=3+" (then scan features within it)')
     ap.add_argument("--frozen", action="store_true", help="forward test of the rules frozen on 2026-11-03")
@@ -235,6 +245,32 @@ def main() -> None:
         clean.append(r)
     print(f"{len(clean)} closed qsim trades since {a.since} ({len(rows) - len(clean)} duplicate opens dropped). "
           f"bank = qsim 2x bank; rug = stop filled < 0.30x; runner = peak or after-exit high >= 5x.")
+
+    if a.feature:
+        channels = [a.channel.lstrip("@")] if a.channel else ["solwhaletrending", "solearlytrending", "solhousesignal"]
+        for ch in channels:
+            rs = [r for r in clean if r["channel_handle"] == ch]
+            if not rs:
+                continue
+            groups = defaultdict(lambda: defaultdict(list))
+            for r in rs:
+                groups[features(r).get(a.feature, "n/a")][r["entry_time"].date()].append(outcome(r))
+            days = sorted({r["entry_time"].date() for r in rs})
+            print(f"\n=== {ch}: '{a.feature}' by day (P&L per SOL, n in brackets) ===")
+            print(f"  {'value':12s} " + " ".join(f"{str(d)[5:]:>12s}" for d in days) + f" {'ALL':>14s}")
+            allrow = {d: [o for g in groups.values() for o in g[d]] for d in days}
+            for val in sorted(groups, key=str) + ["(channel)"]:
+                cells = []
+                src = allrow if val == "(channel)" else groups[val]
+                for d in days:
+                    g = src.get(d, [])
+                    cells.append(f"{per_sol(g):+6.1f} ({len(g):3d})" if g else f"{'-':>12s}")
+                every = [o for d in days for o in src.get(d, [])]
+                n, bank, rug, _, pnl = stats(every)
+                cells.append(f"{pnl:+6.1f} ({n:4d})")
+                print(f"  {str(val):12s} " + " ".join(cells) + f"   bank {bank:4.1f}% rug {rug:4.1f}%")
+        print("\nA group is worth a rule only if it beats the (channel) row on most days, not just overall.")
+        return
 
     if a.frozen:
         frozen_report(clean)
