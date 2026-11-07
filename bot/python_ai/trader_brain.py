@@ -73,7 +73,11 @@ PROMPT_V = 5
 # channel (last 7 days) whose setup was most like this one, and how each ended. Even call_ids get
 # v6, odd call_ids stay v5 — a live A/B on the same days. The market_today brief is off (it showed
 # no effect over Nov 5-6), so the split is free for this test.
-LEARN_V = 6
+LEARN_V = 7
+# v7 (2026-11-07): v6 bought NOTHING on Nov 7 (0 of 57; the coins it passed made +3%) because
+# almost every coin's neighbours read "6 of 8 stopped" — which is simply the channel norm (~20% bank).
+# v7 gives the neighbours' bank / rug rates NEXT TO the channel's real rates with a label
+# (better / about normal / worse) and says plainly that most coins stopping is normal.
 LEARN_ON = os.getenv("TRADER_BRAIN_LEARN", "1") != "0"
 SIMILAR_K = 8
 # v5 (2026-11-04): v4 still said PASS / EXIT_EARLY on every coin with p_2x ~12% on all of them
@@ -238,11 +242,13 @@ LEARN_NOTE = """
 
 "similar_past_coins" lists closed coins on this channel from the last 7 days whose setup (bundle
 at launch, bundle left, the dev's bundled share and how much of it was sold, snipers, liquidity,
-fake volume) was most like this one, and
-how each actually ended: "rugged", "stopped", "banked 2x then collapsed" (the 2x bank still paid)
-or "banked 2x and kept running". "similar_summary" counts them. Treat this as hard evidence about
-what this kind of setup does right now: if setups like this mostly rugged, be skeptical even if the
-coin looks clean; if they mostly banked, lean positive. Weigh it together with everything else."""
+fake volume) was most like this one, and how each actually ended: "rugged", "stopped", "banked 2x
+then collapsed" (the 2x bank still paid) or "banked 2x and kept running".
+"similar_vs_channel" compares them with the channel's REAL rates. IMPORTANT: on these channels most
+coins stop or rug — only about one in five banks 2x — so "6 of 8 stopped" is NORMAL and is not a
+warning. Only let the similar coins move you when similar_vs_channel says "worse" (they rugged or
+lost clearly more than usual: lean PASS) or "better" (they banked clearly more than usual: lean
+BUY). When it says "about normal", ignore them and judge the coin on everything else."""
 
 
 def version_for(call_id: int) -> int:
@@ -546,6 +552,21 @@ def build_context(call_id: int, with_path: bool = True, learn: bool = False) -> 
             sim = similar_coins(channel, mint, tok)
             if sim:
                 ctx["similar_past_coins"], ctx["similar_summary"] = sim
+                summ, typ = sim[1], ctx.get("channel_typical") or {}
+                n = summ["of"] or 1
+                bank_pct, rug_pct = summ["banked"] / n * 100, summ["rugged"] / n * 100
+                cb = float(typ.get("real_bank_2x_rate_pct") or 20)
+                cr = float(typ.get("real_rug_rate_pct") or 20)
+                if rug_pct >= cr + 25 or (bank_pct <= cb - 15 and rug_pct >= cr + 10):
+                    label = "worse"
+                elif bank_pct >= cb + 20 and rug_pct <= cr + 5:
+                    label = "better"
+                else:
+                    label = "about normal"
+                ctx["similar_vs_channel"] = {
+                    "similar_banked_pct": round(bank_pct), "channel_bank_pct": round(cb),
+                    "similar_rugged_pct": round(rug_pct), "channel_rug_pct": round(cr),
+                    "verdict": label}
         except Exception:
             db.safe_rollback()
     return ctx
