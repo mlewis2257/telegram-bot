@@ -153,6 +153,14 @@ def store_migration(msg: dict) -> bool:
     return hit
 
 
+# 2026-11-07: creations stopped being recorded at ~06:00 UTC Nov 4 with nothing in the log.
+# A socket that stays open (pings answered) but stops delivering data hangs `async for` forever,
+# so the receive now has a deadline: pump.fun makes several coins a minute, so STALL_S without a
+# single create means the subscription is dead — say so and reconnect.
+STALL_S = float(os.getenv("NEWS_TOKEN_STALL_S", "180"))
+_last_create = [0.0]
+
+
 async def new_token_loop(stats: dict) -> None:
     import websockets
     while True:
@@ -162,13 +170,27 @@ async def new_token_loop(stats: dict) -> None:
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 # same connection (PumpPortal allows one) — graduations, the launch outcome label
                 await ws.send(json.dumps({"method": "subscribeMigration"}))
-                async for raw in ws:
+                print("[news] new-token feed connected", flush=True)
+                _last_create[0] = time.monotonic()
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                    except asyncio.TimeoutError:
+                        raw = None
+                    if time.monotonic() - _last_create[0] > STALL_S:
+                        print(f"[news] no new coin for {STALL_S:.0f}s — feed stalled, reconnecting", flush=True)
+                        stats["stall_reconnects"] = stats.get("stall_reconnects", 0) + 1
+                        break
+                    if raw is None:
+                        continue
                     try:
                         msg = json.loads(raw)
                     except ValueError:
                         continue
                     if not isinstance(msg, dict) or not msg.get("mint"):
                         continue
+                    if msg.get("txType") == "create":
+                        _last_create[0] = time.monotonic()
                     if msg.get("txType") != "create":
                         if msg.get("txType") == "migrate" or "pool" in msg:
                             if not stats.get("_migration_keys_shown"):
@@ -199,8 +221,10 @@ async def new_token_loop(stats: dict) -> None:
 async def tally_loop(stats: dict) -> None:
     while True:
         await asyncio.sleep(1800)
+        ago = time.monotonic() - _last_create[0] if _last_create[0] else -1
         print("[news] 30m: " + " ".join(f"{k}={v}" for k, v in sorted(stats.items())
-                                        if not k.startswith("_")), flush=True)
+                                        if not k.startswith("_"))
+              + f" last_coin={ago:.0f}s_ago", flush=True)
         shown = stats.get("_migration_keys_shown")
         stats.clear()
         if shown:
