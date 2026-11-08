@@ -3227,6 +3227,66 @@ def is_live_followed(call_id: int) -> bool:
         return cur.fetchone() is not None
 
 
+def ensure_live_brain_table() -> None:
+    """Live positions opened by the brain lane (live_trader LIVE_BRAIN_LANE). Same contract as
+    live_followed_positions: written BEFORE the buy, so an exit process never sees such a
+    position without its row. Idempotent."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_brain_positions (
+                call_id     integer PRIMARY KEY,
+                score       integer,
+                version     integer,
+                dev_bundled numeric,
+                marked_at   timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.commit()
+
+
+def mark_live_brain(call_id: int, score: int | None, version: int | None,
+                    dev_bundled: float | None) -> None:
+    ensure_live_brain_table()
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO live_brain_positions (call_id, score, version, dev_bundled)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (call_id) DO UPDATE SET score = EXCLUDED.score, version = EXCLUDED.version,
+                                                dev_bundled = EXCLUDED.dev_bundled
+            """, (call_id, score, version, dev_bundled))
+        conn.commit()
+
+
+def is_live_brain(call_id: int) -> bool:
+    """True if call_id's live position was opened by the brain lane. A missing table means
+    no such position was ever opened."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('live_brain_positions')")
+        if cur.fetchone()[0] is None:
+            return False
+        cur.execute("SELECT 1 FROM live_brain_positions WHERE call_id = %s", (call_id,))
+        return cur.fetchone() is not None
+
+
+def get_token_bundled_pct(mint: str) -> float | None:
+    """The dev's bundled share of supply from the call's 'Bundled: X% | Sold: Y%' line
+    (tokens.bundled_pct). None when unknown. NOTE tokens.dev_sold_pct is a dead column."""
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute("SELECT bundled_pct FROM tokens WHERE mint_address = %s", (mint,))
+        r = cur.fetchone()
+    return float(r[0]) if r and r[0] is not None else None
+
+
 def get_holdings_watch_coins(after_exit_mins: float, limit: int,
                               channels: list[str] | None = None) -> list[dict]:
     """Coins to check: live positions open or closed within `after_exit_mins`, then

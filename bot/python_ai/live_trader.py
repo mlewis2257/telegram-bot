@@ -390,6 +390,128 @@ print("[live] followed-wallets lane: "
 _followed_cache: dict[int, bool] = {}
 
 
+# ── Brain lane ─────────────────────────────────────────────────────────────────────
+# 2026-11-08. trader_brain (Claude judging each call against the channel's typical coin) was
+# recorded on every qsim trade from Nov 5. Its BUYs (score 6+) never did worse than its PASSes on
+# any day; on solwhaletrending, brain BUY + dev bundled < 40% ran +6.3%/SOL on normal exits over
+# Nov 6-8 (17 trades; +10.6% on 30 over 4 days). Early exits HURT on this channel, so this lane
+# uses qsim's own exits: hard stop LIVE_BRAIN_STOP, bank LIVE_BRAIN_BANK, today's profit floor /
+# time stop otherwise.
+#
+# A SEPARATE lane, like the followed lane: a call on LIVE_BRAIN_CHANNELS / CATEGORIES / DAYS is
+# bought only if (1) the dev's bundled share (the call's "Bundled: X%" line) is below
+# LIVE_BRAIN_MAX_DEV_BUNDLED and (2) the brain's at-call verdict (version LIVE_BRAIN_VERSION) scores
+# LIVE_BRAIN_MIN_SCORE or more, asked right before the buy with a LIVE_BRAIN_TIMEOUT_S limit.
+# Anything else — a lower score, a timeout, no API key, a bad answer — means NO brain buy (the call
+# falls back to the regular lane rules, which are off when those lanes are off). It skips the
+# regular lane's entry filter and young-size gate (the brain lane was measured on every flag and
+# mcap); every safety guard still applies (kill switch, breakers, max positions, duplicate /
+# cooldown, balance, blocked channels, mcap ceiling, dev gate, max exec ratio, roundtrip, the
+# 0.25x dead-coin floor). Positions are marked in live_brain_positions BEFORE the buy (no mark,
+# no buy) and exit on the brain lane's own numbers in both exit processes.
+#   LIVE_BRAIN_LANE=on                   off unless exactly 'on'
+#   LIVE_BRAIN_CHANNELS=solwhaletrending
+#   LIVE_BRAIN_CATEGORIES=none,low_score
+#   LIVE_BRAIN_DAYS=Mon,Tue,Wed,Thu,Fri,Sun   UTC weekdays (Saturday out by default)
+#   LIVE_BRAIN_SIZE_SOL=0.05              capped by LIVE_SIZE_MAX_SOL
+#   LIVE_BRAIN_STOP=0.80  LIVE_BRAIN_BANK=2.0
+#   LIVE_BRAIN_MIN_SCORE=6  LIVE_BRAIN_VERSION=5  LIVE_BRAIN_MAX_DEV_BUNDLED=40
+#   LIVE_BRAIN_TIMEOUT_S=10  LIVE_BRAIN_MIN_ENTRY_RATIO=0.25
+#   LIVE_BRAIN_MAX_VERDICTS_PER_DAY=120 (read by trader_brain)
+LIVE_BRAIN_LANE = os.getenv("LIVE_BRAIN_LANE", "off").strip().lower() == "on"
+LIVE_BRAIN_CHANNELS = {c.strip().lstrip("@") for c in
+                       os.getenv("LIVE_BRAIN_CHANNELS", "solwhaletrending").split(",") if c.strip()}
+LIVE_BRAIN_CATEGORIES = {c.strip() for c in
+                         os.getenv("LIVE_BRAIN_CATEGORIES", "none,low_score").split(",") if c.strip()}
+LIVE_BRAIN_DAYS = {d.strip()[:3].title() for d in
+                   os.getenv("LIVE_BRAIN_DAYS", "Mon,Tue,Wed,Thu,Fri,Sun").split(",") if d.strip()}
+LIVE_BRAIN_SIZE_SOL = entry_quality.env_float(os.getenv("LIVE_BRAIN_SIZE_SOL"), 0.05)
+LIVE_BRAIN_STOP = entry_quality.env_float(os.getenv("LIVE_BRAIN_STOP"), 0.80)
+LIVE_BRAIN_BANK = entry_quality.env_float(os.getenv("LIVE_BRAIN_BANK"), 2.0)
+LIVE_BRAIN_MIN_SCORE = int(entry_quality.env_float(os.getenv("LIVE_BRAIN_MIN_SCORE"), 6.0))
+LIVE_BRAIN_VERSION = int(entry_quality.env_float(os.getenv("LIVE_BRAIN_VERSION"), 5.0))
+LIVE_BRAIN_MAX_DEV_BUNDLED = entry_quality.env_float(os.getenv("LIVE_BRAIN_MAX_DEV_BUNDLED"), 40.0)
+LIVE_BRAIN_TIMEOUT_S = entry_quality.env_float(os.getenv("LIVE_BRAIN_TIMEOUT_S"), 10.0)
+LIVE_BRAIN_MIN_ENTRY_RATIO = entry_quality.env_float(os.getenv("LIVE_BRAIN_MIN_ENTRY_RATIO"), 0.25)
+
+
+def _brain_settings_problems() -> list[str]:
+    bad = []
+    try:
+        size_cap = float(os.getenv("LIVE_SIZE_MAX_SOL", "1.0") or "1.0")
+    except ValueError:
+        size_cap = 1.0
+    if not (0.0 < LIVE_BRAIN_SIZE_SOL <= size_cap):
+        bad.append(f"LIVE_BRAIN_SIZE_SOL={LIVE_BRAIN_SIZE_SOL:g} not in (0, {size_cap:g}]")
+    if not (0.5 <= LIVE_BRAIN_STOP < 1.0):
+        bad.append(f"LIVE_BRAIN_STOP={LIVE_BRAIN_STOP:g} not in [0.5, 1)")
+    if not (LIVE_BRAIN_BANK > 1.0):
+        bad.append(f"LIVE_BRAIN_BANK={LIVE_BRAIN_BANK:g} must be above 1")
+    if not (1 <= LIVE_BRAIN_MIN_SCORE <= 10):
+        bad.append(f"LIVE_BRAIN_MIN_SCORE={LIVE_BRAIN_MIN_SCORE} not in 1-10")
+    if LIVE_BRAIN_VERSION not in (5, 7):
+        bad.append(f"LIVE_BRAIN_VERSION={LIVE_BRAIN_VERSION} must be 5 or 7")
+    if not (0 < LIVE_BRAIN_MAX_DEV_BUNDLED <= 100):
+        bad.append(f"LIVE_BRAIN_MAX_DEV_BUNDLED={LIVE_BRAIN_MAX_DEV_BUNDLED:g} not in (0, 100]")
+    if not (1.0 <= LIVE_BRAIN_TIMEOUT_S <= 30.0):
+        bad.append(f"LIVE_BRAIN_TIMEOUT_S={LIVE_BRAIN_TIMEOUT_S:g} not in [1, 30]")
+    if not LIVE_BRAIN_CHANNELS:
+        bad.append("LIVE_BRAIN_CHANNELS is empty")
+    unknown = LIVE_BRAIN_DAYS - set(_DAYS)
+    if unknown:
+        bad.append(f"LIVE_BRAIN_DAYS has unknown days {sorted(unknown)}")
+    return bad
+
+
+_brain_bad = _brain_settings_problems()
+if _brain_bad:
+    print("[live] WARNING: brain lane settings invalid — lane OFF and its positions use "
+          "the regular exits: " + "; ".join(_brain_bad))
+    LIVE_BRAIN_LANE = False
+_BRAIN_EXITS_OK = not _brain_bad
+_blocked_at_start = {c.strip() for c in os.getenv("LIVE_BLOCKED_CHANNELS", "solwhaletrending").split(",")
+                     if c.strip()}
+print("[live] brain lane: "
+      + (f"ON — {','.join(sorted(LIVE_BRAIN_CHANNELS))} {sorted(LIVE_BRAIN_CATEGORIES)} on "
+         f"{','.join(d for d in _DAYS if d in LIVE_BRAIN_DAYS)} (UTC) when brain v{LIVE_BRAIN_VERSION} "
+         f"scores {LIVE_BRAIN_MIN_SCORE}+ at the call (fail-closed, {LIVE_BRAIN_TIMEOUT_S:g}s limit) and "
+         f"dev bundled < {LIVE_BRAIN_MAX_DEV_BUNDLED:g}%; {LIVE_BRAIN_SIZE_SOL:.4f} SOL; "
+         f"stop {LIVE_BRAIN_STOP:g}x, bank {LIVE_BRAIN_BANK:g}x"
+         if LIVE_BRAIN_LANE else "off"))
+if LIVE_BRAIN_LANE and LIVE_BRAIN_CHANNELS & _blocked_at_start:
+    print(f"[live] WARNING: brain lane channel(s) {sorted(LIVE_BRAIN_CHANNELS & _blocked_at_start)} are in "
+          f"LIVE_BLOCKED_CHANNELS — the blocked-channel guard will skip them")
+
+_brain_cache: dict[int, bool] = {}
+
+
+def brain_lane_eligible(channel_handle: str, category) -> bool:
+    """Could this call go to the brain lane (before asking the brain)?"""
+    if not LIVE_BRAIN_LANE or (channel_handle or "").lstrip("@") not in LIVE_BRAIN_CHANNELS:
+        return False
+    if (category or "none") not in LIVE_BRAIN_CATEGORIES:
+        return False
+    return _DAYS[datetime.now(timezone.utc).weekday()] in LIVE_BRAIN_DAYS
+
+
+def _is_brain_position(call_id: int) -> bool:
+    """Was this live position opened by the brain lane? Cached for the process (the mark is
+    written before the buy)."""
+    if call_id in _brain_cache:
+        return _brain_cache[call_id]
+    try:
+        val = db.is_live_brain(call_id)
+    except Exception as e:
+        db.safe_rollback()
+        print(f"[live] brain-lane lookup failed call_id={call_id} ({type(e).__name__}: {e}) "
+              f"— regular exits this tick")
+        return False
+    _brain_cache[call_id] = val
+    if len(_brain_cache) > 5000:
+        _brain_cache.clear()
+    return val
+
+
 def followed_lane_eligible(channel_handle: str, category) -> bool:
     """Could this call go to the followed lane (before looking at the wallets)?"""
     if not LIVE_FOLLOWED_LANE or (channel_handle or "").lstrip("@") not in LIVE_FOLLOWED_CHANNELS:
@@ -703,6 +825,8 @@ _LIVE_EXIT_OVERLAY = _resolve_live_exit_overlay()
 # The followed lane's bank ('take_profit' is an allowed exit_reason, so no migration).
 _FOLLOWED_OVERLAY = (LiveExitOverlay("take_profit", "bank", bank_mult=LIVE_FOLLOWED_BANK)
                      if _FOLLOWED_EXITS_OK else None)
+_BRAIN_OVERLAY = (LiveExitOverlay("take_profit", "bank", bank_mult=LIVE_BRAIN_BANK)
+                  if _BRAIN_EXITS_OK else None)
 print(f"[live] exit overlay: {_LIVE_EXIT_OVERLAY.name if _LIVE_EXIT_OVERLAY else 'none'}")
 print(f"[live] exit basis: quote={'ON' if LIVE_EXIT_USE_QUOTE else 'OFF'}"
       f"  require_quote={'ON' if LIVE_EXIT_REQUIRE_QUOTE else 'OFF (feed fallback)'}"
@@ -1037,7 +1161,7 @@ async def _trip_circuit_breaker(loss: float, limit: float, kind: str = "daily") 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 async def open_live_position(score_result: dict, token_data: dict,
-                             followed_eligible: bool = False) -> bool:
+                             followed_eligible: bool = False, brain_eligible: bool = False) -> bool:
     """
     Execute a real buy via Jupiter and record the open position.
 
@@ -1159,13 +1283,51 @@ async def open_live_position(score_result: dict, token_data: dict,
                       f"{'check failed' if _f_n is None else f'{_f_n} followed wallets'} "
                       f"(need {LIVE_FOLLOWED_MIN_WALLETS}) — regular lane rules")
 
+        # ── Brain lane: dev-bundle check, then the brain's at-call verdict (fail-closed) ──
+        _brain = False
+        _b_score, _b_dev = None, None
+        if (not _followed and brain_eligible and LIVE_BRAIN_LANE
+                and brain_lane_eligible(channel_handle, db.get_call_skip_reason(call_id))):
+            try:
+                _b_dev = db.get_token_bundled_pct(mint)
+            except Exception as _de:
+                db.safe_rollback()
+                _b_dev = None
+                print(f"[live] {symbol} brain lane: dev-bundle lookup failed ({type(_de).__name__}: {_de})")
+            if _b_dev is not None and _b_dev >= LIVE_BRAIN_MAX_DEV_BUNDLED:
+                print(f"[live] {symbol} brain lane: dev bundled {_b_dev:g}% >= "
+                      f"{LIVE_BRAIN_MAX_DEV_BUNDLED:g}% — not asked, regular lane rules call_id={call_id}")
+            else:
+                try:
+                    import trader_brain
+                    _v = await trader_brain.live_verdict(
+                        call_id, channel_handle,
+                        float(token_data.get("mcap_at_call") or 0) or None,
+                        version=LIVE_BRAIN_VERSION, min_score=LIVE_BRAIN_MIN_SCORE,
+                        timeout_s=LIVE_BRAIN_TIMEOUT_S)
+                except Exception as _ve:
+                    _v = {"buy": False, "score": None, "source": "error", "ms": 0,
+                          "reason": f"{type(_ve).__name__}: {_ve}"}
+                _b_score = _v.get("score")
+                if _v.get("buy") is True:
+                    _brain = True
+                    print(f"[live] {symbol} BRAIN LANE — v{LIVE_BRAIN_VERSION} score {_b_score}/10 "
+                          f"(min {LIVE_BRAIN_MIN_SCORE}), dev bundled "
+                          f"{'?' if _b_dev is None else f'{_b_dev:g}%'} [{_v.get('source')}, {_v.get('ms')}ms] "
+                          f"call_id={call_id}")
+                else:
+                    print(f"[live] {symbol} brain lane: no buy — "
+                          f"{'score ' + str(_b_score) + '/10' if _b_score is not None else 'no verdict'} "
+                          f"({_v.get('source')}: {str(_v.get('reason'))[:120]}) — regular lane rules "
+                          f"call_id={call_id}")
+
         # ── Lane-policy gate — resolved BEFORE size so a LIVE-allowlist lane sets its own size ──
         # LIVE_LANE_STRATEGY "A"/"B" mirror the paper testbed bench (research-wide); "LIVE" uses
         # lane_policy.resolve_live() — a NARROW live-only allowlist (LIVE_LANES) so live trades a
         # realized-CONFIRMED subset while paper stays wide. Both handle day-gates + Sunday opt-in.
         # Does NOT mutate the call's skip_reason (shared lane label the paper dispatch also reads).
         _lane: dict = {"trade": True}
-        if LIVE_USE_LANE_POLICY and not _followed:
+        if LIVE_USE_LANE_POLICY and not (_followed or _brain):
             _cat  = db.get_call_skip_reason(call_id)
             if LIVE_LANE_STRATEGY == "LIVE":
                 _lane = lane_policy.resolve_live(channel_handle, token_data.get("vip_tier"), _cat)
@@ -1189,7 +1351,9 @@ async def open_live_position(score_result: dict, token_data: dict,
         size = float(LIVE_SIZE_SOL or _lane.get("size") or _position_size(label))
         if _followed:
             size = LIVE_FOLLOWED_SIZE_SOL
-        if LIVE_SIZE_SOL_YOUNG and mint and LIVE_SIZE_SOL_YOUNG < size and not _followed:
+        if _brain:
+            size = LIVE_BRAIN_SIZE_SOL
+        if LIVE_SIZE_SOL_YOUNG and mint and LIVE_SIZE_SOL_YOUNG < size and not (_followed or _brain):
             _yage = None
             try:
                 _yage = _entry_token_age(mint)
@@ -1352,7 +1516,9 @@ async def open_live_position(score_result: dict, token_data: dict,
         try:
             import entry_filter
             # The followed lane was measured on every flag and mcap: no band/flag filter.
-            _ok, _why = (True, "followed lane") if _followed else entry_filter.check(mint, msg_mcap)
+            # The brain lane was measured on every flag and mcap too.
+            _ok, _why = ((True, "followed lane") if _followed else (True, "brain lane") if _brain
+                         else entry_filter.check(mint, msg_mcap))
             if not _ok:
                 print(f"[live] {symbol} skipped — entry filter: {_why}")
                 db.set_call_skip_reason(call_id, "entry_filter")
@@ -1385,7 +1551,8 @@ async def open_live_position(score_result: dict, token_data: dict,
         if (
             (LIVE_MAX_ENTRY_EXEC_RATIO > 0 or LIVE_ENTRY_ROUNDTRIP_MIN_MULT > 0
              or LIVE_MIN_ENTRY_EXEC_RATIO > 0
-             or (_followed and LIVE_FOLLOWED_MIN_ENTRY_RATIO > 0))
+             or (_followed and LIVE_FOLLOWED_MIN_ENTRY_RATIO > 0)
+             or (_brain and LIVE_BRAIN_MIN_ENTRY_RATIO > 0))
             and mint
             and not mint.startswith(("INFERRED:", "UNKNOWN:"))
         ):
@@ -1408,13 +1575,13 @@ async def open_live_position(score_result: dict, token_data: dict,
                 token_data=token_data,
                 market=market,
             )
-            if not gate.allowed and _followed and gate.reason == "missing_executable_entry":
+            if not gate.allowed and (_followed or _brain) and gate.reason == "missing_executable_entry":
                 # 2026-10-29: JONSTON (10 followed wallets) was skipped here because the
                 # executable mcap could not be computed (SOL/USD price outage), not because
                 # it had run up. The quote above already proved it is buyable; for the
                 # followed lane an UNKNOWN ratio is not a reason to skip, a high one is.
                 print(f"[live] {symbol} entry exec/ref ratio unknown (no executable mcap) — "
-                      f"followed lane proceeds call_id={call_id}")
+                      f"{'followed' if _followed else 'brain'} lane proceeds call_id={call_id}")
             elif not gate.allowed:
                 print(
                     f"[live] {symbol} skipped — entry exec/ref ratio "
@@ -1425,22 +1592,24 @@ async def open_live_position(score_result: dict, token_data: dict,
                 )
                 db.set_call_skip_reason(call_id, gate.reason)
                 return False
-            if _followed and LIVE_FOLLOWED_MIN_ENTRY_RATIO > 0:
+            _dead_ratio = (LIVE_FOLLOWED_MIN_ENTRY_RATIO if _followed
+                           else LIVE_BRAIN_MIN_ENTRY_RATIO if _brain else 0.0)
+            if _dead_ratio > 0:
                 dead = entry_quality.check_entry_min_ratio(
-                    min_ratio=LIVE_FOLLOWED_MIN_ENTRY_RATIO,
+                    min_ratio=_dead_ratio,
                     executable_mcap=quote_entry,
                     token_data=token_data,
                     market=market,
                 )
                 if not dead.allowed:
                     print(f"[live] {symbol} skipped — entry {(dead.ratio or 0):.2f}x of the call "
-                          f"< {LIVE_FOLLOWED_MIN_ENTRY_RATIO:.2f}x (already dumped) "
+                          f"< {_dead_ratio:.2f}x (already dumped) "
                           f"exec=${(dead.executable_mcap or 0)/1000:.1f}k "
                           f"ref=${(dead.reference_mcap or 0)/1000:.1f}k call_id={call_id}")
                     # an allowed value of calls_skip_reason_check (entry_below_call is not)
                     db.set_call_skip_reason(call_id, "entry_exec_ratio")
                     return False
-            if LIVE_MIN_ENTRY_EXEC_RATIO > 0 and not _followed:
+            if LIVE_MIN_ENTRY_EXEC_RATIO > 0 and not (_followed or _brain):
                 _age = None
                 _min_applies = True
                 if LIVE_MIN_ENTRY_EXEC_RATIO_MAX_AGE_MIN > 0:
@@ -1508,11 +1677,23 @@ async def open_live_position(score_result: dict, token_data: dict,
                       f"({type(_me).__name__}: {_me}) call_id={call_id}")
                 return False
 
+        # ── Brain lane: same contract — mark BEFORE the buy. No mark, no buy. ──
+        if _brain:
+            try:
+                db.mark_live_brain(call_id, _b_score, LIVE_BRAIN_VERSION, _b_dev)
+                _brain_cache[call_id] = True
+            except Exception as _me:
+                db.safe_rollback()
+                print(f"[live] {symbol} skipped — could not mark brain-lane position "
+                      f"({type(_me).__name__}: {_me}) call_id={call_id}")
+                return False
+
         # ── Execute buy ────────────────────────────────────────────────────────
         print(
             f"[live] BUY {symbol}  call_id={call_id}"
             f"  size={size:.4f} SOL  mint={mint[:8]}..."
             + (f"  [followed lane: {_f_n} wallets]" if _followed else "")
+            + (f"  [brain lane: score {_b_score}/10]" if _brain else "")
         )
         result = await jupiter.buy_token(mint, size)
 
@@ -2097,7 +2278,8 @@ def check_live_exits(
         return ExitResult(False)
 
     # ── Steep hold: a held position exits ONLY on target / floor / time ───────────
-    if LIVE_STEEP_HOLD and not (_FOLLOWED_EXITS_OK and _is_followed_position(call_id)):
+    if LIVE_STEEP_HOLD and not ((_FOLLOWED_EXITS_OK and _is_followed_position(call_id))
+                                or (_BRAIN_EXITS_OK and _is_brain_position(call_id))):
         held_at = db.get_live_steep_hold_at(call_id)
         if held_at is not None:
             mult = raw_mult if (raw_mult is not None and raw_mult > 0) else current_mcap / entry_mcap
@@ -2122,6 +2304,11 @@ def check_live_exits(
         cfg = _replace(cfg, hard_stop_pct=round(1.0 - LIVE_FOLLOWED_STOP, 6),
                        vip_gamble_hard_stop_pct=round(1.0 - LIVE_FOLLOWED_STOP, 6))
         position_overlay = _FOLLOWED_OVERLAY
+    # ── Brain lane: its own stop and bank (see LIVE_BRAIN_LANE) ──────────────────
+    elif _BRAIN_EXITS_OK and _is_brain_position(call_id):
+        cfg = _replace(cfg, hard_stop_pct=round(1.0 - LIVE_BRAIN_STOP, 6),
+                       vip_gamble_hard_stop_pct=round(1.0 - LIVE_BRAIN_STOP, 6))
+        position_overlay = _BRAIN_OVERLAY
 
     # ── RAW executable hard stop (mirrors qsim e81d4d7) ──────────────────────────
     # A real sell quote already below the stop is not a phantom — it is the price the bag

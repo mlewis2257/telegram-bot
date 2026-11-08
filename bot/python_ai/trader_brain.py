@@ -457,7 +457,11 @@ def has_brief(call_id: int) -> bool:
     return BRIEF_ON and call_id % 2 == 0
 
 
-def build_context(call_id: int, with_path: bool = True, learn: bool = False) -> dict | None:
+def build_context(call_id: int, with_path: bool = True, learn: bool = False,
+                  fast: bool = False, live: dict | None = None) -> dict | None:
+    """fast=True skips the coin's metadata fetch (IPFS, up to ~20 s) — used before a live buy.
+    live={"channel":..., "entry_mcap":...} builds from the call itself when qsim has no
+    position for it yet (live can decide before qsim opens)."""
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor() as cur:
@@ -468,6 +472,14 @@ def build_context(call_id: int, with_path: bool = True, learn: bool = False) -> 
             FROM qsim_positions qp JOIN calls c ON c.id = qp.call_id JOIN tokens t ON t.id = qp.token_id
             WHERE qp.call_id = %s""", (call_id,))
         row = cur.fetchone()
+        if not row and live:
+            cur.execute("""
+                SELECT %s, now(), %s, NULL, c.mcap_at_call, c.conviction_score,
+                       c.raw_message, c.message_type, c.narrative_tags, c.created_at,
+                       to_jsonb(t) AS tok, t.mint_address, t.symbol, t.name
+                FROM calls c JOIN tokens t ON t.id = c.token_id
+                WHERE c.id = %s""", (live.get("channel"), live.get("entry_mcap"), call_id))
+            row = cur.fetchone()
         if not row:
             return None
         (channel, entry_time, entry_price, sol_in, mcap_call, score, raw, mtype, tags, called_at,
@@ -531,6 +543,8 @@ def build_context(call_id: int, with_path: bool = True, learn: bool = False) -> 
 
     meta = None
     try:
+        if fast:
+            raise RuntimeError("fast: metadata skipped")
         import tweet_source_report as tsr
         with conn.cursor() as cur:
             cur.execute("SELECT uri FROM new_tokens WHERE mint = %s", (mint,))
@@ -628,6 +642,78 @@ def judge(ctx: dict, system: str = None, kind: str = "plan") -> tuple[dict | Non
     if kind == "entry" and not isinstance(v.get("buy"), bool):
         return None, tin, tout, f"bad buy: {v.get('buy')}"
     return v, tin, tout, None
+
+
+# ── Live verdict (used by live_trader's brain lane, BEFORE a real buy) ───────────────────────
+# Fails CLOSED: no key, timeout, bad answer, daily cap or any error -> buy=False with a reason.
+# Reuses an at-call verdict the recorder already stored for this coin and version; otherwise asks
+# now with fast context (no metadata fetch), stores it (verdict.source = "live") so qsim's record
+# and the live decision are the same judgement.
+LIVE_VERDICT_MAX_PER_DAY = int(os.getenv("LIVE_BRAIN_MAX_VERDICTS_PER_DAY", "120"))
+_live_day = None
+_live_n = 0
+
+
+async def live_verdict(call_id: int, channel: str, entry_mcap: float | None, version: int = PROMPT_V,
+                       min_score: int = 6, timeout_s: float = 10.0) -> dict:
+    """{"buy": bool, "score": int|None, "reason": str, "source": str, "ms": int}."""
+    import asyncio
+    global _live_day, _live_n
+    t0 = time.monotonic()
+    out = lambda buy, score, reason, src: {"buy": buy, "score": score, "reason": reason, "source": src,
+                                           "ms": int((time.monotonic() - t0) * 1000)}
+    try:
+        if version not in (PROMPT_V, LEARN_V):
+            return out(False, None, f"unknown brain version v{version}", "config")
+        ensure_table()
+        conn = db.get_conn()
+        db.safe_rollback()
+        with conn.cursor() as cur:
+            cur.execute("SELECT vs_typical FROM trader_brain_entry WHERE call_id = %s AND prompt_v = %s",
+                        (call_id, version))
+            r = cur.fetchone()
+        if r and r[0] is not None:
+            sc = int(r[0])
+            return out(sc >= min_score, sc, f"stored verdict {sc}/10", "stored")
+        if not API_KEY:
+            return out(False, None, "ANTHROPIC_API_KEY not set", "config")
+        today = datetime.now(timezone.utc).date()
+        if today != _live_day:
+            _live_day, _live_n = today, 0
+        if _live_n >= LIVE_VERDICT_MAX_PER_DAY:
+            return out(False, None, f"live verdict cap {LIVE_VERDICT_MAX_PER_DAY}/day reached", "cap")
+        ctx = build_context(call_id, with_path=False, learn=(version == LEARN_V), fast=True,
+                            live={"channel": channel, "entry_mcap": entry_mcap})
+        if not ctx:
+            return out(False, None, "no call/token row for this call", "error")
+        system = ENTRY_SYSTEM + (LEARN_NOTE if version == LEARN_V else "")
+        _live_n += 1
+        v, tin, tout, err = await asyncio.wait_for(asyncio.to_thread(judge, ctx, system, "entry"),
+                                                   timeout=timeout_s)
+        if v is None:
+            return out(False, None, f"model answer unusable: {err}", "error")
+        sc = _int(v.get("vs_typical"))
+        if sc is None:
+            return out(False, None, "model gave no vs_typical score", "error")
+        v["source"] = "live"
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO trader_brain_entry (call_id, model, prompt_v, buy, p_2x, p_rug, story, meme,
+                           attention, verdict, context, ctx_ms, api_ms, in_tokens, out_tokens, has_brief, vs_typical)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                        (call_id, MODEL, version, bool(v.get("buy")), _int(v.get("p_2x")), _int(v.get("p_rug")),
+                         _int(v.get("story")), _int(v.get("meme")), str(v.get("attention") or "")[:10] or None,
+                         json.dumps(v), json.dumps(ctx, default=str), None,
+                         int((time.monotonic() - t0) * 1000), tin, tout, False, sc))
+        conn.commit()
+        return out(sc >= min_score, sc, str(v.get("reason") or "")[:160], "live")
+    except asyncio.TimeoutError:
+        return out(False, None, f"model timeout after {timeout_s:g}s", "timeout")
+    except Exception as e:
+        try:
+            db.safe_rollback()
+        except Exception:
+            pass
+        return out(False, None, f"{type(e).__name__}: {e}"[:200], "error")
 
 
 def due() -> list[int]:

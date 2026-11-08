@@ -436,10 +436,14 @@ async def _dispatch_lane_testbed(score_result: dict, extra: dict) -> None:
                 # the regular lane does not; open_live_position checks the wallets and falls
                 # back to the regular rules when too few hold the coin.
                 _followed_ok = live_trader.followed_lane_eligible(channel, category)
-                if _live_lane.get("trade") or _followed_ok:
+                # The brain lane (off unless LIVE_BRAIN_LANE=on) asks trader_brain right before the
+                # buy; a low score or any failure falls back to the regular rules (fail-closed).
+                _brain_ok = live_trader.brain_lane_eligible(channel, category)
+                if _live_lane.get("trade") or _followed_ok or _brain_ok:
                     _track_task(
                         asyncio.create_task(live_trader.open_live_position(
-                            score_result, extra, followed_eligible=_followed_ok)),
+                            score_result, extra, followed_eligible=_followed_ok,
+                            brain_eligible=_brain_ok)),
                         f"live call_id={call_id}",
                     )
         except Exception as le:
