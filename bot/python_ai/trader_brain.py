@@ -212,6 +212,16 @@ def ensure_table() -> None:
                 out_tokens  integer
             )""")
         cur.execute("ALTER TABLE trader_brain_entry ADD COLUMN IF NOT EXISTS has_brief boolean")
+        # paired judging: one row per (coin, version)
+        cur.execute("""
+            DO $$ BEGIN
+              IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'trader_brain_entry_pkey'
+                         AND array_length(conkey, 1) = 1) THEN
+                ALTER TABLE trader_brain_entry DROP CONSTRAINT trader_brain_entry_pkey;
+                UPDATE trader_brain_entry SET prompt_v = 0 WHERE prompt_v IS NULL;
+                ALTER TABLE trader_brain_entry ADD PRIMARY KEY (call_id, prompt_v);
+              END IF;
+            END $$""")
         cur.execute("ALTER TABLE trader_brain_entry ADD COLUMN IF NOT EXISTS vs_typical integer")
         conn.commit()
 
@@ -251,7 +261,25 @@ lost clearly more than usual: lean PASS) or "better" (they banked clearly more t
 BUY). When it says "about normal", ignore them and judge the coin on everything else."""
 
 
+# 2026-11-08 PAIRED: every coin's at-call verdict is asked of BOTH v5 and the learning version, so
+# the two are compared on the SAME coins (the odd/even split let coin luck swamp the comparison:
+# on Nov 7 the even coins averaged ~+6% and the odd ones ~-27% whatever the brain said). The 45 s
+# plan stays v5 only. TRADER_BRAIN_PAIRED=0 falls back to the odd/even split.
+PAIRED = os.getenv("TRADER_BRAIN_PAIRED", "1") != "0"
+
+
+def entry_versions(call_id: int) -> list[int]:
+    if not LEARN_ON:
+        return [PROMPT_V]
+    if PAIRED:
+        return [PROMPT_V, LEARN_V]
+    return [LEARN_V if call_id % 2 == 0 else PROMPT_V]
+
+
 def version_for(call_id: int) -> int:
+    """Version for the 45 s plan (and the old odd/even split)."""
+    if PAIRED:
+        return PROMPT_V
     return LEARN_V if (LEARN_ON and call_id % 2 == 0) else PROMPT_V
 
 
@@ -613,23 +641,31 @@ def due() -> list[int]:
               AND qp.entry_time >= now() - interval '20 minutes'
               AND NOT EXISTS (SELECT 1 FROM trader_brain b WHERE b.call_id = qp.call_id)
             ORDER BY qp.entry_time""", (CHANNELS, DELAY_SECS))
-        return [r[0] for r in cur.fetchall() if _failed.get(r[0], 0) < 2]
+        return [r[0] for r in cur.fetchall() if _failed.get(("plan", r[0], None), 0) < 2]
 
 
-def due_entry() -> list[int]:
-    """Trades opened in the last 10 min with no entry judgement yet (judged at once, no price path)."""
+def due_entry() -> list[tuple[int, int]]:
+    """(call_id, version) pairs for trades opened in the last 10 min that still lack that
+    version's at-call verdict (judged at once, no price path)."""
     if not ENTRY_ON:
         return []
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT qp.call_id FROM qsim_positions qp
+            SELECT qp.call_id, coalesce(array_agg(e.prompt_v) FILTER (WHERE e.prompt_v IS NOT NULL), '{}')
+            FROM qsim_positions qp
+            LEFT JOIN trader_brain_entry e ON e.call_id = qp.call_id
             WHERE qp.channel_handle = ANY(%s)
               AND qp.entry_time >= now() - interval '10 minutes'
-              AND NOT EXISTS (SELECT 1 FROM trader_brain_entry e WHERE e.call_id = qp.call_id)
+            GROUP BY qp.call_id, qp.entry_time
             ORDER BY qp.entry_time DESC""", (CHANNELS,))
-        return [r[0] for r in cur.fetchall() if _failed.get(-r[0], 0) < 2]
+        out = []
+        for cid, have in cur.fetchall():
+            for ver in entry_versions(cid):
+                if ver not in (have or []) and _failed.get(("entry", cid, ver), 0) < 2:
+                    out.append((cid, ver))
+        return out
 
 
 def _int(v):
@@ -639,11 +675,12 @@ def _int(v):
         return None
 
 
-def _one(kind: str, call_id: int, tally) -> None:
+def _one(kind: str, call_id: int, tally, ver: int | None = None) -> None:
     """Judge one trade (kind 'entry' or 'plan') and store it."""
     global _n_today, _usd_today
     t0 = time.monotonic()
-    ver = version_for(call_id)
+    if ver is None:
+        ver = version_for(call_id)
     ctx = build_context(call_id, with_path=(kind == "plan"), learn=(ver == LEARN_V))
     ctx_ms = int((time.monotonic() - t0) * 1000)
     if not ctx:
@@ -659,7 +696,7 @@ def _one(kind: str, call_id: int, tally) -> None:
     api_ms = int((time.monotonic() - t1) * 1000)
     _usd_today += tin / 1e6 * PRICE_IN + tout / 1e6 * PRICE_OUT
     if v is None:
-        key = -call_id if kind == "entry" else call_id
+        key = ("entry", call_id, ver) if kind == "entry" else ("plan", call_id, None)
         _failed[key] = _failed.get(key, 0) + 1
         tally["failed"] += 1
         print(f"[trader_brain] {kind} call_id={call_id} {ctx.get('symbol')} failed: {err}", flush=True)
@@ -716,7 +753,7 @@ def run() -> None:
             API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
     ensure_table()
     print(f"[trader_brain] RECORD-ONLY v{PROMPT_V}"
-          f"{f' + v{LEARN_V} learning arm (similar past coins) on even call_ids' if LEARN_ON else ''}. model={MODEL}, channels={','.join(CHANNELS)}. Per trade: "
+          f"{(f' + v{LEARN_V} on EVERY coin (paired)' if PAIRED else f' + v{LEARN_V} on even call_ids') if LEARN_ON else ''}. model={MODEL}, channels={','.join(CHANNELS)}. Per trade: "
           f"{'a buy/pass verdict at the call (no price data) + ' if ENTRY_ON else ''}a plan {DELAY_SECS:g}s after "
           f"entry; market brief {'on even call_ids (A/B)' if BRIEF_ON else 'off'}. Ceilings: {MAX_PER_DAY} judgements/day and ${MAX_USD_PER_DAY:.2f}/day "
           f"(~${MAX_USD_PER_DAY * 30:.0f}/month max) at ${PRICE_IN:g}/${PRICE_OUT:g} per M tokens.", flush=True)
@@ -727,15 +764,15 @@ def run() -> None:
         if today != _day:
             _day, _n_today, _usd_today, _capped_noted = today, 0, 0.0, False
         try:
-            work = [("entry", c) for c in due_entry()] + [("plan", c) for c in due()]
-            for kind, call_id in work:
+            work = [("entry", c, v) for c, v in due_entry()] + [("plan", c, None) for c in due()]
+            for kind, call_id, ver in work:
                 if _n_today >= MAX_PER_DAY or _usd_today >= MAX_USD_PER_DAY:
                     if not _capped_noted:
                         print(f"[trader_brain] daily ceiling reached ({_n_today} judgements, ${_usd_today:.2f}) — "
                               f"none until UTC midnight", flush=True)
                         _capped_noted = True
                     break
-                _one(kind, call_id, tally)
+                _one(kind, call_id, tally, ver)
         except Exception as e:
             db.safe_rollback()
             print(f"[trader_brain] pass failed: {type(e).__name__}: {e}", flush=True)
@@ -748,6 +785,66 @@ def run() -> None:
 
 
 # ── Report ──────────────────────────────────────────────────────────────────────
+
+def paired_report(since: str, va: int = PROMPT_V, vb: int = LEARN_V) -> None:
+    """Both versions judged the SAME coins: compare where they disagree, and the combinations."""
+    conn = db.get_conn()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT qp.call_id, qp.channel_handle, qp.entry_time::date, qp.sol_in, qp.sol_out, qp.exit_reason,
+                   a.vs_typical, b.vs_typical
+            FROM qsim_positions qp
+            JOIN trader_brain_entry a ON a.call_id = qp.call_id AND a.prompt_v = %s
+            JOIN trader_brain_entry b ON b.call_id = qp.call_id AND b.prompt_v = %s
+            WHERE qp.status = 'closed' AND qp.sol_in > 0 AND qp.entry_time >= %s
+              AND a.vs_typical IS NOT NULL AND b.vs_typical IS NOT NULL""", (va, vb, since))
+        rows = cur.fetchall()
+    print(f"\n{'=' * 24} PAIRED: v{va} vs v{vb} on the SAME coins (since {since}) {'=' * 24}")
+    if not rows:
+        print("  no coins judged by both versions yet")
+        return
+    items = []
+    for cid, ch, day, s_in, s_out, reason, sa, sb in rows:
+        x = float(s_out or 0) / float(s_in)
+        items.append({"ch": ch, "day": day, "s_in": float(s_in), "pnl": float(s_out or 0) - float(s_in),
+                      "bank": "bank" in (reason or ""), "rug": x < 0.30, "a": sa >= 6, "b": sb >= 6})
+
+    def line(label, g):
+        if not g:
+            print(f"  {label:26s}    0")
+            return
+        n, st = len(g), sum(i["s_in"] for i in g)
+        print(f"  {label:26s} {n:4d}  bank {sum(i['bank'] for i in g) / n * 100:5.1f}%  "
+              f"rug {sum(i['rug'] for i in g) / n * 100:5.1f}%  P&L {sum(i['pnl'] for i in g) / st * 100:+6.1f}%/SOL  "
+              f"({sum(i['pnl'] for i in g):+.4f} SOL)")
+    cells = {
+        "both BUY": [i for i in items if i["a"] and i["b"]],
+        f"v{va} BUY only (v{vb} PASS)": [i for i in items if i["a"] and not i["b"]],
+        f"v{vb} BUY only (v{va} PASS)": [i for i in items if i["b"] and not i["a"]],
+        "both PASS": [i for i in items if not i["a"] and not i["b"]],
+    }
+    print(f"  {len(items)} closed coins judged by both. The DISAGREEMENT rows decide which version is better.")
+    for k, g in cells.items():
+        line(k, g)
+    print("  combinations:")
+    line(f"  v{va} BUY (all)", [i for i in items if i["a"]])
+    line(f"  v{vb} BUY (all)", [i for i in items if i["b"]])
+    line("  AND: both BUY", cells["both BUY"])
+    line("  OR: either BUY", [i for i in items if i["a"] or i["b"]])
+    line("  everything (no brain)", items)
+    print("  disagreements by day (P&L per SOL, n):")
+    for day in sorted({i["day"] for i in items}):
+        da = [i for i in cells[f"v{va} BUY only (v{vb} PASS)"] if i["day"] == day]
+        db_ = [i for i in cells[f"v{vb} BUY only (v{va} PASS)"] if i["day"] == day]
+        f = lambda g: f"{sum(i['pnl'] for i in g) / sum(i['s_in'] for i in g) * 100:+6.1f}% ({len(g):2d})" if g else "     -     "
+        print(f"    {day}   v{va}-only {f(da)}   v{vb}-only {f(db_)}")
+    for ch in sorted({i["ch"] for i in items}):
+        print(f"  -- {ch} --")
+        for k, g in cells.items():
+            line(k, [i for i in g if i["ch"] == ch])
+    print("  Rule (fixed in advance): a version wins if its own picks beat the other's by 10+ pts/SOL\n"
+          "  and on most days, over ~5 days. Combine if AND clearly beats both. Otherwise keep v5.")
+
 
 def report(since: str, PROMPT_V: int = PROMPT_V) -> None:
     conn = db.get_conn()
@@ -930,6 +1027,7 @@ if __name__ == "__main__":
         if j > 0:
             report(since, int(sys.argv[j + 1]))
         else:
+            paired_report(since)
             for ver in (PROMPT_V, LEARN_V):
                 print(f"\n{'=' * 30} PROMPT v{ver} {'(learning: similar past coins)' if ver == LEARN_V else ''} {'=' * 30}")
                 report(since, ver)
