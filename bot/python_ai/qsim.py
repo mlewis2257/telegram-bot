@@ -70,7 +70,9 @@ QSIM_LANES: dict[tuple[str, str, str], dict] = {
     #     already convicted this anchor (booked +12.9, honest -8.4). If qsim lands near -8 it's a
     #     second independent confirmation qsim catches the entry-inflation lie (front-loaded on
     #     07-12 +17.7, then 5 straight red days — expect qsim to gut it).
-    ("solhousesignal",   "none", "low_score"): {"days": {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}, "size": 0.05, "exit": "early"},
+    #     RETIRED 2026-11-08: worst channel all week (-11 to -25%/day Thu-Sun Nov 5-8, brain BUYs
+    #     no better than PASSes on ~10-20 coins/day). Its quote budget goes to swt + solearly.
+    #     Open positions still close out (the monitor reads open rows from the DB). Re-add to revive.
     # EDGE-SCAN candidate (2026-08-05): the biggest UNCONFIRMED shadow winner (+15.8/7d), on our
     # best-performing channel, that qsim has never priced. All 7 days for day-cell discovery;
     # early = EXIT_A_PAPER (ride_vol still held — qsim lacks order_flow). Higher volume than the
