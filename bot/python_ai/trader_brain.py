@@ -54,6 +54,7 @@ load_dotenv(Path(__file__).with_name(".env"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "launcher"))
 import db  # noqa: E402
+import api_alerts  # noqa: E402
 
 API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 MODEL = os.getenv("TRADER_BRAIN_MODEL", "claude-haiku-4-5-20251001")
@@ -160,6 +161,11 @@ _n_today = 0
 _usd_today = 0.0
 _capped_noted = False
 _failed: dict[int, int] = {}
+# Out of credit / bad key: alert, then pause BILLING_PAUSE_S instead of failing every coin (a coin
+# that fails twice is never retried, so an outage would also wipe out that stretch of data).
+BILLING_PAUSE_S = 300
+_pause_until = 0.0
+_streak = api_alerts.FailStreak("trader_brain")
 
 
 def ensure_table() -> None:
@@ -691,6 +697,12 @@ async def live_verdict(call_id: int, channel: str, entry_mcap: float | None, ver
         v, tin, tout, err = await asyncio.wait_for(asyncio.to_thread(judge, ctx, system, "entry"),
                                                    timeout=timeout_s)
         if v is None:
+            if api_alerts.is_billing_error(err):
+                # fire and forget (never delays the decision): the lane is now buying nothing
+                asyncio.get_running_loop().run_in_executor(
+                    None, api_alerts.send, "anthropic_billing_live",
+                    f"LIVE brain lane: Anthropic refused — out of credit or bad key. The lane buys "
+                    f"NOTHING until fixed. {err[:200]}")
             return out(False, None, f"model answer unusable: {err}", "error")
         sc = _int(v.get("vs_typical"))
         if sc is None:
@@ -763,7 +775,7 @@ def _int(v):
 
 def _one(kind: str, call_id: int, tally, ver: int | None = None) -> None:
     """Judge one trade (kind 'entry' or 'plan') and store it."""
-    global _n_today, _usd_today
+    global _n_today, _usd_today, _pause_until
     t0 = time.monotonic()
     if ver is None:
         ver = version_for(call_id)
@@ -782,11 +794,20 @@ def _one(kind: str, call_id: int, tally, ver: int | None = None) -> None:
     api_ms = int((time.monotonic() - t1) * 1000)
     _usd_today += tin / 1e6 * PRICE_IN + tout / 1e6 * PRICE_OUT
     if v is None:
-        key = ("entry", call_id, ver) if kind == "entry" else ("plan", call_id, None)
-        _failed[key] = _failed.get(key, 0) + 1
         tally["failed"] += 1
         print(f"[trader_brain] {kind} call_id={call_id} {ctx.get('symbol')} failed: {err}", flush=True)
+        if api_alerts.is_billing_error(err):
+            _pause_until = time.monotonic() + BILLING_PAUSE_S
+            api_alerts.send("anthropic_billing",
+                            f"trader_brain: Anthropic refused — out of credit or bad key. Judging paused "
+                            f"(retry every {BILLING_PAUSE_S // 60} min); the LIVE brain lane buys nothing "
+                            f"until fixed. {err[:200]}")
+            return                  # not counted against the coin: it is retried after the pause
+        key = ("entry", call_id, ver) if kind == "entry" else ("plan", call_id, None)
+        _failed[key] = _failed.get(key, 0) + 1
+        _streak.fail(err)
         return
+    _streak.ok()
     _n_today += 1
     conn = db.get_conn()
     with conn.cursor() as cur:
@@ -826,6 +847,33 @@ def _one(kind: str, call_id: int, tally, ver: int | None = None) -> None:
               flush=True)
 
 
+def spend_since(since: datetime) -> float:
+    """Estimated Anthropic spend (USD) of every brain judgement — recorder and live — since `since`."""
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT coalesce(sum(in_tokens), 0), coalesce(sum(out_tokens), 0) FROM (
+              SELECT in_tokens, out_tokens FROM trader_brain WHERE judged_at >= %s
+              UNION ALL
+              SELECT in_tokens, out_tokens FROM trader_brain_entry WHERE judged_at >= %s) x""",
+                    (since, since))
+        tin, tout = cur.fetchone()
+    return float(tin) / 1e6 * PRICE_IN + float(tout) / 1e6 * PRICE_OUT
+
+
+def check_credit() -> str:
+    """Warn on Telegram at 75% / 90% of ANTHROPIC_CREDIT_USD used. '' when not configured."""
+    cs = api_alerts.credit_settings("ANTHROPIC")
+    if not cs:
+        return ""
+    try:
+        return " " + api_alerts.credit_check("trader_brain", "ANTHROPIC", spend_since(cs[1]), cs[0])
+    except Exception as e:
+        db.safe_rollback()
+        return f" credit check failed: {type(e).__name__}"
+
+
 def run() -> None:
     global _day, _n_today, _usd_today, _capped_noted
     global API_KEY
@@ -843,6 +891,9 @@ def run() -> None:
           f"{'a buy/pass verdict at the call (no price data) + ' if ENTRY_ON else ''}a plan {DELAY_SECS:g}s after "
           f"entry; market brief {'on even call_ids (A/B)' if BRIEF_ON else 'off'}. Ceilings: {MAX_PER_DAY} judgements/day and ${MAX_USD_PER_DAY:.2f}/day "
           f"(~${MAX_USD_PER_DAY * 30:.0f}/month max) at ${PRICE_IN:g}/${PRICE_OUT:g} per M tokens.", flush=True)
+    print("[trader_brain] alerts: out-of-credit / failing streak → Telegram."
+          + (check_credit() or " Credit warning off (set ANTHROPIC_CREDIT_USD + ANTHROPIC_CREDIT_SINCE)."),
+          flush=True)
     last_tally = time.monotonic()
     tally = defaultdict(int)
     while True:
@@ -850,8 +901,11 @@ def run() -> None:
         if today != _day:
             _day, _n_today, _usd_today, _capped_noted = today, 0, 0.0, False
         try:
-            work = [("entry", c, v) for c, v in due_entry()] + [("plan", c, None) for c in due()]
+            work = [] if time.monotonic() < _pause_until else (
+                [("entry", c, v) for c, v in due_entry()] + [("plan", c, None) for c in due()])
             for kind, call_id, ver in work:
+                if time.monotonic() < _pause_until:
+                    break
                 if _n_today >= MAX_PER_DAY or _usd_today >= MAX_USD_PER_DAY:
                     if not _capped_noted:
                         print(f"[trader_brain] daily ceiling reached ({_n_today} judgements, ${_usd_today:.2f}) — "
@@ -864,7 +918,7 @@ def run() -> None:
             print(f"[trader_brain] pass failed: {type(e).__name__}: {e}", flush=True)
         if time.monotonic() - last_tally >= 3600:
             print("[trader_brain] 1h: " + " ".join(f"{k}={v}" for k, v in sorted(tally.items()))
-                  + f" today={_n_today} ${_usd_today:.3f}", flush=True)
+                  + f" today={_n_today} ${_usd_today:.3f}" + check_credit(), flush=True)
             tally.clear()
             last_tally = time.monotonic()
         time.sleep(PASS_SECS)

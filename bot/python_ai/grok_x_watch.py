@@ -41,6 +41,7 @@ load_dotenv(Path(__file__).with_name(".env"))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db  # noqa: E402
+import api_alerts  # noqa: E402
 
 MODEL = os.getenv("GROK_X_MODEL", "grok-4.3")
 CHANNELS = [c.strip().lstrip("@") for c in
@@ -78,6 +79,24 @@ _n_today = 0
 _usd_today = 0.0
 _capped_noted = False
 _billing_until = 0.0
+_streak = api_alerts.FailStreak("grok_x")
+
+
+def check_credit() -> str:
+    """Warn on Telegram at 75% / 90% of XAI_CREDIT_USD used (from the usd_est column — an estimate)."""
+    cs = api_alerts.credit_settings("XAI")
+    if not cs:
+        return ""
+    try:
+        conn = db.get_conn()
+        db.safe_rollback()
+        with conn.cursor() as cur:
+            cur.execute("SELECT coalesce(sum(usd_est), 0) FROM grok_x WHERE judged_at >= %s", (cs[1],))
+            spent = float(cur.fetchone()[0])
+        return " " + api_alerts.credit_check("grok_x", "XAI", spent, cs[0])
+    except Exception as e:
+        db.safe_rollback()
+        return f" credit check failed: {type(e).__name__}"
 _failed: dict[int, int] = {}
 
 
@@ -199,10 +218,18 @@ def run() -> None:
     print(f"[grok_x] RECORD-ONLY. model={MODEL}, X search for {','.join(CHANNELS)} qsim trades {DELAY_SECS:g}s "
           f"after entry, every {EVERY}{'nd' if EVERY == 2 else 'th'} coin. Ceilings: {MAX_PER_DAY} coins/day and ~${MAX_USD_PER_DAY:.2f}/day (estimated; posts "
           f"${PRICE_PER_POST * 1000:g}/1k + tokens — check the xAI console for real spend).", flush=True)
+    print("[grok_x] alerts: out-of-credit / failing streak → Telegram."
+          + (check_credit() or " Credit warning off (set XAI_CREDIT_USD + XAI_CREDIT_SINCE)."), flush=True)
+    last_credit = time.monotonic()
     while True:
         today = datetime.now(timezone.utc).date()
         if today != _day:
             _day, _n_today, _usd_today, _capped_noted = today, 0, 0.0, False
+        if time.monotonic() - last_credit >= 3600:
+            status = check_credit()
+            if status:
+                print(f"[grok_x] 1h:{status}", flush=True)
+            last_credit = time.monotonic()
         if time.monotonic() < _billing_until:
             time.sleep(PASS_SECS)
             continue
@@ -228,11 +255,15 @@ def run() -> None:
                                               "insufficient")):
                         print(f"[grok_x] xAI billing/permission error — no credits yet? Retrying in "
                               f"{BILLING_BACKOFF_S // 60} min. ({err[:160]})", flush=True)
+                        api_alerts.send("xai_billing", f"grok_x: xAI refused — out of credit or bad key. "
+                                        f"Retrying every {BILLING_BACKOFF_S // 60} min. {err[:200]}")
                         _billing_until = time.monotonic() + BILLING_BACKOFF_S
                         break
+                    _streak.fail(err)
                     _failed[call_id] = _failed.get(call_id, 0) + 1
                     print(f"[grok_x] call_id={call_id} {symbol} failed: {err}", flush=True)
                     continue
+                _streak.ok()
                 _n_today += 1
                 conn = db.get_conn()
                 with conn.cursor() as cur:
