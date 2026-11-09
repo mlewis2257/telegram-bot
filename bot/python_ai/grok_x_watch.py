@@ -18,8 +18,12 @@ No credits / billing errors: logged once, retried every 30 min.
 
 Key: XAI_API_KEY in .env (GROK_API_KEY also accepted). Model: GROK_X_MODEL (default grok-4.3).
 
+2026-11-08: the 60 s entry look was noise over 94 coins, so the default is now GROK_X_MODE=bank —
+one look right after qsim banks a coin at 2x (see MODE below). GROK_X_MODE=entry restores the old look.
+
 Run:     pm2 start grok_x_watch.py --name grok-x --interpreter <venv python>
-Report:  python3 grok_x_watch.py --report [--since 2026-11-05]
+Report:  python3 grok_x_watch.py --report [--since 2026-11-05]               (entry looks)
+         python3 grok_x_watch.py --report --phase bank [--since 2026-11-09]  (at-bank looks)
 """
 
 from __future__ import annotations
@@ -57,6 +61,14 @@ PRICE_PER_POST = 0.005
 EVERY = max(1, int(os.getenv("GROK_X_EVERY", "2")))
 PASS_SECS = 15
 BILLING_BACKOFF_S = 1800
+# 2026-11-08: WHEN to look. 'entry' (the original) searched X DELAY_SECS after the qsim entry; over 94
+# coins it was noise — 60 s after a fresh call X holds mostly bot posts, and an X search is too slow to
+# gate a buy anyway. 'bank' (default) looks right after qsim BANKS at 2x, every banked coin on
+# CHANNELS: the open question is the exit — after 2x, runners and fades look alike on price, and a
+# coin whose X attention is taking off is exactly what price cannot show. Graded on whether the coin
+# then hit 3x before falling to 1.55x (`--report --phase bank`).
+MODE = os.getenv("GROK_X_MODE", "bank").strip().lower()
+BANK_WINDOW_MIN = 20          # a bank older than this is skipped (the moment has passed)
 
 PROMPT = """Search X for posts about this Solana meme coin from the last 24 hours. Search for the
 contract address first, then the ticker with a $ sign (and the name if the ticker is generic).
@@ -127,6 +139,16 @@ def ensure_table() -> None:
                 usd_est      numeric,
                 api_ms       integer
             )""")
+        # one row per (coin, phase): 'entry' rows are the original 60 s looks, 'bank' rows the at-bank look
+        cur.execute("ALTER TABLE grok_x ADD COLUMN IF NOT EXISTS phase text NOT NULL DEFAULT 'entry'")
+        cur.execute("""
+            DO $$ BEGIN
+              IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'grok_x_pkey'
+                         AND array_length(conkey, 1) = 1) THEN
+                ALTER TABLE grok_x DROP CONSTRAINT grok_x_pkey;
+                ALTER TABLE grok_x ADD PRIMARY KEY (call_id, phase);
+              END IF;
+            END $$""")
         conn.commit()
 
 
@@ -142,9 +164,27 @@ def due() -> list[tuple]:
               AND qp.entry_time <= now() - make_interval(secs => %s)
               AND qp.entry_time >= now() - interval '20 minutes'
               AND t.mint_address NOT LIKE 'UNKNOWN:%%' AND t.mint_address NOT LIKE 'INFERRED:%%'
-              AND NOT EXISTS (SELECT 1 FROM grok_x g WHERE g.call_id = qp.call_id)
+              AND NOT EXISTS (SELECT 1 FROM grok_x g WHERE g.call_id = qp.call_id AND g.phase = 'entry')
             ORDER BY qp.entry_time""", (CHANNELS, DELAY_SECS))
         return [r for r in cur.fetchall() if r[0] % EVERY == 0 and _failed.get(r[0], 0) < 2]
+
+
+def due_bank() -> list[tuple]:
+    """Every coin qsim banked on CHANNELS in the last BANK_WINDOW_MIN minutes, not yet looked at."""
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT qp.call_id, t.symbol, t.name, t.mint_address, c.created_at,
+                   (SELECT nt.uri FROM new_tokens nt WHERE nt.mint = t.mint_address)
+            FROM qsim_positions qp JOIN tokens t ON t.id = qp.token_id JOIN calls c ON c.id = qp.call_id
+            WHERE qp.channel_handle = ANY(%s)
+              AND qp.status = 'closed' AND qp.exit_reason LIKE '%%bank%%'
+              AND qp.exit_time >= now() - make_interval(mins => %s)
+              AND t.mint_address NOT LIKE 'UNKNOWN:%%' AND t.mint_address NOT LIKE 'INFERRED:%%'
+              AND NOT EXISTS (SELECT 1 FROM grok_x g WHERE g.call_id = qp.call_id AND g.phase = 'bank')
+            ORDER BY qp.exit_time""", (CHANNELS, BANK_WINDOW_MIN))
+        return [r for r in cur.fetchall() if _failed.get(r[0], 0) < 2]
 
 
 def _source_tweet(uri) -> str:
@@ -215,8 +255,12 @@ def run() -> None:
             time.sleep(600)
             load_dotenv(Path(__file__).with_name(".env"), override=True)
     ensure_table()
-    print(f"[grok_x] RECORD-ONLY. model={MODEL}, X search for {','.join(CHANNELS)} qsim trades {DELAY_SECS:g}s "
-          f"after entry, every {EVERY}{'nd' if EVERY == 2 else 'th'} coin. Ceilings: {MAX_PER_DAY} coins/day and ~${MAX_USD_PER_DAY:.2f}/day (estimated; posts "
+    if MODE not in ("bank", "entry"):
+        print(f"[grok_x] GROK_X_MODE={MODE!r} unknown — using 'bank'", flush=True)
+    when = (f"{DELAY_SECS:g}s after entry, every {EVERY}{'nd' if EVERY == 2 else 'th'} coin" if MODE == "entry"
+            else f"right after qsim BANKS at 2x (every banked coin, within {BANK_WINDOW_MIN} min)")
+    print(f"[grok_x] RECORD-ONLY, mode={MODE}. model={MODEL}, X search for {','.join(CHANNELS)} qsim trades "
+          f"{when}. Ceilings: {MAX_PER_DAY} coins/day and ~${MAX_USD_PER_DAY:.2f}/day (estimated; posts "
           f"${PRICE_PER_POST * 1000:g}/1k + tokens — check the xAI console for real spend).", flush=True)
     print("[grok_x] alerts: out-of-credit / failing streak → Telegram."
           + (check_credit() or " Credit warning off (set XAI_CREDIT_USD + XAI_CREDIT_SINCE)."), flush=True)
@@ -234,7 +278,8 @@ def run() -> None:
             time.sleep(PASS_SECS)
             continue
         try:
-            for call_id, symbol, name, mint, called_at, uri in due():
+            phase = "entry" if MODE == "entry" else "bank"
+            for call_id, symbol, name, mint, called_at, uri in (due() if phase == "entry" else due_bank()):
                 if _n_today >= MAX_PER_DAY or _usd_today >= MAX_USD_PER_DAY:
                     if not _capped_noted:
                         print(f"[grok_x] daily ceiling reached ({_n_today} coins, ~${_usd_today:.2f}) — "
@@ -269,16 +314,16 @@ def run() -> None:
                 with conn.cursor() as cur:
                     cur.execute("""INSERT INTO grok_x (call_id, model, posts_found, posts_30m, posts_30_120, growing,
                                    accounts, accounts_1k, bot_pct, source_viral, verdict, citations, usage, usd_est,
-                                   api_ms) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                   api_ms, phase) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                                    ON CONFLICT DO NOTHING""",
                                 (call_id, MODEL, _int(v.get("posts_found")), _int(v.get("posts_last_30min")),
                                  _int(v.get("posts_30_to_120min")), bool(v.get("growing")),
                                  _int(v.get("distinct_accounts")), _int(v.get("accounts_1k_plus_followers")),
                                  _int(v.get("bot_like_pct")),
                                  v.get("source_tweet_viral") if isinstance(v.get("source_tweet_viral"), bool) else None,
-                                 json.dumps(v), cites, json.dumps(usage), round(usd, 4), api_ms))
+                                 json.dumps(v), cites, json.dumps(usage), round(usd, 4), api_ms, phase))
                 conn.commit()
-                print(f"[grok_x] {symbol} call_id={call_id}: posts {v.get('posts_found')} "
+                print(f"[grok_x] {symbol} call_id={call_id} at {phase}: posts {v.get('posts_found')} "
                       f"(30m {v.get('posts_last_30min')}, {'growing' if v.get('growing') else 'not growing'}), "
                       f"accounts {v.get('distinct_accounts')} / 1k+ {v.get('accounts_1k_plus_followers')}, "
                       f"bot-like {v.get('bot_like_pct')}% — {str(v.get('summary'))[:120]} "
@@ -298,7 +343,8 @@ def report(since: str) -> None:
                    (SELECT max(o.real_mult) FROM qsim_quote_observations o
                      WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time AND o.real_mult IS NOT NULL)
             FROM grok_x g JOIN qsim_positions qp ON qp.call_id = g.call_id
-            WHERE qp.status = 'closed' AND qp.sol_in > 0 AND g.judged_at >= %s""", (since,))
+            WHERE qp.status = 'closed' AND qp.sol_in > 0 AND g.judged_at >= %s
+              AND g.phase = 'entry'""", (since,))
         rows = cur.fetchall()
     if not rows:
         print(f"no closed trades with X data since {since}")
@@ -338,9 +384,72 @@ def report(since: str) -> None:
           "decent count and again later. Only then feed it to the trader brain.")
 
 
+def report_bank(since: str) -> None:
+    """At-bank looks, graded on what the coin did NEXT: did it hit 3x before falling to 1.55x (what a
+    hold-to-3x exit would have caught; break-even ~45%), and did it ever reach 5x."""
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT g.posts_found, g.posts_30m, g.posts_30_120, g.growing, g.accounts_1k, g.bot_pct, g.usd_est,
+                   qp.channel_handle,
+                   (SELECT min(o.observed_at) FROM qsim_quote_observations o
+                     WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time AND o.real_mult >= 3),
+                   (SELECT min(o.observed_at) FROM qsim_quote_observations o
+                     WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time
+                       AND NOT coalesce(o.rate_limited, false)
+                       AND (o.real_mult <= 1.55 OR coalesce(o.no_route, false))),
+                   (SELECT max(o.real_mult) FROM qsim_quote_observations o
+                     WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time)
+            FROM grok_x g JOIN qsim_positions qp ON qp.call_id = g.call_id
+            WHERE g.phase = 'bank' AND g.judged_at >= %s
+              AND qp.exit_time <= now() - interval '2 hours'""", (since,))
+        rows = cur.fetchall()
+    if not rows:
+        print(f"no at-bank X looks older than 2 h since {since} (each needs 2 h of post-bank quotes to grade)")
+        return
+    b = lambda v, cuts, labs: "n/a" if v is None else next((l for c, l in zip(cuts, labs) if v < c), labs[-1])
+    items = []
+    for pf, p30, p30_120, grow, a1k, bot, usd, ch, t3, tfloor, high in rows:
+        # accelerating = more posts in the last 30 min than in the 90 min before it
+        accel = None if p30 is None or p30_120 is None else ("yes" if p30 > p30_120 else "no")
+        items.append({"posts": b(pf, [1, 5, 20], ["0", "1-4", "5-19", "20+"]),
+                      "last 30m": b(p30, [1, 3, 10], ["0", "1-2", "3-9", "10+"]),
+                      "accelerating": accel or "n/a",
+                      "growing": "yes" if grow else "no",
+                      "1k+ accounts": b(a1k, [1, 3], ["0", "1-2", "3+"]),
+                      "bot-like": b(bot, [30, 60], ["<30%", "30-59%", "60%+"]),
+                      "channel": ch or "?", "usd": float(usd or 0),
+                      "run": t3 is not None and (tfloor is None or t3 < tfloor),
+                      "5x": float(high or 0) >= 5})
+
+    def line(label, g):
+        n = len(g)
+        print(f"  {label:16s} {n:4d}  hit 3x before 1.55x {sum(i['run'] for i in g) / n * 100:5.1f}%   "
+              f"ever 5x {sum(i['5x'] for i in g) / n * 100:5.1f}%")
+
+    print(f"{len(items)} banked coins with an at-bank X look since {since} (graded 2 h+ after the bank); "
+          f"est. spend ${sum(i['usd'] for i in items):.2f}\n")
+    line("ALL", items)
+    for key in ("channel", "posts", "last 30m", "accelerating", "growing", "1k+ accounts", "bot-like"):
+        print(f"\nBY {key.upper()}")
+        g = defaultdict(list)
+        for i in items:
+            g[i[key]].append(i)
+        for val in sorted(g):
+            line(val, g[val])
+    print("\nThe question: does some X group hit 3x before the 1.55x floor CLEARLY above ~45% (break-even for\n"
+          "holding to 3x) on 30+ coins, and again on the next 30? Only then is it worth an exit rule.")
+
+
 if __name__ == "__main__":
     if "--report" in sys.argv:
         i = sys.argv.index("--since") if "--since" in sys.argv else -1
-        report(sys.argv[i + 1] if i > 0 else "2026-11-05")
+        since = sys.argv[i + 1] if i > 0 else "2026-11-05"
+        j = sys.argv.index("--phase") if "--phase" in sys.argv else -1
+        if j > 0 and sys.argv[j + 1] == "bank":
+            report_bank(since)
+        else:
+            report(since)
     else:
         run()
