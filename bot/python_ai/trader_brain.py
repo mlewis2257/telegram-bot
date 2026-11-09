@@ -31,7 +31,8 @@ TRADER_BRAIN_MAX_USD_PER_DAY spend (estimated from the API's token counts), whic
 Model: TRADER_BRAIN_MODEL (default claude-haiku-4-5-20251001). Key: ANTHROPIC_API_KEY in .env.
 
 Run:     pm2 start trader_brain.py --name trader-brain --interpreter <venv python>
-Report:  python3 trader_brain.py --report [--since 2026-11-05]
+Report:  python3 trader_brain.py --report [--since 2026-11-05] [--until 2026-11-10]
+         (dates are midnights in REPORT_TZ, default America/Los_Angeles; --until is exclusive)
 """
 
 from __future__ import annotations
@@ -926,20 +927,42 @@ def run() -> None:
 
 # ── Report ──────────────────────────────────────────────────────────────────────
 
-def paired_report(since: str, va: int = PROMPT_V, vb: int = LEARN_V) -> None:
+# 2026-11-09: report days are the USER'S days. A bare date like --since 2026-11-09 used to mean UTC
+# midnight (4 pm Pacific the evening before), which folded Sunday evening into "Monday". --since and
+# --until are now midnights in REPORT_TZ, and the by-day rows group by the REPORT_TZ date.
+REPORT_TZ = os.getenv("REPORT_TZ", "America/Los_Angeles")
+
+
+def _window(col: str, since: str, until: str | None) -> tuple[str, list]:
+    """SQL + params: col inside [since, until) where both are local midnights in REPORT_TZ."""
+    sql = f"{col} >= (%s::date)::timestamp AT TIME ZONE %s"
+    params = [since, REPORT_TZ]
+    if until:
+        sql += f" AND {col} < (%s::date)::timestamp AT TIME ZONE %s"
+        params += [until, REPORT_TZ]
+    return sql, params
+
+
+def _span(since: str, until: str | None) -> str:
+    return f"{since} .. {until} (exclusive), {REPORT_TZ} days" if until else f"since {since}, {REPORT_TZ} days"
+
+
+def paired_report(since: str, va: int = PROMPT_V, vb: int = LEARN_V, until: str | None = None) -> None:
     """Both versions judged the SAME coins: compare where they disagree, and the combinations."""
+    win, wparams = _window("qp.entry_time", since, until)
     conn = db.get_conn()
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT qp.call_id, qp.channel_handle, qp.entry_time::date, qp.sol_in, qp.sol_out, qp.exit_reason,
-                   a.vs_typical, b.vs_typical
+        cur.execute(f"""
+            SELECT qp.call_id, qp.channel_handle, (qp.entry_time AT TIME ZONE %s)::date,
+                   qp.sol_in, qp.sol_out, qp.exit_reason, a.vs_typical, b.vs_typical
             FROM qsim_positions qp
             JOIN trader_brain_entry a ON a.call_id = qp.call_id AND a.prompt_v = %s
             JOIN trader_brain_entry b ON b.call_id = qp.call_id AND b.prompt_v = %s
-            WHERE qp.status = 'closed' AND qp.sol_in > 0 AND qp.entry_time >= %s
-              AND a.vs_typical IS NOT NULL AND b.vs_typical IS NOT NULL""", (va, vb, since))
+            WHERE qp.status = 'closed' AND qp.sol_in > 0 AND {win}
+              AND a.vs_typical IS NOT NULL AND b.vs_typical IS NOT NULL""",
+                    [REPORT_TZ, va, vb] + wparams)
         rows = cur.fetchall()
-    print(f"\n{'=' * 24} PAIRED: v{va} vs v{vb} on the SAME coins (since {since}) {'=' * 24}")
+    print(f"\n{'=' * 24} PAIRED: v{va} vs v{vb} on the SAME coins ({_span(since, until)}) {'=' * 24}")
     if not rows:
         print("  no coins judged by both versions yet")
         return
@@ -986,10 +1009,12 @@ def paired_report(since: str, va: int = PROMPT_V, vb: int = LEARN_V) -> None:
           "  and on most days, over ~5 days. Combine if AND clearly beats both. Otherwise keep v5.")
 
 
-def report(since: str, PROMPT_V: int = PROMPT_V) -> None:
+def report(since: str, PROMPT_V: int = PROMPT_V, until: str | None = None) -> None:
+    win_b, p_b = _window("b.judged_at", since, until)
+    win_e, p_e = _window("e.judged_at", since, until)
     conn = db.get_conn()
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT qp.channel_handle, b.plan, b.story, b.meme, b.flow, b.risk, b.copycat, b.confidence, b.attention,
                    b.ctx_ms, b.api_ms, b.p_2x, b.p_rug, coalesce(b.has_brief, false), t.symbol,
                    b.verdict->>'reason', b.vs_typical,
@@ -999,10 +1024,10 @@ def report(since: str, PROMPT_V: int = PROMPT_V) -> None:
                        AND o.real_mult IS NOT NULL) AS post_max
             FROM trader_brain b JOIN qsim_positions qp ON qp.call_id = b.call_id
             JOIN tokens t ON t.id = qp.token_id
-            WHERE qp.status = 'closed' AND qp.sol_in > 0 AND b.judged_at >= %s
-              AND coalesce(b.prompt_v, 1) = %s""", (since, PROMPT_V))
+            WHERE qp.status = 'closed' AND qp.sol_in > 0 AND {win_b}
+              AND coalesce(b.prompt_v, 1) = %s""", p_b + [PROMPT_V])
         rows = cur.fetchall()
-        cur.execute("""
+        cur.execute(f"""
             SELECT qp.channel_handle, e.buy, e.p_2x, e.p_rug, e.ctx_ms, e.api_ms,
                    coalesce(e.has_brief, false), t.symbol, e.verdict->>'reason', e.vs_typical,
                    qp.sol_in, qp.sol_out, qp.exit_reason, qp.peak_multiplier,
@@ -1011,8 +1036,8 @@ def report(since: str, PROMPT_V: int = PROMPT_V) -> None:
                        AND o.real_mult IS NOT NULL) AS post_max
             FROM trader_brain_entry e JOIN qsim_positions qp ON qp.call_id = e.call_id
             JOIN tokens t ON t.id = qp.token_id
-            WHERE qp.status = 'closed' AND qp.sol_in > 0 AND e.judged_at >= %s AND e.prompt_v = %s""",
-                    (since, PROMPT_V))
+            WHERE qp.status = 'closed' AND qp.sol_in > 0 AND {win_e} AND e.prompt_v = %s""",
+                    p_e + [PROMPT_V])
         erows = cur.fetchall()
     if not rows and not erows:
         print(f"no closed, judged trades since {since} (prompt v{PROMPT_V})")
@@ -1163,14 +1188,16 @@ if __name__ == "__main__":
     if "--report" in sys.argv:
         i = sys.argv.index("--since") if "--since" in sys.argv else -1
         since = sys.argv[i + 1] if i > 0 else "2026-11-05"
+        k = sys.argv.index("--until") if "--until" in sys.argv else -1
+        until = sys.argv[k + 1] if k > 0 else None
         j = sys.argv.index("--v") if "--v" in sys.argv else -1
         if j > 0:
-            report(since, int(sys.argv[j + 1]))
+            report(since, int(sys.argv[j + 1]), until=until)
         else:
-            paired_report(since)
+            paired_report(since, until=until)
             for ver in (PROMPT_V, LEARN_V):
                 print(f"\n{'=' * 30} PROMPT v{ver} {'(learning: similar past coins)' if ver == LEARN_V else ''} {'=' * 30}")
-                report(since, ver)
+                report(since, ver, until=until)
     elif "--dry" in sys.argv:
         # print the context the model would see for one call_id, without calling the API
         i = sys.argv.index("--dry")
