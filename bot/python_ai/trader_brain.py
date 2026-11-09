@@ -1186,6 +1186,9 @@ def report(since: str, PROMPT_V: int = PROMPT_V, until: str | None = None) -> No
 
 if __name__ == "__main__":
     if "--report" in sys.argv:
+        # `--report | head -45` closes the pipe early; exit quietly instead of a BrokenPipeError trace
+        import signal
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
         i = sys.argv.index("--since") if "--since" in sys.argv else -1
         since = sys.argv[i + 1] if i > 0 else "2026-11-05"
         k = sys.argv.index("--until") if "--until" in sys.argv else -1
