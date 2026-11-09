@@ -195,9 +195,37 @@ def _score(banked: list[dict], keep: float, trail: float, **kw) -> dict:
     return {"base": base, "policy": pol, "deployed": dep, "rows": rows, "why": dict(why_n)}
 
 
+# 2026-11-08: "copied" = another coin with the same ticker launched in the 6 h before our entry
+# (new_tokens, from news_recorder). Banked copied solearly coins went on to 3x more often (59% vs
+# 44%); --copied asks whether that makes a kept slice pay. Only entries inside windows where the
+# recorder was running count — outside them a copy count of 0 just means "not recorded".
+RECORDER_WINDOWS = [("2026-11-01 12:00+00", "2026-11-04 06:00+00"), ("2026-11-07 12:00+00", None)]
+_SAME_TICKER_6H = """EXISTS (SELECT 1 FROM new_tokens o
+                             WHERE upper(o.symbol) = upper(t.symbol) AND o.mint <> t.mint_address
+                               AND o.created_at BETWEEN qp.entry_time - interval '6 hours'
+                                                    AND qp.entry_time)"""
+
+
+def _copied_sql(copied: str) -> tuple[str, list]:
+    spans, params = [], []
+    for start, end in RECORDER_WINDOWS:
+        spans.append("(qp.entry_time >= %s" + (" AND qp.entry_time < %s)" if end else ")"))
+        params += [start] + ([end] if end else [])
+    sql = "(" + " OR ".join(spans) + ")"
+    sql += " AND EXISTS (SELECT 1 FROM new_tokens n WHERE n.mint = t.mint_address)"
+    sql += f" AND {'' if copied == 'yes' else 'NOT '}{_SAME_TICKER_6H}"
+    return sql, params
+
+
 def report(a) -> None:
-    channels = [] if a.all_lanes else _live_channels()
+    channels = [a.channel.lstrip("@")] if a.channel else ([] if a.all_lanes else _live_channels())
     where, params = _scope_sql(a.days, a.since, channels, a.mcap_min, a.mcap_max, a.flag)
+    if a.copied:
+        extra, extra_params = _copied_sql(a.copied)
+        where, params = f"{where} AND {extra}", params + extra_params
+        print(f"COPIED={a.copied}: only entries while the token recorder ran "
+              f"({', '.join(s[:10] + '..' + (e[:10] if e else 'now') for s, e in RECORDER_WINDOWS)}) "
+              f"and only coins it recorded")
     pos = _positions(where, params)
     ser = _series(where, params)
     tighten = parse_tighten(a.tighten)
@@ -317,6 +345,10 @@ def main() -> int:
     ap.add_argument("--mcap-min", type=float, default=80000.0)
     ap.add_argument("--mcap-max", type=float, default=120000.0, help="0 = no mcap band")
     ap.add_argument("--all-lanes", action="store_true")
+    ap.add_argument("--channel", help="only this channel (overrides the live-lane scope)")
+    ap.add_argument("--copied", choices=["yes", "no"],
+                    help="only coins with (yes) / without (no) a same-ticker launch in the 6 h "
+                         "before entry; restricts to the token-recorder windows")
     ap.add_argument("--detail", action="store_true")
     ap.add_argument("--sweep", action="store_true", help="grid over trail x keep")
     ap.add_argument("--trails", type=_floats, default=[0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.60])
