@@ -94,6 +94,13 @@ SIMILAR_K = 8
 # brief helps instead of guessing. has_brief is stored on every row.
 BRIEF_ON = os.getenv("TRADER_BRAIN_BRIEF", "0") != "0"     # off since v6 (no effect Nov 5-6)
 ENTRY_ON = os.getenv("TRADER_BRAIN_ENTRY", "1") != "0"
+# 2026-11-09 cost switches (~$2/day at 3 calls per coin).
+# TRADER_BRAIN_PLAN=0 stops the 45 s plan call: record-only, it never chose hold_longer, and the exit
+# question moved to the at-bank Grok look; the 2x bank stays. TRADER_BRAIN_SKIP_DEV_BUNDLED=40 skips
+# coins whose dev bundled 40%+: the brain passed every one (all of Monday's 17 rugs were both-PASS)
+# and the live lane's dev rule blocks them anyway. 0 = judge every coin. Unknown bundle = judged.
+PLAN_ON = os.getenv("TRADER_BRAIN_PLAN", "1") != "0"
+SKIP_DEV_BUNDLED = float(os.getenv("TRADER_BRAIN_SKIP_DEV_BUNDLED", "0") or 0)
 
 _GUIDE = """Most called coins fail; a few run 5-50x. Typically 10-25% of called coins reach 2x and
 5-30% rug, depending on the channel (given in the data). Runners usually combine a REAL, FRESH
@@ -729,17 +736,24 @@ async def live_verdict(call_id: int, channel: str, entry_mcap: float | None, ver
         return out(False, None, f"{type(e).__name__}: {e}"[:200], "error")
 
 
+_DEV_OK = "(%s <= 0 OR t.bundled_pct IS NULL OR t.bundled_pct < %s)"
+
+
 def due() -> list[int]:
+    if not PLAN_ON:
+        return []
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT qp.call_id FROM qsim_positions qp
+            JOIN tokens t ON t.id = qp.token_id
             WHERE qp.channel_handle = ANY(%s)
               AND qp.entry_time <= now() - make_interval(secs => %s)
               AND qp.entry_time >= now() - interval '20 minutes'
+              AND {_DEV_OK}
               AND NOT EXISTS (SELECT 1 FROM trader_brain b WHERE b.call_id = qp.call_id)
-            ORDER BY qp.entry_time""", (CHANNELS, DELAY_SECS))
+            ORDER BY qp.entry_time""", (CHANNELS, DELAY_SECS, SKIP_DEV_BUNDLED, SKIP_DEV_BUNDLED))
         return [r[0] for r in cur.fetchall() if _failed.get(("plan", r[0], None), 0) < 2]
 
 
@@ -751,14 +765,16 @@ def due_entry() -> list[tuple[int, int]]:
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT qp.call_id, coalesce(array_agg(e.prompt_v) FILTER (WHERE e.prompt_v IS NOT NULL), '{}')
+        cur.execute(f"""
+            SELECT qp.call_id, coalesce(array_agg(e.prompt_v) FILTER (WHERE e.prompt_v IS NOT NULL), '{{}}')
             FROM qsim_positions qp
+            JOIN tokens t ON t.id = qp.token_id
             LEFT JOIN trader_brain_entry e ON e.call_id = qp.call_id
             WHERE qp.channel_handle = ANY(%s)
               AND qp.entry_time >= now() - interval '10 minutes'
+              AND {_DEV_OK}
             GROUP BY qp.call_id, qp.entry_time
-            ORDER BY qp.entry_time DESC""", (CHANNELS,))
+            ORDER BY qp.entry_time DESC""", (CHANNELS, SKIP_DEV_BUNDLED, SKIP_DEV_BUNDLED))
         out = []
         for cid, have in cur.fetchall():
             for ver in entry_versions(cid):
@@ -892,6 +908,9 @@ def run() -> None:
           f"{'a buy/pass verdict at the call (no price data) + ' if ENTRY_ON else ''}a plan {DELAY_SECS:g}s after "
           f"entry; market brief {'on even call_ids (A/B)' if BRIEF_ON else 'off'}. Ceilings: {MAX_PER_DAY} judgements/day and ${MAX_USD_PER_DAY:.2f}/day "
           f"(~${MAX_USD_PER_DAY * 30:.0f}/month max) at ${PRICE_IN:g}/${PRICE_OUT:g} per M tokens.", flush=True)
+    print(f"[trader_brain] cost switches: 45 s plan {'ON' if PLAN_ON else 'OFF (TRADER_BRAIN_PLAN=0)'}; "
+          + (f"skipping coins with dev bundled >= {SKIP_DEV_BUNDLED:g}% (TRADER_BRAIN_SKIP_DEV_BUNDLED)"
+             if SKIP_DEV_BUNDLED > 0 else "judging every coin (TRADER_BRAIN_SKIP_DEV_BUNDLED=0)"), flush=True)
     print("[trader_brain] alerts: out-of-credit / failing streak → Telegram."
           + (check_credit() or " Credit warning off (set ANTHROPIC_CREDIT_USD + ANTHROPIC_CREDIT_SINCE)."),
           flush=True)
