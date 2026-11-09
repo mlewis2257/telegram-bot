@@ -33,6 +33,7 @@ Model: TRADER_BRAIN_MODEL (default claude-haiku-4-5-20251001). Key: ANTHROPIC_AP
 Run:     pm2 start trader_brain.py --name trader-brain --interpreter <venv python>
 Report:  python3 trader_brain.py --report [--since 2026-11-05] [--until 2026-11-10]
          (dates are midnights in REPORT_TZ, default America/Los_Angeles; --until is exclusive)
+         python3 trader_brain.py --report --bank [--since 2026-11-10]   (the at-2x-bank decisions)
 """
 
 from __future__ import annotations
@@ -100,6 +101,12 @@ ENTRY_ON = os.getenv("TRADER_BRAIN_ENTRY", "1") != "0"
 # coins whose dev bundled 40%+: the brain passed every one (all of Monday's 17 rugs were both-PASS)
 # and the live lane's dev rule blocks them anyway. 0 = judge every coin. Unknown bundle = judged.
 PLAN_ON = os.getenv("TRADER_BRAIN_PLAN", "1") != "0"
+# WHEN the plan call happens. 'bank' (default since 2026-11-09): once, right after qsim banks a coin at
+# 2x — "take the 2x or hold for 3x?" — only banked coins (~15-20% of trades), and the question the
+# exit work left open. 'entry': the old 45 s plan on every coin. Record-only either way.
+PLAN_AT = os.getenv("TRADER_BRAIN_PLAN_AT", "bank").strip().lower()
+BANK_V = 1                    # prompt version of the at-bank decision (stored in prompt_v)
+BANK_WINDOW_MIN = 15          # banks older than this are skipped
 SKIP_DEV_BUNDLED = float(os.getenv("TRADER_BRAIN_SKIP_DEV_BUNDLED", "0") or 0)
 
 _GUIDE = """Most called coins fail; a few run 5-50x. Typically 10-25% of called coins reach 2x and
@@ -164,6 +171,24 @@ skip = clearly should not have been bought: sell now.
 vs_typical: 5 = an ordinary coin for this channel at this point; use the whole 1-10 range (about a
 third 6+ and a third 4 or lower across coins)."""
 
+BANK_SYSTEM = """You are an experienced Solana meme-coin trader. Your position in the coin below has JUST
+reached 2x of your entry price — the moment you normally take the profit and sell everything.
+Decide: take the 2x now ("bank"), or hold the whole position for more ("hold"). If you hold, you
+sell at 3x, or at 1.55x if it falls back first.
+Know the base rate: of called coins that reach 2x, only about 4 in 10 go on to 3x before falling
+back to 1.55x, and roughly 1 in 8 collapse to near zero within minutes (a dev or bundle dump).
+Holding only pays if you are right clearly more than ~45% of the time, so say "hold" only for coins
+clearly better than that: real, fresh attention still building, broad buying (not one bundle),
+holders not about to dump, a price path that is climbing steadily rather than one spike. Most coins
+should be "bank". You see the price path from your entry up to this moment, the coin's data at the
+call, its holders, copycats and news. Judge ONLY from the data given.
+
+Answer with one JSON object and nothing else:
+{"decision": "hold" | "bank", "p_3x": 0-100, "attention": "early" | "peaking" | "late",
+ "flow": 0-3, "risk": 0-3, "confidence": 1-5, "reason": "<one sentence>"}
+p_3x = chance it reaches 3x of the entry price before falling back to 1.55x. Give honest,
+spread-out numbers; across many coins they should average near 40."""
+
 _day = None
 _n_today = 0
 _usd_today = 0.0
@@ -206,6 +231,18 @@ def ensure_table() -> None:
         cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS prompt_v integer")
         cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS has_brief boolean")
         cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS vs_typical integer")
+        # one row per (coin, phase): '45s' = the old plan 45 s after entry, 'bank' = at the 2x bank
+        cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS phase text NOT NULL DEFAULT '45s'")
+        cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS p_3x integer")
+        cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS secs_after_bank integer")
+        cur.execute("""
+            DO $$ BEGIN
+              IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'trader_brain_pkey'
+                         AND array_length(conkey, 1) = 1) THEN
+                ALTER TABLE trader_brain DROP CONSTRAINT trader_brain_pkey;
+                ALTER TABLE trader_brain ADD PRIMARY KEY (call_id, phase);
+              END IF;
+            END $$""")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS trader_brain_entry (
                 call_id     integer PRIMARY KEY,
@@ -472,10 +509,13 @@ def has_brief(call_id: int) -> bool:
 
 
 def build_context(call_id: int, with_path: bool = True, learn: bool = False,
-                  fast: bool = False, live: dict | None = None) -> dict | None:
+                  fast: bool = False, live: dict | None = None,
+                  as_of: datetime | None = None) -> dict | None:
     """fast=True skips the coin's metadata fetch (IPFS, up to ~20 s) — used before a live buy.
     live={"channel":..., "entry_mcap":...} builds from the call itself when qsim has no
-    position for it yet (live can decide before qsim opens)."""
+    position for it yet (live can decide before qsim opens).
+    as_of: build the view as of that moment (the at-bank call passes the bank time) so a late
+    call can never see prices from after it — no lookahead."""
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor() as cur:
@@ -498,7 +538,7 @@ def build_context(call_id: int, with_path: bool = True, learn: bool = False,
             return None
         (channel, entry_time, entry_price, sol_in, mcap_call, score, raw, mtype, tags, called_at,
          tok, mint, symbol, name) = row
-        judged = datetime.now(timezone.utc)
+        judged = as_of or datetime.now(timezone.utc)
 
         cur.execute("""SELECT round(extract(epoch FROM observed_at - %s)) AS s, round(real_mult, 3)
                        FROM qsim_quote_observations
@@ -655,6 +695,8 @@ def judge(ctx: dict, system: str = None, kind: str = "plan") -> tuple[dict | Non
         return None, tin, tout, f"bad plan: {v.get('plan')}"
     if kind == "entry" and not isinstance(v.get("buy"), bool):
         return None, tin, tout, f"bad buy: {v.get('buy')}"
+    if kind == "bank" and v.get("decision") not in ("hold", "bank"):
+        return None, tin, tout, f"bad decision: {v.get('decision')}"
     return v, tin, tout, None
 
 
@@ -739,8 +781,27 @@ async def live_verdict(call_id: int, channel: str, entry_mcap: float | None, ver
 _DEV_OK = "(%s <= 0 OR t.bundled_pct IS NULL OR t.bundled_pct < %s)"
 
 
+def due_bank() -> list[tuple[int, datetime]]:
+    """(call_id, bank time) for coins qsim banked in the last BANK_WINDOW_MIN minutes, not yet judged."""
+    if not PLAN_ON or PLAN_AT != "bank":
+        return []
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT qp.call_id, qp.exit_time FROM qsim_positions qp
+            JOIN tokens t ON t.id = qp.token_id
+            WHERE qp.channel_handle = ANY(%s)
+              AND qp.status = 'closed' AND qp.exit_reason LIKE '%%bank%%'
+              AND qp.exit_time >= now() - make_interval(mins => %s)
+              AND {_DEV_OK}
+              AND NOT EXISTS (SELECT 1 FROM trader_brain b WHERE b.call_id = qp.call_id AND b.phase = 'bank')
+            ORDER BY qp.exit_time""", (CHANNELS, BANK_WINDOW_MIN, SKIP_DEV_BUNDLED, SKIP_DEV_BUNDLED))
+        return [(cid, et) for cid, et in cur.fetchall() if _failed.get(("bank", cid, None), 0) < 2]
+
+
 def due() -> list[int]:
-    if not PLAN_ON:
+    if not PLAN_ON or PLAN_AT != "entry":
         return []
     conn = db.get_conn()
     db.safe_rollback()
@@ -752,7 +813,7 @@ def due() -> list[int]:
               AND qp.entry_time <= now() - make_interval(secs => %s)
               AND qp.entry_time >= now() - interval '20 minutes'
               AND {_DEV_OK}
-              AND NOT EXISTS (SELECT 1 FROM trader_brain b WHERE b.call_id = qp.call_id)
+              AND NOT EXISTS (SELECT 1 FROM trader_brain b WHERE b.call_id = qp.call_id AND b.phase = '45s')
             ORDER BY qp.entry_time""", (CHANNELS, DELAY_SECS, SKIP_DEV_BUNDLED, SKIP_DEV_BUNDLED))
         return [r[0] for r in cur.fetchall() if _failed.get(("plan", r[0], None), 0) < 2]
 
@@ -790,20 +851,26 @@ def _int(v):
         return None
 
 
-def _one(kind: str, call_id: int, tally, ver: int | None = None) -> None:
-    """Judge one trade (kind 'entry' or 'plan') and store it."""
+def _one(kind: str, call_id: int, tally, ver=None) -> None:
+    """Judge one trade and store it. kind 'entry' (ver = prompt version), 'plan' (the old 45 s plan)
+    or 'bank' (ver = the bank time; the view is built as of that moment)."""
     global _n_today, _usd_today, _pause_until
     t0 = time.monotonic()
-    if ver is None:
-        ver = version_for(call_id)
-    ctx = build_context(call_id, with_path=(kind == "plan"), learn=(ver == LEARN_V))
+    bank_time = None
+    if kind == "bank":
+        bank_time, ver = ver, BANK_V
+        ctx = build_context(call_id, with_path=True, learn=False, as_of=bank_time)
+    else:
+        if ver is None:
+            ver = version_for(call_id)
+        ctx = build_context(call_id, with_path=(kind == "plan"), learn=(ver == LEARN_V))
     ctx_ms = int((time.monotonic() - t0) * 1000)
     if not ctx:
         return
     t1 = time.monotonic()
     try:
-        system = ENTRY_SYSTEM if kind == "entry" else SYSTEM
-        if ver == LEARN_V:
+        system = {"entry": ENTRY_SYSTEM, "bank": BANK_SYSTEM}.get(kind, SYSTEM)
+        if ver == LEARN_V and kind != "bank":
             system = system + LEARN_NOTE
         v, tin, tout, err = judge(ctx, system, kind)
     except requests.RequestException as e:
@@ -820,7 +887,7 @@ def _one(kind: str, call_id: int, tally, ver: int | None = None) -> None:
                             f"(retry every {BILLING_PAUSE_S // 60} min); the LIVE brain lane buys nothing "
                             f"until fixed. {err[:200]}")
             return                  # not counted against the coin: it is retried after the pause
-        key = ("entry", call_id, ver) if kind == "entry" else ("plan", call_id, None)
+        key = ("entry", call_id, ver) if kind == "entry" else (kind, call_id, None)
         _failed[key] = _failed.get(key, 0) + 1
         _streak.fail(err)
         return
@@ -837,6 +904,18 @@ def _one(kind: str, call_id: int, tally, ver: int | None = None) -> None:
                          _int(v.get("story")), _int(v.get("meme")), str(v.get("attention") or "")[:10] or None,
                          json.dumps(v), json.dumps(ctx, default=str), ctx_ms, api_ms, tin, tout,
                          "market_today" in ctx, _int(v.get("vs_typical"))))
+        elif kind == "bank":
+            tally["bank:" + v["decision"]] += 1
+            late = round((datetime.now(timezone.utc) - bank_time).total_seconds())
+            cur.execute("""INSERT INTO trader_brain (call_id, phase, model, delay_secs, context, plan, flow, risk,
+                           confidence, verdict, in_tokens, out_tokens, attention, ctx_ms, api_ms, p_3x, prompt_v,
+                           has_brief, secs_after_bank)
+                           VALUES (%s,'bank',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT DO NOTHING""",
+                        (call_id, MODEL, ctx["our_entry"]["secs_since_entry"], json.dumps(ctx, default=str),
+                         v["decision"], _int(v.get("flow")), _int(v.get("risk")), _int(v.get("confidence")),
+                         json.dumps(v), tin, tout, str(v.get("attention") or "")[:10] or None,
+                         ctx_ms, api_ms, _int(v.get("p_3x")), BANK_V, "market_today" in ctx, late))
         else:
             tally[v["plan"]] += 1
             cur.execute("""INSERT INTO trader_brain (call_id, model, delay_secs, context, plan, story, meme,
@@ -855,6 +934,11 @@ def _one(kind: str, call_id: int, tally, ver: int | None = None) -> None:
         print(f"[trader_brain] {ctx.get('symbol')} ({ctx.get('channel')}) call_id={call_id} AT CALL: "
               f"{'BUY' if v['buy'] else 'PASS'} (vs typical {v.get('vs_typical')}/10, 2x {v.get('p_2x')}%, rug {v.get('p_rug')}%, story {v.get('story')}, "
               f"meme {v.get('meme')}, {v.get('attention')}) — {str(v.get('reason'))[:140]} "
+              f"[data {ctx_ms} ms, model {api_ms} ms]", flush=True)
+    elif kind == "bank":
+        print(f"[trader_brain] {ctx.get('symbol')} ({ctx.get('channel')}) call_id={call_id} AT 2x BANK: "
+              f"{v['decision'].upper()} (3x before 1.55x {v.get('p_3x')}%, flow {v.get('flow')}, risk {v.get('risk')}, "
+              f"{v.get('attention')}, conf {v.get('confidence')}) — {str(v.get('reason'))[:140]} "
               f"[data {ctx_ms} ms, model {api_ms} ms]", flush=True)
     else:
         print(f"[trader_brain] {ctx.get('symbol')} ({ctx.get('channel')}) call_id={call_id} AT "
@@ -908,7 +992,10 @@ def run() -> None:
           f"{'a buy/pass verdict at the call (no price data) + ' if ENTRY_ON else ''}a plan {DELAY_SECS:g}s after "
           f"entry; market brief {'on even call_ids (A/B)' if BRIEF_ON else 'off'}. Ceilings: {MAX_PER_DAY} judgements/day and ${MAX_USD_PER_DAY:.2f}/day "
           f"(~${MAX_USD_PER_DAY * 30:.0f}/month max) at ${PRICE_IN:g}/${PRICE_OUT:g} per M tokens.", flush=True)
-    print(f"[trader_brain] cost switches: 45 s plan {'ON' if PLAN_ON else 'OFF (TRADER_BRAIN_PLAN=0)'}; "
+    plan_txt = ("OFF (TRADER_BRAIN_PLAN=0)" if not PLAN_ON else
+                "AT THE 2x BANK: take it or hold for 3x? (TRADER_BRAIN_PLAN_AT=bank)" if PLAN_AT == "bank" else
+                f"{DELAY_SECS:g}s after entry on every coin (TRADER_BRAIN_PLAN_AT=entry)")
+    print(f"[trader_brain] cost switches: plan call {plan_txt}; "
           + (f"skipping coins with dev bundled >= {SKIP_DEV_BUNDLED:g}% (TRADER_BRAIN_SKIP_DEV_BUNDLED)"
              if SKIP_DEV_BUNDLED > 0 else "judging every coin (TRADER_BRAIN_SKIP_DEV_BUNDLED=0)"), flush=True)
     print("[trader_brain] alerts: out-of-credit / failing streak → Telegram."
@@ -922,7 +1009,8 @@ def run() -> None:
             _day, _n_today, _usd_today, _capped_noted = today, 0, 0.0, False
         try:
             work = [] if time.monotonic() < _pause_until else (
-                [("entry", c, v) for c, v in due_entry()] + [("plan", c, None) for c in due()])
+                [("entry", c, v) for c, v in due_entry()] + [("bank", c, t) for c, t in due_bank()]
+                + [("plan", c, None) for c in due()])
             for kind, call_id, ver in work:
                 if time.monotonic() < _pause_until:
                     break
@@ -1043,7 +1131,7 @@ def report(since: str, PROMPT_V: int = PROMPT_V, until: str | None = None) -> No
                        AND o.real_mult IS NOT NULL) AS post_max
             FROM trader_brain b JOIN qsim_positions qp ON qp.call_id = b.call_id
             JOIN tokens t ON t.id = qp.token_id
-            WHERE qp.status = 'closed' AND qp.sol_in > 0 AND {win_b}
+            WHERE qp.status = 'closed' AND qp.sol_in > 0 AND {win_b} AND b.phase = '45s'
               AND coalesce(b.prompt_v, 1) = %s""", p_b + [PROMPT_V])
         rows = cur.fetchall()
         cur.execute(f"""
@@ -1203,11 +1291,81 @@ def report(since: str, PROMPT_V: int = PROMPT_V, until: str | None = None) -> No
           "on a decent count, and again on a second week. Then (and only then) wire plans into qsim exits.")
 
 
+def report_bank(since: str, until: str | None = None) -> None:
+    """At-bank decisions graded on what the coin did NEXT: did it hit 3x before falling to 1.55x —
+    what holding to 3x would have caught (break-even ~45%) — and did it ever reach 5x."""
+    win, wparams = _window("qp.exit_time", since, until)
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT b.plan, b.p_3x, b.secs_after_bank, qp.channel_handle, t.symbol,
+                   (SELECT min(o.observed_at) FROM qsim_quote_observations o
+                     WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time AND o.real_mult >= 3),
+                   (SELECT min(o.observed_at) FROM qsim_quote_observations o
+                     WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time
+                       AND NOT coalesce(o.rate_limited, false)
+                       AND (o.real_mult <= 1.55 OR coalesce(o.no_route, false))),
+                   (SELECT max(o.real_mult) FROM qsim_quote_observations o
+                     WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time),
+                   b.verdict->>'reason'
+            FROM trader_brain b JOIN qsim_positions qp ON qp.call_id = b.call_id
+            JOIN tokens t ON t.id = qp.token_id
+            WHERE b.phase = 'bank' AND {win}
+              AND qp.exit_time <= now() - interval '2 hours'""", wparams)
+        rows = cur.fetchall()
+    print(f"\n{'=' * 22} AT THE 2x BANK: take it or hold for 3x? ({_span(since, until)}) {'=' * 22}")
+    if not rows:
+        print("  no graded at-bank decisions yet (each needs 2 h of post-bank quotes)")
+        return
+    items = []
+    for dec, p3, late, ch, sym, t3, tfloor, high, reason in rows:
+        items.append({"dec": dec, "p3": p3, "late": late, "ch": ch or "?", "sym": sym, "reason": reason,
+                      "run": t3 is not None and (tfloor is None or t3 < tfloor),
+                      "x5": float(high or 0) >= 5, "high": float(high or 0)})
+
+    def line(label, g):
+        if not g:
+            print(f"  {label:22s}    0")
+            return
+        n = len(g)
+        print(f"  {label:22s} {n:4d}  hit 3x before 1.55x {sum(i['run'] for i in g) / n * 100:5.1f}%   "
+              f"ever 5x {sum(i['x5'] for i in g) / n * 100:5.1f}%")
+
+    print(f"  {len(items)} banked coins judged at the bank, graded 2 h+ later. Break-even for holding ~45%.")
+    line("ALL", items)
+    line("said HOLD", [i for i in items if i["dec"] == "hold"])
+    line("said BANK", [i for i in items if i["dec"] == "bank"])
+    print("  by its chance of 3x before 1.55x:")
+    for lo, hi in ((0, 30), (30, 45), (45, 60), (60, 101)):
+        line(f"  {lo}-{hi - 1 if hi < 101 else 100}%", [i for i in items if i["p3"] is not None and lo <= i["p3"] < hi])
+    for ch in sorted({i["ch"] for i in items}):
+        print(f"  -- {ch} --")
+        line("said HOLD", [i for i in items if i["ch"] == ch and i["dec"] == "hold"])
+        line("said BANK", [i for i in items if i["ch"] == ch and i["dec"] == "bank"])
+    late = [i["late"] for i in items if i["late"] is not None]
+    if late:
+        print(f"  asked a median {statistics.median(late):.0f}s after the bank (its view is fixed at the bank either way)")
+    holds = sorted((i for i in items if i["dec"] == "hold"), key=lambda i: -i["high"])
+    if holds:
+        print("  its HOLD calls (best first):")
+        for i in holds[:10]:
+            print(f"    {str(i['sym'])[:12]:12s} {i['ch'][:16]:16s} {'RAN' if i['run'] else 'fell back':9s} "
+                  f"high {i['high']:5.1f}x  — {str(i['reason'])[:90]}")
+    print("  Useful only if 'said HOLD' hits 3x-before-1.55x clearly above ~45% on 30+ coins, and again on\n"
+          "  the next 30. Only then does it earn an exit rule (hold those for 3x).")
+
+
 if __name__ == "__main__":
     if "--report" in sys.argv:
         # `--report | head -45` closes the pipe early; exit quietly instead of a BrokenPipeError trace
         import signal
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        if "--bank" in sys.argv:
+            i = sys.argv.index("--since") if "--since" in sys.argv else -1
+            k = sys.argv.index("--until") if "--until" in sys.argv else -1
+            report_bank(sys.argv[i + 1] if i > 0 else "2026-11-10", sys.argv[k + 1] if k > 0 else None)
+            sys.exit(0)
         i = sys.argv.index("--since") if "--since" in sys.argv else -1
         since = sys.argv[i + 1] if i > 0 else "2026-11-05"
         k = sys.argv.index("--until") if "--until" in sys.argv else -1
