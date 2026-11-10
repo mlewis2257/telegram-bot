@@ -824,16 +824,36 @@ def _stats(items: list) -> dict:
 
 
 def _row_text(t: dict) -> str:
-    who = {"BUY": "coins you BUY", "PASS": "coins you PASSED", "all": "all coins"}[t["verdict"]]
+    who = {"BUY": "coins you BUY", "PASS": "coins you PASSED", "all": "all judged coins"}[t["verdict"]]
     where = "" if t["feature"] == "overall" else f" with {t['feature']} = {t['bucket']}"
     return (f"{t['id']}: {who}{where}: {t['n']} coins, banked {t['banked_pct']}%, rugged {t['rugged_pct']}%, "
             f"P&L {t['pnl_pct']:+.1f}%/SOL")
 
 
-def playbook_tables(channel: str, first: date, last: date, base_v: int) -> tuple[list, int, list]:
-    """(rows with n >= MIN_N, coins graded, example mistakes) from base_v's calls in [first, last] (Pacific)."""
+def playbook_tables(channel: str, first: date, last: date, base_v: int) -> tuple[list, int, list, int]:
+    """(rows, coins base_v judged, example mistakes, all judged coins) for [first, last] (Pacific days).
+
+    Two kinds of row, kept apart on purpose:
+      "all judged coins" — EVERY coin any brain version judged in the window (v5's included): how coins
+          with a feature did. A coin's outcome doesn't depend on who judged it, so this is fair evidence
+          and it widens the sample (v5 judged from Nov 4, v7 only from Nov 7).
+      "coins you BUY / PASSED" — base_v's OWN calls only. Another version's calls were a different
+          judge and must not be taught to v8 as its own decisions.
+    Only groups of MIN_N+ coins become rows (the overall rows always show)."""
+    span = ("qp.entry_time >= (%s::date)::timestamp AT TIME ZONE %s "
+            "AND qp.entry_time < ((%s::date) + 1)::timestamp AT TIME ZONE %s")
     db.safe_rollback()
     with db.get_conn().cursor() as cur:
+        # one context per coin: base_v's if it judged the coin, else the newest version's
+        cur.execute(f"""
+            SELECT DISTINCT ON (qp.call_id) e.context, qp.sol_in, qp.sol_out, qp.exit_reason, t.mint_address
+            FROM trader_brain_entry e
+            JOIN qsim_positions qp ON qp.call_id = e.call_id
+            JOIN tokens t ON t.id = qp.token_id
+            WHERE qp.channel_handle = %s AND qp.status = 'closed' AND qp.sol_in > 0 AND {span}
+            ORDER BY qp.call_id, (e.prompt_v = %s) DESC, e.prompt_v DESC""",
+                    (channel, first, REPORT_TZ, last, REPORT_TZ, base_v))
+        coins_raw = cur.fetchall()
         cur.execute("""
             SELECT e.vs_typical, e.verdict, e.context, qp.sol_in, qp.sol_out, qp.exit_reason, t.mint_address,
                    t.symbol
@@ -854,6 +874,12 @@ def playbook_tables(channel: str, first: date, last: date, base_v: int) -> tuple
                       "bank": "bank" in (reason or ""), "rug": s_out / s_in < 0.30, "sym": sym,
                       "reason": str(verdict.get("reason") or "")[:160],
                       "f": _features(ctx, {**verdict, "vs_typical": vt}, mint)})
+    coins = []
+    for ctx, s_in, s_out, reason, mint in coins_raw:
+        s_in, s_out = float(s_in), float(s_out or 0)
+        # judge-specific fields (attention / story / meme / score) are left out: no verdict passed
+        coins.append({"s_in": s_in, "pnl": s_out - s_in, "bank": "bank" in (reason or ""),
+                      "rug": s_out / s_in < 0.30, "f": _features(ctx or {}, {}, mint)})
     rows = []
 
     def add(feature, bucket, verdict, group):
@@ -861,25 +887,29 @@ def playbook_tables(channel: str, first: date, last: date, base_v: int) -> tuple
             if group:
                 rows.append({"id": f"R{len(rows) + 1}", "feature": feature, "bucket": bucket, "verdict": verdict,
                              **_stats(group)})
-    add("overall", "", "all", items)
+    add("overall", "", "all", coins)
     for v in ("BUY", "PASS"):
         add("overall", "", v, [i for i in items if i["verdict"] == v])
-    features = list(items[0]["f"]) if items else []
+    features = list((items or coins)[0]["f"]) if (items or coins) else []
     for feat in features:
-        for b in sorted({i["f"][feat] for i in items if i["f"][feat] is not None}):
+        buckets = {i["f"][feat] for i in items + coins if i["f"][feat] is not None}
+        for b in sorted(buckets):
+            add(feat, b, "all", [i for i in coins if i["f"][feat] == b])
             for v in ("BUY", "PASS"):
                 add(feat, b, v, [i for i in items if i["f"][feat] == b and i["verdict"] == v])
     misses = ([f"BUY that lost: {i['sym']} — your reason: {i['reason']}" for i in items
                if i["verdict"] == "BUY" and (i["rug"] or i["pnl"] < 0)][-6:]
               + [f"PASS that banked 2x: {i['sym']} — your reason: {i['reason']}" for i in items
                  if i["verdict"] == "PASS" and i["bank"]][-6:])
-    return rows, len(items), misses
+    return rows, len(items), misses, len(coins)
 
 
 LESSON_SYSTEM = """You are reviewing your own record as a Solana meme-coin trader on one Telegram call
 channel. Every called coin was judged AT THE CALL: BUY (score 6+) or PASS. Below are TABLES computed
-from your graded calls over the past week — how coins did, grouped by something you could see at the
-call, split by your verdict. Only groups of 8+ coins are shown; the "overall" rows are the base rates.
+from the past week — how coins did, grouped by something you could see at the call. "All judged
+coins" rows cover every coin judged in the week (some by an earlier version of you): they show how
+coins with that feature turned out, whatever the verdict. "Coins you BUY / PASSED" rows are YOUR own
+calls only. Only groups of 8+ coins are shown; the "overall" rows are the base rates.
 Then a few example mistakes with your own reasons (anecdotes, not evidence).
 
 Write AT MOST 8 lessons that would make your next BUY/PASS calls on this channel better. Rules:
@@ -924,10 +954,11 @@ def build_playbook(channel: str, made_for: date) -> dict:
     ensure_playbook_table()
     base_v = PAIR[0]
     first, last = made_for - timedelta(days=PLAYBOOK_DAYS), made_for - timedelta(days=1)
-    rows, n, misses = playbook_tables(channel, first, last, base_v)
+    rows, n, misses, n_all = playbook_tables(channel, first, last, base_v)
     lessons, dropped, tin, tout = [], [], 0, 0
-    if n >= MIN_N:
-        user = (f"Channel: {channel}. Your graded calls {first} to {last} ({n} coins).\n\nTABLES:\n"
+    if n_all >= MIN_N:
+        user = (f"Channel: {channel}. {first} to {last}: {n_all} judged coins, {n} of them judged by you "
+                f"(v{base_v}).\n\nTABLES:\n"
                 + "\n".join(_row_text(r) for r in rows)
                 + "\n\nEXAMPLE MISTAKES (anecdotes):\n" + ("\n".join(misses) or "none"))
         v, tin, tout, err = _ask(LESSON_MODEL, LESSON_SYSTEM, user, 1500)
