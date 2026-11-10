@@ -866,6 +866,17 @@ def playbook_tables(channel: str, first: date, last: date, base_v: int) -> tuple
               AND qp.entry_time < ((%s::date) + 1)::timestamp AT TIME ZONE %s""",
                     (base_v, channel, first, REPORT_TZ, last, REPORT_TZ))
         raw = cur.fetchall()
+    def judged_now(ctx: dict) -> bool:
+        """False for coins the brain now skips (dev bundled >= SKIP_DEV_BUNDLED): lessons about coins v8
+        will never see waste a slot and skew the base rates. Unknown bundle = still judged."""
+        b = (ctx.get("token") or {}).get("bundled_pct")
+        try:
+            return SKIP_DEV_BUNDLED <= 0 or b is None or float(b) < SKIP_DEV_BUNDLED
+        except (TypeError, ValueError):
+            return True
+
+    raw = [r for r in raw if judged_now(r[2] or {})]
+    coins_raw = [r for r in coins_raw if judged_now(r[0] or {})]
     items = []
     for vt, verdict, ctx, s_in, s_out, reason, mint, sym in raw:
         verdict, ctx = verdict or {}, ctx or {}
@@ -939,13 +950,41 @@ def _ask(model: str, system: str, user: str, max_tokens: int) -> tuple[dict | No
     usage = j.get("usage") or {}
     tin, tout = int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
     text = "".join(b.get("text", "") for b in j.get("content") or [] if b.get("type") == "text")
+    cut = j.get("stop_reason") == "max_tokens"
     m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        return None, tin, tout, f"no JSON in reply: {text[:120]}"
-    try:
-        return json.loads(m.group(0)), tin, tout, None
-    except ValueError:
-        return None, tin, tout, f"bad JSON: {m.group(0)[:120]}"
+    if m:
+        try:
+            return json.loads(m.group(0)), tin, tout, None
+        except ValueError:
+            pass
+    salvaged = _salvage_lessons(text)
+    if salvaged is not None:
+        print(f"[trader_brain] lesson answer {'cut off at max_tokens' if cut else 'was malformed'} — kept "
+              f"{len(salvaged['lessons'])} complete lessons", flush=True)
+        return salvaged, tin, tout, None
+    return None, tin, tout, (f"answer cut off at max_tokens ({max_tokens})" if cut else
+                             f"bad JSON: {text[:120]}")
+
+
+def _salvage_lessons(text: str) -> dict | None:
+    """The complete lesson objects from a cut-off or malformed {"lessons": [...]} answer, or None."""
+    i = text.find('"lessons"')
+    i = text.find("[", i) if i >= 0 else -1
+    if i < 0:
+        return None
+    dec, out, k = json.JSONDecoder(), [], i + 1
+    while True:
+        while k < len(text) and text[k] in " \t\r\n,":
+            k += 1
+        if k >= len(text) or text[k] != "{":
+            break
+        try:
+            obj, k = dec.raw_decode(text, k)
+        except ValueError:
+            break                                    # the cut-off one: stop, keep what was complete
+        if isinstance(obj, dict):
+            out.append(obj)
+    return {"lessons": out} if out else None
 
 
 def build_playbook(channel: str, made_for: date) -> dict:
@@ -961,7 +1000,7 @@ def build_playbook(channel: str, made_for: date) -> dict:
                 f"(v{base_v}).\n\nTABLES:\n"
                 + "\n".join(_row_text(r) for r in rows)
                 + "\n\nEXAMPLE MISTAKES (anecdotes):\n" + ("\n".join(misses) or "none"))
-        v, tin, tout, err = _ask(LESSON_MODEL, LESSON_SYSTEM, user, 1500)
+        v, tin, tout, err = _ask(LESSON_MODEL, LESSON_SYSTEM, user, 3000)
         if v is None:
             if api_alerts.is_billing_error(err):
                 api_alerts.send("anthropic_billing", f"trader_brain playbook: Anthropic refused — {err[:200]}")
