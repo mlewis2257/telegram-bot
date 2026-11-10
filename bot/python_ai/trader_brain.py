@@ -45,7 +45,7 @@ import statistics
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -323,19 +323,45 @@ BUY). When it says "about normal", ignore them and judge the coin on everything 
 # plan stays v5 only. TRADER_BRAIN_PAIRED=0 falls back to the odd/even split.
 PAIRED = os.getenv("TRADER_BRAIN_PAIRED", "1") != "0"
 
+# v8 (2026-11-10): the LEARNING LOOP. v7 + "lessons_from_your_record": every night, per channel, the
+# code builds tables of how the base version's BUY/PASS calls did over the past 7 days grouped by what
+# was visible at the call (only groups of MIN_N+ coins), a stronger model writes at most 8 lessons that
+# must each cite table rows, and v8 reads that channel's playbook. v7 had won the paired test
+# (Sun none, Mon v7, Tue v7 on both channels), so the pair is now v7 vs v8 — it isolates one thing:
+# do the lessons help? Same 10-pt rule. TRADER_BRAIN_PAIR="5,7" restores the old pair.
+PLAYBOOK_V = 8
+PAIR = [int(x) for x in os.getenv("TRADER_BRAIN_PAIR", "7,8").split(",")][:2]
+PAIR_SINCE = os.getenv("TRADER_BRAIN_PAIR_SINCE", "2026-11-11")   # first Pacific day of this pair
+
+
+def _learns(ver: int) -> bool:
+    return ver in (LEARN_V, PLAYBOOK_V)
+
+
+PLAYBOOK_NOTE = """
+
+"lessons_from_your_record" are lessons written last night from YOUR OWN graded calls on this
+channel over the past week: each says what to lean towards and cites the evidence (how many coins,
+how they did). They are tendencies, not rules: apply a lesson when the coin clearly fits it, and
+judge everything else as usual. Your score must still use the whole 1-10 range."""
+
+
+def _system_for(ver: int) -> str:
+    return ENTRY_SYSTEM + (LEARN_NOTE if _learns(ver) else "") + (PLAYBOOK_NOTE if ver == PLAYBOOK_V else "")
+
 
 def entry_versions(call_id: int) -> list[int]:
     if not LEARN_ON:
         return [PROMPT_V]
     if PAIRED:
-        return [PROMPT_V, LEARN_V]
+        return list(PAIR)
     return [LEARN_V if call_id % 2 == 0 else PROMPT_V]
 
 
 def version_for(call_id: int) -> int:
     """Version for the 45 s plan (and the old odd/even split)."""
     if PAIRED:
-        return PROMPT_V
+        return PAIR[0]
     return LEARN_V if (LEARN_ON and call_id % 2 == 0) else PROMPT_V
 
 
@@ -515,7 +541,7 @@ def has_brief(call_id: int) -> bool:
 
 def build_context(call_id: int, with_path: bool = True, learn: bool = False,
                   fast: bool = False, live: dict | None = None,
-                  as_of: datetime | None = None) -> dict | None:
+                  as_of: datetime | None = None, playbook: bool = False) -> dict | None:
     """fast=True skips the coin's metadata fetch (IPFS, up to ~20 s) — used before a live buy.
     live={"channel":..., "entry_mcap":...} builds from the call itself when qsim has no
     position for it yet (live can decide before qsim opens).
@@ -670,7 +696,328 @@ def build_context(call_id: int, with_path: bool = True, learn: bool = False,
                     "verdict": label}
         except Exception:
             db.safe_rollback()
+    if playbook:
+        ctx["lessons_from_your_record"] = playbook_lessons(channel, _local_day(judged))
     return ctx
+
+
+# ── Playbook (v8's learning loop) ───────────────────────────────────────────────
+
+LESSON_MODEL = os.getenv("TRADER_BRAIN_LESSON_MODEL", "claude-sonnet-5-5")
+LESSON_PRICE_IN = float(os.getenv("TRADER_BRAIN_LESSON_PRICE_IN", "3.0"))     # $ per M tokens (estimate)
+LESSON_PRICE_OUT = float(os.getenv("TRADER_BRAIN_LESSON_PRICE_OUT", "15.0"))
+PLAYBOOK_DAYS = 7
+MIN_N = 8                     # a table row (and so a lesson) needs at least this many coins
+MAX_LESSONS = 8
+PLAYBOOK_AT = (0, 20)         # Pacific: build the day's playbook after 00:20 (yesterday is closed)
+_pb_cache: dict[tuple[str, str], tuple[float, list]] = {}
+
+
+def _local_day(ts: datetime) -> date:
+    from zoneinfo import ZoneInfo
+    return ts.astimezone(ZoneInfo(REPORT_TZ)).date()
+
+
+def ensure_playbook_table() -> None:
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS brain_playbook (
+                channel     text NOT NULL,
+                made_for    date NOT NULL,       -- the Pacific day these lessons are used on
+                base_v      integer NOT NULL,    -- whose graded calls the tables are built from
+                window_from date NOT NULL,
+                window_to   date NOT NULL,       -- inclusive; always before made_for (no hindsight)
+                n_coins     integer,
+                tables      jsonb,
+                lessons     jsonb,
+                dropped     jsonb,               -- lessons rejected for citing rows that don't exist
+                model       text,
+                in_tokens   integer,
+                out_tokens  integer,
+                created_at  timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (channel, made_for)
+            )""")
+        conn.commit()
+
+
+def playbook_lessons(channel: str, day: date) -> list:
+    """The newest playbook made for `day` or earlier: [{lesson, direction, evidence: [row text]}]."""
+    key = (channel, day.isoformat())
+    hit = _pb_cache.get(key)
+    if hit and time.monotonic() - hit[0] < 300:
+        return hit[1]
+    db.safe_rollback()
+    with db.get_conn().cursor() as cur:
+        cur.execute("""SELECT lessons, tables FROM brain_playbook WHERE channel = %s AND made_for <= %s
+                       ORDER BY made_for DESC LIMIT 1""", (channel, day))
+        r = cur.fetchone()
+    out = []
+    if r:
+        rows = {t["id"]: t for t in (r[1] or [])}
+        for les in r[0] or []:
+            out.append({"lesson": les["lesson"], "direction": les.get("direction"),
+                        "evidence": [_row_text(rows[c]) for c in les.get("cites", []) if c in rows]})
+    _pb_cache[key] = (time.monotonic(), out)
+    return out
+
+
+_has_pb: dict[tuple[str, str], tuple[float, bool]] = {}
+
+
+def has_playbook(channel: str, day: date) -> bool:
+    key = (channel, day.isoformat())
+    hit = _has_pb.get(key)
+    if hit and time.monotonic() - hit[0] < 60:
+        return hit[1]
+    db.safe_rollback()
+    with db.get_conn().cursor() as cur:
+        cur.execute("SELECT to_regclass('brain_playbook') IS NOT NULL")
+        ok = False
+        if cur.fetchone()[0]:
+            cur.execute("SELECT 1 FROM brain_playbook WHERE channel = %s AND made_for <= %s LIMIT 1", (channel, day))
+            ok = cur.fetchone() is not None
+    _has_pb[key] = (time.monotonic(), ok)
+    return ok
+
+
+def _bucket(v, cuts: list, labels: list) -> str | None:
+    if v is None:
+        return None
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return next((lab for c, lab in zip(cuts, labels) if v < c), labels[-1])
+
+
+def _features(ctx: dict, verdict: dict, mint: str) -> dict:
+    """What was visible AT THE CALL, bucketed. Only fields the brain itself saw."""
+    tok, cp, dev = ctx.get("token") or {}, ctx.get("copycats") or {}, ctx.get("dev") or {}
+    call, ent = ctx.get("call") or {}, ctx.get("our_entry") or {}
+    sim = (ctx.get("similar_vs_channel") or {}).get("verdict")
+    pad = {"Loat": "Float", "pump": "pump.fun"}.get((mint or "")[-4:], "other launchpad")
+    return {
+        "dev bundled %": _bucket(tok.get("bundled_pct"), [10, 25, 40], ["under 10", "10-25", "25-40", "40+"]),
+        "same-name launches in 6h": _bucket(cp.get("same_name_or_ticker_launches_6h"), [2, 6, 16], ["0-1", "2-5", "6-15", "16+"]),
+        "followed wallets holding": _bucket(ctx.get("followed_wallets_holding"), [1, 2], ["0", "1", "2+"]),
+        "launchpad": pad,
+        "mcap at call": _bucket(call.get("mcap_at_call"), [50_000, 150_000, 500_000], ["under 50k", "50-150k", "150-500k", "500k+"]),
+        "entry vs call price": _bucket(ent.get("entry_vs_call"), [1.05, 1.3], ["under 1.05x", "1.05-1.3x", "1.3x+"]),
+        "dev launches in 7 days": _bucket(dev.get("dev_launches_7d"), [2, 10], ["0-1", "2-9", "10+"]),
+        "news matching the name": "yes" if ctx.get("news_matching_name_last_12h") else "no",
+        "similar past coins": sim,
+        "your attention read": verdict.get("attention"),
+        "your story score": _bucket(verdict.get("story"), [1, 2], ["0", "1", "2-3"]),
+        "your meme score": _bucket(verdict.get("meme"), [1, 2], ["0", "1", "2-3"]),
+        "your score": _bucket(verdict.get("vs_typical"), [4, 6, 8], ["1-3", "4-5", "6-7", "8-10"]),
+    }
+
+
+def _stats(items: list) -> dict:
+    n = len(items)
+    s_in = sum(i["s_in"] for i in items)
+    return {"n": n, "banked_pct": round(sum(i["bank"] for i in items) / n * 100),
+            "rugged_pct": round(sum(i["rug"] for i in items) / n * 100),
+            "pnl_pct": round(sum(i["pnl"] for i in items) / s_in * 100, 1) if s_in else None}
+
+
+def _row_text(t: dict) -> str:
+    who = {"BUY": "coins you BUY", "PASS": "coins you PASSED", "all": "all coins"}[t["verdict"]]
+    where = "" if t["feature"] == "overall" else f" with {t['feature']} = {t['bucket']}"
+    return (f"{t['id']}: {who}{where}: {t['n']} coins, banked {t['banked_pct']}%, rugged {t['rugged_pct']}%, "
+            f"P&L {t['pnl_pct']:+.1f}%/SOL")
+
+
+def playbook_tables(channel: str, first: date, last: date, base_v: int) -> tuple[list, int, list]:
+    """(rows with n >= MIN_N, coins graded, example mistakes) from base_v's calls in [first, last] (Pacific)."""
+    db.safe_rollback()
+    with db.get_conn().cursor() as cur:
+        cur.execute("""
+            SELECT e.vs_typical, e.verdict, e.context, qp.sol_in, qp.sol_out, qp.exit_reason, t.mint_address,
+                   t.symbol
+            FROM trader_brain_entry e
+            JOIN qsim_positions qp ON qp.call_id = e.call_id
+            JOIN tokens t ON t.id = qp.token_id
+            WHERE e.prompt_v = %s AND qp.channel_handle = %s AND qp.status = 'closed' AND qp.sol_in > 0
+              AND e.vs_typical IS NOT NULL
+              AND qp.entry_time >= (%s::date)::timestamp AT TIME ZONE %s
+              AND qp.entry_time < ((%s::date) + 1)::timestamp AT TIME ZONE %s""",
+                    (base_v, channel, first, REPORT_TZ, last, REPORT_TZ))
+        raw = cur.fetchall()
+    items = []
+    for vt, verdict, ctx, s_in, s_out, reason, mint, sym in raw:
+        verdict, ctx = verdict or {}, ctx or {}
+        s_in, s_out = float(s_in), float(s_out or 0)
+        items.append({"verdict": "BUY" if vt >= 6 else "PASS", "s_in": s_in, "pnl": s_out - s_in,
+                      "bank": "bank" in (reason or ""), "rug": s_out / s_in < 0.30, "sym": sym,
+                      "reason": str(verdict.get("reason") or "")[:160],
+                      "f": _features(ctx, {**verdict, "vs_typical": vt}, mint)})
+    rows = []
+
+    def add(feature, bucket, verdict, group):
+        if len(group) >= MIN_N or feature == "overall":
+            if group:
+                rows.append({"id": f"R{len(rows) + 1}", "feature": feature, "bucket": bucket, "verdict": verdict,
+                             **_stats(group)})
+    add("overall", "", "all", items)
+    for v in ("BUY", "PASS"):
+        add("overall", "", v, [i for i in items if i["verdict"] == v])
+    features = list(items[0]["f"]) if items else []
+    for feat in features:
+        for b in sorted({i["f"][feat] for i in items if i["f"][feat] is not None}):
+            for v in ("BUY", "PASS"):
+                add(feat, b, v, [i for i in items if i["f"][feat] == b and i["verdict"] == v])
+    misses = ([f"BUY that lost: {i['sym']} — your reason: {i['reason']}" for i in items
+               if i["verdict"] == "BUY" and (i["rug"] or i["pnl"] < 0)][-6:]
+              + [f"PASS that banked 2x: {i['sym']} — your reason: {i['reason']}" for i in items
+                 if i["verdict"] == "PASS" and i["bank"]][-6:])
+    return rows, len(items), misses
+
+
+LESSON_SYSTEM = """You are reviewing your own record as a Solana meme-coin trader on one Telegram call
+channel. Every called coin was judged AT THE CALL: BUY (score 6+) or PASS. Below are TABLES computed
+from your graded calls over the past week — how coins did, grouped by something you could see at the
+call, split by your verdict. Only groups of 8+ coins are shown; the "overall" rows are the base rates.
+Then a few example mistakes with your own reasons (anecdotes, not evidence).
+
+Write AT MOST 8 lessons that would make your next BUY/PASS calls on this channel better. Rules:
+- every lesson cites 1-3 table row ids (e.g. "R7") whose numbers support it — never invent numbers;
+- a lesson must be about something visible AT THE CALL, phrased as guidance: when X, lean BUY /
+  lean PASS / ignore it;
+- only write a lesson where a group is CLEARLY different from the overall rows (P&L 15+ pts apart,
+  or bank or rug rate 10+ pts apart); weak differences are noise;
+- prefer fewer, stronger lessons; an empty list is a fine answer when nothing clearly stands out;
+- no generic trading advice.
+
+Answer with one JSON object and nothing else:
+{"lessons": [{"lesson": "<one or two sentences>", "cites": ["R3", "R9"],
+              "direction": "lean BUY" | "lean PASS" | "ignore"}]}"""
+
+
+def _ask(model: str, system: str, user: str, max_tokens: int) -> tuple[dict | None, int, int, str | None]:
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+        json={"model": model, "max_tokens": max_tokens, "system": system,
+              "messages": [{"role": "user", "content": user}]},
+        timeout=120)
+    if r.status_code != 200:
+        return None, 0, 0, f"http {r.status_code}: {r.text[:200]}"
+    j = r.json()
+    usage = j.get("usage") or {}
+    tin, tout = int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
+    text = "".join(b.get("text", "") for b in j.get("content") or [] if b.get("type") == "text")
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        return None, tin, tout, f"no JSON in reply: {text[:120]}"
+    try:
+        return json.loads(m.group(0)), tin, tout, None
+    except ValueError:
+        return None, tin, tout, f"bad JSON: {m.group(0)[:120]}"
+
+
+def build_playbook(channel: str, made_for: date) -> dict:
+    """Tables from PAIR[0]'s calls over the PLAYBOOK_DAYS before made_for, lessons from LESSON_MODEL, stored.
+    Returns a summary dict (raises on API / DB errors so the caller can retry later)."""
+    ensure_playbook_table()
+    base_v = PAIR[0]
+    first, last = made_for - timedelta(days=PLAYBOOK_DAYS), made_for - timedelta(days=1)
+    rows, n, misses = playbook_tables(channel, first, last, base_v)
+    lessons, dropped, tin, tout = [], [], 0, 0
+    if n >= MIN_N:
+        user = (f"Channel: {channel}. Your graded calls {first} to {last} ({n} coins).\n\nTABLES:\n"
+                + "\n".join(_row_text(r) for r in rows)
+                + "\n\nEXAMPLE MISTAKES (anecdotes):\n" + ("\n".join(misses) or "none"))
+        v, tin, tout, err = _ask(LESSON_MODEL, LESSON_SYSTEM, user, 1500)
+        if v is None:
+            if api_alerts.is_billing_error(err):
+                api_alerts.send("anthropic_billing", f"trader_brain playbook: Anthropic refused — {err[:200]}")
+            raise RuntimeError(f"lesson model: {err}")
+        ids = {r["id"] for r in rows}
+        for les in (v.get("lessons") or [])[:MAX_LESSONS * 2]:
+            cites = [c for c in (les.get("cites") or []) if isinstance(c, str)]
+            ok = bool(cites) and all(c in ids for c in cites) and str(les.get("lesson") or "").strip()
+            (lessons if ok and len(lessons) < MAX_LESSONS else dropped).append(
+                {"lesson": str(les.get("lesson") or "")[:400], "cites": cites,
+                 "direction": les.get("direction") if les.get("direction") in ("lean BUY", "lean PASS", "ignore")
+                 else None})
+    db.safe_rollback()
+    conn = db.get_conn()
+    with conn.cursor() as cur:
+        cur.execute("""INSERT INTO brain_playbook (channel, made_for, base_v, window_from, window_to, n_coins,
+                       tables, lessons, dropped, model, in_tokens, out_tokens)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (channel, made_for) DO UPDATE SET base_v = EXCLUDED.base_v,
+                         window_from = EXCLUDED.window_from, window_to = EXCLUDED.window_to,
+                         n_coins = EXCLUDED.n_coins, tables = EXCLUDED.tables, lessons = EXCLUDED.lessons,
+                         dropped = EXCLUDED.dropped, model = EXCLUDED.model, in_tokens = EXCLUDED.in_tokens,
+                         out_tokens = EXCLUDED.out_tokens, created_at = now()""",
+                    (channel, made_for, base_v, first, last, n, json.dumps(rows), json.dumps(lessons),
+                     json.dumps(dropped), LESSON_MODEL, tin, tout))
+        conn.commit()
+    _pb_cache.clear()
+    _has_pb.clear()
+    return {"channel": channel, "made_for": made_for, "coins": n, "rows": len(rows), "lessons": len(lessons),
+            "dropped": len(dropped), "usd": tin / 1e6 * LESSON_PRICE_IN + tout / 1e6 * LESSON_PRICE_OUT}
+
+
+_pb_last_try: dict[str, float] = {}
+
+
+def playbook_tick() -> None:
+    """From the run loop: once a day per channel (after PLAYBOOK_AT Pacific), build today's playbook.
+    A failure is retried every 30 min."""
+    if PLAYBOOK_V not in PAIR:
+        return
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo(REPORT_TZ))
+    if (now.hour, now.minute) < PLAYBOOK_AT:
+        return
+    ensure_playbook_table()
+    for ch in CHANNELS:
+        db.safe_rollback()
+        with db.get_conn().cursor() as cur:
+            cur.execute("SELECT 1 FROM brain_playbook WHERE channel = %s AND made_for = %s", (ch, now.date()))
+            if cur.fetchone():
+                continue
+        if time.monotonic() - _pb_last_try.get(ch, -1e9) < 1800:
+            continue
+        _pb_last_try[ch] = time.monotonic()
+        try:
+            s = build_playbook(ch, now.date())
+            print(f"[trader_brain] PLAYBOOK {ch} for {s['made_for']}: {s['coins']} graded coins, {s['rows']} table "
+                  f"rows, {s['lessons']} lessons kept, {s['dropped']} dropped (~${s['usd']:.3f})", flush=True)
+        except Exception as e:
+            db.safe_rollback()
+            print(f"[trader_brain] playbook {ch} failed (retry in 30 min): {type(e).__name__}: {e}", flush=True)
+
+
+def report_playbook() -> None:
+    ensure_playbook_table()
+    db.safe_rollback()
+    with db.get_conn().cursor() as cur:
+        cur.execute("""SELECT DISTINCT ON (channel) channel, made_for, base_v, window_from, window_to, n_coins,
+                              tables, lessons, dropped, model
+                       FROM brain_playbook ORDER BY channel, made_for DESC""")
+        rows = cur.fetchall()
+    if not rows:
+        print("no playbook yet")
+        return
+    for ch, made_for, base_v, w0, w1, n, tables, lessons, dropped, model in rows:
+        print(f"\n{'=' * 18} PLAYBOOK {ch} — for {made_for} (from v{base_v}'s calls {w0}..{w1}, {n} coins, {model}) "
+              f"{'=' * 18}")
+        byid = {t["id"]: t for t in tables or []}
+        if not lessons:
+            print("  no lessons (nothing clearly stood out)")
+        for k, les in enumerate(lessons or [], 1):
+            print(f"  {k}. [{les.get('direction') or '-'}] {les['lesson']}")
+            for c in les.get("cites", []):
+                if c in byid:
+                    print(f"       {_row_text(byid[c])}")
+        if dropped:
+            print(f"  ({len(dropped)} lessons dropped for citing rows that don't exist)")
 
 
 # ── Judge ───────────────────────────────────────────────────────────────────────
@@ -724,7 +1071,7 @@ async def live_verdict(call_id: int, channel: str, entry_mcap: float | None, ver
     out = lambda buy, score, reason, src: {"buy": buy, "score": score, "reason": reason, "source": src,
                                            "ms": int((time.monotonic() - t0) * 1000)}
     try:
-        if version not in (PROMPT_V, LEARN_V):
+        if version not in (PROMPT_V, LEARN_V, PLAYBOOK_V):
             return out(False, None, f"unknown brain version v{version}", "config")
         ensure_table()
         conn = db.get_conn()
@@ -743,11 +1090,12 @@ async def live_verdict(call_id: int, channel: str, entry_mcap: float | None, ver
             _live_day, _live_n = today, 0
         if _live_n >= LIVE_VERDICT_MAX_PER_DAY:
             return out(False, None, f"live verdict cap {LIVE_VERDICT_MAX_PER_DAY}/day reached", "cap")
-        ctx = build_context(call_id, with_path=False, learn=(version == LEARN_V), fast=True,
-                            live={"channel": channel, "entry_mcap": entry_mcap})
+        ctx = build_context(call_id, with_path=False, learn=_learns(version), fast=True,
+                            live={"channel": channel, "entry_mcap": entry_mcap},
+                            playbook=(version == PLAYBOOK_V))
         if not ctx:
             return out(False, None, "no call/token row for this call", "error")
-        system = ENTRY_SYSTEM + (LEARN_NOTE if version == LEARN_V else "")
+        system = _system_for(version)
         _live_n += 1
         v, tin, tout, err = await asyncio.wait_for(asyncio.to_thread(judge, ctx, system, "entry"),
                                                    timeout=timeout_s)
@@ -832,21 +1180,25 @@ def due_entry() -> list[tuple[int, int]]:
     db.safe_rollback()
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT qp.call_id, coalesce(array_agg(e.prompt_v) FILTER (WHERE e.prompt_v IS NOT NULL), '{{}}')
+            SELECT qp.call_id, coalesce(array_agg(e.prompt_v) FILTER (WHERE e.prompt_v IS NOT NULL), '{{}}'),
+                   qp.channel_handle
             FROM qsim_positions qp
             JOIN tokens t ON t.id = qp.token_id
             LEFT JOIN trader_brain_entry e ON e.call_id = qp.call_id
             WHERE qp.channel_handle = ANY(%s)
               AND qp.entry_time >= now() - interval '10 minutes'
               AND {_DEV_OK}
-            GROUP BY qp.call_id, qp.entry_time
+            GROUP BY qp.call_id, qp.entry_time, qp.channel_handle
             ORDER BY qp.entry_time DESC""", (CHANNELS, SKIP_DEV_BUNDLED, SKIP_DEV_BUNDLED))
-        out = []
-        for cid, have in cur.fetchall():
-            for ver in entry_versions(cid):
-                if ver not in (have or []) and _failed.get(("entry", cid, ver), 0) < 2:
-                    out.append((cid, ver))
-        return out
+        rows = cur.fetchall()
+    out, today = [], _local_day(datetime.now(timezone.utc))
+    for cid, have, ch in rows:
+        for ver in entry_versions(cid):
+            if ver == PLAYBOOK_V and not has_playbook(ch, today):
+                continue                    # v8 judges only once its channel has a playbook
+            if ver not in (have or []) and _failed.get(("entry", cid, ver), 0) < 2:
+                out.append((cid, ver))
+    return out
 
 
 def _int(v):
@@ -868,15 +1220,19 @@ def _one(kind: str, call_id: int, tally, ver=None) -> None:
     else:
         if ver is None:
             ver = version_for(call_id)
-        ctx = build_context(call_id, with_path=(kind == "plan"), learn=(ver == LEARN_V))
+        ctx = build_context(call_id, with_path=(kind == "plan"), learn=_learns(ver),
+                            playbook=(kind == "entry" and ver == PLAYBOOK_V))
     ctx_ms = int((time.monotonic() - t0) * 1000)
     if not ctx:
         return
     t1 = time.monotonic()
     try:
-        system = {"entry": ENTRY_SYSTEM, "bank": BANK_SYSTEM}.get(kind, SYSTEM)
-        if ver == LEARN_V and kind != "bank":
-            system = system + LEARN_NOTE
+        if kind == "entry":
+            system = _system_for(ver)
+        elif kind == "bank":
+            system = BANK_SYSTEM
+        else:
+            system = SYSTEM + (LEARN_NOTE if _learns(ver) else "")
         v, tin, tout, err = judge(ctx, system, kind)
     except requests.RequestException as e:
         v, tin, tout, err = None, 0, 0, f"{type(e).__name__}: {e}"
@@ -965,7 +1321,14 @@ def spend_since(since: datetime) -> float:
               SELECT in_tokens, out_tokens FROM trader_brain_entry WHERE judged_at >= %s) x""",
                     (since, since))
         tin, tout = cur.fetchone()
-    return float(tin) / 1e6 * PRICE_IN + float(tout) / 1e6 * PRICE_OUT
+        cur.execute("SELECT to_regclass('brain_playbook') IS NOT NULL")
+        lin = lout = 0
+        if cur.fetchone()[0]:
+            cur.execute("SELECT coalesce(sum(in_tokens), 0), coalesce(sum(out_tokens), 0) FROM brain_playbook "
+                        "WHERE created_at >= %s", (since,))
+            lin, lout = cur.fetchone()
+    return (float(tin) / 1e6 * PRICE_IN + float(tout) / 1e6 * PRICE_OUT
+            + float(lin) / 1e6 * LESSON_PRICE_IN + float(lout) / 1e6 * LESSON_PRICE_OUT)
 
 
 def check_credit() -> str:
@@ -1006,12 +1369,25 @@ def run() -> None:
     print("[trader_brain] alerts: out-of-credit / failing streak → Telegram."
           + (check_credit() or " Credit warning off (set ANTHROPIC_CREDIT_USD + ANTHROPIC_CREDIT_SINCE)."),
           flush=True)
+    ensure_playbook_table()
+    print(f"[trader_brain] pair: v{PAIR[0]} vs v{PAIR[1]} on every coin"
+          + (f"; v{PLAYBOOK_V} reads a nightly per-channel playbook (lessons from v{PAIR[0]}'s graded calls, "
+             f"last {PLAYBOOK_DAYS} days, model {LESSON_MODEL}), built after "
+             f"{PLAYBOOK_AT[0]:02d}:{PLAYBOOK_AT[1]:02d} {REPORT_TZ}" if PLAYBOOK_V in PAIR else ""), flush=True)
     last_tally = time.monotonic()
+    last_pb = 0.0
     tally = defaultdict(int)
     while True:
         today = datetime.now(timezone.utc).date()
         if today != _day:
             _day, _n_today, _usd_today, _capped_noted = today, 0, 0.0, False
+        if time.monotonic() - last_pb >= 60 and time.monotonic() >= _pause_until:
+            last_pb = time.monotonic()
+            try:
+                playbook_tick()
+            except Exception as e:
+                db.safe_rollback()
+                print(f"[trader_brain] playbook tick failed: {type(e).__name__}: {e}", flush=True)
         try:
             work = [] if time.monotonic() < _pause_until else (
                 [("entry", c, v) for c, v in due_entry()] + [("bank", c, t) for c, t in due_bank()]
@@ -1059,7 +1435,8 @@ def _span(since: str, until: str | None) -> str:
     return f"{since} .. {until} (exclusive), {REPORT_TZ} days" if until else f"since {since}, {REPORT_TZ} days"
 
 
-def paired_report(since: str, va: int = PROMPT_V, vb: int = LEARN_V, until: str | None = None) -> None:
+def paired_report(since: str, va: int | None = None, vb: int | None = None, until: str | None = None) -> None:
+    va, vb = va or PAIR[0], vb or PAIR[1]
     """Both versions judged the SAME coins: compare where they disagree, and the combinations."""
     win, wparams = _window("qp.entry_time", since, until)
     conn = db.get_conn()
@@ -1118,7 +1495,7 @@ def paired_report(since: str, va: int = PROMPT_V, vb: int = LEARN_V, until: str 
         for k, g in cells.items():
             line(k, [i for i in g if i["ch"] == ch])
     print("  Rule (fixed in advance): a version wins if its own picks beat the other's by 10+ pts/SOL\n"
-          "  and on most days, over ~5 days. Combine if AND clearly beats both. Otherwise keep v5.")
+          f"  and on most days, over ~5 days. Combine if AND clearly beats both. Otherwise keep v{va}.")
 
 
 def report(since: str, PROMPT_V: int = PROMPT_V, until: str | None = None) -> None:
@@ -1374,6 +1751,9 @@ if __name__ == "__main__":
         # `--report | head -45` closes the pipe early; exit quietly instead of a BrokenPipeError trace
         import signal
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        if "--playbook" in sys.argv:
+            report_playbook()
+            sys.exit(0)
         if "--bank" in sys.argv:
             i = sys.argv.index("--since") if "--since" in sys.argv else -1
             k = sys.argv.index("--until") if "--until" in sys.argv else -1
@@ -1390,8 +1770,9 @@ if __name__ == "__main__":
             report(since, int(sys.argv[j + 1]), until=until)
         else:
             paired_report(since, until=until)
-            for ver in (PROMPT_V, LEARN_V):
-                print(f"\n{'=' * 30} PROMPT v{ver} {'(learning: similar past coins)' if ver == LEARN_V else ''} {'=' * 30}")
+            for ver in PAIR:
+                tag = {LEARN_V: "(learning: similar past coins)", PLAYBOOK_V: "(learning loop: nightly playbook)"}
+                print(f"\n{'=' * 30} PROMPT v{ver} {tag.get(ver, '')} {'=' * 30}")
                 report(since, ver, until=until)
     elif "--dry" in sys.argv:
         # print the context the model would see for one call_id, without calling the API

@@ -1,8 +1,8 @@
 """
 daily_digest.py — the nightly brain dashboard, sent to Telegram.
 
-WHY (2026-11-10). Every night the same five checks were pasted by hand: the paired v5/v7 report,
-v5's solwhaletrending BUYs with the frozen filters F1/F2, the at-bank brain and Grok looks, the
+WHY (2026-11-10). Every night the same five checks were pasted by hand: the paired brain report,
+the base brain's solwhaletrending BUYs with the frozen filters F1/F2, the at-bank brain and Grok looks, the
 Float forward test and the API spend. This gathers all of it for one PACIFIC day and posts it
 through the alert bot: a short text summary plus a self-contained HTML dashboard (a document you
 open on the phone). Read-only: no API calls, no trading access, nothing exposed on the VPS.
@@ -35,17 +35,22 @@ import db  # noqa: E402
 TZ = os.getenv("REPORT_TZ", "America/Los_Angeles")
 CHANNELS = ["solwhaletrending", "solearlytrending"]
 SHORT = {"solwhaletrending": "swt", "solearlytrending": "solearly"}
-PAIRED_SINCE = "2026-11-08"     # first day both versions judged every coin
-SWT_SINCE = "2026-11-05"        # v5 on solwhaletrending
+BASE_SINCE = {5: "2026-11-05", 7: "2026-11-07"}   # first day each base version judged swt
 FILTERS_SINCE = "2026-11-10"    # F1 / F2 frozen
 BANK_SINCE = "2026-11-10"       # at-bank brain prompt v2
 GROK_SINCE = "2026-11-09"       # Grok at-bank looks
 PRICE_IN = float(os.getenv("TRADER_BRAIN_PRICE_IN", "1.0"))
 PRICE_OUT = float(os.getenv("TRADER_BRAIN_PRICE_OUT", "5.0"))
-DIGEST_AT = os.getenv("DIGEST_AT", "00:10")
+DIGEST_AT = os.getenv("DIGEST_AT", "00:30")   # after the 00:20 playbook build
 
 
 # ── data ────────────────────────────────────────────────────────────────────────
+
+def pair() -> tuple[int, int, str]:
+    """(base version, challenger, first Pacific day of the pair) — read from the brain so it never goes stale."""
+    import trader_brain
+    return trader_brain.PAIR[0], trader_brain.PAIR[1], trader_brain.PAIR_SINCE
+
 
 def _q(sql: str, params: list) -> list[tuple]:
     db.safe_rollback()
@@ -87,25 +92,26 @@ def _ran(t3, tfloor) -> bool:
 
 
 def paired(day: str) -> dict:
-    span, sp = _span("qp.entry_time", PAIRED_SINCE, day)
+    va, vb, since = pair()
+    span, sp = _span("qp.entry_time", since, day)
     rows = _q(f"""
         SELECT qp.channel_handle, (qp.entry_time AT TIME ZONE %s)::date, a.vs_typical, b.vs_typical,
                qp.sol_in, qp.sol_out, qp.exit_reason
         FROM qsim_positions qp
-        JOIN trader_brain_entry a ON a.call_id = qp.call_id AND a.prompt_v = 5
-        JOIN trader_brain_entry b ON b.call_id = qp.call_id AND b.prompt_v = 7
+        JOIN trader_brain_entry a ON a.call_id = qp.call_id AND a.prompt_v = %s
+        JOIN trader_brain_entry b ON b.call_id = qp.call_id AND b.prompt_v = %s
         WHERE qp.status = 'closed' AND qp.sol_in > 0 AND qp.channel_handle = ANY(%s)
-          AND a.vs_typical IS NOT NULL AND b.vs_typical IS NOT NULL AND {span}""", [TZ, CHANNELS] + sp)
+          AND a.vs_typical IS NOT NULL AND b.vs_typical IS NOT NULL AND {span}""", [TZ, va, vb, CHANNELS] + sp)
     d = date.fromisoformat(day)
 
     def cells(rs):
         t = lambda r: (r[4], r[5], r[6])
         return {"both BUY": agg([t(r) for r in rs if r[2] >= 6 and r[3] >= 6]),
-                "v5 only": agg([t(r) for r in rs if r[2] >= 6 and r[3] < 6]),
-                "v7 only": agg([t(r) for r in rs if r[3] >= 6 and r[2] < 6]),
+                "A only": agg([t(r) for r in rs if r[2] >= 6 and r[3] < 6]),
+                "B only": agg([t(r) for r in rs if r[3] >= 6 and r[2] < 6]),
                 "both PASS": agg([t(r) for r in rs if r[2] < 6 and r[3] < 6]),
-                "v5 BUY": agg([t(r) for r in rs if r[2] >= 6]),
-                "v7 BUY": agg([t(r) for r in rs if r[3] >= 6]),
+                "A BUY": agg([t(r) for r in rs if r[2] >= 6]),
+                "B BUY": agg([t(r) for r in rs if r[3] >= 6]),
                 "no brain": agg([t(r) for r in rs])}
 
     today = [r for r in rows if r[1] == d]
@@ -114,36 +120,44 @@ def paired(day: str) -> dict:
     tally = []
     for day_i in sorted({r[1] for r in rows}):
         c = cells([r for r in rows if r[1] == day_i])
-        tally.append((day_i, c["v5 only"], c["v7 only"], winner(c["v5 only"], c["v7 only"])))
-    return {"by_ch": by_ch, "tally": tally}
+        tally.append((day_i, c["A only"], c["B only"], winner(c["A only"], c["B only"])))
+    return {"va": va, "vb": vb, "since": since, "by_ch": by_ch, "tally": tally}
 
 
-def winner(v5only: dict, v7only: dict) -> str:
-    """The fixed rule: a version's own picks beat the other's by 10+ pts/SOL. No side = no call."""
-    if not v5only["n"] or not v7only["n"]:
+def winner(a_only: dict, b_only: dict) -> str:
+    """The fixed rule: a version's own picks beat the other's by 10+ pts/SOL. No side = no call.
+    Returns "A" (the base version), "B" (the challenger) or "none"."""
+    if not a_only["n"] or not b_only["n"]:
         return "none"
-    gap = v7only["pnl_pct"] - v5only["pnl_pct"]
-    return "v7" if gap >= 10 else "v5" if gap <= -10 else "none"
+    gap = b_only["pnl_pct"] - a_only["pnl_pct"]
+    return "B" if gap >= 10 else "A" if gap <= -10 else "none"
+
+
+def wname(w: str, p: dict) -> str:
+    return {"A": f"v{p['va']}", "B": f"v{p['vb']}"}.get(w, "none")
 
 
 def swt(day: str) -> dict:
-    span, sp = _span("qp.entry_time", SWT_SINCE, day)
+    base = pair()[0]
+    since = BASE_SINCE.get(base, pair()[2])
+    span, sp = _span("qp.entry_time", since, day)
     rows = _q(f"""
         SELECT (qp.entry_time AT TIME ZONE %s)::date, a.vs_typical >= 6, c.mcap_at_call,
                coalesce(f.n_holding, 0), qp.sol_in, qp.sol_out, qp.exit_reason
         FROM qsim_positions qp
         JOIN calls c ON c.id = qp.call_id
-        JOIN trader_brain_entry a ON a.call_id = qp.call_id AND a.prompt_v = 5
+        JOIN trader_brain_entry a ON a.call_id = qp.call_id AND a.prompt_v = %s
         LEFT JOIN followed_at_call f ON f.call_id = qp.call_id
         WHERE qp.status = 'closed' AND qp.sol_in > 0 AND qp.channel_handle = 'solwhaletrending'
-          AND a.vs_typical IS NOT NULL AND {span}""", [TZ] + sp)
+          AND a.vs_typical IS NOT NULL AND {span}""", [TZ, base] + sp)
     d, f0 = date.fromisoformat(day), date.fromisoformat(FILTERS_SINCE)
     t = lambda r: (r[4], r[5], r[6])
     f1 = lambda r: r[1] and r[2] is not None and float(r[2]) < 150_000
     f2 = lambda r: r[1] and r[3] >= 1
     today = [r for r in rows if r[0] == d]
     since_f = [r for r in rows if r[0] >= f0]
-    return {"today": {"BUY": agg([t(r) for r in today if r[1]]), "pass": agg([t(r) for r in today if not r[1]]),
+    return {"base_v": base, "since": since,
+            "today": {"BUY": agg([t(r) for r in today if r[1]]), "pass": agg([t(r) for r in today if not r[1]]),
                       "F1": agg([t(r) for r in today if f1(r)]), "F2": agg([t(r) for r in today if f2(r)])},
             "cum": {"BUY": agg([t(r) for r in rows if r[1]]), "pass": agg([t(r) for r in rows if not r[1]]),
                     "F1": agg([t(r) for r in since_f if f1(r)]), "F2": agg([t(r) for r in since_f if f2(r)]),
@@ -217,8 +231,29 @@ def spend(day: str) -> dict:
             "brain_calls": int(calls[0]) + int(calls[1]), "xai": float(xai[0]), "grok_calls": int(xai[1])}
 
 
+def playbook(day: str) -> dict:
+    """The lessons v8 will use the NEXT day (built at 00:20), else the newest before it, per channel."""
+    import trader_brain as tb
+    if not _q("SELECT to_regclass('brain_playbook') IS NOT NULL", [])[0][0]:
+        return {"channels": {}}
+    nxt = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+    out = {}
+    for ch in CHANNELS:
+        r = _q("""SELECT made_for, n_coins, lessons, tables, window_from, window_to FROM brain_playbook
+                  WHERE channel = %s AND made_for <= %s ORDER BY made_for DESC LIMIT 1""", [ch, nxt])
+        if not r:
+            continue
+        made_for, n, lessons, tables, w0, w1 = r[0]
+        byid = {t["id"]: t for t in tables or []}
+        out[ch] = {"made_for": made_for, "n": n, "window": (w0, w1),
+                   "lessons": [{"lesson": les["lesson"], "direction": les.get("direction"),
+                                "evidence": [tb._row_text(byid[c]) for c in les.get("cites", []) if c in byid]}
+                               for les in lessons or []]}
+    return {"channels": out}
+
+
 SECTIONS = [("paired", paired), ("swt", swt), ("bank_brain", bank_brain), ("grok_bank", grok_bank),
-            ("market", market), ("spend", spend)]
+            ("market", market), ("spend", spend), ("playbook", playbook)]
 
 
 def collect(day: str) -> dict:
@@ -252,30 +287,31 @@ def text(d: dict) -> str:
     L = [f"🧠 Brain daily — {day:%a %b %-d} (Pacific)", ""]
     p = d.get("paired", {})
     if "error" in p:
-        L.append(f"v5 vs v7: error {p['error']}")
+        L.append(f"Paired brains: error {p['error']}")
     else:
-        L.append("v5 vs v7 — where they disagreed (P&L/SOL, n):")
+        A, B = f"v{p['va']}", f"v{p['vb']}"
+        L.append(f"{A} vs {B} — where they disagreed (P&L/SOL, n):")
         for ch in CHANNELS:
             c = p["by_ch"][ch]
-            L.append(f"  {SHORT[ch]}: v5-only {pct(c['v5 only'])} · v7-only {pct(c['v7 only'])}"
-                     f" → {winner(c['v5 only'], c['v7 only'])}")
+            L.append(f"  {SHORT[ch]}: {A}-only {pct(c['A only'])} · {B}-only {pct(c['B only'])}"
+                     f" → {wname(winner(c['A only'], c['B only']), p)}")
         wins = defaultdict(int)
         for _d, _a, _b, w in p["tally"]:
             wins[w] += 1
-        L.append(f"  Day winner: {winner(p['by_ch']['both']['v5 only'], p['by_ch']['both']['v7 only'])}"
-                 f" | tally since {PAIRED_SINCE[5:]}: v7 {wins['v7']} · v5 {wins['v5']} · none {wins['none']}")
+        L.append(f"  Day winner: {wname(winner(p['by_ch']['both']['A only'], p['by_ch']['both']['B only']), p)}"
+                 f" | tally since {p['since'][5:]}: {B} {wins['B']} · {A} {wins['A']} · none {wins['none']}")
         for ch in CHANNELS:
             c = p["by_ch"][ch]
-            L.append(f"  {SHORT[ch]} BUYs: v5 {pct(c['v5 BUY'])} · v7 {pct(c['v7 BUY'])} · "
+            L.append(f"  {SHORT[ch]} BUYs: {A} {pct(c['A BUY'])} · {B} {pct(c['B BUY'])} · "
                      f"both {pct(c['both BUY'])} · no brain {pct(c['no brain'])}")
     s = d.get("swt", {})
     L.append("")
     if "error" in s:
-        L.append(f"swt v5: error {s['error']}")
+        L.append(f"swt base brain: error {s['error']}")
     else:
-        L.append(f"swt v5 today: BUY {pct(s['today']['BUY'])} vs pass {pct(s['today']['pass'])}"
+        L.append(f"swt v{s['base_v']} today: BUY {pct(s['today']['BUY'])} vs pass {pct(s['today']['pass'])}"
                  f" · F1 {pct(s['today']['F1'])} · F2 {pct(s['today']['F2'])}")
-        L.append(f"swt v5 since {SWT_SINCE[5:]}: BUY {pct(s['cum']['BUY'])} vs pass {pct(s['cum']['pass'])}")
+        L.append(f"swt v{s['base_v']} since {s['since'][5:]}: BUY {pct(s['cum']['BUY'])} vs pass {pct(s['cum']['pass'])}")
         L.append(f"Filters since {FILTERS_SINCE[5:]}: plain BUY {pct(s['cum']['BUY since filters'])} · "
                  f"F1 {pct(s['cum']['F1'])} · F2 {pct(s['cum']['F2'])}")
     b, g = d.get("bank_brain", {}), d.get("grok_bank", {})
@@ -302,6 +338,12 @@ def text(d: dict) -> str:
     if "error" not in sp:
         L.append(f"Spend today: Anthropic ~${sp['anthropic']:.2f} ({sp['brain_calls']} calls) · "
                  f"xAI ~${sp['xai']:.2f} ({sp['grok_calls']} looks)")
+    pb = d.get("playbook", {})
+    if "error" in pb:
+        L.append(f"Playbook: error {pb['error']}")
+    elif pb.get("channels"):
+        L.append("Playbook: " + " · ".join(f"{SHORT[ch]} {len(v['lessons'])} lessons for {v['made_for']:%b %-d}"
+                                           for ch, v in pb["channels"].items()))
     L.append("")
     L.append("Full dashboard: the attached HTML file.")
     return "\n".join(L)
@@ -348,12 +390,12 @@ text-align:right;padding:0 8px 10px;white-space:nowrap}
 .pos{color:var(--pos)}.neg{color:var(--neg)}.mut{color:var(--faint)}.acc{color:var(--acc)}
 .pill{display:inline-block;margin-top:5px;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:650;
 letter-spacing:.02em;text-transform:none;background:var(--sunk);color:var(--mut)}
-.pill.v5,.pill.v7{background:var(--acc-bg);color:var(--acc)}
+.pill.win{background:var(--acc-bg);color:var(--acc)}
 .chips{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 6px}
 .chip{border:1px solid var(--line);background:var(--sunk);border-radius:11px;padding:8px 11px;min-width:104px}
 .chip .d{font-size:11px;color:var(--mut);font-weight:600;letter-spacing:.04em;text-transform:uppercase}
 .chip .w{font-size:14px;font-weight:700;margin-top:2px}
-.chip .w.v5,.chip .w.v7{color:var(--acc)}.chip .w.none{color:var(--faint)}
+.chip .w.win{color:var(--acc)}.chip .w.none{color:var(--faint)}
 .chip .x{font-size:11.5px;color:var(--faint);margin-top:1px}
 .rows td{padding:9px 0;border-top:1px solid var(--line);vertical-align:middle}
 .rows tr:first-child td{border-top:0}
@@ -372,6 +414,14 @@ color:var(--mut);border-top:0}
 .note{font-size:12px;color:var(--faint);margin:10px 0 4px;line-height:1.45}
 .err{color:var(--neg);font-size:13px}
 footer{font-size:12px;color:var(--faint);text-align:center;margin-top:22px;line-height:1.6}
+.pbh{margin:14px 0 6px}.pbh:first-of-type{margin-top:4px}
+.lessons{list-style:none;margin:0 0 6px;padding:0;counter-reset:l}
+.lessons li{counter-increment:l;position:relative;padding:10px 0 10px 30px;border-top:1px solid var(--line)}
+.lessons li:before{content:counter(l);position:absolute;left:0;top:11px;width:20px;height:20px;border-radius:7px;
+background:var(--sunk);color:var(--mut);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center}
+.lessons .dir{font-size:10.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
+.lessons .lt{font-size:14px;margin:2px 0 4px}
+.lessons .ev{font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums}
 """
 
 
@@ -454,17 +504,18 @@ def render_html(d: dict) -> str:
     kp = []
     if "error" not in p:
         both = p["by_ch"]["both"]
-        w = winner(both["v5 only"], both["v7 only"])
-        kp.append(_kpi("Day winner", {"none": "No call"}.get(w, w), f"solo picks: v5 {_e(pct(both['v5 only']))}"
-                       f" · v7 {_e(pct(both['v7 only']))}", "acc" if w != "none" else "mut"))
+        A, B = f"v{p['va']}", f"v{p['vb']}"
+        w = winner(both["A only"], both["B only"])
+        kp.append(_kpi("Day winner", {"none": "No call"}.get(w, wname(w, p)), f"solo picks: {A} {_e(pct(both['A only']))}"
+                       f" · {B} {_e(pct(both['B only']))}", "acc" if w != "none" else "mut"))
         wins = defaultdict(int)
         for *_x, wv in p["tally"]:
             wins[wv] += 1
-        kp.append(_kpi(f"Tally since {date.fromisoformat(PAIRED_SINCE):%b %-d}", f"v7 {wins['v7']} · v5 {wins['v5']}",
+        kp.append(_kpi(f"Tally since {date.fromisoformat(p['since']):%b %-d}", f"{B} {wins['B']} · {A} {wins['A']}",
                        f"{wins['none']} day{'s' if wins['none'] != 1 else ''} without a winner"))
     if "error" not in s:
         t = s["today"]
-        kp.append(_kpi("swt v5 BUYs", _fmt(t["BUY"]["pnl_pct"] if t["BUY"]["n"] else None),
+        kp.append(_kpi(f"swt v{s['base_v']} BUYs", _fmt(t["BUY"]["pnl_pct"] if t["BUY"]["n"] else None),
                        f"{t['BUY']['n']} trades · passes {_e(pct(t['pass']))}",
                        _cls(t["BUY"]["pnl_pct"] if t["BUY"]["n"] else None)))
     if "error" not in sp:
@@ -473,7 +524,8 @@ def render_html(d: dict) -> str:
     out.append(f"<div class=kpis>{''.join(kp)}</div>")
 
     # v5 vs v7
-    out.append("<section><div class=hd><h2>v5 vs v7 — same coins</h2></div>"
+    pa, pb_ = (f"v{p.get('va', '?')}", f"v{p.get('vb', '?')}")
+    out.append(f"<section><div class=hd><h2>{pa} vs {pb_} — same coins</h2></div>"
                "<p class=lede>The solo-pick rows decide it: a version wins a day when its own picks beat the "
                "other’s by 10+ pts per SOL.</p>")
     if _err(p):
@@ -481,23 +533,25 @@ def render_html(d: dict) -> str:
     else:
         cols = CHANNELS + ["both"]
         head = "".join(
-            f"<th>{_e(SHORT.get(c, 'both'))}<br><span class='pill {w}'>{_e({'none': 'no call'}.get(w, w + ' wins'))}</span></th>"
-            for c in cols for w in [winner(p["by_ch"][c]["v5 only"], p["by_ch"][c]["v7 only"])])
+            f"<th>{_e(SHORT.get(c, 'both'))}<br><span class='pill {'win' if w != 'none' else 'none'}'>"
+            f"{_e({'none': 'no call'}.get(w, wname(w, p) + ' wins'))}</span></th>"
+            for c in cols for w in [winner(p["by_ch"][c]["A only"], p["by_ch"][c]["B only"])])
         out.append(f"<div class=scroll><table class=grid><tr><th></th>{head}</tr>")
-        for i, (k, lab) in enumerate((("v5 only", "v5 only"), ("v7 only", "v7 only"), ("both BUY", "Both BUY"),
-                                      ("v5 BUY", "All v5 BUYs"), ("v7 BUY", "All v7 BUYs"),
+        for i, (k, lab) in enumerate((("A only", f"{pa} only"), ("B only", f"{pb_} only"), ("both BUY", "Both BUY"),
+                                      ("A BUY", f"All {pa} BUYs"), ("B BUY", f"All {pb_} BUYs"),
                                       ("both PASS", "Both PASS"), ("no brain", "No brain"))):
             sep = " class=sep" if i in (2, 5) else ""
             out.append(f"<tr{sep}><td>{_e(lab)}</td>" + "".join(_cell(p["by_ch"][c][k]) for c in cols) + "</tr>")
         out.append("</table></div><div class=chips>")
         for day_i, a, bb, w in p["tally"]:
-            out.append(f"<div class=chip><div class=d>{day_i:%a %b %-d}</div><div class='w {w}'>"
-                       f"{_e({'none': 'No call'}.get(w, w))}</div><div class=x>v5 {_e(pct(a))} · v7 {_e(pct(bb))}</div></div>")
+            out.append(f"<div class=chip><div class=d>{day_i:%a %b %-d}</div><div class='w {'win' if w != 'none' else 'none'}'>"
+                       f"{_e({'none': 'No call'}.get(w, wname(w, p)))}</div>"
+                       f"<div class=x>{pa} {_e(pct(a))} · {pb_} {_e(pct(bb))}</div></div>")
         out.append("</div>")
     out.append("</section>")
 
-    # solwhaletrending v5
-    out.append("<section><div class=hd><h2>solwhaletrending — v5</h2></div>"
+    # solwhaletrending base brain
+    out.append(f"<section><div class=hd><h2>solwhaletrending — v{s.get('base_v', '?')}</h2></div>"
                "<p class=lede>The live channel. Live bar: BUYs positive after ~3% fees.</p>")
     if _err(s):
         out.append(_err(s))
@@ -505,7 +559,7 @@ def render_html(d: dict) -> str:
         out.append("<table class=rows>")
         out.append(_group("Today"))
         out.append(_pnl_row("BUY", s["today"]["BUY"]) + _pnl_row("Pass", s["today"]["pass"]))
-        out.append(_group(f"Since {date.fromisoformat(SWT_SINCE):%b %-d}"))
+        out.append(_group(f"Since {date.fromisoformat(s['since']):%b %-d}"))
         out.append(_pnl_row("BUY", s["cum"]["BUY"]) + _pnl_row("Pass", s["cum"]["pass"]))
         out.append(_group(f"Frozen filters · since {date.fromisoformat(FILTERS_SINCE):%b %-d}"))
         out.append(_pnl_row("Plain BUY", s["cum"]["BUY since filters"])
@@ -537,6 +591,29 @@ def render_html(d: dict) -> str:
                    + _rate_row("All", g["all"]))
     out.append("</table><p class=note>Graded 2 h+ after each bank, since each test began. A group needs 30+ "
                "coins clearly above the marker, twice, before it earns an exit rule.</p></section>")
+
+    # what the learning brain will use next
+    pbk = d.get("playbook", {})
+    if "error" in pbk or pbk.get("channels"):
+        out.append("<section><div class=hd><h2>What the learning brain learned</h2></div>"
+                   "<p class=lede>Lessons written from the base brain’s graded calls over the past week. Every "
+                   "lesson cites rows the code computed (8+ coins each); the next day’s v8 reads them.</p>")
+        if _err(pbk):
+            out.append(_err(pbk))
+        for ch, v in (pbk.get("channels") or {}).items():
+            out.append(f"<div class=pbh><span class=eyebrow>{_e(ch)}</span> <span class=meta>· for "
+                       f"{v['made_for']:%a %b %-d} · from {v['n']} coins, {v['window'][0]:%b %-d}–{v['window'][1]:%b %-d}"
+                       f"</span></div>")
+            if not v["lessons"]:
+                out.append("<p class=note>No lessons — nothing clearly stood out from the base rates.</p>")
+            out.append("<ol class=lessons>")
+            for les in v["lessons"]:
+                dcls = {"lean BUY": "pos", "lean PASS": "neg"}.get(les["direction"] or "", "mut")
+                ev = "".join(f"<div class=ev>{_e(e.split(': ', 1)[-1])}</div>" for e in les["evidence"])
+                out.append(f"<li><span class='dir {dcls}'>{_e(les['direction'] or 'note')}</span>"
+                           f"<div class=lt>{_e(les['lesson'])}</div>{ev}</li>")
+            out.append("</ol>")
+        out.append("</section>")
 
     # the day's trades
     out.append("<section><div class=hd><h2>The day’s trades</h2></div>"

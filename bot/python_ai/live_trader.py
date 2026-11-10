@@ -415,7 +415,8 @@ _followed_cache: dict[int, bool] = {}
 #   LIVE_BRAIN_DAYS=Mon,Tue,Wed,Thu,Fri,Sun   UTC weekdays (Saturday out by default)
 #   LIVE_BRAIN_SIZE_SOL=0.05              capped by LIVE_SIZE_MAX_SOL
 #   LIVE_BRAIN_STOP=0.80  LIVE_BRAIN_BANK=2.0
-#   LIVE_BRAIN_MIN_SCORE=6  LIVE_BRAIN_VERSION=5  LIVE_BRAIN_MAX_DEV_BUNDLED=40
+#   LIVE_BRAIN_MIN_SCORE=6  LIVE_BRAIN_VERSION=7  LIVE_BRAIN_MAX_DEV_BUNDLED=40
+#   (7 since 2026-11-10: v7 won the paired test; v5 is no longer judged by the recorder)
 #   LIVE_BRAIN_TIMEOUT_S=10  LIVE_BRAIN_MIN_ENTRY_RATIO=0.25
 #   LIVE_BRAIN_MAX_VERDICTS_PER_DAY=120 (read by trader_brain)
 LIVE_BRAIN_LANE = os.getenv("LIVE_BRAIN_LANE", "off").strip().lower() == "on"
@@ -429,7 +430,7 @@ LIVE_BRAIN_SIZE_SOL = entry_quality.env_float(os.getenv("LIVE_BRAIN_SIZE_SOL"), 
 LIVE_BRAIN_STOP = entry_quality.env_float(os.getenv("LIVE_BRAIN_STOP"), 0.80)
 LIVE_BRAIN_BANK = entry_quality.env_float(os.getenv("LIVE_BRAIN_BANK"), 2.0)
 LIVE_BRAIN_MIN_SCORE = int(entry_quality.env_float(os.getenv("LIVE_BRAIN_MIN_SCORE"), 6.0))
-LIVE_BRAIN_VERSION = int(entry_quality.env_float(os.getenv("LIVE_BRAIN_VERSION"), 5.0))
+LIVE_BRAIN_VERSION = int(entry_quality.env_float(os.getenv("LIVE_BRAIN_VERSION"), 7.0))
 LIVE_BRAIN_MAX_DEV_BUNDLED = entry_quality.env_float(os.getenv("LIVE_BRAIN_MAX_DEV_BUNDLED"), 40.0)
 LIVE_BRAIN_TIMEOUT_S = entry_quality.env_float(os.getenv("LIVE_BRAIN_TIMEOUT_S"), 10.0)
 LIVE_BRAIN_MIN_ENTRY_RATIO = entry_quality.env_float(os.getenv("LIVE_BRAIN_MIN_ENTRY_RATIO"), 0.25)
@@ -449,8 +450,8 @@ def _brain_settings_problems() -> list[str]:
         bad.append(f"LIVE_BRAIN_BANK={LIVE_BRAIN_BANK:g} must be above 1")
     if not (1 <= LIVE_BRAIN_MIN_SCORE <= 10):
         bad.append(f"LIVE_BRAIN_MIN_SCORE={LIVE_BRAIN_MIN_SCORE} not in 1-10")
-    if LIVE_BRAIN_VERSION not in (5, 7):
-        bad.append(f"LIVE_BRAIN_VERSION={LIVE_BRAIN_VERSION} must be 5 or 7")
+    if LIVE_BRAIN_VERSION not in (5, 7, 8):
+        bad.append(f"LIVE_BRAIN_VERSION={LIVE_BRAIN_VERSION} must be 5, 7 or 8")
     if not (0 < LIVE_BRAIN_MAX_DEV_BUNDLED <= 100):
         bad.append(f"LIVE_BRAIN_MAX_DEV_BUNDLED={LIVE_BRAIN_MAX_DEV_BUNDLED:g} not in (0, 100]")
     if not (1.0 <= LIVE_BRAIN_TIMEOUT_S <= 30.0):
