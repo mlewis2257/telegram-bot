@@ -105,7 +105,10 @@ PLAN_ON = os.getenv("TRADER_BRAIN_PLAN", "1") != "0"
 # 2x — "take the 2x or hold for 3x?" — only banked coins (~15-20% of trades), and the question the
 # exit work left open. 'entry': the old 45 s plan on every coin. Record-only either way.
 PLAN_AT = os.getenv("TRADER_BRAIN_PLAN_AT", "bank").strip().lower()
-BANK_V = 1                    # prompt version of the at-bank decision (stored in prompt_v)
+# prompt version of the at-bank decision (stored in prompt_v). v1 (Nov 9-10) said BANK on all 12
+# coins with p_3x mostly <30% — its "Most coins should be bank" line over-steered it. v2 drops that,
+# asks for a spread (a third 50+, a third <30) and holds exactly when p_3x >= 50; graded on p_3x.
+BANK_V = 2
 BANK_WINDOW_MIN = 15          # banks older than this are skipped
 SKIP_DEV_BUNDLED = float(os.getenv("TRADER_BRAIN_SKIP_DEV_BUNDLED", "0") or 0)
 
@@ -177,17 +180,19 @@ Decide: take the 2x now ("bank"), or hold the whole position for more ("hold"). 
 sell at 3x, or at 1.55x if it falls back first.
 Know the base rate: of called coins that reach 2x, only about 4 in 10 go on to 3x before falling
 back to 1.55x, and roughly 1 in 8 collapse to near zero within minutes (a dev or bundle dump).
-Holding only pays if you are right clearly more than ~45% of the time, so say "hold" only for coins
-clearly better than that: real, fresh attention still building, broad buying (not one bundle),
-holders not about to dump, a price path that is climbing steadily rather than one spike. Most coins
-should be "bank". You see the price path from your entry up to this moment, the coin's data at the
-call, its holders, copycats and news. Judge ONLY from the data given.
+Holding pays when your chance is above ~45%. Signs a coin is better than the base rate: real, fresh
+attention still building, broad buying (not one bundle), holders not about to dump, a price path
+climbing steadily rather than one spike. Signs it is worse: a single spike, a copy of a story that
+already ran, heavy bundles still holding, attention already peaked. You see the price path from
+your entry up to this moment, the coin's data at the call, its holders, copycats and news. Judge
+ONLY from the data given.
 
 Answer with one JSON object and nothing else:
-{"decision": "hold" | "bank", "p_3x": 0-100, "attention": "early" | "peaking" | "late",
+{"p_3x": 0-100, "decision": "hold" | "bank", "attention": "early" | "peaking" | "late",
  "flow": 0-3, "risk": 0-3, "confidence": 1-5, "reason": "<one sentence>"}
-p_3x = chance it reaches 3x of the entry price before falling back to 1.55x. Give honest,
-spread-out numbers; across many coins they should average near 40."""
+p_3x = chance it reaches 3x of the entry price before falling back to 1.55x. Use the WHOLE range:
+across many coins they should average near 40, with roughly a third at 50 or higher and a third
+below 30 — coins differ, so your numbers must too. decision = "hold" exactly when p_3x >= 50."""
 
 _day = None
 _n_today = 0
@@ -1291,10 +1296,12 @@ def report(since: str, PROMPT_V: int = PROMPT_V, until: str | None = None) -> No
           "on a decent count, and again on a second week. Then (and only then) wire plans into qsim exits.")
 
 
-def report_bank(since: str, until: str | None = None) -> None:
+def report_bank(since: str, until: str | None = None, ver: int = BANK_V) -> None:
     """At-bank decisions graded on what the coin did NEXT: did it hit 3x before falling to 1.55x —
-    what holding to 3x would have caught (break-even ~45%) — and did it ever reach 5x."""
+    what holding to 3x would have caught (break-even ~45%) — and did it ever reach 5x.
+    Only prompt version `ver` (default: the current one); older versions are counted, not mixed in."""
     win, wparams = _window("qp.exit_time", since, until)
+    wparams = wparams + [ver]
     conn = db.get_conn()
     db.safe_rollback()
     with conn.cursor() as cur:
@@ -1311,10 +1318,15 @@ def report_bank(since: str, until: str | None = None) -> None:
                    b.verdict->>'reason'
             FROM trader_brain b JOIN qsim_positions qp ON qp.call_id = b.call_id
             JOIN tokens t ON t.id = qp.token_id
-            WHERE b.phase = 'bank' AND {win}
+            WHERE b.phase = 'bank' AND {win} AND b.prompt_v = %s
               AND qp.exit_time <= now() - interval '2 hours'""", wparams)
         rows = cur.fetchall()
-    print(f"\n{'=' * 22} AT THE 2x BANK: take it or hold for 3x? ({_span(since, until)}) {'=' * 22}")
+        cur.execute(f"""SELECT count(*) FROM trader_brain b JOIN qsim_positions qp ON qp.call_id = b.call_id
+                        WHERE b.phase = 'bank' AND {win} AND b.prompt_v <> %s""", wparams)
+        other_versions = cur.fetchone()[0]
+    print(f"\n{'=' * 22} AT THE 2x BANK: take it or hold for 3x? (prompt v{ver}, {_span(since, until)}) {'=' * 22}")
+    if other_versions:
+        print(f"  ({other_versions} decisions from other prompt versions left out — use --bank-v N to see them)")
     if not rows:
         print("  no graded at-bank decisions yet (each needs 2 h of post-bank quotes)")
         return
@@ -1352,8 +1364,9 @@ def report_bank(since: str, until: str | None = None) -> None:
         for i in holds[:10]:
             print(f"    {str(i['sym'])[:12]:12s} {i['ch'][:16]:16s} {'RAN' if i['run'] else 'fell back':9s} "
                   f"high {i['high']:5.1f}x  — {str(i['reason'])[:90]}")
-    print("  Useful only if 'said HOLD' hits 3x-before-1.55x clearly above ~45% on 30+ coins, and again on\n"
-          "  the next 30. Only then does it earn an exit rule (hold those for 3x).")
+    print("  Graded on its NUMBER: coins it rates 50%+ (= HOLD) must hit 3x-before-1.55x clearly above ~45%\n"
+          "  AND clearly above the coins it rates <30%, on 30+ coins and again on the next 30. Only then does\n"
+          "  it earn an exit rule (hold those for 3x).")
 
 
 if __name__ == "__main__":
@@ -1364,7 +1377,9 @@ if __name__ == "__main__":
         if "--bank" in sys.argv:
             i = sys.argv.index("--since") if "--since" in sys.argv else -1
             k = sys.argv.index("--until") if "--until" in sys.argv else -1
-            report_bank(sys.argv[i + 1] if i > 0 else "2026-11-10", sys.argv[k + 1] if k > 0 else None)
+            bv = sys.argv.index("--bank-v") if "--bank-v" in sys.argv else -1
+            report_bank(sys.argv[i + 1] if i > 0 else "2026-11-10", sys.argv[k + 1] if k > 0 else None,
+                        int(sys.argv[bv + 1]) if bv > 0 else BANK_V)
             sys.exit(0)
         i = sys.argv.index("--since") if "--since" in sys.argv else -1
         since = sys.argv[i + 1] if i > 0 else "2026-11-05"
