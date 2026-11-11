@@ -49,6 +49,7 @@ It ranks rules; it does not forecast P&L. Live is the ruler for that.
     python3 qsim_slice_trail.py --since 2026-10-08 --keep 0.2 --trail 0.45 \\
         --tighten 5:0.35,10:0.25 --floor 1.5 --detail
     python3 qsim_slice_trail.py --since 2026-10-08 --all-lanes --mcap-max 0 --sweep
+    python3 qsim_slice_trail.py --since 2026-11-01 --channel solearlytrending --mcap-max 0 --v7-buys --ladder
 """
 
 from __future__ import annotations
@@ -217,6 +218,51 @@ def _copied_sql(copied: str) -> tuple[str, list]:
     return sql, params
 
 
+# 2026-11-11: the live brain lane trades only coins v7 scored 6+ — live v7 answers where it judged
+# (Nov 7 on), else the November replay's v7 answers (brain_replay.py run 'nov').
+_V7_BUYS = """(EXISTS (SELECT 1 FROM trader_brain_entry e WHERE e.call_id = qp.call_id AND e.prompt_v = 7
+                        AND e.vs_typical >= 6)
+              OR (NOT EXISTS (SELECT 1 FROM trader_brain_entry e WHERE e.call_id = qp.call_id AND e.prompt_v = 7)
+                  AND EXISTS (SELECT 1 FROM brain_replay_verdict r WHERE r.call_id = qp.call_id AND r.run = 'nov'
+                              AND r.arm = 'v7' AND r.vs_typical >= 6)))"""
+
+
+def ladder(banked: list[dict], floor: float) -> None:
+    """How far banked coins went after the bank, and selling the WHOLE bag at a higher target instead."""
+    n = len(banked)
+    print()
+    print(f"  HOW FAR {n} BANKED COINS WENT (after the 2x bank, inside the watched window)")
+    print(f"  {'level':>7}{'ever reached':>16}{'before ' + format(floor, 'g') + 'x':>18}")
+    for lvl in (2.5, 3.0, 4.0, 5.0):
+        ever = before = 0
+        for b in banked:
+            s_ = b["series"]
+            i = bank_index(s_, b["bank"])
+            rest = [m for m, _l, _mins in s_[i + 1:]]
+            hit = next((k for k, m in enumerate(rest) if m >= lvl), None)
+            low = next((k for k, m in enumerate(rest) if m <= floor), None)
+            ever += hit is not None
+            before += hit is not None and (low is None or hit < low)
+        print(f"  {lvl:>6g}x{ever:>9} ({ever / n:>4.0%}){before:>11} ({before / n:>4.0%})")
+    print()
+    print(f"  SELL THE WHOLE BAG at a target instead of 2x (floor = sell if it falls to the floor first;")
+    print(f"  floor sold at the quote that breached it, target credited at the target)")
+    print(f"  {'target':>7}{'floor':>7}{'vs bank SOL':>13}{'per banked coin':>17}{'without best coin':>19}"
+          f"{'hit target':>12}")
+    for t in (2.5, 3.0, 4.0, 5.0):
+        for f in sorted({floor, 1.8}):
+            r = _score(banked, 1.0, 0.0, floor=f, target=t)
+            d = r["policy"] - r["base"]
+            best = max(r["rows"], key=lambda x: x["delta"])
+            dep = r["deployed"] or 1
+            print(f"  {t:>6g}x{f:>6g}x{d:>+13.4f}{d / dep * 100:>+15.1f}%{d - best['delta']:>+19.4f}"
+                  f"{r['why'].get('target', 0):>8}/{n}")
+    print()
+    print("  Positive = holding for the target beat banking at 2x on these coins. 'without best coin'")
+    print("  shows whether one runner carries it. Coins still above the floor at the last look are")
+    print("  valued at that last look (the watch window is ~45 min of 15 s probes, then sparse).")
+
+
 def report(a) -> None:
     channels = [a.channel.lstrip("@")] if a.channel else ([] if a.all_lanes else _live_channels())
     where, params = _scope_sql(a.days, a.since, channels, a.mcap_min, a.mcap_max, a.flag)
@@ -226,6 +272,9 @@ def report(a) -> None:
         print(f"COPIED={a.copied}: only entries while the token recorder ran "
               f"({', '.join(s[:10] + '..' + (e[:10] if e else 'now') for s, e in RECORDER_WINDOWS)}) "
               f"and only coins it recorded")
+    if a.v7_buys:
+        where = f"{where} AND {_V7_BUYS}"
+        print("V7 BUYS ONLY: coins v7 scored 6+ (live answers, else the November replay's)")
     pos = _positions(where, params)
     ser = _series(where, params)
     tighten = parse_tighten(a.tighten)
@@ -257,6 +306,10 @@ def report(a) -> None:
     if not banked:
         print("\n  No banked coin has a dense post-bank path in this window. The 15s bank")
         print("  probes started 2026-10-07 (36fd7dd); use --since on or after that date.")
+        return
+
+    if a.ladder:
+        ladder(banked, a.floor or 1.55)
         return
 
     kw = dict(floor=a.floor, target=a.target, max_hours=a.max_hours, tighten=tighten)
@@ -349,6 +402,9 @@ def main() -> int:
     ap.add_argument("--copied", choices=["yes", "no"],
                     help="only coins with (yes) / without (no) a same-ticker launch in the 6 h "
                          "before entry; restricts to the token-recorder windows")
+    ap.add_argument("--v7-buys", action="store_true", help="only coins v7 scored 6+ (the live brain lane)")
+    ap.add_argument("--ladder", action="store_true",
+                    help="how many banked coins reached 2.5/3/4/5x, and hold-the-whole-bag targets vs 2x")
     ap.add_argument("--detail", action="store_true")
     ap.add_argument("--sweep", action="store_true", help="grid over trail x keep")
     ap.add_argument("--trails", type=_floats, default=[0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.60])
