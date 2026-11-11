@@ -557,6 +557,31 @@ def has_brief(call_id: int) -> bool:
     return BRIEF_ON and call_id % 2 == 0
 
 
+def add_similar(ctx: dict, mint: str, as_of: datetime | None = None) -> None:
+    """The learn versions' extra (v7+): the nearest closed coins and how they did vs the channel, in place."""
+    try:
+        sim = similar_coins(ctx["channel"], mint, ctx.get("token") or {}, as_of)
+        if sim:
+            ctx["similar_past_coins"], ctx["similar_summary"] = sim
+            summ, typ = sim[1], ctx.get("channel_typical") or {}
+            n = summ["of"] or 1
+            bank_pct, rug_pct = summ["banked"] / n * 100, summ["rugged"] / n * 100
+            cb = float(typ.get("real_bank_2x_rate_pct") or 20)
+            cr = float(typ.get("real_rug_rate_pct") or 20)
+            if rug_pct >= cr + 25 or (bank_pct <= cb - 15 and rug_pct >= cr + 10):
+                label = "worse"
+            elif bank_pct >= cb + 20 and rug_pct <= cr + 5:
+                label = "better"
+            else:
+                label = "about normal"
+            ctx["similar_vs_channel"] = {
+                "similar_banked_pct": round(bank_pct), "channel_bank_pct": round(cb),
+                "similar_rugged_pct": round(rug_pct), "channel_rug_pct": round(cr),
+                "verdict": label}
+    except Exception:
+        db.safe_rollback()
+
+
 def build_context(call_id: int, with_path: bool = True, learn: bool = False,
                   fast: bool = False, live: dict | None = None,
                   as_of: datetime | None = None, playbook: bool = False) -> dict | None:
@@ -693,27 +718,7 @@ def build_context(call_id: int, with_path: bool = True, learn: bool = False,
         except Exception:
             db.safe_rollback()
     if learn:
-        try:
-            sim = similar_coins(channel, mint, tok, as_of)
-            if sim:
-                ctx["similar_past_coins"], ctx["similar_summary"] = sim
-                summ, typ = sim[1], ctx.get("channel_typical") or {}
-                n = summ["of"] or 1
-                bank_pct, rug_pct = summ["banked"] / n * 100, summ["rugged"] / n * 100
-                cb = float(typ.get("real_bank_2x_rate_pct") or 20)
-                cr = float(typ.get("real_rug_rate_pct") or 20)
-                if rug_pct >= cr + 25 or (bank_pct <= cb - 15 and rug_pct >= cr + 10):
-                    label = "worse"
-                elif bank_pct >= cb + 20 and rug_pct <= cr + 5:
-                    label = "better"
-                else:
-                    label = "about normal"
-                ctx["similar_vs_channel"] = {
-                    "similar_banked_pct": round(bank_pct), "channel_bank_pct": round(cb),
-                    "similar_rugged_pct": round(rug_pct), "channel_rug_pct": round(cr),
-                    "verdict": label}
-        except Exception:
-            db.safe_rollback()
+        add_similar(ctx, mint, as_of)
     if playbook:
         ctx["lessons_from_your_record"] = playbook_lessons(channel, _local_day(judged))
     return ctx
@@ -771,14 +776,17 @@ def playbook_lessons(channel: str, day: date) -> list:
         cur.execute("""SELECT lessons, tables FROM brain_playbook WHERE channel = %s AND made_for <= %s
                        ORDER BY made_for DESC LIMIT 1""", (channel, day))
         r = cur.fetchone()
-    out = []
-    if r:
-        rows = {t["id"]: t for t in (r[1] or [])}
-        for les in r[0] or []:
-            out.append({"lesson": les["lesson"], "direction": les.get("direction"),
-                        "evidence": [_row_text(rows[c]) for c in les.get("cites", []) if c in rows]})
+    out = lessons_view(r[0], r[1]) if r else []
     _pb_cache[key] = (time.monotonic(), out)
     return out
+
+
+def lessons_view(lessons: list | None, tables: list | None) -> list:
+    """Stored lessons + tables -> what the brain sees: [{lesson, direction, evidence: [row text]}]."""
+    rows = {t["id"]: t for t in (tables or [])}
+    return [{"lesson": les["lesson"], "direction": les.get("direction"),
+             "evidence": [_row_text(rows[c]) for c in les.get("cites", []) if c in rows]}
+            for les in lessons or []]
 
 
 _has_pb: dict[tuple[str, str], tuple[float, bool]] = {}
@@ -938,32 +946,45 @@ def playbook_tables(channel: str, first: date, last: date, base_v: int) -> tuple
               AND qp.entry_time < ((%s::date) + 1)::timestamp AT TIME ZONE %s""",
                     (base_v, channel, first, REPORT_TZ, last, REPORT_TZ))
         raw = cur.fetchall()
-    def judged_now(ctx: dict) -> bool:
-        """False for coins the brain now skips (dev bundled >= SKIP_DEV_BUNDLED): lessons about coins v8
-        will never see waste a slot and skew the base rates. Unknown bundle = still judged."""
-        b = (ctx.get("token") or {}).get("bundled_pct")
-        try:
-            return SKIP_DEV_BUNDLED <= 0 or b is None or float(b) < SKIP_DEV_BUNDLED
-        except (TypeError, ValueError):
-            return True
-
     gaps = recorder_gaps()
-    raw = [r for r in raw if judged_now(r[2] or {})]
-    coins_raw = [r for r in coins_raw if judged_now(r[0] or {})]
-    items = []
-    for vt, verdict, ctx, s_in, s_out, reason, mint, sym, at in raw:
-        verdict, ctx = verdict or {}, ctx or {}
-        s_in, s_out = float(s_in), float(s_out or 0)
-        items.append({"verdict": "BUY" if vt >= 6 else "PASS", "s_in": s_in, "pnl": s_out - s_in,
-                      "bank": "bank" in (reason or ""), "rug": s_out / s_in < 0.30, "sym": sym,
-                      "reason": str(verdict.get("reason") or "")[:160],
-                      "f": _mask_unrecorded(_features(ctx, {**verdict, "vs_typical": vt}, mint), ctx, at, gaps)})
-    coins = []
-    for ctx, s_in, s_out, reason, mint, at in coins_raw:
-        s_in, s_out = float(s_in), float(s_out or 0)
-        # judge-specific fields (attention / story / meme / score) are left out: no verdict passed
-        coins.append({"s_in": s_in, "pnl": s_out - s_in, "bank": "bank" in (reason or ""),
-                      "rug": s_out / s_in < 0.30, "f": _mask_unrecorded(_features(ctx or {}, {}, mint), ctx or {}, at, gaps)})
+    items = [verdict_item(vt, verdict, ctx, s_in, s_out, reason, mint, sym, at, gaps)
+             for vt, verdict, ctx, s_in, s_out, reason, mint, sym, at in raw if judged_now(ctx or {})]
+    coins = [coin_item(ctx, s_in, s_out, reason, mint, at, gaps)
+             for ctx, s_in, s_out, reason, mint, at in coins_raw if judged_now(ctx or {})]
+    rows, misses = assemble_tables(items, coins)
+    return rows, len(items), misses, len(coins)
+
+
+def judged_now(ctx: dict) -> bool:
+    """False for coins the brain now skips (dev bundled >= SKIP_DEV_BUNDLED): lessons about coins v8
+    will never see waste a slot and skew the base rates. Unknown bundle = still judged."""
+    b = (ctx.get("token") or {}).get("bundled_pct")
+    try:
+        return SKIP_DEV_BUNDLED <= 0 or b is None or float(b) < SKIP_DEV_BUNDLED
+    except (TypeError, ValueError):
+        return True
+
+
+def verdict_item(vt, verdict, ctx, s_in, s_out, reason, mint, sym, at, gaps) -> dict:
+    """One of base_v's own calls, for the BUY / PASS rows."""
+    verdict, ctx = verdict or {}, ctx or {}
+    s_in, s_out = float(s_in), float(s_out or 0)
+    return {"verdict": "BUY" if vt >= 6 else "PASS", "s_in": s_in, "pnl": s_out - s_in,
+            "bank": "bank" in (reason or ""), "rug": s_out / s_in < 0.30, "sym": sym,
+            "reason": str(verdict.get("reason") or "")[:160],
+            "f": _mask_unrecorded(_features(ctx, {**verdict, "vs_typical": vt}, mint), ctx, at, gaps)}
+
+
+def coin_item(ctx, s_in, s_out, reason, mint, at, gaps) -> dict:
+    """Any judged coin, for the "all judged coins" rows."""
+    s_in, s_out = float(s_in), float(s_out or 0)
+    # judge-specific fields (attention / story / meme / score) are left out: no verdict passed
+    return {"s_in": s_in, "pnl": s_out - s_in, "bank": "bank" in (reason or ""),
+            "rug": s_out / s_in < 0.30, "f": _mask_unrecorded(_features(ctx or {}, {}, mint), ctx or {}, at, gaps)}
+
+
+def assemble_tables(items: list, coins: list) -> tuple[list, list]:
+    """(table rows, example mistakes) from verdict_item()s and coin_item()s."""
     rows = []
 
     def add(feature, bucket, verdict, group):
@@ -985,7 +1006,7 @@ def playbook_tables(channel: str, first: date, last: date, base_v: int) -> tuple
                if i["verdict"] == "BUY" and (i["rug"] or i["pnl"] < 0)][-6:]
               + [f"PASS that banked 2x: {i['sym']} — your reason: {i['reason']}" for i in items
                  if i["verdict"] == "PASS" and i["bank"]][-6:])
-    return rows, len(items), misses, len(coins)
+    return rows, misses
 
 
 LESSON_SYSTEM = """You are reviewing your own record as a Solana meme-coin trader on one Telegram call
@@ -1060,13 +1081,9 @@ def _salvage_lessons(text: str) -> dict | None:
     return {"lessons": out} if out else None
 
 
-def build_playbook(channel: str, made_for: date) -> dict:
-    """Tables from PAIR[0]'s calls over the PLAYBOOK_DAYS before made_for, lessons from LESSON_MODEL, stored.
-    Returns a summary dict (raises on API / DB errors so the caller can retry later)."""
-    ensure_playbook_table()
-    base_v = PAIR[0]
-    first, last = made_for - timedelta(days=PLAYBOOK_DAYS), made_for - timedelta(days=1)
-    rows, n, misses, n_all = playbook_tables(channel, first, last, base_v)
+def write_lessons(channel: str, first: date, last: date, base_v: int, rows: list, n: int, misses: list,
+                  n_all: int) -> tuple[list, list, int, int]:
+    """(kept lessons, dropped lessons, in tokens, out tokens) from LESSON_MODEL; raises on an API error."""
     lessons, dropped, tin, tout = [], [], 0, 0
     if n_all >= MIN_N:
         user = (f"Channel: {channel}. {first} to {last}: {n_all} judged coins, {n} of them judged by you "
@@ -1086,6 +1103,17 @@ def build_playbook(channel: str, made_for: date) -> dict:
                 {"lesson": str(les.get("lesson") or "")[:400], "cites": cites,
                  "direction": les.get("direction") if les.get("direction") in ("lean BUY", "lean PASS", "ignore")
                  else None})
+    return lessons, dropped, tin, tout
+
+
+def build_playbook(channel: str, made_for: date) -> dict:
+    """Tables from PAIR[0]'s calls over the PLAYBOOK_DAYS before made_for, lessons from LESSON_MODEL, stored.
+    Returns a summary dict (raises on API / DB errors so the caller can retry later)."""
+    ensure_playbook_table()
+    base_v = PAIR[0]
+    first, last = made_for - timedelta(days=PLAYBOOK_DAYS), made_for - timedelta(days=1)
+    rows, n, misses, n_all = playbook_tables(channel, first, last, base_v)
+    lessons, dropped, tin, tout = write_lessons(channel, first, last, base_v, rows, n, misses, n_all)
     db.safe_rollback()
     conn = db.get_conn()
     with conn.cursor() as cur:
@@ -1470,6 +1498,19 @@ def spend_since(since: datetime) -> float:
             cur.execute("SELECT coalesce(sum(in_tokens), 0), coalesce(sum(out_tokens), 0) FROM brain_playbook "
                         "WHERE created_at >= %s", (since,))
             lin, lout = cur.fetchone()
+        # brain_replay.py's back-test calls draw on the same Anthropic credit
+        cur.execute("SELECT to_regclass('brain_replay_verdict') IS NOT NULL")
+        if cur.fetchone()[0]:
+            cur.execute("SELECT coalesce(sum(in_tokens), 0), coalesce(sum(out_tokens), 0) FROM brain_replay_verdict "
+                        "WHERE created_at >= %s", (since,))
+            a, b = cur.fetchone()
+            tin, tout = tin + a, tout + b
+        cur.execute("SELECT to_regclass('brain_replay_playbook') IS NOT NULL")
+        if cur.fetchone()[0]:
+            cur.execute("SELECT coalesce(sum(in_tokens), 0), coalesce(sum(out_tokens), 0) FROM brain_replay_playbook "
+                        "WHERE created_at >= %s", (since,))
+            a, b = cur.fetchone()
+            lin, lout = lin + a, lout + b
     return (float(tin) / 1e6 * PRICE_IN + float(tout) / 1e6 * PRICE_OUT
             + float(lin) / 1e6 * LESSON_PRICE_IN + float(lout) / 1e6 * LESSON_PRICE_OUT)
 
