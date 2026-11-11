@@ -329,8 +329,12 @@ PAIRED = os.getenv("TRADER_BRAIN_PAIRED", "1") != "0"
 # must each cite table rows, and v8 reads that channel's playbook. v7 had won the paired test
 # (Sun none, Mon v7, Tue v7 on both channels), so the pair is now v7 vs v8 — it isolates one thing:
 # do the lessons help? Same 10-pt rule. TRADER_BRAIN_PAIR="5,7" restores the old pair.
+# 2026-11-11: v8 RETIRED. The November replay (brain_replay.py, 1144 coins Nov 2-10) had v8 behind v7 on
+# solo picks on both channels and in both halves, even after the lesson-fit fix (-6.2 pts/SOL; its extra
+# BUYs lost 11%): the weekly lessons chase patterns that flip the next week. The default is now ONE
+# version, v7 alone (half the spend). TRADER_BRAIN_PAIR="7,8" brings the pair back.
 PLAYBOOK_V = 8
-PAIR = [int(x) for x in os.getenv("TRADER_BRAIN_PAIR", "7,8").split(",")][:2]
+PAIR = [int(x) for x in os.getenv("TRADER_BRAIN_PAIR", "7").split(",") if x.strip()][:2]
 PAIR_SINCE = os.getenv("TRADER_BRAIN_PAIR_SINCE", "2026-11-11")   # first Pacific day of this pair
 
 
@@ -1587,7 +1591,8 @@ def run() -> None:
           + (check_credit() or " Credit warning off (set ANTHROPIC_CREDIT_USD + ANTHROPIC_CREDIT_SINCE)."),
           flush=True)
     ensure_playbook_table()
-    print(f"[trader_brain] pair: v{PAIR[0]} vs v{PAIR[1]} on every coin"
+    print((f"[trader_brain] pair: v{PAIR[0]} vs v{PAIR[1]} on every coin" if len(PAIR) > 1
+           else f"[trader_brain] one version: v{PAIR[0]} on every coin (no pair, no playbook)")
           + (f"; v{PLAYBOOK_V} reads a nightly per-channel playbook (lessons from v{PAIR[0]}'s graded calls, "
              f"last {PLAYBOOK_DAYS} days, model {LESSON_MODEL}), built after "
              f"{PLAYBOOK_AT[0]:02d}:{PLAYBOOK_AT[1]:02d} {REPORT_TZ}" if PLAYBOOK_V in PAIR else ""), flush=True)
@@ -1653,8 +1658,12 @@ def _span(since: str, until: str | None) -> str:
 
 
 def paired_report(since: str, va: int | None = None, vb: int | None = None, until: str | None = None) -> None:
-    va, vb = va or PAIR[0], vb or PAIR[1]
     """Both versions judged the SAME coins: compare where they disagree, and the combinations."""
+    va = va or PAIR[0]
+    vb = vb or (PAIR[1] if len(PAIR) > 1 else None)
+    if vb is None:
+        print(f"(one version running — v{va}; no paired comparison. --report --v N for one version)")
+        return
     win, wparams = _window("qp.entry_time", since, until)
     conn = db.get_conn()
     with conn.cursor() as cur:

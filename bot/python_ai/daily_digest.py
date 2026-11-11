@@ -49,7 +49,8 @@ DIGEST_AT = os.getenv("DIGEST_AT", "00:30")   # after the 00:20 playbook build
 def pair() -> tuple[int, int, str]:
     """(base version, challenger, first Pacific day of the pair) — read from the brain so it never goes stale."""
     import trader_brain
-    return trader_brain.PAIR[0], trader_brain.PAIR[1], trader_brain.PAIR_SINCE
+    P = trader_brain.PAIR
+    return P[0], (P[1] if len(P) > 1 else None), trader_brain.PAIR_SINCE
 
 
 def _q(sql: str, params: list) -> list[tuple]:
@@ -258,8 +259,13 @@ SECTIONS = [("paired", paired), ("swt", swt), ("bank_brain", bank_brain), ("grok
 
 def collect(day: str) -> dict:
     """Every section on its own: one broken section reports its error instead of sinking the digest."""
+    import trader_brain
     out = {"day": day}
     for name, fn in SECTIONS:
+        if name == "paired" and pair()[1] is None:
+            continue                        # one version running: nothing to pair
+        if name == "playbook" and trader_brain.PLAYBOOK_V not in trader_brain.PAIR:
+            continue                        # no v8, no playbook built
         try:
             out[name] = fn(day)
         except Exception as e:
@@ -286,7 +292,9 @@ def text(d: dict) -> str:
     day = date.fromisoformat(d["day"])
     L = [f"🧠 Brain daily — {day:%a %b %-d} (Pacific)", ""]
     p = d.get("paired", {})
-    if "error" in p:
+    if not p:
+        pass
+    elif "error" in p:
         L.append(f"Paired brains: error {p['error']}")
     else:
         A, B = f"v{p['va']}", f"v{p['vb']}"
@@ -502,7 +510,7 @@ def render_html(d: dict) -> str:
 
     # headline strip
     kp = []
-    if "error" not in p:
+    if p and "error" not in p:
         both = p["by_ch"]["both"]
         A, B = f"v{p['va']}", f"v{p['vb']}"
         w = winner(both["A only"], both["B only"])
@@ -523,32 +531,33 @@ def render_html(d: dict) -> str:
                        f"Anthropic ${sp['anthropic']:.2f} · xAI ${sp['xai']:.2f}"))
     out.append(f"<div class=kpis>{''.join(kp)}</div>")
 
-    # v5 vs v7
-    pa, pb_ = (f"v{p.get('va', '?')}", f"v{p.get('vb', '?')}")
-    out.append(f"<section><div class=hd><h2>{pa} vs {pb_} — same coins</h2></div>"
-               "<p class=lede>The solo-pick rows decide it: a version wins a day when its own picks beat the "
-               "other’s by 10+ pts per SOL.</p>")
-    if _err(p):
-        out.append(_err(p))
-    else:
-        cols = CHANNELS + ["both"]
-        head = "".join(
-            f"<th>{_e(SHORT.get(c, 'both'))}<br><span class='pill {'win' if w != 'none' else 'none'}'>"
-            f"{_e({'none': 'no call'}.get(w, wname(w, p) + ' wins'))}</span></th>"
-            for c in cols for w in [winner(p["by_ch"][c]["A only"], p["by_ch"][c]["B only"])])
-        out.append(f"<div class=scroll><table class=grid><tr><th></th>{head}</tr>")
-        for i, (k, lab) in enumerate((("A only", f"{pa} only"), ("B only", f"{pb_} only"), ("both BUY", "Both BUY"),
-                                      ("A BUY", f"All {pa} BUYs"), ("B BUY", f"All {pb_} BUYs"),
-                                      ("both PASS", "Both PASS"), ("no brain", "No brain"))):
-            sep = " class=sep" if i in (2, 5) else ""
-            out.append(f"<tr{sep}><td>{_e(lab)}</td>" + "".join(_cell(p["by_ch"][c][k]) for c in cols) + "</tr>")
-        out.append("</table></div><div class=chips>")
-        for day_i, a, bb, w in p["tally"]:
-            out.append(f"<div class=chip><div class=d>{day_i:%a %b %-d}</div><div class='w {'win' if w != 'none' else 'none'}'>"
-                       f"{_e({'none': 'No call'}.get(w, wname(w, p)))}</div>"
-                       f"<div class=x>{pa} {_e(pct(a))} · {pb_} {_e(pct(bb))}</div></div>")
-        out.append("</div>")
-    out.append("</section>")
+    # v5 vs v7 (only while a pair runs)
+    if p:
+        pa, pb_ = (f"v{p.get('va', '?')}", f"v{p.get('vb', '?')}")
+        out.append(f"<section><div class=hd><h2>{pa} vs {pb_} — same coins</h2></div>"
+                   "<p class=lede>The solo-pick rows decide it: a version wins a day when its own picks beat the "
+                   "other’s by 10+ pts per SOL.</p>")
+        if _err(p):
+            out.append(_err(p))
+        else:
+            cols = CHANNELS + ["both"]
+            head = "".join(
+                f"<th>{_e(SHORT.get(c, 'both'))}<br><span class='pill {'win' if w != 'none' else 'none'}'>"
+                f"{_e({'none': 'no call'}.get(w, wname(w, p) + ' wins'))}</span></th>"
+                for c in cols for w in [winner(p["by_ch"][c]["A only"], p["by_ch"][c]["B only"])])
+            out.append(f"<div class=scroll><table class=grid><tr><th></th>{head}</tr>")
+            for i, (k, lab) in enumerate((("A only", f"{pa} only"), ("B only", f"{pb_} only"), ("both BUY", "Both BUY"),
+                                          ("A BUY", f"All {pa} BUYs"), ("B BUY", f"All {pb_} BUYs"),
+                                          ("both PASS", "Both PASS"), ("no brain", "No brain"))):
+                sep = " class=sep" if i in (2, 5) else ""
+                out.append(f"<tr{sep}><td>{_e(lab)}</td>" + "".join(_cell(p["by_ch"][c][k]) for c in cols) + "</tr>")
+            out.append("</table></div><div class=chips>")
+            for day_i, a, bb, w in p["tally"]:
+                out.append(f"<div class=chip><div class=d>{day_i:%a %b %-d}</div><div class='w {'win' if w != 'none' else 'none'}'>"
+                           f"{_e({'none': 'No call'}.get(w, wname(w, p)))}</div>"
+                           f"<div class=x>{pa} {_e(pct(a))} · {pb_} {_e(pct(bb))}</div></div>")
+            out.append("</div>")
+        out.append("</section>")
 
     # solwhaletrending base brain
     out.append(f"<section><div class=hd><h2>solwhaletrending — v{s.get('base_v', '?')}</h2></div>"
