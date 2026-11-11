@@ -342,8 +342,9 @@ PLAYBOOK_NOTE = """
 
 "lessons_from_your_record" are lessons written last night from YOUR OWN graded calls on this
 channel over the past week: each says what to lean towards and cites the evidence (how many coins,
-how they did). They are tendencies, not rules: apply a lesson when the coin clearly fits it, and
-judge everything else as usual. Your score must still use the whole 1-10 range."""
+how they did). Only the lessons that fit THIS coin are shown — "this_coin" says which of its features
+matched — so don't stretch a lesson to coins it wasn't written for. They are tendencies, not rules:
+weigh them with everything else as usual. Your score must still use the whole 1-10 range."""
 
 
 def _system_for(ver: int) -> str:
@@ -720,7 +721,8 @@ def build_context(call_id: int, with_path: bool = True, learn: bool = False,
     if learn:
         add_similar(ctx, mint, as_of)
     if playbook:
-        ctx["lessons_from_your_record"] = playbook_lessons(channel, _local_day(judged))
+        lessons, tables = playbook_lessons(channel, _local_day(judged))
+        ctx["lessons_from_your_record"] = lessons_for_coin(lessons, tables, ctx, mint, judged)
     return ctx
 
 
@@ -730,7 +732,9 @@ LESSON_MODEL = os.getenv("TRADER_BRAIN_LESSON_MODEL", "claude-sonnet-5-5")
 LESSON_PRICE_IN = float(os.getenv("TRADER_BRAIN_LESSON_PRICE_IN", "3.0"))     # $ per M tokens (estimate)
 LESSON_PRICE_OUT = float(os.getenv("TRADER_BRAIN_LESSON_PRICE_OUT", "15.0"))
 PLAYBOOK_DAYS = 7
-MIN_N = 8                     # a table row (and so a lesson) needs at least this many coins
+# 2026-11-11: 8 -> 15. With 8-20 coin groups the lessons flipped day to day (solearly 50-150k mcap was
+# "lean BUY" on Nov 2 and "lean PASS" on Nov 4-5, the day v7's BUYs there made +43%) — noise taught as rules.
+MIN_N = 15                    # a table row (and so a lesson) needs at least this many coins
 MAX_LESSONS = 8
 PLAYBOOK_AT = (0, 20)         # Pacific: build the day's playbook after 00:20 (yesterday is closed)
 _pb_cache: dict[tuple[str, str], tuple[float, list]] = {}
@@ -765,8 +769,8 @@ def ensure_playbook_table() -> None:
         conn.commit()
 
 
-def playbook_lessons(channel: str, day: date) -> list:
-    """The newest playbook made for `day` or earlier: [{lesson, direction, evidence: [row text]}]."""
+def playbook_lessons(channel: str, day: date) -> tuple[list, list]:
+    """(lessons, tables) of the newest playbook made for `day` or earlier; ([], []) when none."""
     key = (channel, day.isoformat())
     hit = _pb_cache.get(key)
     if hit and time.monotonic() - hit[0] < 300:
@@ -776,8 +780,37 @@ def playbook_lessons(channel: str, day: date) -> list:
         cur.execute("""SELECT lessons, tables FROM brain_playbook WHERE channel = %s AND made_for <= %s
                        ORDER BY made_for DESC LIMIT 1""", (channel, day))
         r = cur.fetchone()
-    out = lessons_view(r[0], r[1]) if r else []
+    out = (r[0] or [], r[1] or []) if r else ([], [])
     _pb_cache[key] = (time.monotonic(), out)
+    return out
+
+
+# Features the brain sets itself while judging (they can't be checked before it answers): a lesson that
+# cites only these, or only "overall" rows, is shown to every coin.
+JUDGE_FEATURES = {"your attention read", "your story score", "your meme score", "your score"}
+
+
+def lessons_for_coin(lessons: list | None, tables: list | None, ctx: dict, mint: str,
+                     at: datetime | None = None) -> list:
+    """The lessons that fit this coin. 2026-11-11: shown every lesson, v8 stretched them — the 50-150k
+    mcap lesson was applied to $22k-$45k and $154k-$195k coins, the 1.05-1.3x entry lesson to 0.86-0.98x
+    entries — and passed coins that went on to bank. A lesson citing coin-feature rows now applies only
+    when the coin is in one of those rows' buckets (an unknown feature — e.g. a recorder gap — matches
+    nothing); the matched feature is shown as "this_coin"."""
+    rows = {t["id"]: t for t in (tables or [])}
+    f = _mask_unrecorded(_features(ctx, {}, mint), ctx, at, recorder_gaps())
+    out = []
+    for les in lessons or []:
+        cited = [rows[c] for c in les.get("cites", []) if c in rows]
+        coin_rows = [r for r in cited if r["feature"] != "overall" and r["feature"] not in JUDGE_FEATURES]
+        hits = [r for r in coin_rows if f.get(r["feature"]) is not None and f.get(r["feature"]) == r["bucket"]]
+        if coin_rows and not hits:
+            continue
+        view = {"lesson": les["lesson"], "direction": les.get("direction"),
+                "evidence": [_row_text(r) for r in cited]}
+        if hits:
+            view["this_coin"] = sorted({f"{r['feature']} = {r['bucket']}" for r in hits})
+        out.append(view)
     return out
 
 
@@ -1014,7 +1047,7 @@ channel. Every called coin was judged AT THE CALL: BUY (score 6+) or PASS. Below
 from the past week — how coins did, grouped by something you could see at the call. "All judged
 coins" rows cover every coin judged in the week (some by an earlier version of you): they show how
 coins with that feature turned out, whatever the verdict. "Coins you BUY / PASSED" rows are YOUR own
-calls only. Only groups of 8+ coins are shown; the "overall" rows are the base rates.
+calls only. Only groups of {min_n}+ coins are shown; the "overall" rows are the base rates.
 Then a few example mistakes with your own reasons (anecdotes, not evidence).
 
 Write AT MOST 8 lessons that would make your next BUY/PASS calls on this channel better. Rules:
@@ -1090,7 +1123,7 @@ def write_lessons(channel: str, first: date, last: date, base_v: int, rows: list
                 f"(v{base_v}).\n\nTABLES:\n"
                 + "\n".join(_row_text(r) for r in rows)
                 + "\n\nEXAMPLE MISTAKES (anecdotes):\n" + ("\n".join(misses) or "none"))
-        v, tin, tout, err = _ask(LESSON_MODEL, LESSON_SYSTEM, user, 3000)
+        v, tin, tout, err = _ask(LESSON_MODEL, LESSON_SYSTEM.replace("{min_n}", str(MIN_N)), user, 3000)
         if v is None:
             if api_alerts.is_billing_error(err):
                 api_alerts.send("anthropic_billing", f"trader_brain playbook: Anthropic refused — {err[:200]}")

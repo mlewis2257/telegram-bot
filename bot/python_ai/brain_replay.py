@@ -38,7 +38,12 @@ Run (VPS, one-off — not a pm2 service):
   python3 brain_replay.py report
 Options: --from YYYY-MM-DD --to YYYY-MM-DD (Pacific days, inclusive), --per-day N (calibrate: coins per
 channel per day, default 25), --sleep S (default 1.5), --run NAME (default cal / nov), --fast (fields:
-skip the coin-metadata fetch).
+skip the coin-metadata fetch), --v7-from RUN (november / report: reuse RUN's replayed v7 answers, so a
+v8 change is re-tested for the price of v8 alone — e.g. --run nov2 --v7-from nov).
+
+2026-11-11 run 'nov' (Nov 2-5): v8 bought 33 coins to v7's 73 and the 44 it dropped made +8.8%/SOL —
+it stretched lessons to coins they didn't fit. Fixed in trader_brain (lessons_for_coin, MIN_N 15);
+run 'nov2' re-tests it.
 """
 
 from __future__ import annotations
@@ -140,11 +145,16 @@ def live_rows(call_ids: list[int]) -> dict[tuple[int, int], dict]:
                                "judged_at": r[6]} for r in cur.fetchall()}
 
 
+V7_FROM = None     # --v7-from RUN: reuse that run's replayed v7 answers (re-test v8 without re-asking v7)
+
+
 def stored(run: str) -> dict[tuple[int, str], dict]:
     db.safe_rollback()
     with db.get_conn().cursor() as cur:
-        cur.execute("""SELECT call_id, arm, vs_typical, buy, verdict, context, ctx_source
-                       FROM brain_replay_verdict WHERE run = %s""", (run,))
+        cur.execute("""SELECT call_id, arm, vs_typical, buy, verdict, context, ctx_source, run
+                       FROM brain_replay_verdict WHERE run = %s OR (run = %s AND arm = 'v7')
+                       ORDER BY (run = %s)""", (run, V7_FROM, run))
+        # this run's own rows come last, so they win over the borrowed v7 answers
         return {(r[0], r[1]): {"vs_typical": r[2], "buy": r[3], "verdict": r[4] or {}, "context": r[5] or {},
                                "ctx_source": r[6]} for r in cur.fetchall()}
 
@@ -492,14 +502,14 @@ def november(d0: date, d1: date, budget: Budget) -> None:
             if pb is None:
                 print(f"[replay] stopped: {budget.stopped}")
                 return
-            lessons = tb.lessons_view(pb["lessons"], pb["tables"])
             have = stored(budget.run)
             for c in cs:                                   # 3. v8
                 cid = c["call_id"]
                 if (cid, "v8") in have or cid not in views:
                     continue
                 ctx, src, at = views[cid]
-                ctx = {**ctx, "lessons_from_your_record": lessons}
+                ctx = {**ctx, "lessons_from_your_record": tb.lessons_for_coin(pb["lessons"], pb["tables"], ctx,
+                                                                              c["mint"], at or c["entry"])}
                 ask(budget, c, "v8", V8, ctx, src, at)
                 if budget.stopped:
                     print(f"[replay] stopped: {budget.stopped}")
@@ -567,6 +577,7 @@ if __name__ == "__main__":
     import signal
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    V7_FROM = _arg("--v7-from")
     D = lambda s: date.fromisoformat(s)
     if cmd in ("fields", "calibrate", "calreport"):
         d0, d1 = D(_arg("--from", "2026-11-08")), D(_arg("--to", "2026-11-10"))
