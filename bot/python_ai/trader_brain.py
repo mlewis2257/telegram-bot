@@ -365,13 +365,21 @@ def version_for(call_id: int) -> int:
     return LEARN_V if (LEARN_ON and call_id % 2 == 0) else PROMPT_V
 
 
-_cand_cache: dict[str, tuple[float, list]] = {}
+_cand_cache: dict[tuple, tuple[float, list]] = {}
 
 
-def _candidates(channel: str) -> list[dict]:
-    """Closed qsim coins on this channel, last 7 days, with setup + outcome. Cached 10 min."""
-    hit = _cand_cache.get(channel)
-    if hit and time.monotonic() - hit[0] < 600:
+def _floor(ts: datetime, minutes: int) -> datetime:
+    return ts - timedelta(minutes=ts.minute % minutes, seconds=ts.second, microseconds=ts.microsecond)
+
+
+def _candidates(channel: str, as_of: datetime | None = None) -> list[dict]:
+    """Closed qsim coins on this channel, last 7 days, with setup + outcome. Cached 10 min.
+    as_of (the replay): the 7 days before that moment, only coins CLOSED before it and only quotes
+    SEEN before it — floored to 10 min, so a little staler, never later."""
+    at = _floor(as_of, 10) if as_of else None
+    key = (channel, at.isoformat() if at else None)
+    hit = _cand_cache.get(key)
+    if hit and (at or time.monotonic() - hit[0] < 600):
         return hit[1]
     conn = db.get_conn()
     db.safe_rollback()
@@ -383,13 +391,16 @@ def _candidates(channel: str) -> list[dict]:
                    t.sniper_count,
                    t.liq_at_detection, t.fake_vol_pct,
                    (SELECT max(o.real_mult) FROM qsim_quote_observations o
-                     WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time AND o.real_mult > 0),
+                     WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time AND o.real_mult > 0
+                       AND o.observed_at < coalesce(%s, now())),
                    (SELECT o.real_mult FROM qsim_quote_observations o
                      WHERE o.call_id = qp.call_id AND o.observed_at > qp.exit_time AND o.real_mult > 0
+                       AND o.observed_at < coalesce(%s, now())
                      ORDER BY o.observed_at DESC LIMIT 1)
             FROM qsim_positions qp JOIN tokens t ON t.id = qp.token_id
             WHERE qp.channel_handle = %s AND qp.status = 'closed' AND qp.sol_in > 0
-              AND qp.entry_time >= now() - interval '7 days' AND qp.exit_time < now()""", (channel,))
+              AND qp.entry_time >= coalesce(%s, now()) - interval '7 days'
+              AND qp.exit_time < coalesce(%s, now())""", (at, at, channel, at, at))
         rows = cur.fetchall()
     out = []
     for (cid, sym, mint, ex_t, reason, x, b0, b1, devb, devs, sn, liq, fake, pmax, plast) in rows:
@@ -415,11 +426,11 @@ def _candidates(channel: str) -> list[dict]:
                     "bundle_launch": f(b0), "bundle_left": f(b1), "dev_bundled": f(devb),
                     "dev_bundle_sold": f(devs), "snipers": f(sn),
                     "liq": f(liq), "fake_vol": f(fake)})
-    _cand_cache[channel] = (time.monotonic(), out)
+    _cand_cache[key] = (time.monotonic(), out)
     return out
 
 
-def similar_coins(channel: str, mint: str, tok: dict) -> tuple[list, dict] | None:
+def similar_coins(channel: str, mint: str, tok: dict, as_of: datetime | None = None) -> tuple[list, dict] | None:
     """The SIMILAR_K closed coins with the nearest setup (normalised distance over the stats both have)."""
     import math
     # dev_bundled / dev_bundle_sold come from the call's "Bundled: X% | Sold: Y%" line (tokens.bundled_pct /
@@ -434,7 +445,7 @@ def similar_coins(channel: str, mint: str, tok: dict) -> tuple[list, dict] | Non
     if sum(v is not None for v in me.values()) < 3:
         return None
     scored = []
-    for c in _candidates(channel):
+    for c in _candidates(channel, as_of):
         if c["mint"] == mint:
             continue
         d, n = 0.0, 0
@@ -500,13 +511,17 @@ def market_brief() -> dict:
     return out
 
 
-_norms_cache: dict[str, tuple[float, dict]] = {}
+_norms_cache: dict[tuple, tuple[float, dict]] = {}
 
 
-def channel_norms(channel: str) -> dict:
-    """7-day medians of key stats for this channel's qsim coins + real bank/rug rates. Cached 1 h."""
-    hit = _norms_cache.get(channel)
-    if hit and time.monotonic() - hit[0] < 3600:
+def channel_norms(channel: str, as_of: datetime | None = None) -> dict:
+    """7-day medians of key stats for this channel's qsim coins + real bank/rug rates. Cached 1 h.
+    as_of (the replay): the 7 days before that moment (floored to the hour), rates only from coins
+    that had CLOSED by then."""
+    at = _floor(as_of, 60) if as_of else None
+    key = (channel, at.isoformat() if at else None)
+    hit = _norms_cache.get(key)
+    if hit and (at or time.monotonic() - hit[0] < 3600):
         return hit[1]
     conn = db.get_conn()
     db.safe_rollback()
@@ -521,17 +536,20 @@ def channel_norms(channel: str) -> dict:
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY t.bundled_sold_pct),
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY t.vol_1h_at_detection),
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY t.token_age_minutes),
-                   avg((qp.exit_reason LIKE '%%bank%%')::int) FILTER (WHERE qp.status = 'closed'),
-                   avg((qp.sol_out / nullif(qp.sol_in, 0) < 0.3)::int) FILTER (WHERE qp.status = 'closed')
+                   avg((qp.exit_reason LIKE '%%bank%%')::int) FILTER (WHERE qp.status = 'closed'
+                       AND qp.exit_time < coalesce(%s, now())),
+                   avg((qp.sol_out / nullif(qp.sol_in, 0) < 0.3)::int) FILTER (WHERE qp.status = 'closed'
+                       AND qp.exit_time < coalesce(%s, now()))
             FROM qsim_positions qp JOIN tokens t ON t.id = qp.token_id
-            WHERE qp.channel_handle = %s AND qp.entry_time >= now() - interval '7 days'""", (channel,))
+            WHERE qp.channel_handle = %s AND qp.entry_time >= coalesce(%s, now()) - interval '7 days'
+              AND qp.entry_time < coalesce(%s, now())""", (at, at, channel, at, at))
         r = cur.fetchone()
     f = lambda v, d=1: None if v is None else round(float(v), d)
     out = {"coins_last_7d": r[0], "median_bundle_pct_remaining": f(r[1]), "median_bundle_pct_initial": f(r[2]),
            "median_sniper_count": f(r[3], 0), "median_liquidity_usd": f(r[4], 0), "median_fake_vol_pct": f(r[5]),
            "median_dev_bundle_sold_pct": f(r[6]), "median_vol_1h_usd": f(r[7], 0), "median_age_min": f(r[8], 0),
            "real_bank_2x_rate_pct": f((r[9] or 0) * 100), "real_rug_rate_pct": f((r[10] or 0) * 100)}
-    _norms_cache[channel] = (time.monotonic(), out)
+    _norms_cache[key] = (time.monotonic(), out)
     return out
 
 
@@ -597,8 +615,8 @@ def build_context(call_id: int, with_path: bool = True, learn: bool = False,
         r = cur.fetchone()
         dev = None
         if r:
-            cur.execute("SELECT count(*) FROM new_tokens WHERE dev = %s AND created_at >= now() - interval '7 days'",
-                        (r[0],))
+            cur.execute("SELECT count(*) FROM new_tokens WHERE dev = %s AND created_at > %s - interval '7 days' "
+                        "AND created_at <= %s", (r[0], judged, judged))
             dev = {"dev_buy_sol": float(r[1] or 0), "dev_launches_7d": cur.fetchone()[0],
                    "created_min_before_call": round((called_at - r[2]).total_seconds() / 60, 1)}
 
@@ -666,7 +684,7 @@ def build_context(call_id: int, with_path: bool = True, learn: bool = False,
         ctx.pop("price_path_since_entry")
         ctx["our_entry"].pop("secs_since_entry")
     try:
-        ctx["channel_typical"] = channel_norms(channel)
+        ctx["channel_typical"] = channel_norms(channel, as_of)
     except Exception:
         db.safe_rollback()
     if has_brief(call_id):
@@ -676,7 +694,7 @@ def build_context(call_id: int, with_path: bool = True, learn: bool = False,
             db.safe_rollback()
     if learn:
         try:
-            sim = similar_coins(channel, mint, tok)
+            sim = similar_coins(channel, mint, tok, as_of)
             if sim:
                 ctx["similar_past_coins"], ctx["similar_summary"] = sim
                 summ, typ = sim[1], ctx.get("channel_typical") or {}
