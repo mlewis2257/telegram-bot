@@ -815,6 +815,59 @@ def _features(ctx: dict, verdict: dict, mint: str) -> dict:
     }
 
 
+# 2026-11-10: "same-name launches in 6h" and "dev launches in 7 days" are counted from new_tokens (the
+# news_recorder feed). While the feed is down they read 0, not "unknown" — it was down Nov 4 06:00 to
+# Nov 7 UTC, and started Oct 31 — so a coin whose LOOKBACK window touches a gap gets those features
+# set to unknown in the playbook tables. Gaps are found in the feed's own data (no new token for
+# RECORDER_GAP_MIN minutes, and everything before its first row), so later outages are caught too.
+# A dev-launch count of 10+ is kept even then: a gap can only hide launches, never add them.
+RECORDER_GAP_MIN = 30
+_gaps_cache: list = [0.0, None]
+
+
+def recorder_gaps() -> list[tuple[datetime | None, datetime | None]]:
+    """[(start, end)] UTC stretches the token feed did NOT record; None = open-ended. Cached 10 min."""
+    if _gaps_cache[1] is not None and time.monotonic() - _gaps_cache[0] < 600:
+        return _gaps_cache[1]
+    db.safe_rollback()
+    with db.get_conn().cursor() as cur:
+        cur.execute("SELECT min(created_at), max(created_at) FROM new_tokens")
+        first, last = cur.fetchone()
+        gaps: list = []
+        if first is None:
+            gaps = [(None, None)]
+        else:
+            gaps.append((None, first))
+            cur.execute("""SELECT created_at, nxt FROM (
+                               SELECT created_at, lead(created_at) OVER (ORDER BY created_at) AS nxt FROM new_tokens) x
+                           WHERE nxt - created_at > make_interval(mins => %s)""", (RECORDER_GAP_MIN,))
+            gaps += [(a, b) for a, b in cur.fetchall()]
+            if datetime.now(timezone.utc) - last > timedelta(minutes=RECORDER_GAP_MIN):
+                gaps.append((last, None))           # the feed is down right now
+    _gaps_cache[0], _gaps_cache[1] = time.monotonic(), gaps
+    return gaps
+
+
+def _recorded(t0: datetime, t1: datetime, gaps: list) -> bool:
+    """True when the token feed was recording for the whole of [t0, t1]."""
+    for a, b in gaps:
+        if (a is None or a < t1) and (b is None or b > t0):
+            return False
+    return True
+
+
+def _mask_unrecorded(f: dict, ctx: dict, at: datetime | None, gaps: list) -> dict:
+    """Set the feed-derived features to unknown when their lookback window wasn't recorded."""
+    if at is None:
+        return f
+    if not _recorded(at - timedelta(hours=6), at, gaps):
+        f["same-name launches in 6h"] = None
+    launches = (ctx.get("dev") or {}).get("dev_launches_7d")
+    if not _recorded(at - timedelta(days=7), at, gaps) and not (launches is not None and launches >= 10):
+        f["dev launches in 7 days"] = None
+    return f
+
+
 def _stats(items: list) -> dict:
     n = len(items)
     s_in = sum(i["s_in"] for i in items)
@@ -846,7 +899,8 @@ def playbook_tables(channel: str, first: date, last: date, base_v: int) -> tuple
     with db.get_conn().cursor() as cur:
         # one context per coin: base_v's if it judged the coin, else the newest version's
         cur.execute(f"""
-            SELECT DISTINCT ON (qp.call_id) e.context, qp.sol_in, qp.sol_out, qp.exit_reason, t.mint_address
+            SELECT DISTINCT ON (qp.call_id) e.context, qp.sol_in, qp.sol_out, qp.exit_reason, t.mint_address,
+                   qp.entry_time
             FROM trader_brain_entry e
             JOIN qsim_positions qp ON qp.call_id = e.call_id
             JOIN tokens t ON t.id = qp.token_id
@@ -856,7 +910,7 @@ def playbook_tables(channel: str, first: date, last: date, base_v: int) -> tuple
         coins_raw = cur.fetchall()
         cur.execute("""
             SELECT e.vs_typical, e.verdict, e.context, qp.sol_in, qp.sol_out, qp.exit_reason, t.mint_address,
-                   t.symbol
+                   t.symbol, qp.entry_time
             FROM trader_brain_entry e
             JOIN qsim_positions qp ON qp.call_id = e.call_id
             JOIN tokens t ON t.id = qp.token_id
@@ -875,22 +929,23 @@ def playbook_tables(channel: str, first: date, last: date, base_v: int) -> tuple
         except (TypeError, ValueError):
             return True
 
+    gaps = recorder_gaps()
     raw = [r for r in raw if judged_now(r[2] or {})]
     coins_raw = [r for r in coins_raw if judged_now(r[0] or {})]
     items = []
-    for vt, verdict, ctx, s_in, s_out, reason, mint, sym in raw:
+    for vt, verdict, ctx, s_in, s_out, reason, mint, sym, at in raw:
         verdict, ctx = verdict or {}, ctx or {}
         s_in, s_out = float(s_in), float(s_out or 0)
         items.append({"verdict": "BUY" if vt >= 6 else "PASS", "s_in": s_in, "pnl": s_out - s_in,
                       "bank": "bank" in (reason or ""), "rug": s_out / s_in < 0.30, "sym": sym,
                       "reason": str(verdict.get("reason") or "")[:160],
-                      "f": _features(ctx, {**verdict, "vs_typical": vt}, mint)})
+                      "f": _mask_unrecorded(_features(ctx, {**verdict, "vs_typical": vt}, mint), ctx, at, gaps)})
     coins = []
-    for ctx, s_in, s_out, reason, mint in coins_raw:
+    for ctx, s_in, s_out, reason, mint, at in coins_raw:
         s_in, s_out = float(s_in), float(s_out or 0)
         # judge-specific fields (attention / story / meme / score) are left out: no verdict passed
         coins.append({"s_in": s_in, "pnl": s_out - s_in, "bank": "bank" in (reason or ""),
-                      "rug": s_out / s_in < 0.30, "f": _features(ctx or {}, {}, mint)})
+                      "rug": s_out / s_in < 0.30, "f": _mask_unrecorded(_features(ctx or {}, {}, mint), ctx or {}, at, gaps)})
     rows = []
 
     def add(feature, bucket, verdict, group):
