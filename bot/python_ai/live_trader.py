@@ -1322,6 +1322,16 @@ async def open_live_position(score_result: dict, token_data: dict,
                           f"({_v.get('source')}: {str(_v.get('reason'))[:120]}) — regular lane rules "
                           f"call_id={call_id}")
 
+        # ── Shadow-only channels: a brain BUY or nothing ──
+        # 2026-11-11: solearlytrending is SHADOW_ONLY (telegram_client labels its calls "shadow_only") and
+        # reaches here only so the brain lane can take it (LIVE_BRAIN_CATEGORIES=shadow_only). Without a
+        # brain BUY it must never trade — whatever the regular lane config (with LIVE_USE_LANE_POLICY off
+        # the fallback below would otherwise buy every call of a money-losing channel).
+        if not _brain and db.get_call_skip_reason(call_id) == "shadow_only":
+            print(f"[live] {symbol} skipped — shadow-only channel {channel_handle}: traded only on a brain "
+                  f"BUY call_id={call_id}")
+            return False
+
         # ── Lane-policy gate — resolved BEFORE size so a LIVE-allowlist lane sets its own size ──
         # LIVE_LANE_STRATEGY "A"/"B" mirror the paper testbed bench (research-wide); "LIVE" uses
         # lane_policy.resolve_live() — a NARROW live-only allowlist (LIVE_LANES) so live trades a
