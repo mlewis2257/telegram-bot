@@ -434,6 +434,63 @@ LIVE_BRAIN_VERSION = int(entry_quality.env_float(os.getenv("LIVE_BRAIN_VERSION")
 LIVE_BRAIN_MAX_DEV_BUNDLED = entry_quality.env_float(os.getenv("LIVE_BRAIN_MAX_DEV_BUNDLED"), 40.0)
 LIVE_BRAIN_TIMEOUT_S = entry_quality.env_float(os.getenv("LIVE_BRAIN_TIMEOUT_S"), 10.0)
 LIVE_BRAIN_MIN_ENTRY_RATIO = entry_quality.env_float(os.getenv("LIVE_BRAIN_MIN_ENTRY_RATIO"), 0.25)
+# SOL weather pause (2026-11-12, OFF by default). market_weather.py --signal sol on v7 BUYs Nov 1-12: buys
+# made while SOL was down more than 1% over the previous 3 h lost (45 trades, -10.9%) while the rest made
+# +11.3%, the same direction in both halves — but ~2 SE, after trying several signals and levels, so it
+# is a precaution, not a proven edge. On (> 0): the brain lane skips buys while SOL is down more than
+# LIVE_PAUSE_SOL_DROP_PCT over LIVE_PAUSE_SOL_HOURS, before asking the brain. Prices come from
+# market_prices (price_recorder.py); a missing or stale price = unknown = trade, with a warning.
+LIVE_PAUSE_SOL_DROP_PCT = entry_quality.env_float(os.getenv("LIVE_PAUSE_SOL_DROP_PCT"), 0.0)
+LIVE_PAUSE_SOL_HOURS = entry_quality.env_float(os.getenv("LIVE_PAUSE_SOL_HOURS"), 3.0)
+_SOL_FRESH_MIN = 20                 # the "now" price must be this recent (the recorder looks every 5 min)
+_SOL_THEN_STALE_H = 2.0
+_sol_cache: list = [0.0, None]
+_sol_warned = [0.0]
+
+
+def sol_change_pct() -> float | None:
+    """SOL's % change in USD over the last LIVE_PAUSE_SOL_HOURS, from market_prices; None when unknown.
+    Cached 60 s."""
+    if time.monotonic() - _sol_cache[0] < 60:
+        return _sol_cache[1]
+    out = None
+    try:
+        db.safe_rollback()
+        with db.get_conn().cursor() as cur:
+            cur.execute("SELECT to_regclass('market_prices') IS NOT NULL")
+            if cur.fetchone()[0]:
+                cur.execute("""SELECT
+                                 (SELECT sol_usd FROM market_prices WHERE sol_usd > 0 AND at <= now()
+                                    AND at >= now() - make_interval(mins => %s) ORDER BY at DESC LIMIT 1),
+                                 (SELECT sol_usd FROM market_prices WHERE sol_usd > 0
+                                    AND at <= now() - make_interval(secs => %s)
+                                    AND at >= now() - make_interval(secs => %s) ORDER BY at DESC LIMIT 1)""",
+                            (_SOL_FRESH_MIN, LIVE_PAUSE_SOL_HOURS * 3600,
+                             (LIVE_PAUSE_SOL_HOURS + _SOL_THEN_STALE_H) * 3600))
+                now_p, then_p = cur.fetchone()
+                if now_p and then_p:
+                    out = (float(now_p) / float(then_p) - 1) * 100
+    except Exception as e:
+        db.safe_rollback()
+        print(f"[live] SOL weather lookup failed ({type(e).__name__}: {e}) — treated as unknown")
+    _sol_cache[0], _sol_cache[1] = time.monotonic(), out
+    return out
+
+
+def sol_pause_reason() -> str | None:
+    """Why the brain lane should not buy right now, or None. Off when LIVE_PAUSE_SOL_DROP_PCT <= 0."""
+    if LIVE_PAUSE_SOL_DROP_PCT <= 0:
+        return None
+    ch = sol_change_pct()
+    if ch is None:
+        if time.monotonic() - _sol_warned[0] > 3600:
+            _sol_warned[0] = time.monotonic()
+            print("[live] WARNING: SOL weather pause is ON but there is no fresh SOL price (is price-recorder "
+                  "running?) — trading as if the weather were fine")
+        return None
+    if ch < -LIVE_PAUSE_SOL_DROP_PCT:
+        return f"SOL {ch:+.1f}% over {LIVE_PAUSE_SOL_HOURS:g} h (pause below -{LIVE_PAUSE_SOL_DROP_PCT:g}%)"
+    return None
 
 
 def _brain_settings_problems() -> list[str]:
@@ -478,6 +535,8 @@ print("[live] brain lane: "
          f"scores {LIVE_BRAIN_MIN_SCORE}+ at the call (fail-closed, {LIVE_BRAIN_TIMEOUT_S:g}s limit) and "
          f"dev bundled < {LIVE_BRAIN_MAX_DEV_BUNDLED:g}%; {LIVE_BRAIN_SIZE_SOL:.4f} SOL; "
          f"stop {LIVE_BRAIN_STOP:g}x, bank {LIVE_BRAIN_BANK:g}x"
+         + (f"; SOL weather pause ON: no buys while SOL is down more than {LIVE_PAUSE_SOL_DROP_PCT:g}% over "
+            f"{LIVE_PAUSE_SOL_HOURS:g} h" if LIVE_PAUSE_SOL_DROP_PCT > 0 else "; SOL weather pause off")
          if LIVE_BRAIN_LANE else "off"))
 if LIVE_BRAIN_LANE and LIVE_BRAIN_CHANNELS & _blocked_at_start:
     print(f"[live] WARNING: brain lane channel(s) {sorted(LIVE_BRAIN_CHANNELS & _blocked_at_start)} are in "
@@ -1289,6 +1348,10 @@ async def open_live_position(score_result: dict, token_data: dict,
         _b_score, _b_dev = None, None
         if (not _followed and brain_eligible and LIVE_BRAIN_LANE
                 and brain_lane_eligible(channel_handle, db.get_call_skip_reason(call_id))):
+            _sol_why = sol_pause_reason()
+            if _sol_why:
+                print(f"[live] {symbol} brain lane: PAUSED — {_sol_why} — not asked, no buy call_id={call_id}")
+                return False
             try:
                 _b_dev = db.get_token_bundled_pct(mint)
             except Exception as _de:
