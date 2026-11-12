@@ -39,6 +39,7 @@ BASE_SINCE = {5: "2026-11-05", 7: "2026-11-07"}   # first day each base version 
 FILTERS_SINCE = "2026-11-10"    # F1 / F2 frozen
 BANK_SINCE = "2026-11-10"       # at-bank brain prompt v2
 BANK3_SINCE = "2026-11-12"      # at-bank brain prompt v3 (asked after a look; sell now vs hold for 4x)
+EXIT_MGR_SINCE = "2026-11-12"  # shadow exit manager (exit_manager.py)
 EXIT_SINCE = "2026-11-01"       # the hold-for-4x check on v7 BUY banks (qsim_slice_trail --ladder)
 GROK_SINCE = "2026-11-09"       # Grok at-bank looks
 PRICE_IN = float(os.getenv("TRADER_BRAIN_PRICE_IN", "1.0"))
@@ -247,6 +248,25 @@ def exit_watch(day: str) -> dict:
     return out
 
 
+def exit_manager(day: str) -> dict:
+    """The shadow exit manager vs the 2x bank on the same coins, cumulative since EXIT_MGR_SINCE."""
+    if not _q("SELECT to_regclass('exit_shadow') IS NOT NULL", [])[0][0]:
+        return {}
+    span, sp = _span("bank_time", EXIT_MGR_SINCE, day)
+    rows = _q(f"""SELECT channel, symbol, bank_x, exit_x, sol_in, status FROM exit_shadow WHERE {span}""", sp)
+    out = {"open": sum(r[5] != "closed" for r in rows)}
+    for ch in CHANNELS + ["all"]:
+        g = [r for r in rows if r[5] == "closed" and (ch == "all" or r[0] == ch)]
+        if not g:
+            out[ch] = {"n": 0}
+            continue
+        deltas = sorted((float(r[3]) - float(r[2])) * float(r[4]) for r in g)
+        dep = sum(float(r[4]) for r in g) or 1
+        out[ch] = {"n": len(g), "delta_sol": sum(deltas), "delta_pct": sum(deltas) / dep * 100,
+                   "without_best": sum(deltas) - deltas[-1], "held_4x": sum(float(r[3]) >= 4 for r in g)}
+    return out
+
+
 def market(day: str) -> dict:
     span, sp = _span("qp.entry_time", day, day)
     rows = _q(f"""
@@ -297,6 +317,7 @@ def playbook(day: str) -> dict:
 
 
 SECTIONS = [("paired", paired), ("swt", swt), ("bank_brain", bank_brain), ("exit_watch", exit_watch),
+            ("exit_manager", exit_manager),
             ("grok_bank", grok_bank),
             ("market", market), ("spend", spend), ("playbook", playbook)]
 
@@ -381,6 +402,15 @@ def text(d: dict) -> str:
             be = f"{e['be']:.0f}%" if e.get("be") is not None else "?"
             L.append(f"  {SHORT[ch]}: {e['hit']}/{e['n']} ({e['rate']:.0f}%, break-even ~{be}) · holding vs "
                      f"the 2x bank {e['delta_sol']:+.3f} SOL ({e['delta_pct']:+.0f}%)")
+    em = d.get("exit_manager", {})
+    if "error" in em:
+        L.append(f"Shadow exit manager: error {em['error']}")
+    elif em:
+        a = em.get("all") or {}
+        L.append(f"Shadow exit manager vs the 2x bank: " + (
+            f"{a['n']} coins, {a['delta_sol']:+.3f} SOL ({a['delta_pct']:+.0f}%), without the best coin "
+            f"{a['without_best']:+.3f}, held to 4x+ {a['held_4x']}" if a.get("n") else "no closed coins yet")
+                 + f" · {em.get('open', 0)} open")
     if b.get("v", 0) >= 3:
         def v3(r):
             return (f"{r['n']} · 4x {r['ran']:.0f}% · vs selling {r['hold_vs_sell_pct']:+.0f}%" if r.get("n")
@@ -684,6 +714,26 @@ def render_html(d: dict) -> str:
                    + _rate_row("All", g["all"]))
     out.append("</table><p class=note>Graded 2 h+ after each bank, since each test began. A group needs 30+ "
                "coins clearly above the marker, twice, before it earns an exit rule.</p></section>")
+
+    em = d.get("exit_manager", {})
+    if em:
+        out.append("<section><div class=hd><h2>Shadow exit manager</h2></div>"
+                   "<p class=lede>A brain managing each banked live-lane coin like a trader (raise the target, "
+                   "tighten, sell), in the shadow — graded against the 2x bank on the same coins.</p>"
+                   "<table class=rows>")
+        if _err(em):
+            out.append(f"<tr><td colspan=4>{_err(em)}</td></tr>")
+        else:
+            for ch in CHANNELS + ["all"]:
+                e = em.get(ch) or {}
+                v = e.get("delta_pct") if e.get("n") else None
+                sub = f"vs 2x bank {e['delta_sol']:+.3f} SOL · w/o best {e['without_best']:+.3f}" if e.get("n") else ""
+                out.append(f"<tr><td class=lab>{_e(SHORT.get(ch, 'All'))}<span class=sub>{_e(sub)}</span></td>"
+                           f"<td class=bar>{_dbar(v)}</td><td class='val {_cls(v)}'>{_fmt(v)}</td>"
+                           f"<td class=cnt>{e.get('n', 0)}" + (f" · 4x+ {e['held_4x']}" if e.get("n") else "")
+                           + "</td></tr>")
+        out.append(f"</table><p class=note>{em.get('open', 0)} still open. Needs 30+ coins ahead of the bank, twice, "
+                   "and not only through one coin.</p></section>")
 
     ex = d.get("exit_watch", {})
     if ex:

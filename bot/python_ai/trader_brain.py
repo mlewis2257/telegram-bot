@@ -1830,6 +1830,13 @@ def spend_since(since: datetime) -> float:
                         "WHERE created_at >= %s", (since,))
             a, b = cur.fetchone()
             tin, tout = tin + a, tout + b
+        # exit_manager.py's shadow exit decisions too (priced like the judge; it defaults to the same model)
+        cur.execute("SELECT to_regclass('exit_shadow_decisions') IS NOT NULL")
+        if cur.fetchone()[0]:
+            cur.execute("SELECT coalesce(sum(in_tokens), 0), coalesce(sum(out_tokens), 0) FROM exit_shadow_decisions "
+                        "WHERE at >= %s", (since,))
+            a, b = cur.fetchone()
+            tin, tout = tin + a, tout + b
         cur.execute("SELECT to_regclass('brain_replay_playbook') IS NOT NULL")
         if cur.fetchone()[0]:
             cur.execute("SELECT coalesce(sum(in_tokens), 0), coalesce(sum(out_tokens), 0) FROM brain_replay_playbook "
