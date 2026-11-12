@@ -157,6 +157,11 @@ def simulate(series: list, bank: float, trail: float, *, floor: float = 0.0,
     if idx is None:
         return None
     bank_x = series[idx][0]
+    if target > 0 and bank_x >= target:
+        # 2026-11-11: the bank quote itself already cleared the target (MAX banked at 2.75x against a
+        # 2.5x target). It was being sold at the NEXT quote above the target and credited at the target —
+        # below the 2.75x that was there to take — which made low targets look worse than they are.
+        return {"bank_x": bank_x, "slice_x": bank_x, "why": "target", "high": bank_x, "mins": 0.0}
     rest = [row for row in series[idx + 1:]
             if max_hours <= 0 or row[2] <= max_hours * 60.0]
     if not rest:
@@ -239,7 +244,7 @@ def ladder(banked: list[dict], floor: float) -> None:
             s_ = b["series"]
             i = bank_index(s_, b["bank"])
             rest = [m for m, _l, _mins in s_[i + 1:]]
-            hit = next((k for k, m in enumerate(rest) if m >= lvl), None)
+            hit = -1 if s_[i][0] >= lvl else next((k for k, m in enumerate(rest) if m >= lvl), None)
             low = next((k for k, m in enumerate(rest) if m <= floor), None)
             ever += hit is not None
             before += hit is not None and (low is None or hit < low)
