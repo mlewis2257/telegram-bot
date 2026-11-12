@@ -38,6 +38,8 @@ SHORT = {"solwhaletrending": "swt", "solearlytrending": "solearly"}
 BASE_SINCE = {5: "2026-11-05", 7: "2026-11-07"}   # first day each base version judged swt
 FILTERS_SINCE = "2026-11-10"    # F1 / F2 frozen
 BANK_SINCE = "2026-11-10"       # at-bank brain prompt v2
+BANK3_SINCE = "2026-11-12"      # at-bank brain prompt v3 (asked after a look; sell now vs hold for 4x)
+EXIT_SINCE = "2026-11-01"       # the hold-for-4x check on v7 BUY banks (qsim_slice_trail --ladder)
 GROK_SINCE = "2026-11-09"       # Grok at-bank looks
 PRICE_IN = float(os.getenv("TRADER_BRAIN_PRICE_IN", "1.0"))
 PRICE_OUT = float(os.getenv("TRADER_BRAIN_PRICE_OUT", "5.0"))
@@ -172,6 +174,14 @@ def bank_v() -> int:
 
 
 def bank_brain(day: str) -> dict:
+    if bank_v() >= 3:
+        import trader_brain as tb
+        until = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+        items, fresh = tb.bank_v3_items(BANK3_SINCE, until, bank_v())
+        asked = [i for i in items if i["dec"] in ("hold", "bank")]
+        return {"v": bank_v(), "HOLD": tb.bank_v3_group([i for i in asked if i["dec"] == "hold"]),
+                "BANK": tb.bank_v3_group([i for i in asked if i["dec"] == "bank"]),
+                "all": tb.bank_v3_group(asked), "auto": len(items) - len(asked), "fresh": fresh}
     span, sp = _span("qp.exit_time", BANK_SINCE, day)
     rows = _q(f"""
         SELECT b.p_3x, {_RUN}
@@ -202,6 +212,39 @@ def grok_bank(day: str) -> dict:
             "accelerating": _runs([r for r in rows if accel(r)]),
             "not accelerating": _runs([r for r in rows if not accel(r)]),
             "1k+ accounts": _runs([r for r in rows if (r[2] or 0) >= 1])}
+
+
+def exit_watch(day: str) -> dict:
+    """The hold-for-4x question on the live lanes' coins: of v7 BUYs that banked at 2x since EXIT_SINCE,
+    how many reached 4x before falling to 1.8x, the break-even rate, and holding vs the 2x bank in SOL.
+    Same replay as qsim_slice_trail --ladder --v7-buys (dense paths, 50+ looks in the first 45 min)."""
+    import qsim_slice_trail as st
+    end = datetime.combine(date.fromisoformat(day) + timedelta(days=1), datetime.min.time(), ZoneInfo(TZ))
+    out = {}
+    for ch in CHANNELS:
+        where, params = st._scope_sql(0, EXIT_SINCE, [ch], 0, 0, None)
+        where, params = f"{where} AND {st._V7_BUYS} AND qp.entry_time < %s", params + [end]
+        pos, ser = st._positions(where, params), st._series(where, params)
+        banked = []
+        for cid, p in pos.items():
+            sr = ser.get(cid) or []
+            i = st.bank_index(sr, 2.0)
+            if i is not None and st.dense_quotes(sr, i, 45.0) >= 50:
+                banked.append({"series": sr, "bank": 2.0, "sol_in": float(p["sol_in"]),
+                               "symbol": p.get("symbol") or "?", "flag": p.get("flag"), "quotes": 0})
+        if not banked:
+            out[ch] = {"n": 0}
+            continue
+        r = st._score(banked, 1.0, 0.0, floor=1.8, target=4.0)
+        wins = [x["delta"] for x in r["rows"] if x["why"] == "target"]
+        losses = [-x["delta"] for x in r["rows"] if x["why"] == "floor"]
+        w = sum(wins) / len(wins) if wins else None
+        lo = sum(losses) / len(losses) if losses else None
+        d = r["policy"] - r["base"]
+        out[ch] = {"n": len(banked), "hit": len(wins), "rate": len(wins) / len(banked) * 100,
+                   "be": lo / (w + lo) * 100 if w and lo else None,
+                   "delta_sol": d, "delta_pct": d / (r["deployed"] or 1) * 100}
+    return out
 
 
 def market(day: str) -> dict:
@@ -253,7 +296,8 @@ def playbook(day: str) -> dict:
     return {"channels": out}
 
 
-SECTIONS = [("paired", paired), ("swt", swt), ("bank_brain", bank_brain), ("grok_bank", grok_bank),
+SECTIONS = [("paired", paired), ("swt", swt), ("bank_brain", bank_brain), ("exit_watch", exit_watch),
+            ("grok_bank", grok_bank),
             ("market", market), ("spend", spend), ("playbook", playbook)]
 
 
@@ -323,10 +367,31 @@ def text(d: dict) -> str:
         L.append(f"Filters since {FILTERS_SINCE[5:]}: plain BUY {pct(s['cum']['BUY since filters'])} · "
                  f"F1 {pct(s['cum']['F1'])} · F2 {pct(s['cum']['F2'])}")
     b, g = d.get("bank_brain", {}), d.get("grok_bank", {})
+    ex = d.get("exit_watch", {})
     L.append("")
-    L.append("At the 2x bank — hit 3x before 1.55x (break-even ~45%):"
-             if "error" not in b else f"At-bank brain: error {b['error']}")
-    if "error" not in b:
+    if "error" in ex:
+        L.append(f"Hold-for-4x check: error {ex['error']}")
+    elif ex:
+        L.append(f"Hold-for-4x check (v7 BUY banks since {EXIT_SINCE[5:]}: reached 4x before 1.8x vs the 2x bank):")
+        for ch in CHANNELS:
+            e = ex.get(ch) or {}
+            if not e.get("n"):
+                L.append(f"  {SHORT[ch]}: no banks yet")
+                continue
+            be = f"{e['be']:.0f}%" if e.get("be") is not None else "?"
+            L.append(f"  {SHORT[ch]}: {e['hit']}/{e['n']} ({e['rate']:.0f}%, break-even ~{be}) · holding vs "
+                     f"the 2x bank {e['delta_sol']:+.3f} SOL ({e['delta_pct']:+.0f}%)")
+    if b.get("v", 0) >= 3:
+        def v3(r):
+            return (f"{r['n']} · 4x {r['ran']:.0f}% · vs selling {r['hold_vs_sell_pct']:+.0f}%" if r.get("n")
+                    else "0")
+        L.append(f"At-bank brain v{b['v']} (asked after a look; graded 2 h+ later): HOLD {v3(b['HOLD'])} | "
+                 f"BANK {v3(b['BANK'])} | decided in the look {b['auto']}")
+    if "error" in b:
+        L.append(f"At-bank brain: error {b['error']}")
+    L.append(("Grok at the 2x bank" if b.get("v", 0) >= 3 else "At the 2x bank")
+             + " — hit 3x before 1.55x (break-even ~45%):")
+    if "error" not in b and b.get("v", 0) < 3:
         L.append(f"  brain v{bank_v()}: HOLD {rate(b['HOLD (p_3x 50+)'])} · under 30% {rate(b['p_3x under 30'])}"
                  f" · all {rate(b['all'])}")
     if "error" in g:
@@ -483,6 +548,20 @@ def _rate_row(label: str, r: dict, sub: str = "") -> str:
             f"<td class=cnt>{r['n']} · 5x {r['x5']:.0f}%</td></tr>")
 
 
+def _exit_row(label: str, rate: float | None, be: float | None, n: int, sub: str = "") -> str:
+    """A rate bar with the row's own break-even as the marker (the 45% marker is for the 3x question)."""
+    sub_html = f"<span class=sub>{_e(sub)}</span>" if sub else ""
+    if not n or rate is None:
+        return (f"<tr><td class=lab>{_e(label)}{sub_html}</td><td class=bar><div class=rbar></div></td>"
+                f"<td class='val mut'>—</td><td class=cnt>0</td></tr>")
+    cls = "acc" if be is None else "pos" if rate > be + 5 else "neg" if rate < be else "acc"
+    mark = f"<span class=mark style='left:{min(be, 100):.1f}%'></span>" if be is not None else ""
+    return (f"<tr><td class=lab>{_e(label)}{sub_html}</td><td class=bar><div class=rbar>"
+            f"<span class='f {cls}' style='width:{min(rate, 100):.1f}%'></span>{mark}</div></td>"
+            f"<td class='val {cls if cls != 'acc' else ''}'>{rate:.0f}%</td>"
+            f"<td class=cnt>{n} · b/e {('%.0f%%' % be) if be is not None else '?'}</td></tr>")
+
+
 def _group(title: str) -> str:
     return f"<tr class=group><td colspan=4>{_e(title)}</td></tr>"
 
@@ -584,6 +663,11 @@ def render_html(d: dict) -> str:
                "break-even for holding.</p><table class=rows>")
     if _err(b):
         out.append(f"<tr><td colspan=4>{_err(b)}</td></tr>")
+    elif b.get("v", 0) >= 3:
+        out.append(_group(f"Brain · prompt v{b['v']} · asked after a look, sell now vs hold for 4x"))
+        for lab, r in (("Says HOLD", b["HOLD"]), ("Says BANK", b["BANK"]), ("All asked", b["all"])):
+            out.append(_exit_row(lab, r.get("ran"), r.get("be"), r.get("n", 0),
+                                 f"vs selling at the look {r['hold_vs_sell_pct']:+.0f}%" if r.get("n") else ""))
     else:
         out.append(_group(f"Brain · prompt v{bank_v()}"))
         out.append(_rate_row("Says HOLD", b["HOLD (p_3x 50+)"], "its 3x odds 50%+")
@@ -600,6 +684,22 @@ def render_html(d: dict) -> str:
                    + _rate_row("All", g["all"]))
     out.append("</table><p class=note>Graded 2 h+ after each bank, since each test began. A group needs 30+ "
                "coins clearly above the marker, twice, before it earns an exit rule.</p></section>")
+
+    ex = d.get("exit_watch", {})
+    if ex:
+        out.append("<section><div class=hd><h2>Hold for 4x instead of the 2x bank?</h2></div>"
+                   f"<p class=lede>v7 BUYs that banked since {date.fromisoformat(EXIT_SINCE):%b %-d}: how many reached 4x "
+                   "before falling to 1.8x. Holding wins when that rate beats the break-even (the marker).</p>"
+                   "<table class=rows>")
+        if _err(ex):
+            out.append(f"<tr><td colspan=4>{_err(ex)}</td></tr>")
+        else:
+            for ch in CHANNELS:
+                e = ex.get(ch) or {}
+                out.append(_exit_row(SHORT[ch], e.get("rate"), e.get("be"), e.get("n", 0),
+                                     f"holding vs 2x bank {e['delta_sol']:+.3f} SOL" if e.get("n") else ""))
+        out.append("</table><p class=note>Decide at ~60 banks per channel: a rate still clearly above the "
+                   "break-even earns the switch; near or below it, the 2x bank stays.</p></section>")
 
     # what the learning brain will use next
     pbk = d.get("playbook", {})

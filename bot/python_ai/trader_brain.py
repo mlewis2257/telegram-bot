@@ -108,8 +108,18 @@ PLAN_AT = os.getenv("TRADER_BRAIN_PLAN_AT", "bank").strip().lower()
 # prompt version of the at-bank decision (stored in prompt_v). v1 (Nov 9-10) said BANK on all 12
 # coins with p_3x mostly <30% — its "Most coins should be bank" line over-steered it. v2 drops that,
 # asks for a spread (a third 50+, a third <30) and holds exactly when p_3x >= 50; graded on p_3x.
-BANK_V = 2
+# v3 (2026-11-11): v2 said BANK on all 27 coins (Nov 10-11) with p_3x mostly <30%, while 63% of them
+# went on to 3x before 1.55x — it saw nothing from AFTER the bank, so it always took the profit. v3 is
+# asked BANK_LOOK_MIN after the bank and sees what happened since (price path, holders shedding, X
+# after the bank) plus the channel's recent rate. The question is the exit the replays left open:
+# sell NOW, or hold for BANK_TARGET with a BANK_FLOOR floor (qsim_slice_trail --ladder). Graded on
+# selling at the look vs holding (report --bank). A coin that hit the floor or the target during the
+# look is recorded without asking (plan 'floor' / 'target').
+BANK_V = 3
 BANK_WINDOW_MIN = 15          # banks older than this are skipped
+BANK_LOOK_MIN = float(os.getenv("TRADER_BRAIN_BANK_LOOK_MIN", "4"))
+BANK_TARGET, BANK_FLOOR = 4.0, 1.8
+BANK_FLOOR_FILL = 1.7         # where floor sells actually filled in the replays (coins gap through)
 SKIP_DEV_BUNDLED = float(os.getenv("TRADER_BRAIN_SKIP_DEV_BUNDLED", "0") or 0)
 
 _GUIDE = """Most called coins fail; a few run 5-50x. Typically 10-25% of called coins reach 2x and
@@ -194,6 +204,27 @@ p_3x = chance it reaches 3x of the entry price before falling back to 1.55x. Use
 across many coins they should average near 40, with roughly a third at 50 or higher and a third
 below 30 — coins differ, so your numbers must too. decision = "hold" exactly when p_3x >= 50."""
 
+BANK_SYSTEM_V3 = """You are an experienced Solana meme-coin trader. Your position reached 2x of your entry
+price a few minutes ago. Instead of selling at 2x you kept it and watched — "after_bank" shows those
+minutes: the price path since 2x (multiples of your entry), the high and low since, where it is now,
+whether the biggest wallets have been selling, and X activity after the 2x when it was checked.
+Decide now: SELL everything at the current price ("bank"), or HOLD the whole position for 4x of
+entry, selling if it falls back to 1.8x first (those floor sells usually fill near 1.7x — these
+coins gap down, they don't drift).
+after_bank.hold_break_even_pct is the chance of reaching 4x before 1.8x at which holding is worth the
+same as selling now. channel_base_rate is how often this channel's recent banked coins actually did
+it — start from that number and move away from it only on evidence in the data: a path still
+climbing on many steps vs one spike already fading, top wallets shedding (danger) vs sitting still,
+X posts growing after the 2x from real accounts vs nothing, a fresh story vs a tired copy. The coin's
+data at the call, holders, copycats and news are also given. Judge ONLY from the data given.
+
+Answer with one JSON object and nothing else:
+{"p_4x": 0-100, "p_3x": 0-100, "decision": "hold" | "bank", "attention": "early" | "peaking" | "late",
+ "flow": 0-3, "risk": 0-3, "confidence": 1-5, "reason": "<one sentence>"}
+p_4x = chance it reaches 4x of entry before falling to 1.8x; p_3x = chance of 3x before 1.55x.
+Coins differ, so your numbers must too — spread them around the channel's base rate.
+decision = "hold" exactly when p_4x is above hold_break_even_pct."""
+
 _day = None
 _n_today = 0
 _usd_today = 0.0
@@ -240,6 +271,7 @@ def ensure_table() -> None:
         cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS phase text NOT NULL DEFAULT '45s'")
         cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS p_3x integer")
         cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS secs_after_bank integer")
+        cur.execute("ALTER TABLE trader_brain ADD COLUMN IF NOT EXISTS p_4x integer")
         cur.execute("""
             DO $$ BEGIN
               IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'trader_brain_pkey'
@@ -1342,6 +1374,241 @@ async def live_verdict(call_id: int, channel: str, entry_mcap: float | None, ver
 _DEV_OK = "(%s <= 0 OR t.bundled_pct IS NULL OR t.bundled_pct < %s)"
 
 
+def _holder_stats(supply, holders) -> dict | None:
+    """Real-wallet concentration from a top-20 snapshot (bonding curve / pools left out)."""
+    if not supply:
+        return None
+    sup = float(supply)
+    real = sorted((float(h["ui_amount"]) for h in holders or []
+                   if h.get("on_curve") is not False and h.get("ui_amount") is not None), reverse=True)
+    return {"largest_wallet_pct": round(real[0] / sup * 100, 2) if real else None,
+            "top10_wallets_pct": round(sum(real[:10]) / sup * 100, 2),
+            "wallets_over_2pct": sum(1 for x in real if x >= 0.02 * sup)}
+
+
+def after_bank(call_id: int, bank_time: datetime, look_at: datetime) -> dict:
+    """What happened between the 2x bank and `look_at` — the v3 at-bank view. 'decided' is set when the
+    coin already hit BANK_FLOOR (or lost its route) or BANK_TARGET in that time."""
+    conn = db.get_conn()
+    db.safe_rollback()
+    out: dict = {"look_min": round((look_at - bank_time).total_seconds() / 60, 1)}
+    with conn.cursor() as cur:
+        cur.execute("SELECT sol_out / nullif(sol_in, 0) FROM qsim_positions WHERE call_id = %s", (call_id,))
+        r = cur.fetchone()
+        out["sold_2x_at"] = round(float(r[0]), 2) if r and r[0] is not None else None
+        cur.execute("""SELECT extract(epoch FROM observed_at - %s),
+                              CASE WHEN coalesce(no_route, false) THEN 0 ELSE real_mult END
+                       FROM qsim_quote_observations
+                       WHERE call_id = %s AND observed_at > %s AND observed_at <= %s
+                         AND NOT coalesce(rate_limited, false)
+                         AND (real_mult IS NOT NULL OR coalesce(no_route, false))
+                       ORDER BY observed_at""", (bank_time, call_id, bank_time, look_at))
+        obs = [(float(s), float(m)) for s, m in cur.fetchall()]
+        cur.execute("""SELECT phase, supply_ui, holders FROM holder_snapshots
+                       WHERE call_id = %s AND phase IN ('entry', 'exit') AND ok""", (call_id,))
+        snaps = {ph: _holder_stats(sup, h) for ph, sup, h in cur.fetchall()}
+        cur.execute("""SELECT holders FROM holder_watch WHERE call_id = %s AND taken_at <= %s
+                       ORDER BY taken_at""", (call_id, look_at))
+        watch = [r[0] or [] for r in cur.fetchall()]
+        cur.execute("SELECT to_regclass('grok_x') IS NOT NULL")
+        x = None
+        if cur.fetchone()[0]:
+            cur.execute("""SELECT posts_30m, posts_30_120, growing, accounts, accounts_1k, bot_pct
+                           FROM grok_x WHERE call_id = %s AND phase = 'bank' AND judged_at <= %s""",
+                        (call_id, look_at))
+            g = cur.fetchone()
+            if g:
+                x = {"posts_last_30m": g[0], "posts_30_to_120m_ago": g[1], "growing": g[2], "accounts": g[3],
+                     "accounts_over_1k_followers": g[4], "bot_pct": g[5]}
+    if obs:
+        mults = [m for _s, m in obs]
+        step = max(1, len(obs) // 10)
+        out.update({"looks": len(obs), "high_since": round(max(mults), 2), "low_since": round(min(mults), 2),
+                    "now": round(mults[-1], 2),
+                    "path": [{"secs": int(s), "mult": round(m, 2)} for s, m in obs[::step]][-10:]})
+        if min(mults) <= BANK_FLOOR:
+            out["decided"] = "floor"
+        elif max(mults) >= BANK_TARGET:
+            out["decided"] = "target"
+        now = mults[-1]
+    else:
+        out["looks"] = 0
+        now = out["sold_2x_at"] or 2.0
+        out["now"] = round(now, 2)
+    out["hold_break_even_pct"] = max(0, min(100, round(
+        (now - BANK_FLOOR_FILL) / (BANK_TARGET - BANK_FLOOR_FILL) * 100)))
+    hold = {}
+    if snaps.get("entry"):
+        hold["at_entry"] = snaps["entry"]
+    if snaps.get("exit"):
+        hold["at_2x"] = snaps["exit"]
+    if len(watch) >= 2:
+        first = {h["wallet"]: float(h.get("ui_amount") or 0) for h in watch[0]
+                 if h.get("on_curve") is not False and h.get("wallet")}
+        top = sorted(first, key=lambda w: -first[w])[:10]
+        last = {h["wallet"]: float(h.get("ui_amount") or 0) for h in watch[-1] if h.get("wallet")}
+        base = sum(first[w] for w in top)
+        if base > 0:
+            hold["first_top10_wallets_sold_pct"] = round(
+                (base - sum(min(last.get(w, 0.0), first[w]) for w in top)) / base * 100, 1)
+    if hold:
+        out["holders"] = hold
+    if x:
+        out["x_after_2x"] = x
+    return out
+
+
+_rates_cache: dict[tuple, tuple[float, dict]] = {}
+
+
+def channel_bank_rates(channel: str, as_of: datetime) -> dict:
+    """How this channel's banked coins did after the bank over the 7 days before `as_of` (only banks
+    2 h+ old, so each is fully graded). Cached per channel-hour."""
+    at = _floor(as_of, 60)
+    key = (channel, at.isoformat())
+    hit = _rates_cache.get(key)
+    if hit:
+        return hit[1]
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT count(*),
+                   count(*) FILTER (WHERE t4 IS NOT NULL AND (t18 IS NULL OR t4 < t18)),
+                   count(*) FILTER (WHERE t3 IS NOT NULL AND (t155 IS NULL OR t3 < t155))
+            FROM (
+              SELECT (SELECT min(o.observed_at) FROM qsim_quote_observations o WHERE o.call_id = qp.call_id
+                        AND o.observed_at > qp.exit_time AND o.real_mult >= %s) AS t4,
+                     (SELECT min(o.observed_at) FROM qsim_quote_observations o WHERE o.call_id = qp.call_id
+                        AND o.observed_at > qp.exit_time AND NOT coalesce(o.rate_limited, false)
+                        AND (o.real_mult <= %s OR coalesce(o.no_route, false))) AS t18,
+                     (SELECT min(o.observed_at) FROM qsim_quote_observations o WHERE o.call_id = qp.call_id
+                        AND o.observed_at > qp.exit_time AND o.real_mult >= 3) AS t3,
+                     (SELECT min(o.observed_at) FROM qsim_quote_observations o WHERE o.call_id = qp.call_id
+                        AND o.observed_at > qp.exit_time AND NOT coalesce(o.rate_limited, false)
+                        AND (o.real_mult <= 1.55 OR coalesce(o.no_route, false))) AS t155
+              FROM qsim_positions qp
+              WHERE qp.channel_handle = %s AND qp.status = 'closed' AND qp.exit_reason LIKE '%%bank%%'
+                AND qp.exit_time >= %s - interval '7 days' AND qp.exit_time <= %s - interval '2 hours') x""",
+                    (BANK_TARGET, BANK_FLOOR, channel, at, at))
+        n, n4, n3 = cur.fetchone()
+    out = {"banked_coins_last_7d": n,
+           "reached_4x_before_1_8x_pct": round(n4 / n * 100) if n else None,
+           "reached_3x_before_1_55x_pct": round(n3 / n * 100) if n else None}
+    _rates_cache[key] = (time.monotonic(), out)
+    return out
+
+
+def bank_v3_items(since: str, until: str | None = None, ver: int = 3) -> tuple[list, int]:
+    """(graded v3 decisions, coins still too fresh to grade). Each item: decision (hold / bank / floor /
+    target), p_4x, break-even, the price at the look, what holding from the look paid (4x, the first
+    quote at or under the floor — 0 for a dead route — or the last quote), and whether it ran."""
+    win, wparams = _window("qp.exit_time", since, until)
+    conn = db.get_conn()
+    db.safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT b.call_id, b.plan, b.p_4x, b.context->'after_bank', qp.exit_time, qp.sol_in,
+                   qp.channel_handle, t.symbol, b.verdict->>'reason', qp.exit_time <= now() - interval '2 hours'
+            FROM trader_brain b JOIN qsim_positions qp ON qp.call_id = b.call_id
+            JOIN tokens t ON t.id = qp.token_id
+            WHERE b.phase = 'bank' AND b.prompt_v = %s AND {win}""", [ver] + wparams)
+        rows = cur.fetchall()
+        fresh = sum(1 for r in rows if not r[9])
+        rows = [r for r in rows if r[9]]
+        obs: dict[int, list] = defaultdict(list)
+        if rows:
+            cur.execute("""SELECT o.call_id, o.observed_at,
+                                  CASE WHEN coalesce(o.no_route, false) THEN 0 ELSE o.real_mult END
+                           FROM qsim_quote_observations o JOIN qsim_positions qp ON qp.call_id = o.call_id
+                           WHERE o.call_id = ANY(%s) AND o.observed_at > qp.exit_time
+                             AND NOT coalesce(o.rate_limited, false)
+                             AND (o.real_mult IS NOT NULL OR coalesce(o.no_route, false))
+                           ORDER BY o.call_id, o.observed_at""", ([r[0] for r in rows],))
+            for cid, at, m in cur.fetchall():
+                obs[cid].append((at, float(m)))
+    items = []
+    for cid, plan, p4, ab, ex_t, sol_in, ch, sym, reason, _ok in rows:
+        ab = ab or {}
+        look_at = ex_t + timedelta(minutes=float(ab.get("look_min") or 0))
+        now = float(ab.get("now") or 2.0)
+        rest = [m for at, m in obs.get(cid, []) if at > look_at]
+        paid, ran = (rest[-1] if rest else now), False
+        for m in rest:
+            if m >= BANK_TARGET:
+                paid, ran = BANK_TARGET, True
+                break
+            if m <= BANK_FLOOR:
+                paid = m
+                break
+        items.append({"cid": cid, "dec": plan, "p4": p4, "be": ab.get("hold_break_even_pct"), "now": now,
+                      "paid": paid, "ran": ran, "sol_in": float(sol_in or 0), "ch": ch or "?", "sym": sym,
+                      "reason": reason})
+    return items, fresh
+
+
+def bank_v3_group(g: list) -> dict:
+    """n, 4x-before-1.8x rate, and holding from the look vs selling at the look (%/SOL and SOL)."""
+    n = len(g)
+    if not n:
+        return {"n": 0}
+    dep = sum(i["sol_in"] for i in g) or 1
+    d = sum(i["sol_in"] * (i["paid"] - i["now"]) for i in g)
+    be = [i["be"] for i in g if i["be"] is not None]
+    return {"n": n, "ran": sum(i["ran"] for i in g) / n * 100, "be": statistics.mean(be) if be else None,
+            "hold_vs_sell_pct": d / dep * 100, "hold_vs_sell_sol": d}
+
+
+def report_bank_v3(since: str, until: str | None = None, ver: int = 3) -> None:
+    items, fresh = bank_v3_items(since, until, ver)
+    print(f"\n{'=' * 18} AFTER THE 2x BANK: sell now or hold for {BANK_TARGET:g}x (floor {BANK_FLOOR:g}x)? "
+          f"(prompt v{ver}, {_span(since, until)}) {'=' * 18}")
+    if fresh:
+        print(f"  ({fresh} more decisions are under 2 h old — graded later)")
+    asked = [i for i in items if i["dec"] in ("hold", "bank")]
+    auto = [i for i in items if i["dec"] not in ("hold", "bank")]
+    if not items:
+        print("  no graded v3 decisions yet")
+        return
+
+    def line(label, g):
+        r = bank_v3_group(g)
+        if not r["n"]:
+            print(f"  {label:24s}    0")
+            return
+        print(f"  {label:24s} {r['n']:4d}  4x before {BANK_FLOOR:g}x {r['ran']:5.1f}%"
+              f"  (break-even {r['be'] or 0:4.0f}%)   holding vs selling at the look "
+              f"{r['hold_vs_sell_pct']:+6.1f}%  ({r['hold_vs_sell_sol']:+.4f} SOL)")
+    print(f"  {len(asked)} asked {BANK_LOOK_MIN:g} min after the bank, graded 2 h+ later; "
+          f"{len(auto)} decided during the look without asking "
+          f"({sum(i['dec'] == 'floor' for i in auto)} floor, {sum(i['dec'] == 'target' for i in auto)} target).")
+    line("ALL asked", asked)
+    line("said HOLD", [i for i in asked if i["dec"] == "hold"])
+    line("said BANK", [i for i in asked if i["dec"] == "bank"])
+    print("  by its p_4x minus the break-even:")
+    for lo, hi, lab in ((-101, -15, "15+ pts below"), (-15, 0, "0-15 below"), (0, 15, "0-15 above"),
+                        (15, 101, "15+ pts above")):
+        line(f"  {lab}", [i for i in asked if i["p4"] is not None and i["be"] is not None
+                         and lo <= i["p4"] - i["be"] < hi])
+    for ch in sorted({i["ch"] for i in asked}):
+        print(f"  -- {ch} --")
+        line("said HOLD", [i for i in asked if i["ch"] == ch and i["dec"] == "hold"])
+        line("said BANK", [i for i in asked if i["ch"] == ch and i["dec"] == "bank"])
+    holds = sorted((i for i in asked if i["dec"] == "hold"), key=lambda i: -(i["paid"] - i["now"]))
+    if holds:
+        print("  its HOLD calls (best first):")
+        for i in holds[:10]:
+            print(f"    {str(i['sym'])[:12]:12s} {i['ch'][:16]:16s} at the look {i['now']:.2f}x -> "
+                  f"{i['paid']:.2f}x {'RAN' if i['ran'] else ''} — {str(i['reason'])[:80]}")
+    print(f"  Graded on what it DOES: its HOLD calls must beat selling at the look (positive %), and reach\n"
+          f"  {BANK_TARGET:g}x more often than its BANK calls, on 30+ coins and again on the next 30. Only then\n"
+          f"  does it earn a live exit rule.")
+
+
+def _look_secs() -> float:
+    return BANK_LOOK_MIN * 60 if BANK_V >= 3 else 0.0
+
+
 def due_bank() -> list[tuple[int, datetime]]:
     """(call_id, bank time) for coins qsim banked in the last BANK_WINDOW_MIN minutes, not yet judged."""
     if not PLAN_ON or PLAN_AT != "bank":
@@ -1355,9 +1622,10 @@ def due_bank() -> list[tuple[int, datetime]]:
             WHERE qp.channel_handle = ANY(%s)
               AND qp.status = 'closed' AND qp.exit_reason LIKE '%%bank%%'
               AND qp.exit_time >= now() - make_interval(mins => %s)
+              AND qp.exit_time <= now() - make_interval(secs => %s)
               AND {_DEV_OK}
               AND NOT EXISTS (SELECT 1 FROM trader_brain b WHERE b.call_id = qp.call_id AND b.phase = 'bank')
-            ORDER BY qp.exit_time""", (CHANNELS, BANK_WINDOW_MIN, SKIP_DEV_BUNDLED, SKIP_DEV_BUNDLED))
+            ORDER BY qp.exit_time""", (CHANNELS, BANK_WINDOW_MIN, _look_secs(), SKIP_DEV_BUNDLED, SKIP_DEV_BUNDLED))
         return [(cid, et) for cid, et in cur.fetchall() if _failed.get(("bank", cid, None), 0) < 2]
 
 
@@ -1424,7 +1692,25 @@ def _one(kind: str, call_id: int, tally, ver=None) -> None:
     bank_time = None
     if kind == "bank":
         bank_time, ver = ver, BANK_V
-        ctx = build_context(call_id, with_path=True, learn=False, as_of=bank_time)
+        look_at = bank_time + timedelta(seconds=_look_secs())
+        ctx = build_context(call_id, with_path=True, learn=False, as_of=look_at)
+        if ctx and BANK_V >= 3:
+            ctx["after_bank"] = after_bank(call_id, bank_time, look_at)
+            ctx["channel_base_rate"] = channel_bank_rates(ctx["channel"], bank_time)
+            auto = ctx["after_bank"].get("decided")
+            if auto:                        # hit the floor or the target during the look: nothing to ask
+                tally["bank:" + auto] += 1
+                conn = db.get_conn()
+                with conn.cursor() as cur:
+                    cur.execute("""INSERT INTO trader_brain (call_id, phase, model, context, plan, verdict,
+                                   in_tokens, out_tokens, prompt_v, secs_after_bank)
+                                   VALUES (%s,'bank',NULL,%s,%s,%s,0,0,%s,%s) ON CONFLICT DO NOTHING""",
+                                (call_id, json.dumps(ctx, default=str), auto, json.dumps({"auto": auto}), BANK_V,
+                                 round((datetime.now(timezone.utc) - bank_time).total_seconds())))
+                conn.commit()
+                print(f"[trader_brain] {ctx.get('symbol')} ({ctx.get('channel')}) call_id={call_id} AT 2x BANK: "
+                      f"hit the {auto} during the {BANK_LOOK_MIN:g} min look — recorded, not asked", flush=True)
+                return
     else:
         if ver is None:
             ver = version_for(call_id)
@@ -1438,7 +1724,7 @@ def _one(kind: str, call_id: int, tally, ver=None) -> None:
         if kind == "entry":
             system = _system_for(ver)
         elif kind == "bank":
-            system = BANK_SYSTEM
+            system = BANK_SYSTEM_V3 if BANK_V >= 3 else BANK_SYSTEM
         else:
             system = SYSTEM + (LEARN_NOTE if _learns(ver) else "")
         v, tin, tout, err = judge(ctx, system, kind)
@@ -1478,13 +1764,14 @@ def _one(kind: str, call_id: int, tally, ver=None) -> None:
             late = round((datetime.now(timezone.utc) - bank_time).total_seconds())
             cur.execute("""INSERT INTO trader_brain (call_id, phase, model, delay_secs, context, plan, flow, risk,
                            confidence, verdict, in_tokens, out_tokens, attention, ctx_ms, api_ms, p_3x, prompt_v,
-                           has_brief, secs_after_bank)
-                           VALUES (%s,'bank',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           has_brief, secs_after_bank, p_4x)
+                           VALUES (%s,'bank',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                            ON CONFLICT DO NOTHING""",
                         (call_id, MODEL, ctx["our_entry"]["secs_since_entry"], json.dumps(ctx, default=str),
                          v["decision"], _int(v.get("flow")), _int(v.get("risk")), _int(v.get("confidence")),
                          json.dumps(v), tin, tout, str(v.get("attention") or "")[:10] or None,
-                         ctx_ms, api_ms, _int(v.get("p_3x")), BANK_V, "market_today" in ctx, late))
+                         ctx_ms, api_ms, _int(v.get("p_3x")), BANK_V, "market_today" in ctx, late,
+                         _int(v.get("p_4x"))))
         else:
             tally[v["plan"]] += 1
             cur.execute("""INSERT INTO trader_brain (call_id, model, delay_secs, context, plan, story, meme,
@@ -1506,7 +1793,8 @@ def _one(kind: str, call_id: int, tally, ver=None) -> None:
               f"[data {ctx_ms} ms, model {api_ms} ms]", flush=True)
     elif kind == "bank":
         print(f"[trader_brain] {ctx.get('symbol')} ({ctx.get('channel')}) call_id={call_id} AT 2x BANK: "
-              f"{v['decision'].upper()} (3x before 1.55x {v.get('p_3x')}%, flow {v.get('flow')}, risk {v.get('risk')}, "
+              f"{v['decision'].upper()} (4x before 1.8x {v.get('p_4x')}% vs break-even "
+              f"{(ctx.get('after_bank') or {}).get('hold_break_even_pct')}%, 3x before 1.55x {v.get('p_3x')}%, flow {v.get('flow')}, risk {v.get('risk')}, "
               f"{v.get('attention')}, conf {v.get('confidence')}) — {str(v.get('reason'))[:140]} "
               f"[data {ctx_ms} ms, model {api_ms} ms]", flush=True)
     else:
@@ -1903,6 +2191,8 @@ def report_bank(since: str, until: str | None = None, ver: int = BANK_V) -> None
     """At-bank decisions graded on what the coin did NEXT: did it hit 3x before falling to 1.55x —
     what holding to 3x would have caught (break-even ~45%) — and did it ever reach 5x.
     Only prompt version `ver` (default: the current one); older versions are counted, not mixed in."""
+    if ver >= 3:
+        return report_bank_v3(since, until, ver)
     win, wparams = _window("qp.exit_time", since, until)
     wparams = wparams + [ver]
     conn = db.get_conn()
