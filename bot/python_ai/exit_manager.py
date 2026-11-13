@@ -94,6 +94,14 @@ stop (or your take-profit). Prices are multiples of your entry. Sells fill at th
 apart, and these coins GAP — a stop at 2.5x often fills at 2.2x — so a stop right under the price
 gets you shaken out by noise, and a stop far under it gives back a lot. Size it to how the coin moves.
 
+AT THE 2x, EVERY COIN LOOKS STRONG. A coin that just doubled always shows explosive last-5-minute volume
+and more buys than sells — that IS the move to 2x, seen from inside, not evidence it will continue.
+"typical_at_2x" shows what coins usually look like at that moment; only what is clearly BEYOND that counts
+(a second leg after holding a level, holders and attention growing, X picking up). Most coins that reach
+2x never reach 4x: "channel_base_rate" says how many lately did it before falling to 1.8x, and
+"hold_break_even_pct" is the chance at which holding (to 4x, 1.8x floor) is worth the same as selling
+now. If you can't point to evidence that puts this coin clearly above that, sell.
+
 Read it like a trader:
 - momentum: a path still making higher highs on many steps vs one spike already fading;
 - volume and buyers: last-5-minute volume and buy count vs the hourly pace (rising = demand still
@@ -413,6 +421,29 @@ def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+def typical_at_2x(limit: int = 40) -> dict | None:
+    """Median flow numbers from earlier at-2x asks (needs 5+), so a coin's numbers at its 2x can be read
+    against what every coin shows at that moment."""
+    db.safe_rollback()
+    with db.get_conn().cursor() as cur:
+        cur.execute("""SELECT context->'volume_and_buyers_now' FROM exit_shadow_decisions
+                       WHERE trigger = 'at_2x' AND context ? 'volume_and_buyers_now'
+                         AND jsonb_typeof(context->'volume_and_buyers_now') = 'object'
+                       ORDER BY at DESC LIMIT %s""", (limit,))
+        flows = [r[0] for r in cur.fetchall() if r[0]]
+    if len(flows) < 5:
+        return None
+    import statistics
+
+    def med(key):
+        vals = [float(x[key]) for x in flows if isinstance(x.get(key), (int, float))]
+        return round(statistics.median(vals), 2) if vals else None
+    ratio = [x["buys_5m"] / x["sells_5m"] for x in flows if x.get("buys_5m") and x.get("sells_5m")]
+    return {"coins": len(flows), "median_last_5m_vs_hourly_pace": med("last_5m_vs_hourly_pace"),
+            "median_buys_per_sell_5m": round(statistics.median(ratio), 2) if ratio else None,
+            "median_price_change_5m_pct": med("price_change_5m_pct")}
+
+
 def decide(row: dict, trigger: str) -> None:
     global _n_today, _usd_today, _pause_until
     conn = db.get_conn()
@@ -442,13 +473,27 @@ def decide(row: dict, trigger: str) -> None:
                     "take_profit": float(p) if p is not None else None, "reason": r}
                    for t, mm, a, s, p, r in cur.fetchall()][::-1]
     mins = (datetime.now(timezone.utc) - row["bank_time"]).total_seconds() / 60
+    try:
+        base = tb.channel_bank_rates(row["channel"], datetime.now(timezone.utc))
+    except Exception:
+        db.safe_rollback()
+        base = None
+    try:
+        typical = typical_at_2x()
+    except Exception:
+        db.safe_rollback()
+        typical = None
     ctx = {"why_asked_now": trigger,
            "position": {"sold_2x_at": float(row["bank_x"]), "now": m, "high_since_2x": high,
                         "minutes_since_2x": round(mins, 1),
                         "minutes_since_high": round((datetime.now(timezone.utc) - row["high_at"]).total_seconds() / 60, 1)
                         if row["high_at"] else None,
                         "current_stop": float(row["stop"]) if row["stop"] is not None else None,
-                        "current_take_profit": float(row["take_profit"]) if row["take_profit"] is not None else None},
+                        "current_take_profit": float(row["take_profit"]) if row["take_profit"] is not None else None,
+                        "hold_break_even_pct": max(0, min(100, round((m - tb.BANK_FLOOR_FILL)
+                                                                     / (tb.BANK_TARGET - tb.BANK_FLOOR_FILL) * 100)))},
+           "channel_base_rate": base,
+           "typical_at_2x": typical,
            "path_since_2x": path_since(row["call_id"], row["bank_time"]),
            "volume_and_buyers_now": dex_flow(row["mint"]),
            "top_holders_now": hold, "top_holders_previous_check": row.get("last_holders"),
