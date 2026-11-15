@@ -267,6 +267,52 @@ def exit_manager(day: str) -> dict:
     return out
 
 
+# 2026-11-14: channels get better and worse in cycles (solearly led Nov 1-10, then its v7 BUYs trailed its
+# passes four days running while swt low_score carried live). The live lane list should follow that, so each
+# lane is graded every night on the last LANE_DAYS Pacific days of v7 BUYs vs passes. Report only: switching
+# lanes stays a manual .env change.
+LANES = [("solearlytrending", "shadow_only", "solearly"), ("solwhaletrending", "low_score", "swt low_score"),
+         ("solwhaletrending", "none", "swt none")]
+LANE_DAYS = 3
+LANE_MIN_BUYS = 15
+LANE_MIN_PNL = 10.0
+
+
+def lane_health(day: str) -> dict:
+    """Per lane, the last LANE_DAYS days: v7 BUYs vs passes and a verdict (working / borderline / benched /
+    too few BUYs). 'live' marks lanes in LIVE_BRAIN_CHANNELS x LIVE_BRAIN_CATEGORIES."""
+    first = (date.fromisoformat(day) - timedelta(days=LANE_DAYS - 1)).isoformat()
+    span, sp = _span("qp.entry_time", first, day)
+    ver = pair()[0]
+    live_ch = {c.strip().lstrip("@") for c in os.getenv("LIVE_BRAIN_CHANNELS", "solwhaletrending").split(",") if c.strip()}
+    live_cat = {c.strip() for c in os.getenv("LIVE_BRAIN_CATEGORIES", "none,low_score").split(",") if c.strip()}
+    on = os.getenv("LIVE_BRAIN_LANE", "off").strip().lower() == "on"
+    rows = _q(f"""
+        SELECT qp.channel_handle, coalesce(c.skip_reason, 'none'), e.vs_typical >= 6,
+               qp.sol_in, qp.sol_out, qp.exit_reason
+        FROM qsim_positions qp
+        JOIN calls c ON c.id = qp.call_id
+        JOIN trader_brain_entry e ON e.call_id = qp.call_id AND e.prompt_v = %s AND e.vs_typical IS NOT NULL
+        WHERE qp.status = 'closed' AND qp.sol_in > 0 AND {span}""", [ver] + sp)
+    out = {"first": first, "last": day, "v": ver, "lanes": {}}
+    for ch, cat, label in LANES:
+        g = [r for r in rows if r[0] == ch and r[1] == cat]
+        buy = agg([(r[3], r[4], r[5]) for r in g if r[2]])
+        pas = agg([(r[3], r[4], r[5]) for r in g if not r[2]])
+        gap = (buy["pnl_pct"] - pas["pnl_pct"]) if buy["n"] and pas["n"] else None
+        if buy["n"] < LANE_MIN_BUYS:
+            verdict = f"too few BUYs ({buy['n']} of {LANE_MIN_BUYS})"
+        elif buy["pnl_pct"] >= LANE_MIN_PNL and (gap is None or gap > 0):
+            verdict = "working"
+        elif buy["pnl_pct"] < 0 or (gap is not None and gap < 0):
+            verdict = "benched"
+        else:
+            verdict = "borderline"
+        out["lanes"][label] = {"buy": buy, "pass": pas, "gap": gap, "verdict": verdict,
+                               "live": on and ch in live_ch and cat in live_cat}
+    return out
+
+
 def market(day: str) -> dict:
     span, sp = _span("qp.entry_time", day, day)
     rows = _q(f"""
@@ -316,7 +362,8 @@ def playbook(day: str) -> dict:
     return {"channels": out}
 
 
-SECTIONS = [("paired", paired), ("swt", swt), ("bank_brain", bank_brain), ("exit_watch", exit_watch),
+SECTIONS = [("lane_health", lane_health), ("paired", paired), ("swt", swt), ("bank_brain", bank_brain),
+            ("exit_watch", exit_watch),
             ("exit_manager", exit_manager),
             ("grok_bank", grok_bank),
             ("market", market), ("spend", spend), ("playbook", playbook)]
@@ -356,6 +403,17 @@ def rate(r: dict | None, key: str = "ran") -> str:
 def text(d: dict) -> str:
     day = date.fromisoformat(d["day"])
     L = [f"🧠 Brain daily — {day:%a %b %-d} (Pacific)", ""]
+    lh = d.get("lane_health", {})
+    if "error" in lh:
+        L += [f"Lane health: error {lh['error']}", ""]
+    elif lh.get("lanes"):
+        L.append(f"Lane health — last {LANE_DAYS} days ({lh['first'][5:]}..{lh['last'][5:]}), v{lh['v']} BUYs vs passes:")
+        for lab, x in lh["lanes"].items():
+            lbuy = x["buy"]
+            L.append(f"  {lab}{' [LIVE]' if x['live'] else ''}: {x['verdict'].upper()} — BUY {pct(lbuy)}"
+                     + (f", {lbuy['banks']} banks" if lbuy["n"] else "") + f" · pass {pct(x['pass'])}"
+                     + (f" · gap {x['gap']:+.0f} pts" if x["gap"] is not None else ""))
+        L.append("")
     p = d.get("paired", {})
     if not p:
         pass
@@ -639,6 +697,27 @@ def render_html(d: dict) -> str:
         kp.append(_kpi("API spend", f"${sp['anthropic'] + sp['xai']:.2f}",
                        f"Anthropic ${sp['anthropic']:.2f} · xAI ${sp['xai']:.2f}"))
     out.append(f"<div class=kpis>{''.join(kp)}</div>")
+
+    lh = d.get("lane_health", {})
+    if lh:
+        out.append(f"<section><div class=hd><h2>Lane health</h2></div><p class=lede>Last {LANE_DAYS} days of "
+                   f"v{lh.get('v', '?')} BUYs vs passes per lane. Working = {LANE_MIN_BUYS}+ BUYs, BUY P&amp;L "
+                   f"+{LANE_MIN_PNL:g}% or better and ahead of the passes; benched = BUYs losing or behind the "
+                   "passes. Report only — lanes are switched in .env.</p><table class=rows>")
+        if _err(lh):
+            out.append(f"<tr><td colspan=4>{_err(lh)}</td></tr>")
+        else:
+            for lab, x in lh["lanes"].items():
+                lbuy, v = x["buy"], x["verdict"]
+                cls = "win" if v == "working" else ""
+                sub = (f"pass {pct(x['pass'])}" + (f" · gap {x['gap']:+.0f} pts" if x["gap"] is not None else "")
+                       + (" · LIVE" if x["live"] else ""))
+                val = lbuy["pnl_pct"] if lbuy["n"] else None
+                out.append(f"<tr><td class=lab>{_e(lab)}<span class=sub>{_e(sub)}</span>"
+                           f"<span class='pill {cls}'>{_e(v)}</span></td><td class=bar>{_dbar(val)}</td>"
+                           f"<td class='val {_cls(val)}'>{_fmt(val)}</td>"
+                           f"<td class=cnt>{lbuy['n']} BUYs · {lbuy['banks']}b</td></tr>")
+        out.append("</table></section>")
 
     # v5 vs v7 (only while a pair runs)
     if p:
