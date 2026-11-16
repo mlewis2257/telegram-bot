@@ -544,6 +544,13 @@ def decide(row: dict, trigger: str) -> None:
                     (stop, tp, action == "sell", milestone, m, x is not None,
                      json.dumps(hold) if hold else None, row["call_id"]))
     conn.commit()
+    if trigger == "at_2x" and action == "sell":
+        # 2026-11-15: a sell at the 2x IS the 2x bank — live already sold there. Filling it at the next quote
+        # (minutes later, usually lower) charged the brain for agreeing with the bank (LUMINA, Speed, USDC).
+        # Record it at the bank price so the score measures only the coins it chose to HOLD.
+        with conn.cursor() as cur:
+            _close(cur, {**row, "high": high}, float(row["bank_x"]), "sold_at_bank", row["bank_time"])
+        conn.commit()
     print(f"[exit] {row['symbol']} ({row['channel']}) {trigger} at {m:.2f}x (high {high:.2f}x): "
           f"{action.upper()}" + (f" — stop {stop:.2f}x" + (f", take-profit {tp:.2f}x" if tp else "")
                                  if action == "hold" else "")
@@ -563,6 +570,14 @@ def tick() -> None:
     for cid in ids:
         with db.get_conn().cursor() as cur:
             row = _row(cur, cid)
+        if not row.get("decisions"):
+            # the at-2x question is asked as of the bank, before any later quote is applied (no lookahead,
+            # and a sell there is the bank itself)
+            decide(row, "at_2x")
+            with db.get_conn().cursor() as cur:
+                row = _row(cur, cid)
+            if row.get("status") != "open":
+                continue
         row = walk_quotes(row)
         if row.get("status") != "open":
             continue
