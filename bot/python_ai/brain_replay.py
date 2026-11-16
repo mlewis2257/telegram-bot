@@ -569,6 +569,72 @@ def report(d0: date, d1: date, run: str) -> None:
     print("\nRead against calreport's v7_stored solo gap: a v8 lead smaller than that is noise.")
 
 
+# ── ablation: what drives v7's calls on one channel? ───────────────────────────
+# 2026-11-15: on solearly Nov 12-15 v7's BUYs lost to its passes four days running and its own chance of 2x
+# ran BACKWARDS (under 15%: 19% banked; 25%+: 4%). Nearly every losing BUY leaned on "similar past coins
+# banked 50-62% vs channel ~20%". ablate re-asks on the exact view live v7 saw, minus one part, and
+# ablreport compares the answers with live v7's on the same coins.
+ARMS = {
+    # v7's view without the similar-coins block, and the prompt without the note that explains it
+    "nosim": (5, ("similar_past_coins", "similar_summary", "similar_vs_channel")),
+}
+
+
+def ablate(d0: date, d1: date, budget: Budget, channel: str, arm: str) -> None:
+    ensure_tables()
+    ver, drop = ARMS[arm]
+    have = stored(budget.run)
+    for d in _days(d0, d1):
+        cs = coins(channel, d)
+        live = live_rows([c["call_id"] for c in cs])
+        cs = [c for c in cs if (c["call_id"], V7) in live]
+        print(f"[replay] ablate {arm} {d} {channel}: {len(cs)} coins with a live v7 answer", flush=True)
+        for c in cs:
+            if (c["call_id"], arm) in have:
+                continue
+            lv = live[(c["call_id"], V7)]
+            ctx = {k: v for k, v in lv["context"].items() if k not in drop}
+            ask(budget, c, arm, ver, ctx, "live_v7-" + arm, lv["judged_at"])
+            if budget.stopped:
+                print(f"[replay] stopped: {budget.stopped}")
+                return
+    print(f"[replay] ablate done: {budget.calls} calls ({budget.failed} failed), run '{budget.run}' ~${budget.spent():.2f}")
+
+
+def ablreport(d0: date, d1: date, run: str, channel: str, arm: str) -> None:
+    have = stored(run)
+    cs = [c for d in _days(d0, d1) for c in coins(channel, d)]
+    live = live_rows([c["call_id"] for c in cs])
+    by_id = {c["call_id"]: c for c in cs}
+    ids = [i for i in by_id if (i, arm) in have and (i, V7) in live]
+    print(f"\nABLATION '{arm}' on {channel}, {d0}..{d1} (run '{run}'): {len(ids)} coins answered both ways")
+    if not ids:
+        return
+    pnl = lambda g: _f(_pts([by_id[i] for i in g])).strip()
+    bank = lambda g: f"{sum('bank' in (by_id[i]['reason'] or '') for i in g)}/{len(g)}"
+    rug = lambda g: sum(by_id[i]["s_out"] / by_id[i]["s_in"] < 0.3 for i in g)
+    for name, src in (("live v7", lambda i: live[(i, V7)]), (arm, lambda i: have[(i, arm)])):
+        b = {i for i in ids if is_buy(src(i))}
+        p = set(ids) - b
+        print(f"  {name:<8} BUY {len(b):>3}  banked {bank(b):>6}  rugs {rug(b):>2}  P&L {pnl(b):>7}   |   "
+              f"PASS {len(p):>3}  banked {bank(p):>6}  P&L {pnl(p):>7}")
+    lb = {i for i in ids if is_buy(live[(i, V7)])}
+    ab = {i for i in ids if is_buy(have[(i, arm)])}
+    na, pa, nb, pb, gap = solo(ab, lb, by_id)
+    agree = sum((i in lb) == (i in ab) for i in ids) / len(ids) * 100
+    print(f"  agreement {agree:.0f}%  |  solo picks: {arm}-only {na} {_f(pa).strip()}, live-only {nb} {_f(pb).strip()}, "
+          f"{arm} - live {_f(gap).strip()} pts/SOL")
+    print(f"  {arm} chance of 2x vs what happened:")
+    for lo, hi in ((0, 15), (15, 25), (25, 101)):
+        g = [i for i in ids if (have[(i, arm)]["verdict"] or {}).get("p_2x") is not None
+             and lo <= float(have[(i, arm)]["verdict"]["p_2x"]) < hi]
+        if g:
+            print(f"    p_2x {lo}-{hi - 1 if hi < 101 else 100}%: {len(g):>3} coins  banked {bank(g):>6}  P&L {pnl(g):>7}")
+    print("\nRead: the arm fixes the problem if its BUYs beat its passes, its chance of 2x runs the right way")
+    print("(higher = better), and its solo picks beat live v7's. Calibration noise: ~95% agreement re-asking the")
+    print("SAME view, solo gap +-25 pts on a handful of coins — judge on the BUY/PASS split, not one number.")
+
+
 def _arg(name: str, default=None):
     return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
 
@@ -585,6 +651,22 @@ if __name__ == "__main__":
     else:
         d0, d1 = D(_arg("--from", "2026-11-01")), D(_arg("--to", "2026-11-10"))
         run = _arg("--run", "nov")
+    if cmd in ("ablate", "ablreport"):
+        d0, d1 = D(_arg("--from", "2026-11-12")), D(_arg("--to", "2026-11-15"))
+        run, ch, arm = _arg("--run", "abl"), _arg("--channel", "solearlytrending"), _arg("--arm", "nosim")
+        if arm not in ARMS:
+            sys.exit(f"unknown --arm {arm}; known: {', '.join(ARMS)}")
+        ensure_tables()
+        if cmd == "ablreport":
+            ablreport(d0, d1, run, ch, arm)
+            sys.exit(0)
+        if not tb.API_KEY:
+            sys.exit("no ANTHROPIC_API_KEY in .env")
+        b = Budget(run, float(_arg("--max-usd", "2.5")), float(_arg("--sleep", "1.5")))
+        print(f"[replay] ablate '{arm}' {ch} {d0}..{d1} run '{run}': ceiling ${b.max_usd:.2f} (spent so far "
+              f"${b.spent():.2f}), model {tb.MODEL}", flush=True)
+        ablate(d0, d1, b, ch, arm)
+        sys.exit(0)
     if cmd in ("calibrate", "november"):
         if not tb.API_KEY:
             sys.exit("no ANTHROPIC_API_KEY in .env")
