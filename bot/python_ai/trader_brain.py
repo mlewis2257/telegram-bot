@@ -594,6 +594,20 @@ def has_brief(call_id: int) -> bool:
     return BRIEF_ON and call_id % 2 == 0
 
 
+# 2026-11-17 SIMILAR "WORSE ONLY" (per channel). On solearly v7 read the raw lookalike list ("7 of 8
+# stopped") as a red flag on every coin although the label said "about normal" (44 of 45 coins on
+# Nov 16-17, despite LEARN_NOTE saying exactly that is normal): 0 BUYs in 45 while the passes banked 24%,
+# and its pass reasons were the same for the banks and the losers. Earlier: the "better" label flipped
+# from +30% (Nov 1-10) to -31% (Nov 11-13), and the nosim ablation (Nov 12-15) removed the inversion.
+# The protective side works ("worse" = 57% rugs on all solearly coins Oct 1-Nov 16). So on these
+# channels the lookalikes are shown ONLY when they say "worse"; otherwise they are dropped entirely
+# and the hidden label is kept in the stored context as "_similar_hidden" (never sent to the model —
+# judge() strips "_" keys) so the change can be graded. Same prompt_v (7); grade by date and by
+# context->>'_similar_hidden'. Set TRADER_BRAIN_SIM_WORSE_ONLY="" to switch back.
+SIM_WORSE_ONLY = {c.strip().lstrip("@") for c in
+                  os.getenv("TRADER_BRAIN_SIM_WORSE_ONLY", "solearlytrending").split(",") if c.strip()}
+
+
 def add_similar(ctx: dict, mint: str, as_of: datetime | None = None) -> None:
     """The learn versions' extra (v7+): the nearest closed coins and how they did vs the channel, in place."""
     try:
@@ -611,6 +625,12 @@ def add_similar(ctx: dict, mint: str, as_of: datetime | None = None) -> None:
                 label = "better"
             else:
                 label = "about normal"
+            if ctx.get("channel") in SIM_WORSE_ONLY and label != "worse":
+                ctx.pop("similar_past_coins", None)
+                ctx.pop("similar_summary", None)
+                ctx.pop("similar_vs_channel", None)
+                ctx["_similar_hidden"] = label
+                return
             ctx["similar_vs_channel"] = {
                 "similar_banked_pct": round(bank_pct), "channel_bank_pct": round(cb),
                 "similar_rugged_pct": round(rug_pct), "channel_rug_pct": round(cr),
@@ -1263,7 +1283,9 @@ def report_playbook() -> None:
 # ── Judge ───────────────────────────────────────────────────────────────────────
 
 def judge(ctx: dict, system: str = None, kind: str = "plan") -> tuple[dict | None, int, int, str | None]:
-    """(verdict, input tokens, output tokens, error). kind 'plan' or 'entry' (validation differs)."""
+    """(verdict, input tokens, output tokens, error). kind 'plan' or 'entry' (validation differs).
+    Keys starting with "_" are bookkeeping kept in the stored context and never shown to the model."""
+    ctx = {k: v for k, v in ctx.items() if not str(k).startswith("_")}
     r = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},

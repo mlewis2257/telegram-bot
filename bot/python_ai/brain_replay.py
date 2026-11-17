@@ -174,7 +174,8 @@ def rebuilt_view(c: dict, as_of: datetime, fast: bool = False) -> dict | None:
 def v5sim_view(c: dict, v5: dict) -> dict:
     """Live v5's stored view + similar coins as of the moment v5 judged (v5 and v7 views differ only there)."""
     ctx = json.loads(json.dumps(v5["context"]))
-    for k in ("similar_past_coins", "similar_summary", "similar_vs_channel", "lessons_from_your_record"):
+    for k in ("similar_past_coins", "similar_summary", "similar_vs_channel", "lessons_from_your_record",
+              "_similar_hidden"):
         ctx.pop(k, None)
     tb.add_similar(ctx, c["mint"], v5["judged_at"])
     return ctx
