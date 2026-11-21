@@ -9,7 +9,7 @@ target; when it stalls and the big wallets start selling, they sell for the best
 Replays on stored quotes can't measure that, so this runs FORWARD, in real time, on the coins the
 live lanes trade, and is graded against the 2x bank on the same coins.
 
-WHAT. When qsim banks a live-lane coin (a v7 BUY on LIVE_BRAIN_CHANNELS / LIVE_BRAIN_CATEGORIES), a
+WHAT. When qsim banks a brain-lane coin (a v7 BUY on EXIT_MANAGER_CHANNELS / _CATEGORIES), a
 VIRTUAL position starts at the bank. Live keeps banking at 2x for real; nothing here trades.
   price   qsim's own sell-quote probes after the bank (every 15 s while the coin is >= 1.5x, up to
           6 h) — the same ruler as qsim, so its numbers compare with qsim's.
@@ -56,9 +56,12 @@ import trader_brain as tb  # noqa: E402
 MODEL = os.getenv("EXIT_BRAIN_MODEL", tb.MODEL)
 PRICE_IN = float(os.getenv("EXIT_BRAIN_PRICE_IN", str(tb.PRICE_IN)))
 PRICE_OUT = float(os.getenv("EXIT_BRAIN_PRICE_OUT", str(tb.PRICE_OUT)))
+# 2026-11-21: its OWN lane list. It used LIVE_BRAIN_CHANNELS / _CATEGORIES, so when live was cut to swt
+# low_score only (Nov 14) the shadow lost every solearly bank (16 v7-BUY banks Nov 17-20) and had 4 coins
+# in 5 days against a 30-coin bar. It trades nothing, so it watches every brain lane, live or benched.
 CHANNELS = [c.strip().lstrip("@") for c in
-            os.getenv("LIVE_BRAIN_CHANNELS", "solearlytrending,solwhaletrending").split(",") if c.strip()]
-CATEGORIES = [c.strip() for c in os.getenv("LIVE_BRAIN_CATEGORIES", "shadow_only,low_score").split(",") if c.strip()]
+            os.getenv("EXIT_MANAGER_CHANNELS", "solearlytrending,solwhaletrending").split(",") if c.strip()]
+CATEGORIES = [c.strip() for c in os.getenv("EXIT_MANAGER_CATEGORIES", "shadow_only,low_score").split(",") if c.strip()]
 MIN_SCORE = int(float(os.getenv("LIVE_BRAIN_MIN_SCORE", "6")))
 BRAIN_V = int(os.getenv("LIVE_BRAIN_VERSION", "7"))
 
@@ -371,6 +374,7 @@ def walk_quotes(row: dict) -> dict:
         for at, m in quotes:
             last_at, last_m = at, m
             if row["pending_sell"] and (row["last_ask_at"] is None or at > row["last_ask_at"]):
+                high = max(high, m)          # the selling quote can be the high (BUL: sold 2.81, high read 2.50)
                 row.update(high=high)
                 _close(cur, row, m, "brain_sell" if m > 0 else "rug", at)
                 break
@@ -588,7 +592,7 @@ def tick() -> None:
 
 def run() -> None:
     ensure_tables()
-    print(f"[exit] shadow exit manager — live-lane coins: {','.join(CHANNELS)} {CATEGORIES}, v{BRAIN_V} score "
+    print(f"[exit] shadow exit manager — brain-lane coins: {','.join(CHANNELS)} {CATEGORIES}, v{BRAIN_V} score "
           f"{MIN_SCORE}+; brain {MODEL}. Asks at 2x, milestones {MILESTONES[:6]}..., a {DROP_PCT:g}% drop, every "
           f"{CHECK_MIN:g} min. Ceilings: {MAX_CALLS_PER_DAY} calls / ${MAX_USD_PER_DAY:.2f} a day (Anthropic); "
           f"X looks {'on' if GROK_ON else 'off'} — {GROK_MAX_PER_DAY}/day, ${GROK_MAX_USD_PER_DAY:.2f}/day; "
