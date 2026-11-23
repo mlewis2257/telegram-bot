@@ -434,6 +434,29 @@ LIVE_BRAIN_VERSION = int(entry_quality.env_float(os.getenv("LIVE_BRAIN_VERSION")
 LIVE_BRAIN_MAX_DEV_BUNDLED = entry_quality.env_float(os.getenv("LIVE_BRAIN_MAX_DEV_BUNDLED"), 40.0)
 LIVE_BRAIN_TIMEOUT_S = entry_quality.env_float(os.getenv("LIVE_BRAIN_TIMEOUT_S"), 10.0)
 LIVE_BRAIN_MIN_ENTRY_RATIO = entry_quality.env_float(os.getenv("LIVE_BRAIN_MIN_ENTRY_RATIO"), 0.25)
+# Follow qsim's exits (2026-11-23, OFF by default). Paired brain-lane trades Nov 12-23 (n=55): live
+# -5.8%/trade vs qsim +1.2%. 46 entries within 3% of qsim's tracked it (-0.3 pts); the whole gap was
+# ~6 coins live sold on a wick or a worse entry while qsim held them to the bank (MCAT, JENSEN, SEXCOIN,
+# CATMARIO, ANTHROPICINU, Cyber). Lanes are chosen and forward-tested on qsim's exits, so this makes
+# live run the exits that were tested. On: a brain position sells when ITS qsim position (same
+# call_id) closes, and otherwise holds, except
+#   - a raw sell quote at/below LIVE_BRAIN_FOLLOW_BACKSTOP (default 0.60) -> hard_stop (rug backstop)
+#   - a raw sell quote at/above LIVE_BRAIN_BANK -> take_profit (never skip our own bank)
+#   - qsim has no position, closed before we bought, or has not quoted in
+#     LIVE_BRAIN_FOLLOW_STALE_SECS (default 150) -> live's own rules this tick
+# The quote-less collapse guard runs before any of this and is untouched.
+LIVE_BRAIN_FOLLOW_QSIM = os.getenv("LIVE_BRAIN_FOLLOW_QSIM", "off").strip().lower() == "on"
+LIVE_BRAIN_FOLLOW_BACKSTOP = entry_quality.env_float(os.getenv("LIVE_BRAIN_FOLLOW_BACKSTOP"), 0.60)
+LIVE_BRAIN_FOLLOW_STALE_SECS = entry_quality.env_float(os.getenv("LIVE_BRAIN_FOLLOW_STALE_SECS"), 150.0)
+if LIVE_BRAIN_FOLLOW_QSIM and not (0.3 <= LIVE_BRAIN_FOLLOW_BACKSTOP < 1.0
+                                   and 30.0 <= LIVE_BRAIN_FOLLOW_STALE_SECS <= 600.0):
+    print(f"[live] WARNING: LIVE_BRAIN_FOLLOW_BACKSTOP={LIVE_BRAIN_FOLLOW_BACKSTOP:g} (needs [0.3, 1)) or "
+          f"LIVE_BRAIN_FOLLOW_STALE_SECS={LIVE_BRAIN_FOLLOW_STALE_SECS:g} (needs [30, 600]) invalid — "
+          f"follow-qsim OFF")
+    LIVE_BRAIN_FOLLOW_QSIM = False
+print(f"[live] brain follow-qsim exits: "
+      + (f"ON (backstop {LIVE_BRAIN_FOLLOW_BACKSTOP:g}x, own rules if qsim silent "
+         f">{LIVE_BRAIN_FOLLOW_STALE_SECS:g}s)" if LIVE_BRAIN_FOLLOW_QSIM else "off"))
 # SOL weather pause (2026-11-12, OFF by default). market_weather.py --signal sol on v7 BUYs Nov 1-12: buys
 # made while SOL was down more than 1% over the previous 3 h lost (45 trades, -10.9%) while the rest made
 # +11.3%, the same direction in both halves — but ~2 SE, after trying several signals and levels, so it
@@ -570,6 +593,91 @@ def _is_brain_position(call_id: int) -> bool:
     if len(_brain_cache) > 5000:
         _brain_cache.clear()
     return val
+
+
+_follow_cache: dict[int, tuple[float, dict | None]] = {}
+_follow_logged: dict[tuple[int, str], float] = {}
+
+
+def _follow_log(call_id: int, key: str, msg: str, every: float = 60.0) -> None:
+    now = time.monotonic()
+    if now - _follow_logged.get((call_id, key), 0.0) >= every:
+        _follow_logged[(call_id, key)] = now
+        print(msg)
+        if len(_follow_logged) > 5000:
+            _follow_logged.clear()
+
+
+def _qsim_reason_to_live(reason: str | None) -> str:
+    """Map a qsim exit_reason onto one the trading_positions CHECK constraint allows."""
+    r = (reason or "").lower()
+    if "bank" in r:
+        return "take_profit"
+    if "profit_floor" in r:
+        return "profit_floor"
+    if "rug" in r:
+        return "rug"
+    if "stop" in r:
+        return "hard_stop"
+    return "stop_loss"
+
+
+def _qsim_follow_decision(call_id: int, position: dict, raw_mult: float | None,
+                          entry_mcap: float, current_mcap: float) -> ExitResult | None:
+    """LIVE_BRAIN_FOLLOW_QSIM: exit when this call's qsim position exits.
+
+    None = no opinion (qsim missing / closed before we bought / silent) -> live's own rules.
+    """
+    now = time.monotonic()
+    hit = _follow_cache.get(call_id)
+    if hit is not None and now - hit[0] < 2.0:
+        st = hit[1]
+    else:
+        try:
+            st = db.get_qsim_follow_state(call_id)
+        except Exception as e:
+            db.safe_rollback()
+            _follow_log(call_id, "err", f"[live] follow-qsim lookup failed call_id={call_id} "
+                        f"({type(e).__name__}: {e}) — own rules this tick")
+            return None
+        _follow_cache[call_id] = (now, st)
+        if len(_follow_cache) > 2000:
+            _follow_cache.clear()
+    if not st:
+        _follow_log(call_id, "none", f"[live] follow-qsim call_id={call_id}: no qsim position — own rules",
+                    every=600.0)
+        return None
+
+    exit_mcap = (entry_mcap * raw_mult) if (raw_mult is not None and raw_mult > 0) else current_mcap
+    if st.get("status") != "open":
+        xt = st.get("exit_time")
+        et = position.get("entry_time")
+        if et is not None and et.tzinfo is None:
+            et = et.replace(tzinfo=timezone.utc)
+        if xt is not None and xt.tzinfo is None:
+            xt = xt.replace(tzinfo=timezone.utc)
+        if xt is None or (et is not None and xt < et):
+            _follow_log(call_id, "early", f"[live] follow-qsim call_id={call_id}: qsim closed before "
+                        f"our buy — own rules", every=600.0)
+            return None
+        reason = _qsim_reason_to_live(st.get("exit_reason"))
+        print(f"[live] follow-qsim call_id={call_id}: qsim closed ({st.get('exit_reason')}) — "
+              f"selling as {reason}" + (f" at {raw_mult:.2f}x" if raw_mult else ""))
+        return ExitResult(True, reason, exit_mcap=exit_mcap)
+
+    age = st.get("last_obs_age_s")
+    if age is None or age > LIVE_BRAIN_FOLLOW_STALE_SECS:
+        _follow_log(call_id, "stale", f"[live] follow-qsim call_id={call_id}: qsim silent "
+                    f"{'never quoted' if age is None else f'{age:.0f}s'} — own rules")
+        return None
+    if raw_mult is not None and raw_mult > 0:
+        if raw_mult <= LIVE_BRAIN_FOLLOW_BACKSTOP:
+            print(f"[live] follow-qsim call_id={call_id}: {raw_mult:.2f}x <= backstop "
+                  f"{LIVE_BRAIN_FOLLOW_BACKSTOP:g}x — hard_stop")
+            return ExitResult(True, "hard_stop", exit_mcap=exit_mcap)
+        if raw_mult >= LIVE_BRAIN_BANK:
+            return ExitResult(True, "take_profit", exit_mcap=exit_mcap)
+    return ExitResult(False)
 
 
 def followed_lane_eligible(channel_handle: str, category) -> bool:
@@ -2383,6 +2491,10 @@ def check_live_exits(
         cfg = _replace(cfg, hard_stop_pct=round(1.0 - LIVE_BRAIN_STOP, 6),
                        vip_gamble_hard_stop_pct=round(1.0 - LIVE_BRAIN_STOP, 6))
         position_overlay = _BRAIN_OVERLAY
+        if LIVE_BRAIN_FOLLOW_QSIM:
+            _follow = _qsim_follow_decision(call_id, position, raw_mult, entry_mcap, current_mcap)
+            if _follow is not None:
+                return _follow
 
     # ── RAW executable hard stop (mirrors qsim e81d4d7) ──────────────────────────
     # A real sell quote already below the stop is not a phantom — it is the price the bag

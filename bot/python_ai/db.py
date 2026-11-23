@@ -3507,6 +3507,34 @@ def get_today_live_losses() -> float:
         return float(cur.fetchone()[0])
 
 
+def get_qsim_follow_state(call_id: int) -> dict | None:
+    """qsim's position for call_id as live's follow-qsim exit needs it, or None if qsim has none.
+
+    last_obs_age_s = seconds since qsim's last real quote attempt (rate-limited rows excluded:
+    a 429 is not a look at the coin; no-route rows count, they are how qsim sees a rug).
+    """
+    conn = get_conn()
+    safe_rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT q.status, q.exit_reason, q.exit_time,
+                   extract(epoch FROM now() - (
+                       SELECT max(o.observed_at) FROM qsim_quote_observations o
+                       WHERE o.call_id = q.call_id AND NOT coalesce(o.rate_limited, false)
+                   )) AS last_obs_age_s
+            FROM qsim_positions q
+            WHERE q.call_id = %s
+            """,
+            (call_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {"status": row[0], "exit_reason": row[1], "exit_time": row[2],
+            "last_obs_age_s": float(row[3]) if row[3] is not None else None}
+
+
 def get_qsim_mult_before(call_id: int, seconds_before: float,
                          max_extra_secs: float = 120.0) -> float | None:
     """qsim's real multiple for call_id as it stood `seconds_before` seconds ago.
